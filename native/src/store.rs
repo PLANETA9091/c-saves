@@ -91,6 +91,54 @@ fn env_parse<T: std::str::FromStr>(key: &str, dflt: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt)
 }
 
+/// Exclusive flock guarding one store directory against a second live
+/// opener in ANOTHER process (concurrent scan+truncate from a second
+/// process destroys the container). Re-entrant within this process via a
+/// global registry: reopening the same dir shares the held flock.
+fn take_flock(dir: &Path) -> std::io::Result<Option<File>> {
+    use std::collections::HashSet;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    static HELD: OnceLock<Mutex<Vec<Arc<File>>>> = OnceLock::new();
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut reg = REGISTRY
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if !reg.insert(key.clone()) {
+        // already locked by this process
+        return Ok(None);
+    }
+    let path = key.join("lock");
+    let f = OpenOptions::new().create(true).write(true).truncate(false).open(path)?;
+    const LOCK_EX: i32 = 2;
+    let rc = unsafe { libc_flock(f.as_raw_fd(), LOCK_EX) };
+    if rc != 0 {
+        reg.remove(&key);
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "c-saves: store already opened by another process",
+            ));
+        }
+        return Err(err);
+    }
+    // keep the fd alive for the process lifetime (flock holds until exit)
+    HELD
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(Arc::new(f));
+    Ok(None)
+}
+
+extern "C" {
+    #[link_name = "flock"]
+    fn libc_flock(fd: i32, op: i32) -> i32;
+}
+
 impl Cfg {
     fn from_env() -> Cfg {
         Cfg {
@@ -339,7 +387,10 @@ impl Recipe {
                 for _ in 0..n {
                     let d = unzigzag(get_u64(b, &mut p)?);
                     prev += d;
-                    sections.push(*id2h.get(&(prev as u32))?);
+                    match id2h.get(&(prev as u32)) {
+                        Some(h) => sections.push(*h),
+                        None => return None,
+                    }
                 }
                 let tail = parse_tail(&mut p)?;
                 Some(Recipe { whole: None, sections, tail, ..EMPTY })
@@ -611,6 +662,10 @@ impl SlabCache {
 
 pub struct Store {
     uid: u64,
+    /// Exclusive flock on `<dir>/lock` — refuses a second live opener of the
+    /// same store (concurrent scan+truncate from a second process destroys
+    /// the container).
+    _lock: Option<File>,
     dir: PathBuf,
     cfg: Cfg,
     segs: RwLock<HashMap<u32, Arc<Seg>>>,
@@ -622,6 +677,10 @@ pub struct Store {
     /// On-disk kind-6 record count per key name (a key whose last record
     /// would die with a compacted segment is re-recorded first).
     key_refcnt: RwLock<HashMap<String, u32>>,
+    /// Pending chunk recipes batched into one kind-7 record (saves the
+    /// 8-byte record frame + 2 header bytes per chunk). Read-your-writes is
+    /// served from the pending map until the batch is flushed.
+    recipe_batch: Mutex<Vec<(u64, Vec<u8>)>>,
     writer: Mutex<Option<Writer>>,
     next_seg: AtomicU64,
     next_blob_id: AtomicU64,
@@ -647,8 +706,10 @@ impl Store {
     pub fn open_cfg(dir: &Path, dict_enabled: bool, cfg: Cfg) -> std::io::Result<Arc<Store>> {
         fs::create_dir_all(dir)?;
         static NEXT_UID: AtomicU64 = AtomicU64::new(1);
+        let lock = take_flock(dir)?;
         let st = Arc::new(Store {
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
+            _lock: lock,
             dir: dir.to_path_buf(),
             cfg,
             segs: RwLock::new(HashMap::new()),
@@ -657,6 +718,7 @@ impl Store {
             chunks: RwLock::new(HashMap::new()),
             keys_tab: RwLock::new(Vec::new()),
             key_refcnt: RwLock::new(HashMap::new()),
+            recipe_batch: Mutex::new(Vec::new()),
             writer: Mutex::new(None),
             slab_cache: Mutex::new(SlabCache::new(32 * 1024 * 1024)),
             next_seg: AtomicU64::new(0),
@@ -837,7 +899,7 @@ impl Store {
         {
             let mut blobs = self.blobs.write();
             let mut id2h = self.ids.write();
-            for id in ids {
+            for id in ids.clone() {
                 let path = self.seg_path(id);
                 let file = OpenOptions::new().read(true).write(true).open(&path)?;
                 let total = file.metadata()?.len();
@@ -1025,6 +1087,35 @@ impl Store {
                                 }
                             }
                         }
+                        7 => {
+                            // recipe batch: [7][u32 n]{[u64 key][u16 rl][0xFF][recipe]}
+                            if body.len() < 5 {
+                                false
+                            } else {
+                                let n = u32::from_le_bytes(body[1..5].try_into().unwrap()) as usize;
+                                let mut p = 5usize;
+                                let base = off + 8;
+                                let mut ok = true;
+                                for _ in 0..n {
+                                    if p + 10 > body.len() {
+                                        ok = false;
+                                        break;
+                                    }
+                                    let k = u64::from_le_bytes(body[p..p + 8].try_into().unwrap());
+                                    p += 8;
+                                    let rl =
+                                        u16::from_le_bytes(body[p..p + 2].try_into().unwrap()) as usize;
+                                    p += 2;
+                                    if rl < 2 || p + rl > body.len() || body[p] != 0xFF {
+                                        ok = false;
+                                        break;
+                                    }
+                                    self.chunks.write().insert(k, (id, base + p as u64, rl as u32));
+                                    p += rl;
+                                }
+                                ok
+                            }
+                        }
                         3 => {
                             if body.len() < 9 {
                                 false
@@ -1058,6 +1149,13 @@ impl Store {
         }
         self.next_blob_id
             .store(max_bid as u64 + 1, Ordering::Relaxed);
+        // CRITICAL: resume the segment counter AFTER the highest existing id
+        // — otherwise the first post-reopen append recreates seg-00000 and
+        // overwrites the container from byte 0 (observed as total data loss
+        // of every chunk written before the reopen).
+        let max_seg = ids.iter().copied().max().unwrap_or(0);
+        self.next_seg
+            .store(max_seg as u64 + 1, Ordering::Relaxed);
         // pass 2: refcounts + live accounting from live recipes
         let recipe_entries: Vec<(u64, u32, u64, u32)> = self
             .chunks
@@ -1100,17 +1198,87 @@ impl Store {
         let s = segs.get(&seg)?;
         let sealed = Some(seg) != self.writer_seg_id();
         let body = s.read_at(off, len as usize, sealed)?;
-        // body = [2][u64 key][u32 rec_len][recipe..]
-        if body.first() != Some(&2) || body.len() < 13 {
-            return None;
-        }
-        let rl = u32::from_le_bytes(body[9..13].try_into().unwrap()) as usize;
-        if body.len() < 13 + rl {
-            return None;
-        }
+        self.parse_recipe_body(&body)
+    }
+
+    /// Parse a recipe from an on-disk body: either a wrapped CHUNK record
+    /// `[2][key][reclen][recipe]` or a bare batched sub-recipe `[0xFF][recipe]`.
+    fn parse_recipe_body(&self, body: &[u8]) -> Option<Recipe> {
+        let recipe_bytes: &[u8] = if body.first() == Some(&0xFF) {
+            &body[1..]
+        } else {
+            if body.first() != Some(&2) || body.len() < 13 {
+                return None;
+            }
+            let rl = u32::from_le_bytes(body[9..13].try_into().unwrap()) as usize;
+            if body.len() < 13 + rl {
+                return None;
+            }
+            &body[13..13 + rl]
+        };
         let id2h = self.ids.read();
         let keytab = self.keys_tab.read();
-        Recipe::parse(&body[13..13 + rl], &id2h, &keytab)
+        Recipe::parse(recipe_bytes, &id2h, &keytab)
+    }
+
+    /// Drain the pending recipe batch into kind-7 batch record(s):
+    /// `[7][u32 n]{[u64 key][u16 rl][0xFF][recipe]}`. Each sub-entry is
+    /// indexed in the chunks map at its own (off, len) so loads need no
+    /// batch awareness once flushed.
+    fn flush_recipe_batch(&self) {
+        const BATCH_BYTES: usize = 64 * 1024;
+        let entries: Vec<(u64, Vec<u8>)> = {
+            let mut b = self.recipe_batch.lock();
+            if b.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *b)
+        };
+        let mut body: Vec<u8> = Vec::with_capacity(BATCH_BYTES + 4096);
+        let mut n = 0u32;
+        let mut starts: Vec<(u64, usize, usize)> = Vec::new(); // (key, off-in-body, len)
+        let mut flush = |body: &mut Vec<u8>, n: &mut u32, starts: &mut Vec<(u64, usize, usize)>| {
+            if starts.is_empty() {
+                return;
+            }
+            let mut rec = Vec::with_capacity(body.len() + 5);
+            rec.push(7u8);
+            rec.extend_from_slice(&(starts.len() as u32).to_le_bytes());
+            rec.extend_from_slice(body);
+            if let Ok((seg, off, _)) = self.append(&rec) {
+                // `off` points at the [7][n] header; entry offsets (i) are
+                // relative to the first entry, which sits 5 bytes later
+                let base = off + 5;
+                {
+                    let mut chunks = self.chunks.write();
+                    for (key, i, l) in starts.iter() {
+                        chunks.insert(*key, (seg, base + *i as u64, *l as u32));
+                    }
+                }
+                // align live accounting with the per-entry 8+rl scheme used
+                // by scan/compaction: record bytes (13+10n+Σrl minus the
+                // frame append already added) vs Σ(8+rl) -> subtract 13+2n
+                if let Some(sg) = self.segs.read().get(&seg) {
+                    sg.live.fetch_sub(13 + 2 * starts.len() as u64, Ordering::Relaxed);
+                }
+            }
+            body.clear();
+            *n = 0;
+            starts.clear();
+        };
+        for (key, bare) in &entries {
+            let rl = bare.len();
+            if !body.is_empty() && body.len() + 10 + rl > BATCH_BYTES {
+                flush(&mut body, &mut n, &mut starts);
+            }
+            let i = body.len() + 10; // entry payload offset within body
+            body.extend_from_slice(&key.to_le_bytes());
+            body.extend_from_slice(&(rl as u16).to_le_bytes());
+            body.extend_from_slice(bare);
+            starts.push((*key, i, rl));
+            n += 1;
+        }
+        flush(&mut body, &mut n, &mut starts);
     }
 
     fn writer_seg_id(&self) -> Option<u32> {
@@ -1401,21 +1569,40 @@ impl Store {
                 .encode_fields(id_of)
                 .ok_or_else(|| "field recipe too large".to_string())?
         };
-        let mut body = Vec::with_capacity(13 + rec.len());
-        body.push(2u8);
-        body.extend_from_slice(&key.to_le_bytes());
-        body.extend_from_slice(&(rec.len() as u32).to_le_bytes());
-        body.extend_from_slice(&rec);
-        let (seg, off, len) = self.append(&body).map_err(|e| e.to_string())?;
-
-        let old = self.chunks.write().insert(key, (seg, off, len));
         self.bump_recipe_refs(&recipe);
-        if let Some((oseg, ooff, olen)) = old {
-            if let Some(old_rec) = self.load_recipe(oseg, ooff, olen) {
-                self.drop_recipe_refs(&old_rec);
+
+        // supersede refs: a pending batch entry first, then the chunks-map
+        // entry (which is only dropped when it was not already superseded by
+        // a pending entry for the same key)
+        {
+            let mut batch = self.recipe_batch.lock();
+            if let Some(i) = batch.iter().position(|(k, _)| *k == key) {
+                let (_, old_body) = batch.remove(i);
+                if let Some(old_rec) = self.parse_recipe_body(&old_body) {
+                    self.drop_recipe_refs(&old_rec);
+                }
+            } else if let Some((oseg, ooff, olen)) = self.chunks.read().get(&key).copied() {
+                if let Some(old_rec) = self.load_recipe(oseg, ooff, olen) {
+                    self.drop_recipe_refs(&old_rec);
+                }
+                if let Some(s) = self.segs.read().get(&oseg) {
+                    s.live.fetch_sub(8 + olen as u64, Ordering::Relaxed);
+                }
             }
-            if let Some(s) = self.segs.read().get(&oseg) {
-                s.live.fetch_sub(8 + olen as u64, Ordering::Relaxed);
+        }
+
+        // queue the bare recipe into the batch; flushed on sync/seal/compact
+        // or when the batch grows past its size cap
+        {
+            let mut batch = self.recipe_batch.lock();
+            let mut bare = Vec::with_capacity(1 + rec.len());
+            bare.push(0xFFu8);
+            bare.extend_from_slice(&rec);
+            batch.push((key, bare));
+            let total: usize = batch.iter().map(|(_, b)| 10 + b.len()).sum();
+            drop(batch);
+            if total >= 64 * 1024 {
+                self.flush_recipe_batch();
             }
         }
         Ok(())
@@ -1424,17 +1611,37 @@ impl Store {
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
     pub fn read_chunk(&self, key: u64) -> Option<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        let (seg, off, len) = *self.chunks.read().get(&key)?;
+        // located in a segment, or still pending in the recipe batch?
+        enum Loc {
+            Seg(u32, u64, u32),
+            Pending(Vec<u8>),
+        }
+        let loc = match self.chunks.read().get(&key).copied() {
+            Some((s, o, l)) => Loc::Seg(s, o, l),
+            None => {
+                let pending = self
+                    .recipe_batch
+                    .lock()
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, b)| b.clone())?;
+                Loc::Pending(pending)
+            }
+        };
         let dbg = |stage: &str| {
             if std::env::var("CSAVES_READ_DEBUG").map(|v| v == "1").unwrap_or(false) {
-                eprintln!("[c-saves] read fail key={key:016x} seg={seg} off={off} len={len} stage={stage}");
+                eprintln!("[c-saves] read fail key={key:016x} stage={stage}");
             }
         };
         let fail = |stage: &str| -> Option<Vec<u8>> {
             dbg(stage);
             None
         };
-        let rec = match self.load_recipe(seg, off, len) {
+        let rec = match &loc {
+            Loc::Pending(body) => self.parse_recipe_body(body),
+            Loc::Seg(seg, off, len) => self.load_recipe(*seg, *off, *len),
+        };
+        let rec = match rec {
             Some(r) => r,
             None => {
                 dbg("recipe");
@@ -1559,14 +1766,26 @@ impl Store {
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunks.read().len()
+        let pending = self.recipe_batch.lock();
+        let chunks = self.chunks.read();
+        chunks.len()
+            + pending.iter().filter(|(k, _)| !chunks.contains_key(k)).count()
     }
 
     pub fn keys(&self) -> Vec<u64> {
-        self.chunks.read().keys().copied().collect()
+        let pending = self.recipe_batch.lock();
+        let chunks = self.chunks.read();
+        let mut v: Vec<u64> = chunks.keys().copied().collect();
+        for (k, _) in pending.iter() {
+            if !chunks.contains_key(k) {
+                v.push(*k);
+            }
+        }
+        v
     }
 
     pub fn delete_chunk(&self, key: u64) -> Result<(), String> {
+        self.flush_recipe_batch();
         let old = self.chunks.write().remove(&key);
         if let Some((seg, off, len)) = old {
             if let Some(rec) = self.load_recipe(seg, off, len) {
@@ -1584,6 +1803,7 @@ impl Store {
 
     /// fsync all segments + flush buffers (end of a save cycle).
     pub fn sync(&self) {
+        self.flush_recipe_batch();
         self.flush_writer();
         {
             let wg = self.writer.lock();
@@ -1601,6 +1821,7 @@ impl Store {
     /// the next append opens a fresh segment. Sealed segments become immutable
     /// (mmap reads) and eligible for background compaction.
     pub fn seal(&self) {
+        self.flush_recipe_batch();
         self.flush_writer();
         let mut wg = self.writer.lock();
         if let Some(w) = wg.as_ref() {
@@ -2001,13 +2222,14 @@ impl Store {
                 blobs.get(&h).and_then(|l| if l.id == NO_ID { None } else { Some(l.id) })
             };
             let Some(enc) = new_rec.encode_fields(id_of) else { continue };
-            let mut body = Vec::with_capacity(13 + enc.len());
-            body.push(2u8);
-            body.extend_from_slice(&key.to_le_bytes());
-            body.extend_from_slice(&(enc.len() as u32).to_le_bytes());
-            body.extend_from_slice(&enc);
-            let Ok((nseg, noff, nlen)) = self.append(&body) else { continue };
-            self.chunks.write().insert(key, (nseg, noff, nlen));
+            // route through the recipe batch (same accounting as compaction
+            // moves); the chunks map flips at flush
+            {
+                let mut bare = Vec::with_capacity(1 + enc.len());
+                bare.push(0xFFu8);
+                bare.extend_from_slice(&enc);
+                self.recipe_batch.lock().push((key, bare));
+            }
             self.bump_recipe_refs(&new_rec);
             if let Some(old_rec) = self.load_recipe(seg, off, len) {
                 self.drop_recipe_refs(&old_rec);
@@ -2016,7 +2238,15 @@ impl Store {
                 s.live.fetch_sub(8 + len as u64, Ordering::Relaxed);
             }
             rewritten += 1;
+            let total: usize = {
+                let b = self.recipe_batch.lock();
+                b.iter().map(|(_, b)| 10 + b.len()).sum()
+            };
+            if total >= 64 * 1024 {
+                self.flush_recipe_batch();
+            }
         }
+        self.flush_recipe_batch();
         rewritten > 0
     }
 
@@ -2024,6 +2254,7 @@ impl Store {
     /// the cold tier), then drop the segment. Returns true if work was done.
     pub fn compact_step(&self) -> bool {
         self.train_dict_if_needed();
+        self.flush_recipe_batch();
         // seal any open writer so previously appended data (including our
         // own past moves and optimize rewrites) is eligible for selection;
         // without this, dead bytes trapped in the writer segment would never
@@ -2123,15 +2354,35 @@ impl Store {
             let Some(seg) = segs.get(&worst_id) else { continue };
             let Some(body) = seg.read_at(off, len as usize, false) else { continue };
             drop(segs);
-            if body.first() != Some(&2) {
+            // normalize to a bare batched recipe
+            let bare: Vec<u8> = if body.first() == Some(&0xFF) {
+                body.clone()
+            } else if body.first() == Some(&2) && body.len() >= 13 {
+                let rl = u32::from_le_bytes(body[9..13].try_into().unwrap()) as usize;
+                if body.len() < 13 + rl {
+                    continue;
+                }
+                let mut b = Vec::with_capacity(1 + rl);
+                b.push(0xFFu8);
+                b.extend_from_slice(&body[13..13 + rl]);
+                b
+            } else {
                 continue;
+            };
+            {
+                let mut batch = self.recipe_batch.lock();
+                batch.push((key, bare));
+                let total: usize = batch.iter().map(|(_, b)| 10 + b.len()).sum();
+                drop(batch);
+                if total >= 64 * 1024 {
+                    self.flush_recipe_batch();
+                }
             }
-            let Ok((nseg, noff, nlen)) = self.append(&body) else { continue };
             if let Some(old) = self.segs.read().get(&worst_id) {
                 old.live.fetch_sub(8 + len as u64, Ordering::Relaxed);
             }
-            self.chunks.write().insert(key, (nseg, noff, nlen));
         }
+        self.flush_recipe_batch();
         // preserve interned keys recorded in this segment (kind-6 records
         // are not referenced by recipes but the key table must survive)
         self.preserve_keys(worst_id);
@@ -2146,16 +2397,16 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use fastnbt::Value;
     use std::collections::HashMap as Map;
 
-    fn key(cx: i32, cz: i32) -> u64 {
+    pub(crate) fn key(cx: i32, cz: i32) -> u64 {
         ((cx as u64) << 32) | (cz as u64 & 0xffff_ffff)
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    pub(crate) fn temp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "csaves-test-{tag}-{}",
             std::time::SystemTime::now()
@@ -2167,7 +2418,7 @@ mod tests {
         d
     }
 
-    fn bench_cfg() -> Cfg {
+    pub(crate) fn bench_cfg() -> Cfg {
         Cfg {
             compact_min: 512 * 1024,
             compact_ratio: 0.30,
@@ -2492,7 +2743,7 @@ mod repro {
     use fastnbt::Value;
     use std::collections::HashMap as Map;
 
-    fn key(cx: i32, cz: i32) -> u64 {
+    pub(crate) fn key(cx: i32, cz: i32) -> u64 {
         ((cx as u64) << 32) | (cz as u64 & 0xffff_ffff)
     }
 
@@ -2556,5 +2807,58 @@ mod repro {
         }
         assert_eq!(bad, 0, "{bad} unreadable chunks");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod reopen_regression {
+    use super::tests::{bench_cfg, key, temp_dir};
+    use super::*;
+    use fastnbt::Value;
+    use std::collections::HashMap as Map;
+
+    /// WRITE -> REOPEN -> WRITE MORE -> REOPEN -> verify everything.
+    /// Regression for the next_seg reset that overwrote seg-00000.
+    #[test]
+    fn writes_after_reopen_append_not_overwrite() {
+        let dir = temp_dir("reopensave");
+        let n = 120usize;
+        let payload = |i: usize| -> Vec<u8> {
+            let mut root: Map<String, Value> = Map::new();
+            root.insert("DataVersion".to_string(), Value::Int(4189));
+            root.insert("Position".to_string(), Value::List(vec![
+                Value::Int(i as i32), Value::Int(0), Value::Int(0)]));
+            root.insert("Pad".to_string(), Value::String("x".repeat(64 + i % 200)));
+            fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+        };
+        // session 1
+        {
+            let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+            for i in 0..n {
+                st.write_chunk(key(i as i32, 0), &payload(i), true).unwrap();
+            }
+            st.sync();
+            st.seal();
+        }
+        // session 2: reopen + write MORE chunks (new seg must not clobber)
+        {
+            let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+            assert_eq!(st.chunk_count(), n);
+            for i in n..2 * n {
+                st.write_chunk(key(i as i32, 0), &payload(i), true).unwrap();
+            }
+            st.sync();
+            st.seal();
+        }
+        // session 3: everything must survive
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        assert_eq!(st.chunk_count(), 2 * n, "all chunks must survive reopen+write");
+        for i in 0..2 * n {
+            let got = st.read_chunk(key(i as i32, 0)).expect("chunk survives");
+            let a: Value = fastnbt::from_bytes(&got).unwrap();
+            let b: Value = fastnbt::from_bytes(&payload(i)).unwrap();
+            assert_eq!(a, b, "chunk {i} corrupted by reopen-write cycle");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
