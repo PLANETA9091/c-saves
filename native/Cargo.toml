@@ -1,0 +1,30 @@
+[package]
+name = "c-saves"
+version = "0.1.0"
+edition = "2021"
+description = "CRUSSTY module: Rust-native Minecraft world storage engine (c-saves). Content-addressed section dedup + zstd container, transparent Paper 26.3 chunk IO takeover."
+
+[workspace]
+exclude = ["cplug-abi", "cplug-sdk"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cplug-abi = { path = "../cplug-abi" }
+cplug-sdk = { path = "../cplug-sdk" }
+jvmti-bindings = "2"
+jni-sys = "0.4"
+fastnbt = "2"
+zstd = "0.13"
+zstd-safe = "7"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32fast = "1"
+parking_lot = "0.12"
+flate2 = "1"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

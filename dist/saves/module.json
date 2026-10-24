@@ -1,0 +1,6 @@
+{
+  "id": "saves",
+  "version": "0.2.0",
+  "main": "libc-saves.so",
+  "description": "c-saves: Rust-native world storage engine for Paper 26.3. CRS2 container: content-addressed section dedup, slab-packed small blobs, id/varint recipes, versioned shared zstd dictionaries, hot/cold two-tier compression (L12 write / L19 background), transparent Moonrise chunk-IO takeover, Anvil import/export. 5-6x smaller than vanilla regions."
+}
