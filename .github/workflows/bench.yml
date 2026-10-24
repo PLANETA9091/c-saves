@@ -1,0 +1,47 @@
+name: bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
+        working-directory: native
+        run: cargo test --release
+
+  size-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build bench
+        working-directory: native
+        run: cargo build --release --example bench_size
+      - name: run size benchmark (64x64 chunks, 4 edit rounds)
+        working-directory: native
+        run: |
+          ./target/release/examples/bench_size 64 4 2>&1 | tee bench_output.txt
+      - name: record all stall points (compaction steps)
+        working-directory: native
+        run: |
+          ./target/release/examples/bench_size 48 3 2>&1 | grep -E "compacted|trained|A write|B edits|C compaction|D verify|summary|logical|anvil|c-saves" | tee bench_stalls.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            native/bench_output.txt
+            native/bench_stalls.txt
+      - name: regression gate — container must stay under 25% of Anvil size
+        working-directory: native
+        run: |
+          RATIO=$(./target/release/examples/bench_size 32 2 2>/dev/null | grep "c-saves compact" | grep -o "x0\.[0-9]* vs anvil" | grep -o "0\.[0-9]*")
+          echo "compact/anvil ratio: $RATIO"
+          awk -v r="$RATIO" 'BEGIN { if (r+0 > 0.25) { print "FAIL: ratio " r " exceeds 0.25"; exit 1 } print "OK" }'
