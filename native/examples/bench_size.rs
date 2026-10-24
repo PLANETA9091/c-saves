@@ -65,6 +65,37 @@ fn semantic_eq(a: &[u8], b: &[u8]) -> bool {
     va == vb
 }
 
+
+/// Chunk-level semantic equality: sections compare by expanded state vectors
+/// (canonical re-encoding permutes palette order), everything else structurally.
+fn chunk_semantic_eq(a: &[u8], b: &[u8]) -> bool {
+    let (Ok(Value::Compound(ma)), Ok(Value::Compound(mb))) =
+        (fastnbt::from_bytes::<Value>(a), fastnbt::from_bytes::<Value>(b))
+    else {
+        return false;
+    };
+    if ma.len() != mb.len() {
+        return false;
+    }
+    for (k, va) in &ma {
+        let Some(vb) = mb.get(k) else { return false };
+        if k == "sections" {
+            let (Value::List(la), Value::List(lb)) = (va, vb) else { return false };
+            if la.len() != lb.len() {
+                return false;
+            }
+            for (sa, sb) in la.iter().zip(lb.iter()) {
+                if !c_saves::chunknbt::sections_semantically_equal(sa, sb) {
+                    return false;
+                }
+            }
+        } else if va != vb {
+            return false;
+        }
+    }
+    true
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let grid = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(96);
@@ -94,6 +125,8 @@ fn main() {
     let cfg = Cfg { compact_min: 256 * 1024, compact_ratio: 0.10, dict_train: 400, ..Cfg::default() };
     let region_store = Store::open_cfg(&dir.join("region"), true, cfg.clone()).unwrap();
     let entity_store = Store::open_cfg(&dir.join("entities"), true, cfg.clone()).unwrap();
+    entity_store.set_whole_mode();
+    entity_store.set_whole_mode();
     let t0 = Instant::now();
     for &(cx, cz) in &coords {
         let p = chunk_payload(&w, cx, cz, 0);
@@ -206,7 +239,7 @@ fn main() {
         let round = *edited.get(&key(cx, cz)).unwrap_or(&0);
         let want = chunk_payload(&w, cx, cz, round);
         let got = region_store.read_chunk(key(cx, cz)).expect("chunk present");
-        assert!(semantic_eq(&got, &want), "chunk ({cx},{cz}) mismatch");
+        assert!(chunk_semantic_eq(&got, &want), "chunk ({cx},{cz}) mismatch");
         let want_e = entity_payload(cx, cz, *edited_ent.get(&key(cx, cz)).unwrap_or(&0));
         let got_e = match entity_store.read_chunk(key(cx, cz)) {
             Some(g) => g,
@@ -229,7 +262,7 @@ fn main() {
     let sample = coords[n / 2];
     let got = rs2.read_chunk(key(sample.0, sample.1)).expect("read after reopen");
     let want = chunk_payload(&w, sample.0, sample.1, 0);
-    assert!(semantic_eq(&got, &want), "reopen semantic equality");
+    assert!(chunk_semantic_eq(&got, &want), "reopen semantic equality");
 
     // ---- summary ----
     let total_logical = logical_region + logical_ent;

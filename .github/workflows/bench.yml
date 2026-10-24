@@ -25,14 +25,14 @@ jobs:
       - name: build bench
         working-directory: native
         run: cargo build --release --example bench_size
-      - name: run size benchmark (64x64 chunks, 4 edit rounds)
+      - name: run size benchmark (4096 chunks, 4 edit rounds)
         working-directory: native
         run: |
           ./target/release/examples/bench_size 64 4 2>&1 | tee bench_output.txt
       - name: record all stall points (compaction steps)
         working-directory: native
         run: |
-          ./target/release/examples/bench_size 48 3 2>&1 | grep -E "compacted|trained|A write|B edits|C compaction|D verify|summary|logical|anvil|c-saves" | tee bench_stalls.txt
+          ./target/release/examples/bench_size 48 3 2>&1 | grep -E "compacted|packed|trained|A write|B edits|C compaction|D verify|summary|logical|anvil|c-saves" | tee bench_stalls.txt
       - uses: actions/upload-artifact@v4
         with:
           name: bench-results
@@ -44,9 +44,37 @@ jobs:
         run: |
           cargo build --release --example profile_size
           ./target/release/examples/profile_size 32 2 2>/dev/null | tee bench_profile.txt
-      - name: regression gate — container must stay under 15% of Anvil size
+      - name: regression gate — compact container must stay under 15% of Anvil size
         working-directory: native
         run: |
           RATIO=$(./target/release/examples/bench_size 32 2 2>/dev/null | grep "c-saves compact" | grep -o "x0\.[0-9]* vs anvil" | grep -o "0\.[0-9]*")
           echo "compact/anvil ratio: $RATIO"
-          awk -v r="$RATIO" 'BEGIN { if (r+0 > 0.15) { print "FAIL: ratio " r " exceeds 0.25"; exit 1 } print "OK" }'
+          awk -v r="$RATIO" 'BEGIN { if (r+0 > 0.15) { print "FAIL: ratio " r " exceeds 0.15"; exit 1 } print "OK" }'
+
+  jj-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build jj_profile
+        working-directory: native
+        run: cargo build --release --example jj_profile
+      - name: JJThunder To The Max real-world bench (131-section chunks + 10k entities)
+        working-directory: native
+        run: |
+          ./target/release/examples/jj_profile ../bench-corpus/dim 2>/dev/null | tee jj_bench.txt
+          cat jj_bench.txt
+      - name: gate — semantic verify clean, container under 50% of Anvil
+        working-directory: native
+        run: |
+          grep -q "verify: ok=" jj_bench.txt || { echo "FAIL: no verification line"; exit 1; }
+          BAD=$(grep "verify:" jj_bench.txt | grep -o "bad=[0-9]*" | cut -d= -f2)
+          [ "$BAD" = "0" ] || { echo "FAIL: semantic verification bad=$BAD"; exit 1; }
+          RATIO=$(grep "^TOTAL" jj_bench.txt | grep -o "x[0-9.]* smaller" | grep -o "[0-9.]*")
+          echo "container is ${RATIO}x smaller than Anvil on the JJThunder corpus"
+          awk -v r="$RATIO" 'BEGIN { if (r+0 < 2.0) { print "FAIL: ratio below 2.0x"; exit 1 } print "OK" }'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jj-bench-results
+          path: native/jj_bench.txt

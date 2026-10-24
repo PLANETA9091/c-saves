@@ -363,6 +363,8 @@ fn main() {
     let cfg = Cfg { compact_min: 256 * 1024, compact_ratio: 0.10, dict_train: 400, ..Cfg::default() };
     let region_store = Store::open_cfg(&dir.join("region"), true, cfg.clone()).unwrap();
     let entity_store = Store::open_cfg(&dir.join("entities"), true, cfg.clone()).unwrap();
+    entity_store.set_whole_mode();
+    entity_store.set_whole_mode();
 
     for &(cx, cz) in &coords {
         region_store.write_chunk(key(cx, cz), &chunk_payload(&w, cx, cz, 0), false).unwrap();

@@ -30,6 +30,9 @@ impl Registry {
             Store::open(&PathBuf::from(format!("/tmp/csaves-fallback-{kind}-{level}")), false).unwrap()
         });
         let whole_mode = kind != "region";
+        if whole_mode {
+            store.set_whole_mode();
+        }
         let chunk_count = store.chunk_count();
         let mut stores = self.stores.write();
         stores.push((store.clone(), whole_mode));

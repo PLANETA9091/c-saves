@@ -36,7 +36,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 const SEG_ROLL: u64 = 64 * 1024 * 1024;
@@ -54,8 +54,15 @@ pub struct Cfg {
     pub cold_level: i32,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
+    /// Slab member cap for whole-mode stores (entity/POI payloads compress
+    /// best per-blob WITH the dictionary; section stores use the big cap).
+    pub slab_max_member_whole: u32,
     /// Dead-byte ratio that triggers compaction.
     pub compact_ratio: f64,
+    /// Hot-tier bytes accumulated since the last pack before an auto-pack
+    /// is requested (keeps fresh data slab-packed + cold-tiered without
+    /// relying on dead bytes appearing).
+    pub auto_pack_bytes: u64,
     /// Shared dictionary size cap.
     pub dict_max: usize,
     /// Samples collected before (re)training the dictionary.
@@ -77,11 +84,13 @@ impl Default for Cfg {
             cold_level: 19,
             compact_min: 4 * 1024 * 1024,
             compact_ratio: 0.25,
+            auto_pack_bytes: 4 * 1024 * 1024,
+            slab_max_member_whole: 4 * 1024,
             dict_max: 112 * 1024,
-            dict_train: 600,
+            dict_train: 200,
             tail_blob_min: 512,
-            slab_max_member: 4096,
-            slab_max_raw: 192 * 1024,
+            slab_max_member: 64 * 1024,
+            slab_max_raw: 512 * 1024,
             slab_cache: 32 * 1024 * 1024,
         }
     }
@@ -146,11 +155,13 @@ impl Cfg {
             cold_level: env_parse("CSAVES_COLD_LEVEL", 19),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 4 * 1024 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),
+            auto_pack_bytes: env_parse("CSAVES_AUTO_PACK_BYTES", 4 * 1024 * 1024),
+            slab_max_member_whole: env_parse("CSAVES_SLAB_MAX_MEMBER_WHOLE", 4 * 1024),
             dict_max: env_parse("CSAVES_DICT_MAX_BYTES", 112 * 1024),
-            dict_train: env_parse("CSAVES_DICT_TRAIN_BLOBS", 600),
+            dict_train: env_parse("CSAVES_DICT_TRAIN_BLOBS", 200),
             tail_blob_min: env_parse("CSAVES_TAIL_BLOB_MIN", 512),
-            slab_max_member: env_parse("CSAVES_SLAB_MAX_MEMBER", 4096),
-            slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 192 * 1024),
+            slab_max_member: env_parse("CSAVES_SLAB_MAX_MEMBER", 64 * 1024),
+            slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 512 * 1024),
             slab_cache: env_parse("CSAVES_SLAB_CACHE", 32 * 1024 * 1024),
         }
     }
@@ -208,6 +219,9 @@ struct BlobLoc {
     id: u32, // NO_ID for legacy kind-1 records
     // slab membership (kind-5 records): the blob lives inside a packed slab
     slab: bool,
+    /// true when the record was written at the cold tier (background pack);
+    /// hot-tier records are pack candidates (recompress + slab).
+    cold: bool,
     share: u32,        // exact on-disk byte share incl. framing
     slab_off: u32,     // own offset within the decompressed slab
     slab_raw: u32,     // total decompressed slab size
@@ -696,6 +710,15 @@ pub struct Store {
     pub dedup_hits: AtomicU64,
     pub disk_written: AtomicU64,
     pub logical_bytes: AtomicU64,
+    /// Whole-mode stores (entities/POI) hold raw NBT payloads whose repeated
+    /// strings benefit from the shared dictionary in slab streams; section
+    /// stores hold canonical CSEC bytes where the dict only dilutes matches.
+    whole_mode: AtomicBool,
+    /// Set when a pack (slab + cold tier) pass was explicitly requested
+    /// (e.g. right after an Anvil import).
+    pack_requested: AtomicBool,
+    /// disk_bytes() watermark at the last completed pack pass.
+    pack_watermark: AtomicU64,
 }
 
 impl Store {
@@ -733,6 +756,9 @@ impl Store {
             dedup_hits: AtomicU64::new(0),
             disk_written: AtomicU64::new(0),
             logical_bytes: AtomicU64::new(0),
+            whole_mode: AtomicBool::new(false),
+            pack_requested: AtomicBool::new(false),
+            pack_watermark: AtomicU64::new(0),
         });
         *st.slab_cache.lock() = SlabCache::new(st.cfg.slab_cache);
         st.load_dicts()?;
@@ -965,6 +991,7 @@ impl Store {
                                             refs: 0,
                                             id: NO_ID,
                                             slab: false,
+                                            cold: false,
                                             share: 0,
                                             slab_off: 0,
                                             slab_raw: 0,
@@ -1002,6 +1029,7 @@ impl Store {
                                             refs: 0,
                                             id: bid,
                                             slab: false,
+                                            cold: false,
                                             share: 0,
                                             slab_off: 0,
                                             slab_raw: 0,
@@ -1046,6 +1074,7 @@ impl Store {
                                                     refs: 0,
                                                     id: bid,
                                                     slab: true,
+                                                    cold: true,
                                                     share: sh,
                                                     slab_off: cursor,
                                                     slab_raw: raw_total,
@@ -1342,6 +1371,18 @@ impl Store {
     // ---- compression tiers ----
 
     /// Hot tier: write path. Cold tier: background compaction.
+    /// Compress without a shared dictionary. Slab streams (up to 192 KiB of
+    /// similar section bytes) measure ~4% SMALLER without the dictionary:
+    /// the zstd window already covers the whole slab, so the dict only adds
+    /// header cost and dilutes match search.
+    fn compress_tier_plain(&self, data: &[u8], cold: bool) -> (u8, Vec<u8>) {
+        let level = if cold { self.cfg.cold_level } else { self.cfg.hot_level };
+        match zstd::bulk::compress(data, level) {
+            Ok(out) => (0, out),
+            Err(_) => (0, data.to_vec()),
+        }
+    }
+
     fn compress_tier(&self, data: &[u8], cold: bool) -> (u8, Vec<u8>) {
         let level = if cold { self.cfg.cold_level } else { self.cfg.hot_level };
         let dict = self.current_dict();
@@ -1415,7 +1456,8 @@ impl Store {
         self.blobs.write().insert(h, BlobLoc {
             seg, off, comp_len: comp.len() as u32, raw_len: raw.len() as u32,
             dict_id, refs: 0, id,
-            slab: false, share: 0, slab_off: 0, slab_raw: 0, slab_comp: 0,
+            slab: false, cold,
+            share: 0, slab_off: 0, slab_raw: 0, slab_comp: 0,
         });
         self.ids.write().insert(id, h);
         self.dict_sample(raw);
@@ -2006,7 +2048,11 @@ impl Store {
             }
             stream.extend_from_slice(&rawcat);
             let raw_total = stream.len() as u32;
-            let (dict_id, comp) = self.compress_tier(&stream, true);
+            let (dict_id, comp) = if self.whole_mode.load(Ordering::Relaxed) {
+                self.compress_tier(&stream, true)
+            } else {
+                self.compress_tier_plain(&stream, true)
+            };
             let mut body = Vec::with_capacity(12 + comp.len());
             body.push(5u8);
             body.push(dict_id);
@@ -2279,21 +2325,121 @@ impl Store {
             }
             worst
         };
-        let Some((worst_id, ratio)) = worst else { return self.optimize_fields_step(); };
-        if ratio < self.cfg.compact_ratio {
+        if let Some((worst_id, ratio)) = worst {
+            if ratio >= self.cfg.compact_ratio {
+                return self.pack_segment(worst_id, true);
+            }
+        }
+        self.pack_fallback(writer_id)
+    }
+
+    /// Mark this store as whole-mode (entity/POI payloads): slab streams are
+    /// then compressed WITH the shared dictionary (measured win on raw-NBT
+    /// payloads; section stores measure a win WITHOUT it).
+    pub fn set_whole_mode(&self) {
+        self.whole_mode.store(true, Ordering::Relaxed);
+    }
+
+    /// Request a pack pass (slab-packing + cold-tier recompression) without
+    /// waiting for dead bytes. Used after Anvil imports and for fresh data
+    /// accumulation (auto-watermark).
+    pub fn request_pack(&self) {
+        self.pack_requested.store(true, Ordering::Relaxed);
+    }
+
+    /// Pack pass without dead bytes: picks the sealed non-writer segment
+    /// holding the most hot-tier bytes and re-packs only its hot blobs
+    /// (small -> kind-5 slabs, big -> cold-tier BLOB2). Cold and slab data
+    /// is left in place, so repeated passes never re-compress packed bytes.
+    fn pack_fallback(&self, writer_id: u32) -> bool {
+        let mut do_pack = self.pack_requested.swap(false, Ordering::Relaxed);
+        if !do_pack && self.cfg.auto_pack_bytes > 0 {
+            let disk = self.disk_bytes();
+            if disk.saturating_sub(self.pack_watermark.load(Ordering::Relaxed))
+                >= self.cfg.auto_pack_bytes
+            {
+                do_pack = true;
+            }
+        }
+        if !do_pack {
             return self.optimize_fields_step();
         }
-        // move live blobs: big ones as recompressed BLOB2 (cold tier), small
-        // ones batched into kind-5 slab records (one header, one stream)
-        let victims: Vec<(Hash, BlobLoc)> = {
+        let mut hot: HashMap<u32, u64> = HashMap::new();
+        {
             let blobs = self.blobs.read();
-            blobs.iter().filter(|(_, l)| l.seg == worst_id).map(|(h, l)| (*h, *l)).collect()
+            for l in blobs.values() {
+                if l.slab || l.cold || l.seg == writer_id {
+                    continue;
+                }
+                *hot.entry(l.seg).or_default() += l.body_len();
+            }
+        }
+        let pick = hot.iter().max_by_key(|(_, b)| **b).map(|(s, _)| *s);
+        let did = match pick {
+            Some(id) => self.pack_segment(id, false),
+            None => false,
         };
+        self.pack_watermark.store(self.disk_bytes(), Ordering::Relaxed);
+        if !did {
+            return self.optimize_fields_step();
+        }
+        true
+    }
+
+    /// Move one segment's live data to fresh records. `drop_seg=true` rewrites
+    /// everything (recipes included) and removes the segment (dead-ratio
+    /// compaction); `drop_seg=false` re-packs only hot blobs and keeps the
+    /// segment (continuous pack pass).
+    fn pack_segment(&self, worst_id: u32, drop_seg: bool) -> bool {
+        self.pack_requested.store(false, Ordering::Relaxed);
+        // Locality-ordered victims: walk live recipes in chunk-key order and
+        // collect their blobs in section (Y) order, so sections of one chunk
+        // become adjacent slab members. Measured -17% slab bytes vs map-order
+        // packing (same-chunk sections share palettes and data texture).
+        let mut victims: Vec<(Hash, BlobLoc)> = Vec::new();
+        {
+            let blobs = self.blobs.read();
+            let mut seen: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+            {
+                let chunks = self.chunks.read();
+                let mut keys: Vec<u64> = chunks.keys().copied().collect();
+                keys.sort_unstable();
+                for k in keys {
+                    let Some((seg, off, len)) = chunks.get(&k).copied() else { continue };
+                    let Some(rec) = self.load_recipe(seg, off, len) else { continue };
+                    for h in rec.blob_hashes() {
+                        if seen.insert(h) {
+                            if let Some(l) = blobs.get(&h) {
+                                if l.seg == worst_id && (drop_seg || !(l.slab || l.cold)) {
+                                    victims.push((h, *l));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // hot blobs not covered by any live recipe (orphans) go last
+            for (h, l) in blobs.iter() {
+                if l.seg == worst_id && !seen.contains(h) && (drop_seg || !(l.slab || l.cold)) {
+                    victims.push((*h, *l));
+                }
+            }
+        }
         let mut cands: Vec<(Hash, u32, BlobLoc, Vec<u8>)> = Vec::new();
         let mut cand_bytes = 0usize;
+        let mut did = false;
         for (h, loc) in victims {
+            if !drop_seg && (loc.slab || loc.cold) {
+                continue; // already packed: leave in place
+            }
             let Some(data) = self.read_blob(loc, Some(worst_id)) else { continue };
-            if (data.len() as u32) <= self.cfg.slab_max_member {
+            did = true;
+            let member_cap = if self.whole_mode.load(Ordering::Relaxed) {
+                self.cfg.slab_max_member_whole
+            } else {
+                self.cfg.slab_max_member
+            };
+            if (data.len() as u32) <= member_cap {
                 let id = if loc.id != NO_ID {
                     loc.id
                 } else {
@@ -2333,6 +2479,7 @@ impl Store {
                 l.comp_len = comp.len() as u32;
                 l.dict_id = dict_id;
                 l.slab = false;
+                l.cold = true;
                 if l.id == NO_ID {
                     l.id = id;
                     self.ids.write().insert(id, h);
@@ -2340,6 +2487,22 @@ impl Store {
             }
         }
         self.flush_slab_cands(&mut cands, worst_id);
+        if !drop_seg {
+            // the segment may have emptied out entirely
+            let empty = self
+                .segs
+                .read()
+                .get(&worst_id)
+                .map(|s| s.live.load(Ordering::Relaxed) == 0)
+                .unwrap_or(true);
+            if empty {
+                let old = self.segs.write().remove(&worst_id);
+                drop(old);
+                let _ = fs::remove_file(self.seg_path(worst_id));
+                self.gc_dicts();
+            }
+            return did;
+        }
         // move live recipes byte-exact
         let recs: Vec<(u64, u32, u64, u32)> = {
             let chunks = self.chunks.read();
@@ -2391,7 +2554,7 @@ impl Store {
         drop(old);
         let _ = fs::remove_file(self.seg_path(worst_id));
         self.gc_dicts();
-        eprintln!("[c-saves] compacted seg-{worst_id:05} ({:.0}% dead, cold-tier recompressed)", ratio * 100.0);
+        eprintln!("[c-saves] packed seg-{worst_id:05} (full rewrite, cold-tier recompressed)");
         true
     }
 }

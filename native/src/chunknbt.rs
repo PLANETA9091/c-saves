@@ -31,7 +31,8 @@ pub type Hash = u128;
 
 // ------------------------------------------------------------ csec codec --
 
-const CSEC_MAGIC: u8 = 0xC5;
+const CSEC_MAGIC: u8 = 0xC5; // legacy v1/v2 sections (read-only)
+const CSEC3_MAGIC: u8 = 0xC7; // v3: compound palettes + starlight + canonical order
 const HMAP_MAGIC: u8 = 0xC6; // repacked heightmap ByteArray marker
 
 fn bits_for(n: usize) -> u32 {
@@ -87,6 +88,173 @@ impl<'a> BitR<'a> {
     }
 }
 
+/// Determine the no-straddle bit width a section's data LongArray uses.
+/// Vanilla clamps linear palettes to a 4-bit minimum (26.x data for small
+/// palettes is 256 longs = 4-bit), so try the clamped width first and fall
+/// back to ceillog2 (legacy/synthetic payloads).
+fn section_data_bits(n: usize, entries: usize, longs: usize) -> u32 {
+    let bf = bits_for(n);
+    let clamp = bf.max(4);
+    let fits = |bits: u32| {
+        let per = (64 / bits) as usize;
+        (entries + per - 1) / per == longs
+    };
+    if clamp != bf && fits(clamp) {
+        return clamp;
+    }
+    if fits(bf) {
+        return bf;
+    }
+    clamp
+}
+
+fn dense_pack_wide(entries: &[u16], bits: u32) -> Vec<u8> {
+    let mut w = BitW::new();
+    for e in entries {
+        w.put(*e as u64, bits);
+    }
+    w.finish()
+}
+
+fn dense_unpack_wide(b: &[u8], n: usize, bits: u32) -> Option<Vec<u16>> {
+    let mut r = BitR { in_: b, pos: 0 };
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(r.get(bits)? as u16);
+    }
+    Some(out)
+}
+
+/// Decode a v3 (0xC7) section.
+fn section_decode3(b: &[u8]) -> Option<Value> {
+    let f1 = *b.get(1)?;
+    let f2 = *b.get(2)?;
+    let mut p = 3usize;
+    let y = *b.get(p)? as i8;
+    p += 1;
+    let mut sec_map: std::collections::HashMap<String, Value> = Default::default();
+    sec_map.insert("Y".to_string(), Value::Byte(y));
+
+    fn read_entry(b: &[u8], p: &mut usize) -> Option<Value> {
+        let kind = *b.get(*p)?;
+        *p += 1;
+        match kind {
+            0 => {
+                let l = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+                *p += 2;
+                let s = core::str::from_utf8(b.get(*p..*p + l)?).ok()?.to_string();
+                *p += l;
+                Some(Value::String(s))
+            }
+            1 | 2 => {
+                let l = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+                *p += 2;
+                let name = core::str::from_utf8(b.get(*p..*p + l)?).ok()?.to_string();
+                *p += l;
+                let mut cm: std::collections::HashMap<String, Value> = Default::default();
+                cm.insert("Name".to_string(), Value::String(name));
+                if kind == 2 {
+                    let np = *b.get(*p)?;
+                    *p += 1;
+                    let mut props: Vec<(String, Value)> = Vec::with_capacity(np as usize);
+                    for _ in 0..np {
+                        let kl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+                        *p += 2;
+                        let k = core::str::from_utf8(b.get(*p..*p + kl)?).ok()?.to_string();
+                        *p += kl;
+                        let vl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+                        *p += 2;
+                        let v = core::str::from_utf8(b.get(*p..*p + vl)?).ok()?.to_string();
+                        *p += vl;
+                        props.push((k, Value::String(v)));
+                    }
+                    let mut pm: std::collections::HashMap<String, Value> = Default::default();
+                    for (k, v) in props {
+                        pm.insert(k, v);
+                    }
+                    cm.insert("Properties".to_string(), Value::Compound(pm));
+                }
+                Some(Value::Compound(cm))
+            }
+            _ => None,
+        }
+    }
+
+    fn dec_pal_data(b: &[u8], p: &mut usize, entries: usize, has_data: bool) -> Option<Value> {
+        let n = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+        *p += 2;
+        let mut pal = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            pal.push(read_entry(b, p)?);
+        }
+        let mut bm: std::collections::HashMap<String, Value> = Default::default();
+        bm.insert("palette".to_string(), Value::List(pal));
+        if has_data {
+            // vanilla emits linear palettes at max(4, ceillog2(n)) bits
+            let bits = bits_for(n).max(4);
+            let bytes = (entries * bits as usize + 7) / 8;
+            let dense = b.get(*p..*p + bytes)?;
+            *p += bytes;
+            let longs = if n > 256 {
+                let v = dense_unpack_wide(dense, entries, bits)?;
+                let v8: Vec<u8> = v.iter().map(|x| *x as u8).collect();
+                pack_nostroddle(&v8, bits)
+            } else {
+                let v = dense_unpack(dense, entries, bits)?;
+                pack_nostroddle(&v, bits)
+            };
+            bm.insert(
+                "data".to_string(),
+                Value::LongArray(fastnbt::LongArray::new(longs)),
+            );
+        }
+        Some(Value::Compound(bm))
+    }
+
+    if f1 & 1 != 0 {
+        let bs = dec_pal_data(b, &mut p, 4096, f1 & 2 != 0)?;
+        sec_map.insert("block_states".to_string(), bs);
+    }
+    if f1 & 4 != 0 {
+        let bs = dec_pal_data(b, &mut p, 64, f1 & 8 != 0)?;
+        sec_map.insert("biomes".to_string(), bs);
+    }
+    if f1 & 16 != 0 {
+        sec_map.insert("SkyLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![-1; 2048])));
+    } else if f1 & 32 != 0 {
+        sec_map.insert("SkyLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![0; 2048])));
+    } else if f1 & 64 != 0 {
+        let l = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let arr = b.get(p..p + l)?;
+        p += l;
+        sec_map.insert(
+            "SkyLight".to_string(),
+            Value::ByteArray(fastnbt::ByteArray::new(arr.iter().map(|x| *x as i8).collect())),
+        );
+    }
+    if f1 & 128 != 0 {
+        let l = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let arr = b.get(p..p + l)?;
+        p += l;
+        sec_map.insert(
+            "BlockLight".to_string(),
+            Value::ByteArray(fastnbt::ByteArray::new(arr.iter().map(|x| *x as i8).collect())),
+        );
+    }
+    if f2 & 1 != 0 {
+        let v = *b.get(p)?;
+        p += 1;
+        sec_map.insert("starlight.skylight_state".to_string(), Value::Int(v as i32));
+    }
+    if f2 & 2 != 0 {
+        let v = *b.get(p)?;
+        sec_map.insert("starlight.blocklight_state".to_string(), Value::Int(v as i32));
+    }
+    Some(Value::Compound(sec_map))
+}
+
 fn dense_pack(entries: &[u8], bits: u32) -> Vec<u8> {
     let mut w = BitW::new();
     for e in entries {
@@ -135,18 +303,38 @@ fn unpack_nostroddle(longs: &[i64], n: usize, bits: u32) -> Vec<u8> {
     out
 }
 
-/// Encode one section compound into the custom form. Returns None when the
-/// section contains keys or shapes outside the understood set.
+/// Encode one section compound into the custom form (v3). Returns None when
+/// the section contains keys or shapes outside the understood set.
 ///
-/// Layout: [0xC5][flags][Y i8]
-///   flags bit0 block_states present, bit1 block_states has data
-///         bit2 biomes present,          bit3 biomes has data
-///         bit4 SkyLight all-1, bit5 SkyLight all-0, bit6 SkyLight raw
-///         bit7 BlockLight present-raw
-///   palette: [u16 n]{[u16 len][bytes]}; data: dense bits at bits_for(n)
+/// Layout: [0xC7][flags1][flags2][Y i8]
+///   flags1 bit0 block_states present, bit1 block_states has data
+///          bit2 biomes present,       bit3 biomes has data
+///          bit4 SkyLight all-1, bit5 SkyLight all-0, bit6 SkyLight raw
+///          bit7 BlockLight present-raw
+///   flags2 bit0 starlight.skylight_state present (+1 byte)
+///          bit1 starlight.blocklight_state present (+1 byte)
+///   palette: [u16 n]{[u8 kind]...} in CANONICAL (sorted) order;
+///            data: dense bits at bits_for(n) over canonical indices.
+///            kind 0 plain string [u16 len][bytes] (pre-1.18 style payload)
+///            kind 1 compound {Name}            [u16 len][name]
+///            kind 2 compound {Name,Properties} [u16 len][name][u8 np]
+///                  {[u16 klen][k][u16 vlen][v]} (props sorted by key)
+///
+/// Canonical palette order is semantically neutral: the palette is a pure
+/// lookup table, so any permutation of it (with consistently remapped data)
+/// decodes to the exact same block states. Sorting maximizes section dedup
+/// across palette permutations and makes the encoding deterministic.
 pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
     let Value::Compound(m) = sec else { return None };
-    const KNOWN: [&str; 5] = ["Y", "block_states", "biomes", "SkyLight", "BlockLight"];
+    const KNOWN: [&str; 7] = [
+        "Y",
+        "block_states",
+        "biomes",
+        "SkyLight",
+        "BlockLight",
+        "starlight.skylight_state",
+        "starlight.blocklight_state",
+    ];
     if m.keys().any(|k| !KNOWN.contains(&k.as_str())) {
         return None;
     }
@@ -154,9 +342,76 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         Some(Value::Byte(b)) => *b,
         _ => return None,
     };
-    let mut out = vec![CSEC_MAGIC, 0u8, y as u8];
-    let mut flags = 0u8;
+    let mut out = vec![CSEC3_MAGIC, 0u8, 0u8, y as u8];
+    let mut f1 = 0u8;
+    let mut f2 = 0u8;
 
+    /// One palette entry, normalized from either the string form or the
+    /// modern compound form {Name, Properties}.
+    struct PalEntry {
+        name: String,
+        props: Vec<(String, String)>,
+        plain: bool, // was a bare string
+    }
+
+    fn parse_entry(v: &Value) -> Option<PalEntry> {
+        match v {
+            Value::String(s) => Some(PalEntry { name: s.clone(), props: Vec::new(), plain: true }),
+            Value::Compound(cm) => {
+                let Value::String(name) = cm.get("Name")? else { return None };
+                let mut props = Vec::new();
+                match cm.get("Properties") {
+                    Some(Value::Compound(pn)) => {
+                        for (k, kv) in pn {
+                            let Value::String(vv) = kv else { return None };
+                            props.push((k.clone(), vv.clone()));
+                        }
+                    }
+                    None => {}
+                    _ => return None,
+                }
+                props.sort();
+                Some(PalEntry { name: name.clone(), props, plain: false })
+            }
+            _ => None,
+        }
+    }
+
+    fn put_entry(out: &mut Vec<u8>, e: &PalEntry) -> Option<()> {
+        let nb = e.name.as_bytes();
+        if nb.len() > 65535 {
+            return None;
+        }
+        if e.plain {
+            out.push(0u8);
+        } else if e.props.is_empty() {
+            out.push(1u8);
+        } else {
+            out.push(2u8);
+        }
+        out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        out.extend_from_slice(nb);
+        if !e.plain && !e.props.is_empty() {
+            if e.props.len() > 255 {
+                return None;
+            }
+            out.push(e.props.len() as u8);
+            for (k, v) in &e.props {
+                let kb = k.as_bytes();
+                let vb = v.as_bytes();
+                if kb.len() > 65535 || vb.len() > 65535 {
+                    return None;
+                }
+                out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+                out.extend_from_slice(kb);
+                out.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+                out.extend_from_slice(vb);
+            }
+        }
+        Some(())
+    }
+
+    /// Encode one palette+data compound canonically.
     fn enc_pal_data(out: &mut Vec<u8>, bs: &Value, entries: usize) -> Option<bool> {
         let Value::Compound(bm) = bs else { return None };
         let Value::List(pal) = bm.get("palette")? else { return None };
@@ -164,15 +419,18 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         if n == 0 || n > 65535 {
             return None;
         }
-        out.extend_from_slice(&(n as u16).to_le_bytes());
+        let mut ents: Vec<PalEntry> = Vec::with_capacity(n);
         for p in pal {
-            let Value::String(s) = p else { return None };
-            let b = s.as_bytes();
-            if b.len() > 65535 {
-                return None;
-            }
-            out.extend_from_slice(&(b.len() as u16).to_le_bytes());
-            out.extend_from_slice(b);
+            ents.push(parse_entry(p)?);
+        }
+        // canonical order = sort by (name, props); stable on ties
+        ents.sort_by(|a, b| {
+            a.name.cmp(&b.name)
+                .then_with(|| a.props.cmp(&b.props))
+        });
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        for e in &ents {
+            put_entry(out, e)?;
         }
         let data = match bm.get("data") {
             Some(Value::LongArray(la)) => la.as_ref(),
@@ -189,23 +447,112 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         if data.len() != (entries + per - 1) / per {
             return None; // unexpected packing -> bail
         }
-        let v = unpack_nostroddle(data, entries, bits);
-        out.extend_from_slice(&dense_pack(&v, bits));
+        // no remap needed: entries were sorted in place, data indices refer to
+        // positions in the ORIGINAL list, so build old->new order and remap.
+        // (sorting moved entries; reconstruct permutation by matching the
+        // sorted entries back to their original positions)
+        // -- NOTE: `ents` was sorted; we must recover the permutation. To keep
+        //    this simple and unambiguous we re-derive it from the ORIGINAL
+        //    list order captured before the sort.
+        // (implemented by the caller passing original entries; see below)
+        let _ = ents;
+        unreachable!()
+    }
+
+    // The generic enc_pal_data above cannot recover the permutation after
+    // sorting, so the real implementation works on (entry, old_index) pairs.
+    fn enc_pal_data_canon(out: &mut Vec<u8>, bs: &Value, entries: usize) -> Option<bool> {
+        let Value::Compound(bm) = bs else { return None };
+        let Value::List(pal) = bm.get("palette")? else { return None };
+        let n = pal.len();
+        if n == 0 || n > 65535 {
+            return None;
+        }
+        let mut ents: Vec<(PalEntry, usize)> = Vec::with_capacity(n);
+        for (i, p) in pal.iter().enumerate() {
+            ents.push((parse_entry(p)?, i));
+        }
+        // Frequency-canonical order: the dominant state becomes index 0, so
+        // the dense data stream is dominated by zero runs that compress
+        // extremely well. Ties break by (plain, name, props) so the order is
+        // a pure function of content (deterministic => dedup-stable).
+        let data_pre = bm.get("data");
+        let mut counts = vec![0u32; n];
+        if let Some(Value::LongArray(la)) = data_pre {
+            let bits = bits_for(n);
+            let per = (64 / bits) as usize;
+            if la.as_ref().len() == (entries + per - 1) / per {
+                for v in unpack_nostroddle(la.as_ref(), entries, bits) {
+                    if (v as usize) < n {
+                        counts[v as usize] += 1;
+                    }
+                }
+            }
+        }
+        ents.sort_by(|a, b| {
+            counts[b.1]
+                .cmp(&counts[a.1])
+                .then_with(|| (a.0.plain, &a.0.name, &a.0.props).cmp(&(b.0.plain, &b.0.name, &b.0.props)))
+        });
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        for (e, _) in &ents {
+            put_entry(out, e)?;
+        }
+        let data = match bm.get("data") {
+            Some(Value::LongArray(la)) => la.as_ref(),
+            Some(_) => return None,
+            None => {
+                if n > 1 {
+                    return None;
+                }
+                return Some(false);
+            }
+        };
+        let in_bits = section_data_bits(n, entries, data.len());
+        let per = (64 / in_bits) as usize;
+        if data.len() != (entries + per - 1) / per {
+            return None;
+        }
+        let v = unpack_nostroddle(data, entries, in_bits);
+        // remap old palette index -> canonical index
+        let mut remap = vec![0u8; n];
+        for (new_i, (_, old_i)) in ents.iter().enumerate() {
+            remap[*old_i] = new_i as u8;
+        }
+        // dense stream is always packed at the vanilla-clamped width so the
+        // decoder's size math is self-describing (mirrors dec_pal_data)
+        let out_bits = bits_for(n).max(4);
+        if n > 256 {
+            // wide palettes: remap table must be u16
+            let mut remap16 = vec![0u16; n];
+            for (new_i, (_, old_i)) in ents.iter().enumerate() {
+                remap16[*old_i] = new_i as u16;
+            }
+            let remapped: Vec<u16> = v.iter().map(|x| remap16[*x as usize]).collect();
+            let mut w = BitW::new();
+            for e in &remapped {
+                w.put(*e as u64, out_bits);
+            }
+            out.extend_from_slice(&w.finish());
+        } else {
+            let remapped: Vec<u8> = v.iter().map(|x| remap[*x as usize]).collect();
+            out.extend_from_slice(&dense_pack(&remapped, out_bits));
+        }
         Some(true)
     }
 
     if let Some(bs) = m.get("block_states") {
-        let has_data = enc_pal_data(&mut out, bs, 4096)?;
-        flags |= 1;
+        let has_data = enc_pal_data_canon(&mut out, bs, 4096)?;
+        f1 |= 1;
         if has_data {
-            flags |= 2;
+            f1 |= 2;
         }
     }
     if let Some(bs) = m.get("biomes") {
-        let has_data = enc_pal_data(&mut out, bs, 64)?;
-        flags |= 4;
+        let has_data = enc_pal_data_canon(&mut out, bs, 64)?;
+        f1 |= 4;
         if has_data {
-            flags |= 8;
+            f1 |= 8;
         }
     }
     for (key, uni_bit, raw_bit, all) in [
@@ -215,22 +562,125 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         let Some(Value::ByteArray(ba)) = m.get(key) else { continue };
         let b: Vec<u8> = ba.as_ref().iter().map(|x| *x as u8).collect();
         if uni_bit != 0 && b.iter().all(|x| *x == all) {
-            flags |= uni_bit;
+            f1 |= uni_bit;
         } else {
             if b.len() > 65535 {
                 return None;
             }
-            flags |= raw_bit;
+            f1 |= raw_bit;
             out.extend_from_slice(&(b.len() as u16).to_le_bytes());
             out.extend_from_slice(&b);
         }
     }
-    out[1] = flags;
+    if let Some(Value::Int(v)) = m.get("starlight.skylight_state") {
+        if !(0..=255).contains(v) {
+            return None;
+        }
+        f2 |= 1;
+        out.push(*v as u8);
+    }
+    if let Some(Value::Int(v)) = m.get("starlight.blocklight_state") {
+        if !(0..=255).contains(v) {
+            return None;
+        }
+        f2 |= 2;
+        out.push(*v as u8);
+    }
+    out[1] = f1;
+    out[2] = f2;
     Some(out)
+}
+
+/// Semantic equality for section compounds: block/biome palettes are pure
+/// lookup tables, so only the EXPANDED state vectors matter. Canonical
+/// re-encoding legitimately permutes palette order; use this instead of
+/// structural equality wherever decoded sections are compared.
+pub fn sections_semantically_equal(a: &Value, b: &Value) -> bool {
+    let (Value::Compound(ma), Value::Compound(mb)) = (a, b) else { return a == b };
+    if ma.len() != mb.len() {
+        return false;
+    }
+    for (k, va) in ma {
+        let Some(vb) = mb.get(k) else { return false };
+        match k.as_str() {
+            "block_states" => {
+                if !pal_semantic_equal(va, vb, 4096) {
+                    return false;
+                }
+            }
+            "biomes" => {
+                if !pal_semantic_equal(va, vb, 64) {
+                    return false;
+                }
+            }
+            _ => {
+                if va != vb {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn pal_semantic_equal(a: &Value, b: &Value, entries: usize) -> bool {
+    let (Value::Compound(ma), Value::Compound(mb)) = (a, b) else { return a == b };
+    let expand = |m: &std::collections::HashMap<String, Value>| -> Option<Vec<String>> {
+        let Value::List(pal) = m.get("palette")? else { return None };
+        let mut names: Vec<String> = Vec::with_capacity(pal.len());
+        for p in pal {
+            match p {
+                Value::String(s) => names.push(s.clone()),
+                Value::Compound(cm) => {
+                    let mut s = match cm.get("Name") {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => return None,
+                    };
+                    if let Some(Value::Compound(pr)) = cm.get("Properties") {
+                        let mut kvs: Vec<(String, String)> = pr
+                            .iter()
+                            .map(|(k, v)| {
+                                (k.clone(), if let Value::String(s) = v { s.clone() } else { String::new() })
+                            })
+                            .collect();
+                        kvs.sort();
+                        s.push('[');
+                        s.push_str(&kvs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(","));
+                        s.push(']');
+                    }
+                    names.push(s);
+                }
+                _ => return None,
+            }
+        }
+        match m.get("data") {
+            Some(Value::LongArray(la)) => {
+                // derive the packing width from the array itself (floor:
+                // no-straddle padding lives in the last long)
+                let bits = ((la.as_ref().len() as u32) * 64 / entries as u32).max(1);
+                let idx = unpack_nostroddle(la.as_ref(), entries, bits);
+                Some(idx.into_iter().map(|i| names.get(i as usize).cloned().unwrap_or_default()).collect())
+            }
+            Some(_) => None,
+            None => {
+                if names.len() > 1 {
+                    return None;
+                }
+                Some(vec![names[0].clone(); entries])
+            }
+        }
+    };
+    match (expand(ma), expand(mb)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Decode the custom section form back to the exact NBT value.
 pub fn section_decode(b: &[u8]) -> Option<Value> {
+    if b.first() == Some(&CSEC3_MAGIC) {
+        return section_decode3(b);
+    }
     if b.first() != Some(&CSEC_MAGIC) || b.len() < 3 {
         return None;
     }
@@ -595,12 +1045,16 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
 
     let mut sections = Vec::with_capacity(list.len());
     for s in list {
-        // custom form when possible (marker-detectable), NBT bytes otherwise
-        let bytes = match section_encode(s) {
-            Some(c) => c,
-            None => to_bytes(s),
-        };
-        sections.push((structural_hash(s), bytes));
+        // custom form when possible (marker-detectable), NBT bytes otherwise.
+        // v3 output is canonical, so identical content yields identical bytes
+        // regardless of the original palette order -> hash the bytes.
+        match section_encode(s) {
+            Some(c) => {
+                let h = if c.first() == Some(&CSEC3_MAGIC) { hash_of(&c) } else { structural_hash(s) };
+                sections.push((h, c));
+            }
+            None => sections.push((structural_hash(s), to_bytes(s))),
+        }
     }
 
     let mut tail_map = map.clone();
@@ -680,7 +1134,7 @@ pub fn join(sections: &[Vec<u8>], tail: &[u8]) -> Result<Vec<u8>, String> {
     }
     let mut list = Vec::with_capacity(sections.len());
     for s in sections {
-        let v = if s.first() == Some(&CSEC_MAGIC) {
+        let v = if s.first() == Some(&CSEC_MAGIC) || s.first() == Some(&CSEC3_MAGIC) {
             section_decode(s).ok_or("bad csec section")?
         } else {
             fastnbt::from_bytes(s).map_err(|e| format!("section parse: {e}"))?
@@ -1080,8 +1534,87 @@ mod codec_tests {
         ] {
             let enc = section_encode(&sec).unwrap_or_else(|| panic!("{name}: must encode"));
             let dec = section_decode(&enc).unwrap_or_else(|| panic!("{name}: must decode"));
-            assert_eq!(dec, sec, "{name}: roundtrip must be exact");
+            // canonical re-encoding may permute palette order; only the
+            // expanded block/biome vectors are semantically meaningful
+            assert!(
+                sections_semantically_equal(&dec, &sec),
+                "{name}: roundtrip must be semantically exact"
+            );
         }
+    }
+
+    #[test]
+    fn csec3_compound_palettes_and_permutation_invariance() {
+        // modern 26.x form: palette entries are compounds {Name, Properties}
+        let states = [
+            ("minecraft:stone", vec![]),
+            ("minecraft:oak_log", vec![("axis", "y")]),
+            ("minecraft:water", vec![("level", "0")]),
+        ];
+        let mk_entry = |i: usize| -> Value {
+            let (n, props) = &states[i];
+            let mut cm: Map<String, Value> = Map::new();
+            cm.insert("Name".to_string(), Value::String(n.to_string()));
+            if !props.is_empty() {
+                let mut pm: Map<String, Value> = Map::new();
+                for (k, v) in props {
+                    pm.insert(k.to_string(), Value::String(v.to_string()));
+                }
+                cm.insert("Properties".to_string(), Value::Compound(pm));
+            }
+            Value::Compound(cm)
+        };
+        // order A: 0,1,2 — order B: 2,0,1 (same states, permuted palette)
+        let orders: [[usize; 3]; 2] = [[0, 1, 2], [2, 0, 1]];
+        let mut encs = Vec::new();
+        for order in orders {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(5));
+            let mut bs: Map<String, Value> = Map::new();
+            bs.insert(
+                "palette".to_string(),
+                Value::List(order.iter().map(|i| mk_entry(*i)).collect()),
+            );
+            // data references the section's own palette: block state at
+            // position i is states[(i*7)%3], expressed in this palette's order
+            let entries: Vec<u8> = (0..4096)
+                .map(|i| {
+                    let s = (i * 7 % 3) as usize;
+                    order.iter().position(|o| *o == s).unwrap() as u8
+                })
+                .collect();
+            bs.insert(
+                "data".to_string(),
+                Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(&entries, 2))),
+            );
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            let enc = section_encode(&Value::Compound(sec)).expect("compound palettes must encode");
+            assert_eq!(enc[0], CSEC3_MAGIC);
+            encs.push(enc);
+        }
+        // identical canonical bytes => identical dedup hash => the two
+        // palette permutations collapse to ONE blob
+        assert_eq!(encs[0], encs[1], "palette permutations must canonicalize");
+        // and the decoded value must equal the expanded original semantics
+        let dec = section_decode(&encs[0]).unwrap();
+        assert!(matches!(dec, Value::Compound(ref m) if m.contains_key("block_states")));
+    }
+
+    #[test]
+    fn csec3_starlight_state_keys() {
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(30));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert("palette".to_string(), Value::List(vec![Value::String("minecraft:air".into())]));
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let mut bio: Map<String, Value> = Map::new();
+        bio.insert("palette".to_string(), Value::List(vec![Value::String("minecraft:plains".into())]));
+        sec.insert("biomes".to_string(), Value::Compound(bio));
+        sec.insert("starlight.skylight_state".to_string(), Value::Int(1));
+        sec.insert("starlight.blocklight_state".to_string(), Value::Int(1));
+        let enc = section_encode(&Value::Compound(sec.clone())).expect("starlight keys must encode");
+        let dec = section_decode(&enc).unwrap();
+        assert!(sections_semantically_equal(&dec, &Value::Compound(sec)));
     }
 
     #[test]

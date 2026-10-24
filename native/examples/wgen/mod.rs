@@ -271,7 +271,8 @@ pub fn build_section(
                 by_slot[*s as usize] = k;
             }
             let palette: Vec<Value> = by_slot.iter().map(|k| Value::String(k.to_string())).collect();
-            let bits = bits_for(palette.len().max(1));
+            // vanilla clamps linear palettes to a 4-bit minimum
+            let bits = bits_for(palette.len().max(1)).max(4);
             let longs = pack(&entries, bits);
             let mut bs: Map<String, Value> = Map::new();
             bs.insert("palette".to_string(), Value::List(palette));

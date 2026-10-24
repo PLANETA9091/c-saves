@@ -47,6 +47,9 @@ pub fn maybe_spawn_import(
                         disk as f64 / 1048576.0
                     );
                     // per-file removal happens inside import_dir (only clean files)
+                    // imported data lands at the hot tier; request a pack pass so
+                    // it gets slab-packed + cold-tiered right away
+                    store.request_pack();
                 }
                 Err(e) => eprintln!("[c-saves] import {kind} failed: {e}"),
             }

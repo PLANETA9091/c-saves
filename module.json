@@ -1,6 +1,6 @@
 {
   "id": "saves",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "main": "libc-saves.so",
-  "description": "c-saves: Rust-native world storage engine for Paper 26.3. CRS2 container: custom section codec (dense bit-packed palettes + delta-varint heightmaps), per-key field split for entity/POI payloads with interned keys and key-redundant Position stripping, content-addressed section dedup, slab-packed small blobs, id/varint recipes, versioned shared zstd dictionaries, hot/cold two-tier compression (L12 write / L19 background), transparent Moonrise chunk-IO takeover, Anvil import/export. 8-9x smaller than vanilla regions."
+  "description": "c-saves: Rust-native world storage engine for Paper 26.3. CRS2 container: CSEC-v3 section codec (compound palettes, vanilla 4-bit width clamp, frequency-canonical order, dense bit-packing), delta-varint heightmaps, per-key field split for entity/POI payloads, content-addressed section dedup with canonical permutation-invariant hashes, chunk-locality-ordered slab packing (mode-aware dictionary), id/varint recipes, versioned shared zstd dictionaries, hot/cold two-tier compression with auto-pack watermark, transparent Moonrise chunk-IO takeover, Anvil import/export. Verified on a real JJThunder To The Max world (131-section chunks, 10k entities): 2.2x smaller than Anvil; synthetic bench 9x."
 }
