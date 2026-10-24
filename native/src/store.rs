@@ -226,10 +226,22 @@ enum Tail {
 }
 
 #[derive(Clone, Debug)]
+enum FieldVal {
+    /// Unnamed-value bytes inlined in the recipe (≤255B).
+    Inline { raw: Vec<u8> },
+    /// Blob reference (always a BLOB2 with an id).
+    Hash(Hash),
+}
+
+#[derive(Clone, Debug)]
 struct Recipe {
     whole: Option<Hash>,
     sections: Vec<Hash>,
     tail: Tail,
+    /// Mode-5 field split (whole-mode payloads): (key id, value).
+    fields: Vec<(u16, FieldVal)>,
+    /// Mode-5: the Position marker was key-redundant and stripped.
+    pos_from_key: bool,
 }
 
 fn crc_of(b: &[u8]) -> u32 {
@@ -239,8 +251,16 @@ fn crc_of(b: &[u8]) -> u32 {
 }
 
 impl Recipe {
-    /// Parse any recipe mode. `id2h` resolves BLOB2 ids (pass-1 complete).
-    fn parse(b: &[u8], id2h: &HashMap<u32, Hash>) -> Option<Recipe> {
+    /// Parse any recipe mode. `id2h` resolves BLOB2 ids (pass-1 complete);
+    /// `keytab` resolves mode-5 interned key ids.
+    fn parse(b: &[u8], id2h: &HashMap<u32, Hash>, keytab: &[String]) -> Option<Recipe> {
+        const EMPTY: Recipe = Recipe {
+            whole: None,
+            sections: Vec::new(),
+            tail: Tail::None,
+            fields: Vec::new(),
+            pos_from_key: false,
+        };
         let mut p = 0usize;
         let mode = *b.first()?;
         p += 1;
@@ -284,7 +304,7 @@ impl Recipe {
             }
         };
         match mode {
-            0 => Some(Recipe { whole: Some(rd_hash(&mut p)), sections: Vec::new(), tail: Tail::None }),
+            0 => Some(Recipe { whole: Some(rd_hash(&mut p)), ..EMPTY }),
             1 => {
                 let n = *b.get(p)? as usize;
                 p += 1;
@@ -308,6 +328,7 @@ impl Recipe {
                     whole: None,
                     sections,
                     tail: Tail::Inline { dict, comp, raw },
+                    ..EMPTY
                 })
             }
             2 => {
@@ -321,15 +342,46 @@ impl Recipe {
                     sections.push(*id2h.get(&(prev as u32))?);
                 }
                 let tail = parse_tail(&mut p)?;
-                Some(Recipe { whole: None, sections, tail })
+                Some(Recipe { whole: None, sections, tail, ..EMPTY })
             }
             3 => {
                 let id = get_u64(b, &mut p)? as u32;
                 Some(Recipe {
                     whole: Some(*id2h.get(&id)?),
-                    sections: Vec::new(),
-                    tail: Tail::None,
+                    ..EMPTY
                 })
+            }
+            5 => {
+                let flags = *b.get(p)?;
+                p += 1;
+                let n = *b.get(p)? as usize;
+                p += 1;
+                let mut fields = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    let kid = get_u64(b, &mut p)? as u16;
+                    let kind = *b.get(p)?;
+                    p += 1;
+                    let val = match kind {
+                        0 => {
+                            let l = *b.get(p)? as usize;
+                            p += 1;
+                            let raw = b.get(p..p + l)?.to_vec();
+                            p += l;
+                            FieldVal::Inline { raw }
+                        }
+                        1 => {
+                            let id = get_u64(b, &mut p)? as u32;
+                            FieldVal::Hash(*id2h.get(&id)?)
+                        }
+                        2 => FieldVal::Hash(rd_hash(&mut p)),
+                        _ => return None,
+                    };
+                    fields.push((kid, val));
+                }
+                if fields.iter().any(|(k, _)| *k as usize >= keytab.len()) {
+                    return None;
+                }
+                Some(Recipe { fields, pos_from_key: flags & 1 != 0, ..EMPTY })
             }
             4 => {
                 let n = *b.get(p)? as usize;
@@ -339,18 +391,23 @@ impl Recipe {
                     sections.push(rd_hash(&mut p));
                 }
                 let tail = parse_tail(&mut p)?;
-                Some(Recipe { whole: None, sections, tail })
+                Some(Recipe { whole: None, sections, tail, ..EMPTY })
             }
             _ => None,
         }
     }
 
     fn blob_hashes(&self) -> Vec<Hash> {
-        let mut v = Vec::with_capacity(self.sections.len() + 1);
+        let mut v = Vec::with_capacity(self.sections.len() + self.fields.len() + 1);
         if let Some(h) = self.whole {
             v.push(h);
         }
         v.extend_from_slice(&self.sections);
+        for (_, f) in &self.fields {
+            if let FieldVal::Hash(h) = f {
+                v.push(*h);
+            }
+        }
         if let Tail::Blob(h) = &self.tail {
             v.push(*h);
         }
@@ -408,6 +465,42 @@ impl Recipe {
             }
         }
         v
+    }
+
+    /// Encode mode 5 (field split).
+    fn encode_fields(&self, id_of: impl Fn(Hash) -> Option<u32> + Copy) -> Option<Vec<u8>> {
+        if self.fields.is_empty() || self.fields.len() > 255 {
+            return None;
+        }
+        let mut v = Vec::with_capacity(48);
+        v.push(5u8);
+        v.push(if self.pos_from_key { 1u8 } else { 0u8 });
+        v.push(self.fields.len() as u8);
+        for (kid, val) in &self.fields {
+            put_u64(&mut v, *kid as u64);
+            match val {
+                FieldVal::Inline { raw } => {
+                    if raw.len() > 255 {
+                        return None;
+                    }
+                    v.push(0u8);
+                    v.push(raw.len() as u8);
+                    v.extend_from_slice(raw);
+                }
+                FieldVal::Hash(h) => match id_of(*h) {
+                    Some(id) => {
+                        v.push(1u8);
+                        put_u64(&mut v, id as u64);
+                    }
+                    None => {
+                        v.push(2u8);
+                        v.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
+                        v.extend_from_slice(&((*h as u64).to_le_bytes()));
+                    }
+                },
+            }
+        }
+        Some(v)
     }
 }
 
@@ -524,6 +617,11 @@ pub struct Store {
     blobs: RwLock<HashMap<Hash, BlobLoc>>,
     ids: RwLock<HashMap<u32, Hash>>,
     chunks: RwLock<HashMap<u64, (u32, u64, u32)>>,
+    /// Interned recipe key names (mode 5); persisted as kind-6 records.
+    keys_tab: RwLock<Vec<String>>,
+    /// On-disk kind-6 record count per key name (a key whose last record
+    /// would die with a compacted segment is re-recorded first).
+    key_refcnt: RwLock<HashMap<String, u32>>,
     writer: Mutex<Option<Writer>>,
     next_seg: AtomicU64,
     next_blob_id: AtomicU64,
@@ -557,6 +655,8 @@ impl Store {
             blobs: RwLock::new(HashMap::new()),
             ids: RwLock::new(HashMap::new()),
             chunks: RwLock::new(HashMap::new()),
+            keys_tab: RwLock::new(Vec::new()),
+            key_refcnt: RwLock::new(HashMap::new()),
             writer: Mutex::new(None),
             slab_cache: Mutex::new(SlabCache::new(32 * 1024 * 1024)),
             next_seg: AtomicU64::new(0),
@@ -909,6 +1009,22 @@ impl Store {
                                 true
                             }
                         }
+                        6 => {
+                            // interned recipe key: [6][u16 len][bytes]
+                            if body.len() < 3 {
+                                false
+                            } else {
+                                let l = u16::from_le_bytes(body[1..3].try_into().unwrap()) as usize;
+                                if body.len() < 3 + l {
+                                    false
+                                } else {
+                                    let k = String::from_utf8_lossy(&body[3..3 + l]).to_string();
+                                    *self.key_refcnt.write().entry(k.clone()).or_default() += 1;
+                                    self.keys_tab.write().push(k);
+                                    true
+                                }
+                            }
+                        }
                         3 => {
                             if body.len() < 9 {
                                 false
@@ -993,7 +1109,8 @@ impl Store {
             return None;
         }
         let id2h = self.ids.read();
-        Recipe::parse(&body[13..13 + rl], &id2h)
+        let keytab = self.keys_tab.read();
+        Recipe::parse(&body[13..13 + rl], &id2h, &keytab)
     }
 
     fn writer_seg_id(&self) -> Option<u32> {
@@ -1194,6 +1311,33 @@ impl Store {
         Some(out)
     }
 
+    /// Intern a recipe key name; persists it as a kind-6 record so scans
+    /// rebuild the table in log order.
+    fn intern_key(&self, key: &str) -> Result<u16, String> {
+        {
+            let t = self.keys_tab.read();
+            if let Some(i) = t.iter().position(|k| k == key) {
+                return Ok(i as u16);
+            }
+        }
+        let mut body = Vec::with_capacity(3 + key.len());
+        body.push(6u8);
+        body.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        body.extend_from_slice(key.as_bytes());
+        self.append(&body).map_err(|e| e.to_string())?;
+        *self.key_refcnt.write().entry(key.to_string()).or_default() += 1;
+        let mut t = self.keys_tab.write();
+        // double-check under write lock (concurrent interning)
+        if let Some(i) = t.iter().position(|k| k == key) {
+            return Ok(i as u16);
+        }
+        if t.len() >= u16::MAX as usize {
+            return Err("key table full".into());
+        }
+        t.push(key.to_string());
+        Ok((t.len() - 1) as u16)
+    }
+
     // ---- public chunk API ----
 
     /// Store one chunk payload. `whole_mode` is used for entity/poi payloads
@@ -1201,17 +1345,30 @@ impl Store {
     pub fn write_chunk(&self, key: u64, payload: &[u8], whole_mode: bool) -> Result<(), String> {
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.logical_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
-        let split = chunknbt::split(payload, whole_mode)?;
+        let pos_hint = Some(((key >> 32) as i32, (key & 0xffff_ffff) as i32));
+        let split = chunknbt::split(payload, whole_mode, pos_hint)?;
         let recipe = match split {
             Split::Whole { hash } => {
                 self.ensure_blob(hash, payload, false)?;
-                Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None }
+                Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
+            }
+            Split::Fields { parts, pos_from_key } => {
+                let mut fields = Vec::with_capacity(parts.len());
+                for p in parts {
+                    if p.inline {
+                        fields.push((self.intern_key(&p.key)?, FieldVal::Inline { raw: p.bytes }));
+                    } else {
+                        self.ensure_blob(p.hash, &p.bytes, false)?;
+                        fields.push((self.intern_key(&p.key)?, FieldVal::Hash(p.hash)));
+                    }
+                }
+                Recipe { whole: None, sections: Vec::new(), tail: Tail::None, fields, pos_from_key }
             }
             Split::Split { sections, tail } => {
                 if sections.len() > MAX_SECTIONS {
                     let h = chunknbt::hash_of(payload);
                     self.ensure_blob(h, payload, false)?;
-                    Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None }
+                    Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
                 } else {
                     let mut hashes = Vec::with_capacity(sections.len());
                     for (h, bytes) in &sections {
@@ -1227,7 +1384,7 @@ impl Store {
                     } else {
                         Tail::Inline { dict: tdict, comp: tcomp, raw: tail.len() as u32 }
                     };
-                    Recipe { whole: None, sections: hashes, tail: tail_ref }
+                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false }
                 }
             }
         };
@@ -1237,7 +1394,13 @@ impl Store {
             let l = blobs.get(&h)?;
             if l.id == NO_ID { None } else { Some(l.id) }
         };
-        let rec = recipe.encode(id_of);
+        let rec = if recipe.fields.is_empty() {
+            recipe.encode(id_of)
+        } else {
+            recipe
+                .encode_fields(id_of)
+                .ok_or_else(|| "field recipe too large".to_string())?
+        };
         let mut body = Vec::with_capacity(13 + rec.len());
         body.push(2u8);
         body.extend_from_slice(&key.to_le_bytes());
@@ -1291,6 +1454,31 @@ impl Store {
             Some(h) => {
                 let loc = *self.blobs.read().get(&h)?;
                 self.read_blob(loc, writer_id).or_else(|| fail("whole-blob"))
+            }
+            None if !rec.fields.is_empty() => {
+                let keytab = self.keys_tab.read();
+                let mut parts = Vec::with_capacity(rec.fields.len());
+                for (kid, val) in &rec.fields {
+                    let key = keytab.get(*kid as usize)?; // parse checked bounds
+                    let bytes = match val {
+                        FieldVal::Inline { raw } => raw.clone(),
+                        FieldVal::Hash(h) => {
+                            let loc = *self.blobs.read().get(h)?;
+                            self.read_blob(loc, writer_id).or_else(|| fail("field-blob"))?
+                        }
+                    };
+                    parts.push(chunknbt::FieldBytes { key: key.clone(), inline: matches!(val, FieldVal::Inline { .. }), bytes });
+                }
+                drop(keytab);
+                let pos = if rec.pos_from_key {
+                    Some(((key >> 32) as i32, (key & 0xffff_ffff) as i32))
+                } else {
+                    None
+                };
+                match chunknbt::join_fields(&parts, pos) {
+                    Ok(v) => Some(v),
+                    Err(e) => fail(&format!("join_fields: {e}")),
+                }
             }
             None => {
                 let tail = tail_bytes.or_else(|| fail("tail"))?;
@@ -1443,6 +1631,123 @@ impl Store {
         )
     }
 
+    /// Exact on-disk accounting: every byte of the container attributed to
+    /// record framing, blob headers, compressed payload, slabs, recipes or
+    /// dictionaries. Returns a JSON object.
+    pub fn profile_json(&self) -> String {
+        let blobs = self.blobs.read();
+        let mut rec_frame = 0u64; // 8-byte [len][crc] per record
+        let mut blob_hdr = 0u64; // kind-4 headers
+        let mut blob_comp = 0u64; // compressed bytes in kind-4
+        let mut blob_n = 0u64;
+        let mut slab_frame = 0u64; // kind-5 headers (12) + framing, full
+        let mut slab_comp = 0u64; // compressed slab streams
+        let mut slab_share = 0u64; // sum of member shares (attribution view)
+        let mut slab_n = 0u64; // members
+        let mut raw_regular = 0u64;
+        let mut slab_seen: std::collections::HashSet<(u32, u64)> = std::collections::HashSet::new();
+        let mut slab_records: std::collections::HashMap<(u32, u64), (u64, u64, usize)> =
+            std::collections::HashMap::new(); // -> (frame, comp, members)
+        for l in blobs.values() {
+            if l.slab {
+                slab_n += 1;
+                slab_share += l.share as u64;
+                let e = slab_records.entry((l.seg, l.off)).or_insert((0, 0, 0));
+                e.2 += 1;
+            } else {
+                blob_n += 1;
+                blob_hdr += l.header_len();
+                blob_comp += l.comp_len as u64;
+                raw_regular += l.raw_len as u64;
+                rec_frame += 8;
+            }
+        }
+        for (&(seg, off), e) in slab_records.iter_mut() {
+            // reconstruct the kind-5 record size: hdr 12 + comp; framing 8
+            if let Some(s) = self.segs.read().get(&seg) {
+                let hdr = s.read_at(off, 12, true);
+                if let Some(h) = hdr {
+                    let cl = u32::from_le_bytes(h[2..6].try_into().unwrap()) as u64;
+                    e.0 = 8 + 12 + cl;
+                    e.1 = cl;
+                }
+            }
+            slab_frame += e.0;
+            slab_comp += e.1;
+        }
+        // recipes: live chunk records
+        let mut rec_bytes = 0u64;
+        {
+            let chunks = self.chunks.read();
+            for (_k, (_s, _o, l)) in chunks.iter() {
+                rec_bytes += 8 + *l as u64;
+            }
+        }
+        // dictionaries on disk
+        let mut dict_bytes = 0u64;
+        if let Ok(rd) = fs::read_dir(self.dict_dir()) {
+            for e in rd.flatten() {
+                dict_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        // segment headers that are unaccounted (should be ~0)
+        let attributed = rec_frame + blob_hdr + blob_comp + slab_frame + rec_bytes;
+        let disk = self.disk_bytes();
+        let unattr = disk.saturating_sub(attributed);
+        let mut s = String::with_capacity(1024);
+        s.push_str("{");
+        s.push_str(&format!(r#""disk":{disk},"#));
+        s.push_str(&format!(r#""recipes":{{"count":{},"bytes":{rec_bytes}}},"#, self.chunk_count()));
+        s.push_str(&format!(
+            r#""blobs_regular":{{"count":{blob_n},"headers":{blob_hdr},"comp":{blob_comp},"raw":{raw_regular}}},"#
+        ));
+        s.push_str(&format!(
+            r#""slabs":{{"records_frame":{slab_frame},"comp":{slab_comp},"members":{slab_n},"member_share":{slab_share}}},"#
+        ));
+        s.push_str(&format!(r#""dicts":{dict_bytes},"#));
+        s.push_str(&format!(r#""unattributed":{unattr}"#));
+        s.push_str("}");
+        s
+    }
+
+    /// Per-blob compressed-size histogram bucketed by raw size class
+    /// (write-path insight: which payload sizes dominate the container).
+    pub fn blob_histogram_json(&self) -> String {
+        let buckets: [(u64, &str); 8] = [
+            (128, "b<=128"),
+            (512, "b<=512"),
+            (2048, "b<=2k"),
+            (4096, "b<=4k"),
+            (16384, "b<=16k"),
+            (65536, "b<=64k"),
+            (262144, "b<=256k"),
+            (u64::MAX, "b>256k"),
+        ];
+        let mut out = String::from("{");
+        let blobs = self.blobs.read();
+        let mut raw_tot = vec![0u64; buckets.len()];
+        let mut comp_tot = vec![0u64; buckets.len()];
+        let mut cnt = vec![0u64; buckets.len()];
+        for l in blobs.values() {
+            let raw = l.raw_len as u64;
+            let i = buckets.iter().position(|(t, _)| raw <= *t).unwrap_or(buckets.len() - 1);
+            cnt[i] += 1;
+            raw_tot[i] += raw;
+            comp_tot[i] += if l.slab { l.share as u64 } else { l.body_len() };
+        }
+        for (i, (_, name)) in buckets.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                r#""{}":{{"n":{},"raw":{},"disk":{}}}"#,
+                name, cnt[i], raw_tot[i], comp_tot[i]
+            ));
+        }
+        out.push('}');
+        out
+    }
+
     // ---- compaction ----
 
     /// Pack accumulated small-blob candidates into kind-5 slab record(s) in
@@ -1522,10 +1827,208 @@ impl Store {
         }
     }
 
+    /// Re-append kind-6 key records of a dying segment so the interned key
+    /// table survives compaction (indices of existing keys are stable; only
+    /// names missing from the table are re-recorded).
+    fn preserve_keys(&self, seg_id: u32) {
+        let total = match self.segs.read().get(&seg_id) {
+            Some(s) => s.total.load(Ordering::Relaxed),
+            None => return,
+        };
+        let mut off = 0u64;
+        while off + 8 <= total {
+            let body = {
+                let segs = self.segs.read();
+                let Some(seg) = segs.get(&seg_id) else { return };
+                let Some(hdr) = seg.read_at(off, 8, true) else { return };
+                let blen = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as u64;
+                if blen == 0 || off + 8 + blen > total {
+                    return;
+                }
+                match seg.read_at(off + 8, blen as usize, true) {
+                    Some(b) => b,
+                    None => return,
+                }
+            };
+            if body.first() == Some(&6) && body.len() >= 3 {
+                let l = u16::from_le_bytes(body[1..3].try_into().unwrap()) as usize;
+                if body.len() >= 3 + l {
+                    let name = String::from_utf8_lossy(&body[3..3 + l]).to_string();
+                    let mut refs = self.key_refcnt.write();
+                    let e = refs.entry(name.clone()).or_default();
+                    if *e <= 1 {
+                        // last on-disk record dies with this segment -> re-record
+                        *e = 1;
+                        drop(refs);
+                        let mut rec = Vec::with_capacity(3 + name.len());
+                        rec.push(6u8);
+                        rec.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                        rec.extend_from_slice(name.as_bytes());
+                        if self.append(&rec).is_ok() {
+                            let mut t = self.keys_tab.write();
+                            if !t.iter().any(|k| *k == name) {
+                                t.push(name);
+                            }
+                        }
+                    } else {
+                        *e -= 1;
+                    }
+                }
+            }
+            off += 8 + body.len() as u64;
+        }
+    }
+
+    /// Rewrite mode-5 (field split) recipes when it shrinks them:
+    ///   * inline parts whose exact bytes repeat across live recipes become
+    ///     dedup blobs (empty Entities lists, constant scalars, ...);
+    ///   * single-ref small blobs become inline raw bytes.
+    /// Runs as the fallback work item of compact_step (no dead space needed).
+    /// Returns true when any recipe was rewritten.
+    fn optimize_fields_step(&self) -> bool {
+        let live: Vec<(u64, u32, u64, u32)> = {
+            let chunks = self.chunks.read();
+            chunks.iter().map(|(k, (s, o, l))| (*k, *s, *o, *l)).collect()
+        };
+        if live.is_empty() {
+            return false;
+        }
+        let mut counts: HashMap<Hash, u32> = HashMap::new();
+        let mut has_demote = false;
+        let mut parsed: Vec<(u64, u32, u64, u32, Recipe)> = Vec::new();
+        {
+            let blobs = self.blobs.read();
+            for (key, seg, off, len) in &live {
+                let Some(rec) = self.load_recipe(*seg, *off, *len) else { continue };
+                if rec.whole.is_some() || !rec.sections.is_empty() || rec.fields.is_empty() {
+                    continue;
+                }
+                for (_, f) in &rec.fields {
+                    match f {
+                        FieldVal::Inline { raw } => {
+                            *counts.entry(chunknbt::hash_of(raw)).or_default() += 1;
+                        }
+                        FieldVal::Hash(h) => {
+                            if let Some(loc) = blobs.get(h) {
+                                if loc.refs <= 1 && loc.raw_len <= 64 {
+                                    has_demote = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                parsed.push((*key, *seg, *off, *len, rec));
+            }
+        }
+        let promote: std::collections::HashSet<Hash> = counts
+            .iter()
+            .filter(|(_, c)| **c >= 2)
+            .map(|(h, _)| *h)
+            .collect();
+        if promote.is_empty() && !has_demote {
+            return false;
+        }
+        let mut rewritten = 0usize;
+        for (key, seg, off, len, rec) in parsed {
+            // skip recipes superseded since capture (concurrent rewrite)
+            if *self.chunks.read().get(&key).unwrap_or(&(0, 0, 0)) != (seg, off, len) {
+                continue;
+            }
+            let mut changed = false;
+            let mut new_fields = Vec::with_capacity(rec.fields.len());
+            for (kid, f) in &rec.fields {
+                match f {
+                    FieldVal::Inline { raw } => {
+                        let h = chunknbt::hash_of(raw);
+                        if promote.contains(&h) {
+                            let Some(v) = chunknbt::read_unnamed(raw) else {
+                                new_fields.push((*kid, f.clone()));
+                                continue;
+                            };
+                            let sh = chunknbt::structural_hash(&v);
+                            let wrapped = chunknbt::wrap(&v);
+                            match self.ensure_blob(sh, &wrapped, false) {
+                                Ok(_) => {
+                                    new_fields.push((*kid, FieldVal::Hash(sh)));
+                                    changed = true;
+                                }
+                                Err(_) => new_fields.push((*kid, f.clone())),
+                            }
+                        } else {
+                            new_fields.push((*kid, f.clone()));
+                        }
+                    }
+                    FieldVal::Hash(h) => {
+                        let loc = self.blobs.read().get(h).copied();
+                        let mut demoted = false;
+                        if let Some(loc) = loc {
+                            if loc.refs <= 1 && loc.raw_len <= 64 {
+                                if let Some(data) = self.read_blob(loc, self.writer_seg_id()) {
+                                    if let Some(v) = chunknbt::unwrap_wrapped(&data) {
+                                        let mut raw2 = Vec::with_capacity(48);
+                                        if chunknbt::write_unnamed(&v, &mut raw2).is_some()
+                                            && raw2.len() <= 255
+                                        {
+                                            new_fields.push((*kid, FieldVal::Inline { raw: raw2 }));
+                                            changed = true;
+                                            demoted = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !demoted {
+                            new_fields.push((*kid, f.clone()));
+                        }
+                    }
+                }
+            }
+            if !changed {
+                continue;
+            }
+            if *self.chunks.read().get(&key).unwrap_or(&(0, 0, 0)) != (seg, off, len) {
+                continue;
+            }
+            let new_rec = Recipe {
+                whole: None,
+                sections: Vec::new(),
+                tail: Tail::None,
+                fields: new_fields,
+                pos_from_key: rec.pos_from_key,
+            };
+            let id_of = |h: Hash| -> Option<u32> {
+                let blobs = self.blobs.read();
+                blobs.get(&h).and_then(|l| if l.id == NO_ID { None } else { Some(l.id) })
+            };
+            let Some(enc) = new_rec.encode_fields(id_of) else { continue };
+            let mut body = Vec::with_capacity(13 + enc.len());
+            body.push(2u8);
+            body.extend_from_slice(&key.to_le_bytes());
+            body.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+            body.extend_from_slice(&enc);
+            let Ok((nseg, noff, nlen)) = self.append(&body) else { continue };
+            self.chunks.write().insert(key, (nseg, noff, nlen));
+            self.bump_recipe_refs(&new_rec);
+            if let Some(old_rec) = self.load_recipe(seg, off, len) {
+                self.drop_recipe_refs(&old_rec);
+            }
+            if let Some(s) = self.segs.read().get(&seg) {
+                s.live.fetch_sub(8 + len as u64, Ordering::Relaxed);
+            }
+            rewritten += 1;
+        }
+        rewritten > 0
+    }
+
     /// Compact at most one segment: move live data (recompressing blobs at
     /// the cold tier), then drop the segment. Returns true if work was done.
     pub fn compact_step(&self) -> bool {
         self.train_dict_if_needed();
+        // seal any open writer so previously appended data (including our
+        // own past moves and optimize rewrites) is eligible for selection;
+        // without this, dead bytes trapped in the writer segment would never
+        // be reclaimed (the writer segment is exempt below).
+        self.seal();
         let writer_id = self.writer_seg_id().unwrap_or(u32::MAX);
         let worst = {
             let segs = self.segs.read();
@@ -1545,9 +2048,9 @@ impl Store {
             }
             worst
         };
-        let Some((worst_id, ratio)) = worst else { return false };
+        let Some((worst_id, ratio)) = worst else { return self.optimize_fields_step(); };
         if ratio < self.cfg.compact_ratio {
-            return false;
+            return self.optimize_fields_step();
         }
         // move live blobs: big ones as recompressed BLOB2 (cold tier), small
         // ones batched into kind-5 slab records (one header, one stream)
@@ -1629,6 +2132,9 @@ impl Store {
             }
             self.chunks.write().insert(key, (nseg, noff, nlen));
         }
+        // preserve interned keys recorded in this segment (kind-6 records
+        // are not referenced by recipes but the key table must survive)
+        self.preserve_keys(worst_id);
         // drop the segment
         let old = self.segs.write().remove(&worst_id);
         drop(old);
@@ -1945,19 +2451,24 @@ mod tests {
     fn legacy_recipe_modes_still_parse() {
         // mode 0: whole by hash
         let mut id2h = HashMap::new();
-        let r0 = Recipe::parse(&{
-            let mut v = vec![0u8];
-            v.extend_from_slice(&1u64.to_le_bytes());
-            v.extend_from_slice(&2u64.to_le_bytes());
-            v
-        }, &id2h).unwrap();
+        let r0 = Recipe::parse(
+            &{
+                let mut v = vec![0u8];
+                v.extend_from_slice(&1u64.to_le_bytes());
+                v.extend_from_slice(&2u64.to_le_bytes());
+                v
+            },
+            &id2h,
+            &[],
+        )
+        .unwrap();
         assert_eq!(r0.whole, Some(((1u128) << 64) | 2));
         // mode 2 with ids resolved
         id2h.insert(7u32, 0xABu128);
         let mut v = vec![2u8, 1u8];
         put_u64(&mut v, zigzag(7i64));
         v.push(0u8); // tail none
-        let r2 = Recipe::parse(&v, &id2h).unwrap();
+        let r2 = Recipe::parse(&v, &id2h, &[]).unwrap();
         assert_eq!(r2.sections, vec![0xABu128]);
         // mode 2 with delta encoding: id 7 then id 9
         id2h.insert(9u32, 0xBCu128);
@@ -1965,12 +2476,12 @@ mod tests {
         put_u64(&mut v, zigzag(7i64));
         put_u64(&mut v, zigzag(2i64));
         v.push(0u8);
-        let r2 = Recipe::parse(&v, &id2h).unwrap();
+        let r2 = Recipe::parse(&v, &id2h, &[]).unwrap();
         assert_eq!(r2.sections.len(), 2);
         // mode 3: whole by id
         let mut v = vec![3u8];
         put_u64(&mut v, 7);
-        let r3 = Recipe::parse(&v, &id2h).unwrap();
+        let r3 = Recipe::parse(&v, &id2h, &[]).unwrap();
         assert_eq!(r3.whole, Some(0xABu128));
     }
 }

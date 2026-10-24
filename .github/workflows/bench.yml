@@ -39,9 +39,14 @@ jobs:
           path: |
             native/bench_output.txt
             native/bench_stalls.txt
-      - name: regression gate — container must stay under 25% of Anvil size
+      - name: size profile (what weighs the most)
+        working-directory: native
+        run: |
+          cargo build --release --example profile_size
+          ./target/release/examples/profile_size 32 2 2>/dev/null | tee bench_profile.txt
+      - name: regression gate — container must stay under 15% of Anvil size
         working-directory: native
         run: |
           RATIO=$(./target/release/examples/bench_size 32 2 2>/dev/null | grep "c-saves compact" | grep -o "x0\.[0-9]* vs anvil" | grep -o "0\.[0-9]*")
           echo "compact/anvil ratio: $RATIO"
-          awk -v r="$RATIO" 'BEGIN { if (r+0 > 0.25) { print "FAIL: ratio " r " exceeds 0.25"; exit 1 } print "OK" }'
+          awk -v r="$RATIO" 'BEGIN { if (r+0 > 0.15) { print "FAIL: ratio " r " exceeds 0.25"; exit 1 } print "OK" }'
