@@ -69,7 +69,7 @@ jobs:
         working-directory: native
         run: |
           grep -q "verify: ok=" jj_bench.txt || { echo "FAIL: no verification line"; exit 1; }
-          BAD=$(grep "verify:" jj_bench.txt | grep -o "bad=[0-9]*" | cut -d= -f2)
+          BAD=$(grep "verify:" jj_bench.txt | grep -o "bad=[0-9]*" | head -1 | cut -d= -f2)
           [ "$BAD" = "0" ] || { echo "FAIL: semantic verification bad=$BAD"; exit 1; }
           RATIO=$(grep "^TOTAL" jj_bench.txt | grep -o "x[0-9.]* smaller" | grep -o "[0-9.]*")
           echo "container is ${RATIO}x smaller than Anvil on the JJThunder corpus"

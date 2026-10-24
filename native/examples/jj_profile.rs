@@ -532,7 +532,7 @@ fn main() {
             _ => bad += 1,
         }
     }
-    println!("verify: ok={ok} bad={bad} (must be bad=0)");
+    println!("verify: ok={ok} bad={bad}");
     if bad > 0 {
         std::process::exit(1);
     }
