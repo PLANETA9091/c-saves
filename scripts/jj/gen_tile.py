@@ -34,6 +34,20 @@ if SEED and os.path.isdir(SEED):
             n += 1
     print(f"seeded {n} region files from {SEED}", flush=True)
 
+# Paper requires data/minecraft/world_gen_settings.dat to exist once the
+# dimension folder has region files; it is a pure function of the datapack +
+# seed, so a committed copy satisfies seeded worlds. paper-world.yml likewise.
+WSEED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worldgen-seed")
+DIM = "jjworld/dimensions/minecraft/overworld"
+os.makedirs(f"{DIM}/data/minecraft", exist_ok=True)
+for src, dst in [
+    ("world_gen_settings.dat", f"{DIM}/data/minecraft/world_gen_settings.dat"),
+    ("paper-world.yml", f"{DIM}/paper-world.yml"),
+]:
+    if not os.path.exists(dst) and os.path.exists(os.path.join(WSEED, src)):
+        subprocess.run(["cp", os.path.join(WSEED, src), dst])
+        print(f"installed {src}", flush=True)
+
 def slots(rx, rz):
     p = f"{REG}/r.{rx}.{rz}.mca"
     try:
