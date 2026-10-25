@@ -65,7 +65,7 @@ proc = subprocess.Popen(
     ["java", "-Xms1G", "-Xmx8G", "-jar", "paper.jar", "nogui"],
     stdout=open("server.log", "w"), stderr=subprocess.STDOUT)
 booted = False
-for _ in range(420):
+for _ in range(900):
     try:
         if "Done (" in open("server.log").read():
             booted = True
@@ -74,7 +74,12 @@ for _ in range(420):
         pass
     time.sleep(1)
 if not booted:
-    print("BOOT_FAIL", flush=True)
+    print("BOOT_FAIL — server.log tail:", flush=True)
+    try:
+        for line in open("server.log").readlines()[-40:]:
+            print("  |", line.rstrip()[:180], flush=True)
+    except Exception:
+        pass
     proc.kill()
     sys.exit(1)
 print(f"booted t={time.time()-T0:.0f}s", flush=True)
