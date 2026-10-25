@@ -31,12 +31,12 @@ The profile reports, byte-exactly:
    (split → CSEC-v3 encode → dedup → dict → hot tier → pack pass → cold tier),
 3. full semantic verification of every chunk (must be `bad=0`).
 
-Current results on the corpus (v0.5.0):
+Current results on the corpus (v0.5.1):
 
 ```
-region  : anvil 4.47 MiB -> c-saves 1.63 MiB  (x2.74 smaller)
+region  : anvil 4.47 MiB -> c-saves 1.61 MiB  (x2.78 smaller)
 entities: anvil 0.93 MiB -> c-saves 0.30 MiB  (x3.13 smaller)
-TOTAL   : anvil 5.39 MiB -> c-saves 1.93 MiB  (x2.80 smaller)
+TOTAL   : anvil 5.39 MiB -> c-saves 1.91 MiB  (x2.83 smaller)
 verify: ok=946 bad=0
 ```
 
@@ -131,3 +131,17 @@ weak spot (x1.21 vs Anvil while the concatenated z19 floor implied x3+):
 
 Synthetic bench (Tectonic-style wgen): compact container is x0.08 of Anvil
 (was x0.11), 24/24 unit tests green.
+
+## v0.5.1: CSEC narrow-data packing
+
+Vanilla clamps linear palettes to 4 bits/entry, so a 2-entry palette wastes
+4x (2 KiB of data per section where 512 B would do). CSEC now packs dense
+streams at ceillog2(n) whenever that beats the clamp (palettes under 16
+entries; flags2 bits 2/3 mark narrow block_states/biomes data), and the
+decoder normalizes back to the vanilla width. The palette frequency-count
+pass now also detects vanilla-clamped source arrays (it previously failed
+its length check and silently lost the frequency ordering for all
+small-palette sections). Raw data bytes across the corpus drop x1.47;
+post-compression the corpus gains ~20 KiB (4-bit zero runs were already
+cheap), but repeat-encode stability and dedup ordering improve for any
+small-palette world.

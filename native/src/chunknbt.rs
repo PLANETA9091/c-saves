@@ -180,7 +180,13 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
         }
     }
 
-    fn dec_pal_data(b: &[u8], p: &mut usize, entries: usize, has_data: bool) -> Option<Value> {
+    fn dec_pal_data(
+        b: &[u8],
+        p: &mut usize,
+        entries: usize,
+        has_data: bool,
+        narrow: bool,
+    ) -> Option<Value> {
         let n = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
         *p += 2;
         let mut pal = Vec::with_capacity(n.min(1024));
@@ -190,19 +196,21 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
         let mut bm: std::collections::HashMap<String, Value> = Default::default();
         bm.insert("palette".to_string(), Value::List(pal));
         if has_data {
-            // vanilla emits linear palettes at max(4, ceillog2(n)) bits
-            let bits = bits_for(n).max(4);
-            let bytes = (entries * bits as usize + 7) / 8;
+            // narrow mode: dense stream at ceillog2(n) (encode-side choice
+            // when that beats the vanilla 4-bit clamp); output is normalized
+            // back to the vanilla-clamped width either way.
+            let rbits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+            let bytes = (entries * rbits as usize + 7) / 8;
             let dense = b.get(*p..*p + bytes)?;
             *p += bytes;
-            let longs = if n > 256 {
-                let v = dense_unpack_wide(dense, entries, bits)?;
-                let v8: Vec<u8> = v.iter().map(|x| *x as u8).collect();
-                pack_nostroddle(&v8, bits)
+            let v = if n > 256 {
+                let v = dense_unpack_wide(dense, entries, rbits)?;
+                v.iter().map(|x| *x as u8).collect::<Vec<u8>>()
             } else {
-                let v = dense_unpack(dense, entries, bits)?;
-                pack_nostroddle(&v, bits)
+                dense_unpack(dense, entries, rbits)?
             };
+            let out_bits = bits_for(n).max(4);
+            let longs = pack_nostroddle(&v, out_bits);
             bm.insert(
                 "data".to_string(),
                 Value::LongArray(fastnbt::LongArray::new(longs)),
@@ -212,11 +220,11 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
     }
 
     if f1 & 1 != 0 {
-        let bs = dec_pal_data(b, &mut p, 4096, f1 & 2 != 0)?;
+        let bs = dec_pal_data(b, &mut p, 4096, f1 & 2 != 0, f2 & 4 != 0)?;
         sec_map.insert("block_states".to_string(), bs);
     }
     if f1 & 4 != 0 {
-        let bs = dec_pal_data(b, &mut p, 64, f1 & 8 != 0)?;
+        let bs = dec_pal_data(b, &mut p, 64, f1 & 8 != 0, f2 & 8 != 0)?;
         sec_map.insert("biomes".to_string(), bs);
     }
     if f1 & 16 != 0 {
@@ -461,7 +469,9 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
 
     // The generic enc_pal_data above cannot recover the permutation after
     // sorting, so the real implementation works on (entry, old_index) pairs.
-    fn enc_pal_data_canon(out: &mut Vec<u8>, bs: &Value, entries: usize) -> Option<bool> {
+    // Returns (has_data, narrow): narrow = dense stream packed at ceillog2(n)
+    // because that beats the vanilla 4-bit clamp (palettes under 16 entries).
+    fn enc_pal_data_canon(out: &mut Vec<u8>, bs: &Value, entries: usize) -> Option<(bool, bool)> {
         let Value::Compound(bm) = bs else { return None };
         let Value::List(pal) = bm.get("palette")? else { return None };
         let n = pal.len();
@@ -479,7 +489,9 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         let data_pre = bm.get("data");
         let mut counts = vec![0u32; n];
         if let Some(Value::LongArray(la)) = data_pre {
-            let bits = bits_for(n);
+            // the source array may be vanilla-clamped (max(4, bits)) or
+            // legacy ceillog2 — detect from its length
+            let bits = section_data_bits(n, entries, la.as_ref().len());
             let per = (64 / bits) as usize;
             if la.as_ref().len() == (entries + per - 1) / per {
                 for v in unpack_nostroddle(la.as_ref(), entries, bits) {
@@ -505,7 +517,7 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
                 if n > 1 {
                     return None;
                 }
-                return Some(false);
+                return Some((false, false));
             }
         };
         let in_bits = section_data_bits(n, entries, data.len());
@@ -519,9 +531,12 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         for (new_i, (_, old_i)) in ents.iter().enumerate() {
             remap[*old_i] = new_i as u8;
         }
-        // dense stream is always packed at the vanilla-clamped width so the
-        // decoder's size math is self-describing (mirrors dec_pal_data)
-        let out_bits = bits_for(n).max(4);
+        // Narrow packing: vanilla clamps linear palettes to 4 bits/entry, so
+        // a 2-entry palette wastes 4x (2 KiB vs 512 B per section). Under
+        // 16-entry palettes re-pack at ceillog2(n); the decoder normalizes
+        // back to the vanilla width. n >= 16: ceillog2 >= 4, no change.
+        let narrow = bits_for(n) < 4;
+        let out_bits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
         if n > 256 {
             // wide palettes: remap table must be u16
             let mut remap16 = vec![0u16; n];
@@ -538,21 +553,27 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             let remapped: Vec<u8> = v.iter().map(|x| remap[*x as usize]).collect();
             out.extend_from_slice(&dense_pack(&remapped, out_bits));
         }
-        Some(true)
+        Some((true, narrow))
     }
 
     if let Some(bs) = m.get("block_states") {
-        let has_data = enc_pal_data_canon(&mut out, bs, 4096)?;
+        let (has_data, narrow) = enc_pal_data_canon(&mut out, bs, 4096)?;
         f1 |= 1;
         if has_data {
             f1 |= 2;
         }
+        if narrow {
+            f2 |= 4;
+        }
     }
     if let Some(bs) = m.get("biomes") {
-        let has_data = enc_pal_data_canon(&mut out, bs, 64)?;
+        let (has_data, narrow) = enc_pal_data_canon(&mut out, bs, 64)?;
         f1 |= 4;
         if has_data {
             f1 |= 8;
+        }
+        if narrow {
+            f2 |= 8;
         }
     }
     for (key, uni_bit, raw_bit, all) in [

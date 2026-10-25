@@ -221,6 +221,46 @@ fn main() {
         println!("  equal bytes in first 4000 common: {eq}");
     }
 
+
+    // P: palette-size histogram + data-bytes-by-class over region sections
+    let mut hist: std::collections::BTreeMap<usize, (u64, u64)> = Default::default();
+    let mut load2 = |p: &std::path::Path| -> Vec<(i32, i32, Vec<u8>)> { load_mca(p) };
+    for e in std::fs::read_dir(dim.join("region")).unwrap().flatten() {
+        for (_cx, _cz, p) in load2(&e.path()) {
+            if let Ok(Value::Compound(root)) = fastnbt::from_bytes::<Value>(&p) {
+                if let Some(Value::List(sects)) = root.get("sections") {
+                    for s in sects {
+                        if let Value::Compound(sm) = s {
+                            if let Some(Value::Compound(bs)) = sm.get("block_states") {
+                                let n = match bs.get("palette") {
+                                    Some(Value::List(l)) => l.len(),
+                                    _ => 0,
+                                };
+                                let longs = match bs.get("data") {
+                                    Some(Value::LongArray(la)) => la.as_ref().len() as u64,
+                                    _ => 0,
+                                };
+                                let e = hist.entry(n).or_default();
+                                e.0 += 1;
+                                e.1 += longs * 8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("\nP palette-size histogram (sections, data bytes):");
+    let mut tot_cur = 0u64; let mut tot_narrow = 0u64;
+    for (n, (cnt, bytes)) in &hist {
+        println!("  n={n:>4}: sections={cnt:>6} data_bytes={bytes:>10}");
+        let cur_bits = cbits(*n).max(4) as u64;
+        let nar_bits = cbits(*n).max(1) as u64;
+        tot_cur += bytes;
+        tot_narrow += bytes * nar_bits / cur_bits.max(1);
+    }
+    println!("P data raw total={tot_cur} narrow-packed would be={tot_narrow} (x{:.2} less)", tot_cur as f64 / tot_narrow.max(1) as f64);
+
     // J: full fastnbt round-trip forensics — diff payload vs re-serialized
     {
         let (jx, jz, jp) = &chunks[5];
@@ -279,4 +319,10 @@ fn putv(v: &mut Vec<u8>, mut x: u64) {
         }
         v.push(b | 0x80);
     }
+}
+
+fn cbits(n: usize) -> u64 {
+    let mut b = 1u64;
+    while (1u64 << b) < n as u64 { b += 1; }
+    b
 }
