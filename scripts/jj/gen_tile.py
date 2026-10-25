@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
-"""gen_tile.py X1 Z1 X2 Z2 [chunk coords, multiples of 128]
+"""gen_tile.py X1 Z1 X2 Z2 [budget_s] [seed_artifact_dir]
 
-Generates one tile of the big JJThunder benchmark world on a CI runner:
-boots Paper, marks all incomplete 16x16-chunk wave blocks inside the tile,
-waits for the chunk count on disk to stabilize, stops (stop persists),
-repeats until the tile is complete. Each iteration re-boots; completed
-waves are skipped via region-file slot checks.
+Generates one tile of the big JJThunder benchmark world on a CI runner.
+Boots Paper ONCE, keeps it alive for the whole budget, and re-marks all
+incomplete 16x16-chunk wave blocks every round (rounds interleave so the
+chunk system always has work). Completed waves are skipped via region-file
+slot checks, so seeding from a previous run's artifact (world dir with
+region/*.mca copied in) resumes where that run stopped.
 
-The paper.jar / datapack / world layout must already exist in the CWD
-(server.properties with rcon enabled, level-name=jjworld,
-jjworld/datapacks/JJThunder zip).
+Requires: paper.jar, eula.txt, server.properties (rcon on),
+jjworld/datapacks/ with the JJThunder zip, config/paper-global.yml with the
+watchdog disabled — all in the CWD.
 """
 import sys, time, os, subprocess
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rcon import rcon
 
 X1, Z1, X2, Z2 = (int(x) for x in sys.argv[1:5])
-BUDGET = int(sys.argv[5]) if len(sys.argv) > 5 else 3300
+BUDGET = int(sys.argv[5]) if len(sys.argv) > 5 else 7200
+SEED = sys.argv[6] if len(sys.argv) > 6 else None
 REG = "jjworld/dimensions/minecraft/overworld/region"
 T0 = time.time()
 
 assert X1 % 128 == 0 and Z1 % 128 == 0, "tile bounds must be multiples of 128 chunks"
+
+if SEED and os.path.isdir(SEED):
+    os.makedirs(REG, exist_ok=True)
+    n = 0
+    for f in os.listdir(SEED):
+        if f.endswith(".mca"):
+            subprocess.run(["cp", os.path.join(SEED, f), REG])
+            n += 1
+    print(f"seeded {n} region files from {SEED}", flush=True)
 
 def slots(rx, rz):
     p = f"{REG}/r.{rx}.{rz}.mca"
@@ -46,70 +57,70 @@ def wave_done(cx1, cz1):
                 return False
     return True
 
-def boot():
-    proc = subprocess.Popen(
-        ["java", "-Xms1G", "-Xmx8G", "-jar", "paper.jar", "nogui"],
-        stdout=open("server.log", "w"), stderr=subprocess.STDOUT)
-    for _ in range(360):
-        try:
-            if "Done (" in open("server.log").read():
-                return proc
-        except FileNotFoundError:
-            pass
-        time.sleep(1)
-    proc.kill()
-    raise RuntimeError("boot timeout")
-
-def stop(proc):
-    try:
-        rcon("forceload remove all", timeout=120)
-    except Exception:
-        pass
-    try:
-        rcon("stop", timeout=60)
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=180)
-    except Exception:
-        proc.kill()
-        proc.wait()
-
 WAVES = [(X1 + i * 16, Z1 + j * 16) for i in range(8) for j in range(8)]
 TARGET = 128 * 128
 
-attempt = 0
+print(f"tile chunks on disk: {tile_chunks()}/{TARGET}", flush=True)
+proc = subprocess.Popen(
+    ["java", "-Xms1G", "-Xmx8G", "-jar", "paper.jar", "nogui"],
+    stdout=open("server.log", "w"), stderr=subprocess.STDOUT)
+booted = False
+for _ in range(420):
+    try:
+        if "Done (" in open("server.log").read():
+            booted = True
+            break
+    except FileNotFoundError:
+        pass
+    time.sleep(1)
+if not booted:
+    print("BOOT_FAIL", flush=True)
+    proc.kill()
+    sys.exit(1)
+print(f"booted t={time.time()-T0:.0f}s", flush=True)
+
+round_no = 0
 while time.time() - T0 < BUDGET:
-    attempt += 1
+    round_no += 1
     pending = [w for w in WAVES if not wave_done(*w)]
-    done = len(WAVES) - len(pending)
-    print(f"[attempt {attempt}] tile chunks={tile_chunks()}/{TARGET} "
-          f"waves done={done}/64 t={time.time()-T0:.0f}s", flush=True)
+    print(f"[round {round_no}] pending waves={len(pending)}/64 "
+          f"chunks={tile_chunks()}/{TARGET} t={time.time()-T0:.0f}s", flush=True)
     if not pending:
         break
-    proc = boot()
     for wx, wz in pending:
         x1, z1 = wx * 16, wz * 16
         try:
             rcon(f"forceload add {x1} {z1} {x1+255} {z1+255}", timeout=60)
         except Exception as e:
             print(f"  mark {wx},{wz} err {e}", flush=True)
-        time.sleep(0.3)
+            time.sleep(3)
+        time.sleep(0.25)
     print(f"  marked {len(pending)} waves t={time.time()-T0:.0f}s", flush=True)
-    # wait for generation: poll owned chunk count, stop when stable
-    last, stable = tile_chunks(), 0
-    while time.time() - T0 < BUDGET:
-        time.sleep(15)
+    # let the chunk system chew; report progress every 5 min
+    deadline = min(time.time() + 1200, T0 + BUDGET)
+    last = -1
+    while time.time() < deadline:
+        time.sleep(300)
         cur = tile_chunks()
-        stable = stable + 1 if cur >= last else 0
-        last = max(last, cur)
-        if stable >= 4 or cur >= TARGET:
+        print(f"  progress chunks={cur}/{TARGET} t={time.time()-T0:.0f}s", flush=True)
+        if cur >= TARGET:
             break
-    print(f"  iteration done: chunks={tile_chunks()} t={time.time()-T0:.0f}s", flush=True)
-    stop(proc)
+    if tile_chunks() >= TARGET:
+        break
 
+print("stopping (stop persists all chunks)", flush=True)
+try:
+    rcon("forceload remove all", timeout=120)
+except Exception:
+    pass
+try:
+    rcon("stop", timeout=90)
+except Exception:
+    pass
+try:
+    proc.wait(timeout=240)
+except Exception:
+    proc.kill()
 final = tile_chunks()
-print(f"TILE COMPLETE chunks={final}/{TARGET} elapsed={time.time()-T0:.0f}s", flush=True)
-ok = final >= TARGET
-print(f"TILE_RESULT {'OK' if ok else 'INCOMPLETE'} {final}/{TARGET}", flush=True)
-sys.exit(0 if ok else 1)
+print(f"TILE_RESULT {'OK' if final >= TARGET else 'INCOMPLETE'} {final}/{TARGET}", flush=True)
+sys.exit(0 if final >= TARGET else 1)

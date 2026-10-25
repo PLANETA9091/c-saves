@@ -7,6 +7,11 @@ name: bigworld
 
 on:
   workflow_dispatch:
+    inputs:
+      seed_run_id:
+        description: 'run id whose tile artifacts to seed from (resume)'
+        required: false
+        default: ''
 
 jobs:
   tile:
@@ -34,6 +39,15 @@ jobs:
           printf 'rcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\nlevel-seed=90919091\nonline-mode=false\nspawn-protection=0\nview-distance=4\nsimulation-distance=4\nsync-chunk-writes=true\nlevel-name=jjworld\n' > server.properties
           printf '_version: 29\nwatchdog:\n  enable: false\n' > config/paper-global.yml
 
+      - name: seed from previous run (resume)
+        if: inputs.seed_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: jjserver
+        run: |
+          mkdir -p seed
+          gh run download ${{ inputs.seed_run_id }} -n "tile-${{ matrix.tx }}-${{ matrix.tz }}" -D seed || echo "no seed artifact"
+
       - name: generate tile
         working-directory: jjserver
         run: |
@@ -44,7 +58,10 @@ jobs:
           X2=$((X1 + 127))
           Z2=$((Z1 + 127))
           echo "tile ($TX,$TZ) = chunks [$X1..$X2] x [$Z1..$Z2]"
-          python3 ../scripts/jj/gen_tile.py $X1 $Z1 $X2 $Z2 7800
+          SEED_ARG=""
+          if [ -d ../seed/region ]; then SEED_ARG=../seed/region; fi
+          if [ -d seed/region ]; then SEED_ARG=seed/region; fi
+          python3 ../scripts/jj/gen_tile.py $X1 $Z1 $X2 $Z2 7800 $SEED_ARG
 
       - name: collect owned region files
         if: always()
@@ -74,7 +91,7 @@ jobs:
 
   bench:
     needs: tile
-    if: always() && ${{ needs.tile.result != 'skipped' }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
