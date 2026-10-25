@@ -11,7 +11,7 @@ on:
 jobs:
   tile:
     runs-on: ubuntu-latest
-    timeout-minutes: 130
+    timeout-minutes: 160
     strategy:
       matrix:
         tx: [0, 1, 2, 3]
@@ -44,7 +44,7 @@ jobs:
           X2=$((X1 + 127))
           Z2=$((Z1 + 127))
           echo "tile ($TX,$TZ) = chunks [$X1..$X2] x [$Z1..$Z2]"
-          python3 ../scripts/jj/gen_tile.py $X1 $Z1 $X2 $Z2 6000
+          python3 ../scripts/jj/gen_tile.py $X1 $Z1 $X2 $Z2 7800
 
       - name: collect owned region files
         if: always()
@@ -74,6 +74,7 @@ jobs:
 
   bench:
     needs: tile
+    if: always() && ${{ needs.tile.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
