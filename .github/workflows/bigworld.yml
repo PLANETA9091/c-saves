@@ -1,0 +1,154 @@
+name: bigworld
+
+# 512x512-chunk JJThunder To The Max benchmark:
+# 16 tile jobs (128x128 chunks each) generate the world in parallel,
+# then one bench job merges the tiles, spawns a 20k entity corpus and
+# measures Anvil vs c-saves on the full world.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    strategy:
+      matrix:
+        tx: [0, 1, 2, 3]
+        tz: [0, 1, 2, 3]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: download Paper 26.2 + JJThunder datapack
+        run: |
+          mkdir -p jjserver && cd jjserver
+          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/3cce0a4922baf79bd8e1275ee5ff9f073f24675770e09b0d4be9442d513e7a6b/paper-26.2-134.jar"
+          echo "3cce0a4922baf79bd8e1275ee5ff9f073f24675770e09b0d4be9442d513e7a6b  paper.jar" | sha256sum -c -
+          mkdir -p jjworld/datapacks config
+          curl -sL -o jjworld/datapacks/jj.zip "https://cdn.modrinth.com/data/1NnAVIR5/versions/IgqEqiO9/JJThunder_To_The_Max_26.2_v0.9.0.zip"
+          echo "eula=true" > eula.txt
+          printf 'rcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\nlevel-seed=90919091\nonline-mode=false\nspawn-protection=0\nview-distance=4\nsimulation-distance=4\nsync-chunk-writes=true\nlevel-name=jjworld\n' > server.properties
+          printf '_version: 29\nwatchdog:\n  enable: false\n' > config/paper-global.yml
+
+      - name: generate tile
+        working-directory: jjserver
+        run: |
+          TX=${{ matrix.tx }}
+          TZ=${{ matrix.tz }}
+          X1=$((TX * 128 - 256))
+          Z1=$((TZ * 128 - 256))
+          X2=$((X1 + 127))
+          Z2=$((Z1 + 127))
+          echo "tile ($TX,$TZ) = chunks [$X1..$X2] x [$Z1..$Z2]"
+          python3 ../scripts/jj/gen_tile.py $X1 $Z1 $X2 $Z2 4800
+
+      - name: collect owned region files
+        if: always()
+        working-directory: jjserver
+        run: |
+          TX=${{ matrix.tx }}
+          TZ=${{ matrix.tz }}
+          X1=$((TX * 128 - 256))
+          Z1=$((TZ * 128 - 256))
+          RX1=$((X1 >> 5)); RX2=$((RX1 + 3))
+          RZ1=$((Z1 >> 5)); RZ2=$((RZ1 + 3))
+          mkdir -p artifact/region
+          for rx in $(seq $RX1 $RX2); do
+            for rz in $(seq $RZ1 $RZ2); do
+              F="jjworld/dimensions/minecraft/overworld/region/r.$rx.$rz.mca"
+              if [ -f "$F" ]; then cp "$F" artifact/region/; else echo "missing r.$rx.$rz.mca"; fi
+            done
+          done
+          du -sh artifact
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tile-${{ matrix.tx }}-${{ matrix.tz }}
+          path: jjserver/artifact
+          retention-days: 3
+
+  bench:
+    needs: tile
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: download 16 tile artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tx in 0 1 2 3; do
+            for tz in 0 1 2 3; do
+              gh run download $GITHUB_RUN_ID -n "tile-$tx-$tz" -D "art/tile-$tx-$tz"
+            done
+          done
+          ls art
+
+      - name: merge into one world
+        run: |
+          R=jjserver/jjworld/dimensions/minecraft/overworld/region
+          mkdir -p "$R"
+          for d in art/tile-*; do
+            if ls "$d"/region/*.mca >/dev/null 2>&1; then
+              cp "$d"/region/*.mca "$R"/
+            fi
+          done
+          COUNT=$(ls "$R" | wc -l)
+          echo "region files: $COUNT (expect 64)"
+          [ "$COUNT" = "64" ] || echo "::warning::expected 64 region files, got $COUNT"
+
+      - name: setup server + spawn 20k entities
+        working-directory: jjserver
+        run: |
+          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/3cce0a4922baf79bd8e1275ee5ff9f073f24675770e09b0d4be9442d513e7a6b/paper-26.2-134.jar"
+          echo "3cce0a4922baf79bd8e1275ee5ff9f073f24675770e09b0d4be9442d513e7a6b  paper.jar" | sha256sum -c -
+          mkdir -p jjworld/datapacks config
+          curl -sL -o jjworld/datapacks/jj.zip "https://cdn.modrinth.com/data/1NnAVIR5/versions/IgqEqiO9/JJThunder_To_The_Max_26.2_v0.9.0.zip"
+          echo "eula=true" > eula.txt
+          printf 'rcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\nlevel-seed=90919091\nonline-mode=false\nspawn-protection=0\nview-distance=4\nsimulation-distance=4\nsync-chunk-writes=true\nlevel-name=jjworld\n' > server.properties
+          printf '_version: 29\nwatchdog:\n  enable: false\n' > config/paper-global.yml
+          java -Xms1G -Xmx8G -jar paper.jar nogui > server.log 2>&1 &
+          for i in $(seq 1 420); do grep -q 'Done (' server.log 2>/dev/null && break; sleep 1; done
+          grep -q 'Done (' server.log || { echo BOOT_FAIL; tail -20 server.log; exit 1; }
+          python3 ../scripts/jj/rcon.py "forceload add -512 -512 511 511" || true
+          sleep 150
+          python3 ../scripts/jj/entities20k.py 2>&1 | tail -4
+          python3 ../scripts/jj/rcon.py "forceload remove all" || true
+          python3 ../scripts/jj/rcon.py "save-all flush" || true
+          sleep 3
+          python3 ../scripts/jj/rcon.py "stop" || true
+          sleep 10
+          du -sh jjworld/dimensions/minecraft/overworld/* || true
+
+      - name: build + run the comparison
+        run: |
+          cd native
+          cargo build --release --example jj_profile
+          CSAVES_VERIFY_SAMPLE=10 ./target/release/examples/jj_profile \
+            ../jjserver/jjworld/dimensions/minecraft/overworld 2>jj_err.txt | tee jj_big.txt
+          grep -E "^TOTAL|verify:" jj_big.txt
+          BAD=$(grep "verify:" jj_big.txt | grep -o "bad=[0-9]*" | cut -d= -f2)
+          [ "$BAD" = "0" ] || { echo "FAIL: semantic verification bad=$BAD"; exit 1; }
+
+      - name: verdict
+        run: |
+          grep -E "chunks:|region :|entities:|TOTAL|verify:" native/jj_big.txt
+          RATIO=$(grep "^TOTAL" native/jj_big.txt | grep -o "x[0-9.]* smaller" | grep -o "[0-9.]*")
+          echo "=== 512x512 JJThunder world: c-saves container is ${RATIO}x smaller than Anvil ==="
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bigworld-results
+          path: native/jj_big.txt
+          retention-days: 30

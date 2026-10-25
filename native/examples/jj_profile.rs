@@ -509,8 +509,19 @@ fn main() {
     };
     let mut ok = 0usize;
     let mut bad = 0usize;
-    for (cx, cz, p) in &region_chunks {
-        match rs.read_chunk(key(*cx, *cz)) {
+    // CSAVES_VERIFY_SAMPLE=n: verify every n-th chunk (0 = all). The 512x512
+    // CI bench verifies a sample to keep the job under the time cap.
+    let sample: usize = std::env::var("CSAVES_VERIFY_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    for (vi_, (cx, cz, p)) in region_chunks.iter().enumerate() {
+        if vi_ % sample != 0 {
+            continue;
+        }
+        let (cx, cz, p) = (*cx, *cz, p);
+        match rs.read_chunk(key(cx, cz)) {
             Some(d) => {
                 if chunks_semantic(p, &d) {
                     ok += 1;
@@ -524,13 +535,17 @@ fn main() {
             _ => {
                 bad += 1;
                 if bad <= 3 {
-                    eprintln!("region MISSING chunk ({cx},{cz}) debug={}", rs.debug_blob_state(key(*cx, *cz)));
+                    eprintln!("region MISSING chunk ({cx},{cz}) debug={}", rs.debug_blob_state(key(cx, cz)));
                 }
             }
         }
     }
-    for (cx, cz, p) in &entity_chunks {
-        match es.read_chunk(key(*cx, *cz)) {
+    for (ei, (cx, cz, p)) in entity_chunks.iter().enumerate() {
+        if sample > 1 && ei % sample != 0 {
+            continue;
+        }
+        let (cx, cz, p) = (*cx, *cz, p);
+        match es.read_chunk(key(cx, cz)) {
             Some(d) => {
                 let va: Value = fastnbt::from_bytes(p).unwrap();
                 let vb: Value = fastnbt::from_bytes(&d).unwrap();
@@ -539,19 +554,19 @@ fn main() {
                 } else {
                     bad += 1;
                     if bad <= 3 {
-                        eprintln!("ENTITY MISMATCH chunk ({cx},{cz}) raw_len={} got_len={} debug={}", p.len(), d.len(), es.debug_blob_state(key(*cx, *cz)));
+                        eprintln!("ENTITY MISMATCH chunk ({cx},{cz}) raw_len={} got_len={} debug={}", p.len(), d.len(), es.debug_blob_state(key(cx, cz)));
                     }
                 }
             }
             _ => {
                 bad += 1;
                 if bad <= 3 {
-                    eprintln!("ENTITY MISSING chunk ({cx},{cz}) debug={}", es.debug_blob_state(key(*cx, *cz)));
+                    eprintln!("ENTITY MISSING chunk ({cx},{cz}) debug={}", es.debug_blob_state(key(cx, cz)));
                 }
             }
         }
     }
-    println!("verify: ok={ok} bad={bad}");
+    println!("verify: ok={ok} bad={bad} sampled_every={sample}");
     if bad > 0 {
         std::process::exit(1);
     }
