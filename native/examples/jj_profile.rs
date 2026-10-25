@@ -410,6 +410,10 @@ fn main() {
         compact_min: 256 * 1024,
         compact_ratio: 0.10,
         dict_train: 200,
+        slab_max_raw: std::env::var("CSAVES_SLAB_MAX_RAW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512 * 1024),
         ..Cfg::default()
     };
     let rs = Store::open_cfg(&out.join("region"), true, cfg.clone()).unwrap();
@@ -469,6 +473,8 @@ fn main() {
     println!("region stats: {}", rs.stats_json());
     println!("entity stats: {}", es.stats_json());
     println!("region profile: {}", rs.profile_json());
+    println!("entity profile: {}", es.profile_json());
+    println!("entity blob histogram: {}", es.blob_histogram_json());
 
     // ---- phase V: verification (semantic equality, all chunks) ----
     // canonical section re-encoding permutes palette order (semantically
@@ -515,7 +521,12 @@ fn main() {
                     }
                 }
             }
-            _ => bad += 1,
+            _ => {
+                bad += 1;
+                if bad <= 3 {
+                    eprintln!("region MISSING chunk ({cx},{cz}) debug={}", rs.debug_blob_state(key(*cx, *cz)));
+                }
+            }
         }
     }
     for (cx, cz, p) in &entity_chunks {
@@ -527,9 +538,17 @@ fn main() {
                     ok += 1;
                 } else {
                     bad += 1;
+                    if bad <= 3 {
+                        eprintln!("ENTITY MISMATCH chunk ({cx},{cz}) raw_len={} got_len={} debug={}", p.len(), d.len(), es.debug_blob_state(key(*cx, *cz)));
+                    }
                 }
             }
-            _ => bad += 1,
+            _ => {
+                bad += 1;
+                if bad <= 3 {
+                    eprintln!("ENTITY MISSING chunk ({cx},{cz}) debug={}", es.debug_blob_state(key(*cx, *cz)));
+                }
+            }
         }
     }
     println!("verify: ok={ok} bad={bad}");

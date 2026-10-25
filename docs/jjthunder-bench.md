@@ -31,16 +31,17 @@ The profile reports, byte-exactly:
    (split → CSEC-v3 encode → dedup → dict → hot tier → pack pass → cold tier),
 3. full semantic verification of every chunk (must be `bad=0`).
 
-Current results on the corpus (v0.4.0):
+Current results on the corpus (v0.5.0):
 
 ```
-region  : anvil 4.47 MiB -> c-saves 1.73 MiB  (x2.58 smaller)
-entities: anvil 0.93 MiB -> c-saves 0.77 MiB  (x1.21 smaller)
-TOTAL   : anvil 5.39 MiB -> c-saves 2.50 MiB  (x2.16 smaller)
+region  : anvil 4.47 MiB -> c-saves 1.63 MiB  (x2.74 smaller)
+entities: anvil 0.93 MiB -> c-saves 0.30 MiB  (x3.13 smaller)
+TOTAL   : anvil 5.39 MiB -> c-saves 1.93 MiB  (x2.80 smaller)
 verify: ok=946 bad=0
 ```
 
-On the full 1024-chunk world (13 MiB anvil): region x2.38, total x2.24.
+Entity slabs sit within ~2% of the theoretical zstd-19 concatenated floor
+(301,927 B for the whole corpus as one frame).
 
 ## Reproducing the world from scratch
 
@@ -90,3 +91,43 @@ Profiling the real corpus drove every 0.4.0 change:
 * **Mode-aware dictionary** — section slabs compress better WITHOUT the
   zstd dictionary (canonical CSEC bytes); entity payload slabs compress
   better WITH it (raw NBT boilerplate).
+
+## What v0.5.0 changed (profiling-driven)
+
+Re-profiling the real corpus after v0.4.0 showed the entity store was the
+weak spot (x1.21 vs Anvil while the concatenated z19 floor implied x3+):
+
+1. **Verbatim whole-mode blobs** — the field-split path re-serialized entity
+   NBT through the value model, which sorts compound keys alphabetically.
+   Vanilla/Paper writers emit optional fields (Bukkit.*, Paper.*, Spigot.*)
+   last, keeping identical entities byte-aligned across the corpus; the
+   alphabetical order interleaves them and destroyed zstd matches:
+   measured x24.6 (verbatim) vs x10.3 (re-serialized). Payloads above 1 KiB
+   are now stored as one verbatim blob (field split kept for small POI-style
+   payloads where cross-chunk structure dedup wins).
+2. **Batched entity slabs** — whole-mode slab records grew from 512 KiB to
+   4 MiB raw (`slab_max_raw_whole`) with a 1 MiB member cap: 218 entity
+   chunks pack into 2 slabs, so each zstd frame sees the whole corpus
+   window. Entity store: 803 KiB -> 310 KiB.
+3. **No dictionary for whole-mode stores** — the trained dict cost 114 KiB
+   on disk but saved only ~38 KiB of compressed bytes (net loss); batched
+   4 MiB frames self-compress to the floor without it.
+4. **SLAB v2 (kind-8) varint entry tables** — member entries were 24 fixed
+   bytes (u32 id + u32 len + 16B hash); ids are assigned in walk order, so
+   zigzag-delta varint id + varint len + 16B hash cuts the table to
+   ~18-19 bytes/member and compresses better. Legacy kind-5 slabs parse
+   unchanged; full rewrites upgrade them.
+5. **Compressed recipe batches (kind-9)** — batch records now carry their
+   (key, len) tables plus all recipes as ONE zstd-19 stream; entries are
+   addressed through an in-memory batch index (`len=BATCHED` marker +
+   `batch_idx`), rebuilt by scan on reopen. Legacy kind-7 batches still
+   scan, load and rewrite. A stale-index-removal race (an in-loop flush
+   re-batching a key whose old index entry was then deleted unconditionally)
+   was caught by the corpus verification gate (bad=1) and fixed with a
+   location check before removal.
+6. **2 MiB section slabs** — region slab frames grew from 512 KiB to 2 MiB
+   (x2.63 -> x2.74 on the corpus; bounded by the fixed 32 MiB slab cache so
+   RAM is unchanged).
+
+Synthetic bench (Tectonic-style wgen): compact container is x0.08 of Anvil
+(was x0.11), 24/24 unit tests green.
