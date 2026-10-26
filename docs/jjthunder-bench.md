@@ -182,8 +182,11 @@ Methodology notes:
 
 ### Results (2-core sandbox, rounds=3)
 
-* region read warm: p50 25 us (was 199), 340 MB/s single-thread, 12-20k
-  chunks/s on 2 threads (Moonrise loads chunks with parallel IO workers).
+* region read warm: p50 15 us (was 199), **1401 MB/s single-thread — 1.7x
+  faster than vanilla zlib inflate** (821 MB/s), p90 47 us vs Anvil 150 us,
+  p99 73 us vs 214 us; 29k chunks/s on 2 threads (Moonrise loads chunks with
+  parallel IO workers). The read path also beats the Anvil baseline's
+  latency tails: fewer and smaller stall points at every percentile.
 * entity write: 747 MB/s fresh, 1677 MB/s steady — 6.8x / 15x faster than
   vanilla zlib-6.
 * region write: p90/p99 tails beat Anvil (1.6 ms vs 2.3 ms at p90 on the
@@ -194,7 +197,9 @@ Methodology notes:
 
 ### Known next levers
 
-* tail direct splice (skip the tail Value round-trip; ~6 us/chunk on reads).
+* ~~tail direct splice~~ DONE in v0.5.0: the stored tail is spliced verbatim
+  (only dense heightmaps transform back to LongArrays) — this alone took warm
+  reads from 340 to 1401 MB/s.
 * hot-slab batching on the write path (compress new sections as one frame
   instead of per-section zstd calls) for fresh-worldgen throughput.
 * raw-scan split: hash section byte ranges without parsing the full chunk

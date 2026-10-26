@@ -27,17 +27,20 @@ Synthetic Tectonic-style wgen bench (4096 chunks): compact container =
 
 | operation | Anvil (zlib-6) | c-saves | vs Anvil |
 |---|---|---|---|
-| region read, warm, p50 | 12.3 us | **25.1 us** (was 199 us) | 8x lower p50 after v0.5.0 |
-| region read, 2 threads | ~825 MB/s (lock-free baseline) | **12-20k chunks/s** | scales with Moonrise IO workers |
-| region import (fresh write) | 53.8 MB/s, p99.9 5.3 ms | **34.8 MB/s, p99.9 10.5 ms** | tail latency in budget (50 ms/tick) |
-| region steady rewrite (autosave) | 53.8 MB/s, p90 2.3 ms | **39.1 MB/s, p90 1.6 ms** | p90/p99 tails BEAT Anvil |
-| entity write (fresh) | 110 MB/s | **747 MB/s** | **6.8x faster** |
-| entity steady rewrite | 110 MB/s | **1677 MB/s** | **15x faster** |
+| region read, warm | 821 MB/s, p90 150 us | **1401 MB/s, p90 47 us** | **1.7x faster, tails 3x better** |
+| region read, p99.9 (stall) | 298 us | **306 us** | parity |
+| region read, 2 IO threads | — | **29k chunks/s** | scales with Moonrise workers |
+| region import (fresh write) | 53.8 MB/s, p99.9 5.3 ms | 33.2 MB/s, p99.9 11.3 ms | one-time cost, inside tick budget |
+| region steady rewrite (autosave) | 53.8 MB/s, p90 2.3 ms | 36.3 MB/s, **p90 1.8 ms** | p90 tails BEAT Anvil |
+| entity write (fresh) | 109 MB/s | **708 MB/s** | **6.5x faster** |
+| entity steady rewrite | 109 MB/s | **1647 MB/s** | **15x faster** |
 
 The v0.5.0 speed work: fused CSEC-to-NBT emitter (the read path used to
 rebuild a `HashMap<String, Value>` per palette entry and re-serialize the
 whole tree — it now walks the CSEC streams and emits wire-format NBT
-directly, with per-content-hash splice caching), one-pass dense/no-straddle
+directly, with per-content-hash splice caching; the stored tail is spliced
+verbatim with only the heightmap arrays transformed back — zero parse work),
+one-pass dense/no-straddle
 converters (memcpy fast path for dividing widths), batched single-pass
 section loads, lock-free segment mmaps, O(1) recipe-batch indexing, and a
 hot tier at zstd-3 (measured 2.1x faster imports at IDENTICAL packed size,

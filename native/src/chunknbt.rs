@@ -1953,6 +1953,28 @@ pub struct SecSrc<'a> {
 /// the decoded tail. Returns None when any section is not a CSEC-v3 stream
 /// (or the shape is unexpected) — the caller then uses the generic join.
 pub fn join_fused(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
+    for (si, s) in sections.iter().enumerate() {
+        if s.b.first() != Some(&CSEC3_MAGIC) {
+            fdbg!("fused: section {si} not CSEC3 (first={:02x})", s.b.first().copied().unwrap_or(0));
+            return None;
+        }
+    }
+    let mut out = Vec::with_capacity((1 << 16).max(sections.len() * 8200));
+    out.push(0x0A); // root compound, name ""
+    put_be16(&mut out, 0);
+    // FAST TAIL: the stored tail is already wire-format NBT (our own
+    // to_bytes output) — splice it verbatim and only transform the
+    // heightmap dense arrays back to LongArrays. No Value tree, no
+    // re-serialization. Falls back to the Value path on any surprise.
+    if emit_tail_direct(tail, sections, &mut out).is_none() {
+        fdbg!("fused: direct tail failed, using Value path");
+        return join_fused_tail_value(sections, tail);
+    }
+    Some(out)
+}
+
+/// Value-tree fallback (pre-v0.5 tail path): parse + tail_decode + emit.
+fn join_fused_tail_value(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
     let tail_val: Value = fastnbt::from_bytes(tail).ok()?;
     let Value::Compound(mut map) = tail_val else {
         fdbg!("fused: tail not compound");
@@ -1962,12 +1984,6 @@ pub fn join_fused(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
         let mut tv = Value::Compound(std::mem::take(&mut map));
         tail_decode(&mut tv);
         map = match tv { Value::Compound(m) => m, _ => unreachable!() };
-    }
-    for (si, s) in sections.iter().enumerate() {
-        if s.b.first() != Some(&CSEC3_MAGIC) {
-            fdbg!("fused: section {si} not CSEC3 (first={:02x})", s.b.first().copied().unwrap_or(0));
-            return None;
-        }
     }
     let mut out = Vec::with_capacity((1 << 16).max(sections.len() * 8200));
     out.push(0x0A); // root compound, name ""
@@ -2003,6 +2019,147 @@ pub fn join_fused(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
     }
     out.push(0x00); // end root
     Some(out)
+}
+
+// --------------------------------------------------- direct tail splice ---
+
+/// Skip one NBT value payload of type `tag` at *p (bounds-checked).
+fn nbt_skip(b: &[u8], p: &mut usize, tag: u8, depth: u32) -> Option<()> {
+    if depth > 128 {
+        return None;
+    }
+    match tag {
+        1 => *p += 1,
+        2 => *p += 2,
+        3 | 5 => *p += 4,
+        4 | 6 => *p += 8,
+        7 => {
+            let n = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?) as usize;
+            *p += 4 + n;
+        }
+        11 => {
+            let n = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?) as usize;
+            *p += 4 + n * 4;
+        }
+        12 => {
+            let n = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?) as usize;
+            *p += 4 + n * 8;
+        }
+        8 => {
+            let n = u16::from_be_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p += 2 + n;
+        }
+        9 => {
+            let elem = *b.get(*p)?;
+            *p += 1;
+            let n = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?) as usize;
+            *p += 4;
+            if n > 0 && elem == 0 {
+                return None;
+            }
+            for _ in 0..n {
+                nbt_skip(b, p, elem, depth + 1)?;
+            }
+        }
+        10 => loop {
+            let t = *b.get(*p)?;
+            *p += 1;
+            if t == 0 {
+                break;
+            }
+            let nl = u16::from_be_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p += 2;
+            *p += nl;
+            nbt_skip(b, p, t, depth + 1)?;
+        },
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Emit the stored tail verbatim, transforming only dense heightmaps back
+/// into LongArrays, with the sections list spliced at its sorted position.
+fn emit_tail_direct(tail: &[u8], sections: &[SecSrc], out: &mut Vec<u8>) -> Option<()> {
+    if tail.first() != Some(&0x0A) {
+        return None;
+    }
+    let nl = u16::from_be_bytes(tail.get(1..3)?.try_into().ok()?) as usize;
+    if nl != 0 {
+        return None; // our own tails always have an empty root name
+    }
+    let mut p = 3usize;
+    let mut sections_done = false;
+    loop {
+        let start = p;
+        let tag = *tail.get(p)?;
+        p += 1;
+        if tag == 0 {
+            break;
+        }
+        let klen = u16::from_be_bytes(tail.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let name = core::str::from_utf8(tail.get(p..p + klen)?).ok()?;
+        p += klen;
+        if !sections_done && name > "sections" {
+            emit_sections_list(sections, out)?;
+            sections_done = true;
+        }
+        if name == "Heightmaps" && tag == 0x0A {
+            // inner entries: dense ByteArray (our marker) -> LongArray
+            out.push(0x0A);
+            out.extend_from_slice(b"\x00\x0AHeightmaps");
+            loop {
+                let itag = *tail.get(p)?;
+                p += 1;
+                if itag == 0 {
+                    break;
+                }
+                let inl = u16::from_be_bytes(tail.get(p..p + 2)?.try_into().ok()?) as usize;
+                p += 2;
+                let iname = tail.get(p..p + inl)?;
+                p += inl;
+                if itag == 0x07 {
+                    let n = i32::from_be_bytes(tail.get(p..p + 4)?.try_into().ok()?) as usize;
+                    p += 4;
+                    let raw = tail.get(p..p + n)?;
+                    p += n;
+                    if raw.first() == Some(&HMAP_MAGIC) {
+                        if let Some(longs) = hmap_decode(raw) {
+                            out.push(0x12);
+                            out.extend_from_slice(&(inl as u16).to_be_bytes());
+                            out.extend_from_slice(iname);
+                            out.extend_from_slice(&(longs.len() as i32).to_be_bytes());
+                            for l in &longs {
+                                out.extend_from_slice(&l.to_be_bytes());
+                            }
+                            continue;
+                        }
+                    }
+                    // not our dense form: copy verbatim
+                    out.push(0x07);
+                    out.extend_from_slice(&(inl as u16).to_be_bytes());
+                    out.extend_from_slice(iname);
+                    out.extend_from_slice(&(n as i32).to_be_bytes());
+                    out.extend_from_slice(raw);
+                } else {
+                    // unexpected inner tag (e.g. a LongArray heightmap that
+                    // could not be densified): copy the whole entry verbatim
+                    let e0 = p - 3 - inl; // tag(1) + namelen(2) + name(inl)
+                    nbt_skip(tail, &mut p, itag, 1)?;
+                    out.extend_from_slice(&tail[e0..p]);
+                }
+            }
+            out.push(0x00); // end Heightmaps compound
+        } else {
+            nbt_skip(tail, &mut p, tag, 0)?;
+            out.extend_from_slice(&tail[start..p]);
+        }
+    }
+    if !sections_done {
+        emit_sections_list(sections, out)?;
+    }
+    out.push(0x00); // end root
+    Some(())
 }
 
 fn emit_sections_list(sections: &[SecSrc], out: &mut Vec<u8>) -> Option<()> {
