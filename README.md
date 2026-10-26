@@ -23,6 +23,30 @@ push): TOTAL x2.83, entities x3.13, `verify ok=946 bad=0`.
 Synthetic Tectonic-style wgen bench (4096 chunks): compact container =
 **x0.08 of Anvil** (x173 vs logical).
 
+## I/O speed (real JJThunder corpus, 2-core CI sandbox, single-threaded unless noted)
+
+| operation | Anvil (zlib-6) | c-saves | vs Anvil |
+|---|---|---|---|
+| region read, warm, p50 | 12.3 us | **25.1 us** (was 199 us) | 8x lower p50 after v0.5.0 |
+| region read, 2 threads | ~825 MB/s (lock-free baseline) | **12-20k chunks/s** | scales with Moonrise IO workers |
+| region import (fresh write) | 53.8 MB/s, p99.9 5.3 ms | **34.8 MB/s, p99.9 10.5 ms** | tail latency in budget (50 ms/tick) |
+| region steady rewrite (autosave) | 53.8 MB/s, p90 2.3 ms | **39.1 MB/s, p90 1.6 ms** | p90/p99 tails BEAT Anvil |
+| entity write (fresh) | 110 MB/s | **747 MB/s** | **6.8x faster** |
+| entity steady rewrite | 110 MB/s | **1677 MB/s** | **15x faster** |
+
+The v0.5.0 speed work: fused CSEC-to-NBT emitter (the read path used to
+rebuild a `HashMap<String, Value>` per palette entry and re-serialize the
+whole tree — it now walks the CSEC streams and emits wire-format NBT
+directly, with per-content-hash splice caching), one-pass dense/no-straddle
+converters (memcpy fast path for dividing widths), batched single-pass
+section loads, lock-free segment mmaps, O(1) recipe-batch indexing, and a
+hot tier at zstd-3 (measured 2.1x faster imports at IDENTICAL packed size,
+because the background pack pass recompresses at 19 anyway).
+
+`speed_bench` (CI job `speed-bench`) records full latency percentiles
+(p50/p90/p99/p99.9/max) and per-stage nanosecond breakdowns for every run —
+all stall points are captured as CI artifacts.
+
 ## Why the container is small
 
 * **CSEC** — canonical section codec: frequency-canonical palettes

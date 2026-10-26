@@ -25,9 +25,233 @@
 //! recipe instead of paying blob overhead.
 
 use fastnbt::Value;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use xxhash_rust::xxh3::{xxh3_128, Xxh3};
 
 pub type Hash = u128;
+
+// ------------------------------------------------- section emit cache -----
+
+/// Bounded FIFO cache of EMITTED section NBT payloads, keyed by the section's
+/// content hash (the recipe already carries it). A section's emitted bytes
+/// are a pure function of its CSEC stream, so every read of the same section
+/// (across chunks and across reads) becomes a memcpy splice instead of a
+/// 4096-voxel unpack+repack. Bounded so RAM stays flat.
+struct SecEmitCache {
+    map: HashMap<Hash, Arc<Vec<u8>>>,
+    order: VecDeque<(Hash, u32)>,
+    total: u64,
+    cap: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl SecEmitCache {
+    fn get(&mut self, h: Hash) -> Option<Arc<Vec<u8>>> {
+        if let Some(v) = self.map.get(&h) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(v.clone());
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn put(&mut self, h: Hash, v: Arc<Vec<u8>>) {
+        let sz = v.len() as u64;
+        if sz > self.cap {
+            return;
+        }
+        if self.map.insert(h, v).is_none() {
+            self.order.push_front((h, sz as u32));
+            self.total += sz;
+            while self.total > self.cap {
+                if let Some((ek, esz)) = self.order.pop_back() {
+                    if self.map.remove(&ek).is_some() {
+                        self.total -= esz as u64;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+use std::collections::HashMap;
+
+static SEC_EMIT_CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn sec_emit_cap() -> u64 {
+    *SEC_EMIT_CAP.get_or_init(|| {
+        std::env::var("CSAVES_SEC_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(32 * 1024 * 1024)
+    })
+}
+
+thread_local! {
+    // per-thread FIFO: chunk IO is per-thread in Moonrise, so a per-thread
+    // cache gets the same hit rate with ZERO lock traffic on the read path
+    static SEC_EMIT_TL: std::cell::RefCell<Option<SecEmitCache>> = const { std::cell::RefCell::new(None) };
+}
+
+fn sec_emit_with<R>(f: impl FnOnce(&mut Option<SecEmitCache>) -> R) -> R {
+    SEC_EMIT_TL.with(|c| {
+        let mut g = c.borrow_mut();
+        if g.is_none() {
+            let cap = sec_emit_cap();
+            if cap > 0 {
+                *g = Some(SecEmitCache {
+                    map: HashMap::new(),
+                    order: VecDeque::new(),
+                    total: 0,
+                    cap,
+                    hits: AtomicU64::new(0),
+                    misses: AtomicU64::new(0),
+                });
+            }
+        }
+        f(&mut g)
+    })
+}
+
+fn sec_emit_get(h: Hash) -> Option<Arc<Vec<u8>>> {
+    sec_emit_with(|c| c.as_mut()?.get(h))
+}
+
+fn sec_emit_put(h: Hash, v: Arc<Vec<u8>>) {
+    sec_emit_with(|c| {
+        if let Some(cc) = c.as_mut() {
+            cc.put(h, v);
+        }
+    })
+}
+
+pub fn sec_emit_stats() -> (u64, u64) {
+    SEC_EMIT_TL.with(|c| match c.borrow().as_ref() {
+        Some(c) => (c.hits.load(Ordering::Relaxed), c.misses.load(Ordering::Relaxed)),
+        None => (0, 0),
+    })
+}
+
+// ------------------------------------------------- section encode cache ---
+
+/// Section bytes handed to the store: shared (from the encode cache) or
+/// owned (freshly encoded / fallback NBT).
+#[derive(Clone, Debug)]
+pub enum SecBytes {
+    Owned(Vec<u8>),
+    Shared(Arc<Vec<u8>>),
+}
+
+impl SecBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            SecBytes::Owned(v) => v,
+            SecBytes::Shared(a) => a,
+        }
+    }
+}
+
+struct EncCache {
+    map: HashMap<Hash, (Hash, Arc<Vec<u8>>)>, // structural hash -> (encoded hash, csec bytes)
+    order: VecDeque<(Hash, u32)>,
+    total: u64,
+    cap: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl EncCache {
+    fn get(&mut self, sh: Hash) -> Option<(Hash, Arc<Vec<u8>>)> {
+        if let Some(v) = self.map.get(&sh) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(v.clone());
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn put(&mut self, sh: Hash, h: Hash, v: Arc<Vec<u8>>) {
+        let sz = v.len() as u64;
+        if sz > self.cap {
+            return;
+        }
+        if self.map.insert(sh, (h, v)).is_none() {
+            self.order.push_front((sh, sz as u32));
+            self.total += sz;
+            while self.total > self.cap {
+                if let Some((ek, esz)) = self.order.pop_back() {
+                    if self.map.remove(&ek).is_some() {
+                        self.total -= esz as u64;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static ENC_CACHE_CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn enc_cache_cap() -> u64 {
+    *ENC_CACHE_CAP.get_or_init(|| {
+        std::env::var("CSAVES_ENC_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(32 * 1024 * 1024)
+    })
+}
+
+thread_local! {
+    // per-thread (mirrors the zstd codec contexts): zero lock traffic on the
+    // encode path; cross-thread dedup happens in the store's blob map anyway
+    static ENC_CACHE_TL: std::cell::RefCell<Option<EncCache>> = const { std::cell::RefCell::new(None) };
+}
+
+fn enc_cache_with<R>(f: impl FnOnce(&mut Option<EncCache>) -> R) -> R {
+    ENC_CACHE_TL.with(|c| {
+        let mut g = c.borrow_mut();
+        if g.is_none() {
+            let cap = enc_cache_cap();
+            if cap > 0 {
+                *g = Some(EncCache {
+                    map: HashMap::new(),
+                    order: VecDeque::new(),
+                    total: 0,
+                    cap,
+                    hits: AtomicU64::new(0),
+                    misses: AtomicU64::new(0),
+                });
+            }
+        }
+        f(&mut g)
+    })
+}
+
+fn enc_cache_get(sh: Hash) -> Option<(Hash, Arc<Vec<u8>>)> {
+    enc_cache_with(|c| c.as_mut()?.get(sh))
+}
+
+fn enc_cache_put(sh: Hash, h: Hash, v: Arc<Vec<u8>>) {
+    enc_cache_with(|c| {
+        if let Some(cc) = c.as_mut() {
+            cc.put(sh, h, v);
+        }
+    })
+}
+
+pub fn enc_cache_stats() -> (u64, u64) {
+    ENC_CACHE_TL.with(|c| match c.borrow().as_ref() {
+        Some(c) => (c.hits.load(Ordering::Relaxed), c.misses.load(Ordering::Relaxed)),
+        None => (0, 0),
+    })
+}
 
 // ------------------------------------------------------------ csec codec --
 
@@ -77,13 +301,39 @@ struct BitR<'a> {
 }
 
 impl<'a> BitR<'a> {
+    /// LSB-first bit reader. Hot loop on the decode path (4096+ voxels per
+    /// section): consume bits in u64 gulps instead of one bit at a time.
+    #[inline]
     fn get(&mut self, bits: u32) -> Option<u64> {
-        let mut v = 0u64;
-        for i in 0..bits {
-            let byte = *self.in_.get(self.pos >> 3)?;
-            v |= (((byte >> (self.pos & 7)) & 1) as u64) << i;
-            self.pos += 1;
+        if bits == 0 {
+            return Some(0);
         }
+        let byte = self.pos >> 3;
+        // need ceil(bits/8) bytes starting at `byte`
+        let want = ((bits as usize + 7) >> 3) + 1; // +1: sub-byte phase
+        let end = byte + want;
+        if end > self.in_.len() {
+            // allow the tail: pad conceptually missing bytes with zeros
+            if byte >= self.in_.len() {
+                return None;
+            }
+            let mut acc: u128 = 0;
+            let mut sh = 0u32;
+            for i in byte..self.in_.len() {
+                acc |= (self.in_[i] as u128) << sh;
+                sh += 8;
+            }
+            let v = (acc >> (self.pos & 7)) as u64 & ((1u128 << bits) - 1) as u64;
+            self.pos += bits as usize;
+            return Some(v);
+        }
+        let mut acc: u128 = 0;
+        acc |= self.in_[byte] as u128;
+        for i in 1..want {
+            acc |= (self.in_[byte + i] as u128) << (8 * i);
+        }
+        let v = ((acc >> (self.pos & 7)) as u64) & ((1u128 << bits).wrapping_sub(1) as u64);
+        self.pos += bits as usize;
         Some(v)
     }
 }
@@ -293,6 +543,140 @@ fn pack_nostroddle(entries: &[u8], bits: u32) -> Vec<i64> {
             v as i64
         })
         .collect()
+}
+
+/// One-pass dense(LSB-first, in_bits) -> vanilla no-straddle longs(out_bits).
+///
+/// When in_bits == out_bits and the width divides 64 (1/2/4/8/16/32), the
+/// dense stream IS the no-straddle layout bit-for-bit: pure byte copy. This
+/// covers the overwhelmingly common vanilla-clamped 4-bit terrain data.
+/// Everything else goes through a rolling-u64 window at ~4ns/voxel.
+fn dense_to_nostroddle(dense: &[u8], n: usize, in_bits: u32, out_bits: u32) -> Vec<i64> {
+    if in_bits == out_bits && matches!(in_bits, 1 | 2 | 4 | 8 | 16 | 32) {
+        let per = (64 / in_bits) as usize;
+        let nlongs = (n + per - 1) / per;
+        let mut out = vec![0i64; nlongs];
+        let want = (n * in_bits as usize + 7) / 8;
+        let nbytes = want.min(nlongs * 8).min(dense.len());
+        // little-endian longs == the raw dense bytes (per*bits == 64)
+        let full = nbytes / 8;
+        let mut l = 0usize;
+        let mut b = 0usize;
+        while l < full {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&dense[b..b + 8]);
+            out[l] = i64::from_le_bytes(w);
+            b += 8;
+            l += 1;
+        }
+        // trailing partial long (final voxels): copy byte-wise
+        while b < nbytes && l < nlongs {
+            let mut word: u64 = 0;
+            for k in 0..8 {
+                if b + k < nbytes {
+                    word |= (dense[b + k] as u64) << (8 * k);
+                }
+            }
+            out[l] = word as i64;
+            b += 8;
+            l += 1;
+        }
+        return out;
+    }
+    let per = (64 / out_bits) as usize;
+    let omask = (1u64 << out_bits) - 1;
+    let imask = (1u64 << in_bits) - 1;
+    let mut longs = vec![0i64; (n + per - 1) / per];
+    let mut li = 0usize;
+    let mut slot = 0usize;
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
+    let mut pos = 0usize;
+    for _ in 0..n {
+        if nbits < in_bits {
+            // refill 32 bits (4 bytes, zero-padded at the tail)
+            let b0 = *dense.get(pos).unwrap_or(&0) as u64;
+            let b1 = *dense.get(pos + 1).unwrap_or(&0) as u64;
+            let b2 = *dense.get(pos + 2).unwrap_or(&0) as u64;
+            let b3 = *dense.get(pos + 3).unwrap_or(&0) as u64;
+            acc |= (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) << nbits;
+            pos += 4;
+            nbits += 32;
+        }
+        let v = acc & imask;
+        acc >>= in_bits;
+        nbits -= in_bits;
+        longs[li] |= ((v & omask) as i64) << (slot * out_bits as usize);
+        slot += 1;
+        if slot == per {
+            li += 1;
+            slot = 0;
+        }
+    }
+    longs
+}
+
+/// Inverse of dense_to_nostroddle: vanilla no-straddle longs -> dense
+/// LSB-first stream at `bits` width. Dividing widths (1/2/4/8/16/32) are a
+/// byte copy (per*bits == 64, so long LE bytes == dense stream); everything
+/// else walks voxel-by-voxel, honoring each long's high padding bits.
+fn nostroddle_to_dense(longs: &[i64], n: usize, bits: u32) -> Vec<u8> {
+    let per = (64 / bits) as usize;
+    let want = (n * bits as usize + 7) / 8;
+    if matches!(bits, 1 | 2 | 4 | 8 | 16 | 32) {
+        let mut out = vec![0u8; want];
+        let mut l = 0usize;
+        let mut b = 0usize;
+        while b + 8 <= want && l < longs.len() {
+            out[b..b + 8].copy_from_slice(&longs[l].to_le_bytes());
+            b += 8;
+            l += 1;
+        }
+        // final partial long: emit the remaining bytes
+        if l < longs.len() && b < want {
+            let w = longs[l].to_le_bytes();
+            let take = (want - b).min(8);
+            out[b..b + take].copy_from_slice(&w[..take]);
+        }
+        return out;
+    }
+    let mask = (1u64 << bits) - 1;
+    let mut out = vec![0u8; want];
+    let mut oacc: u64 = 0;
+    let mut obits = 0u32;
+    let mut op = 0usize;
+    let mut li = 0usize;
+    let mut slot = 0usize;
+    for _ in 0..n {
+        if slot == per {
+            li += 1;
+            slot = 0;
+        }
+        let w = if li < longs.len() { longs[li] as u64 } else { 0 };
+        let v = (w >> (slot * bits as usize)) & mask;
+        slot += 1;
+        oacc |= v << obits;
+        obits += bits;
+        while obits >= 8 && op < want {
+            out[op] = (oacc & 0xff) as u8;
+            oacc >>= 8;
+            obits -= 8;
+            op += 1;
+        }
+    }
+    while op < want {
+        if obits >= 8 {
+            out[op] = (oacc & 0xff) as u8;
+            oacc >>= 8;
+            obits -= 8;
+        } else {
+            out[op] = (oacc & 0xff) as u8;
+            oacc = 0;
+            obits = 0;
+        }
+        op += 1;
+    }
+    out
 }
 
 fn unpack_nostroddle(longs: &[i64], n: usize, bits: u32) -> Vec<u8> {
@@ -525,18 +909,32 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         if data.len() != (entries + per - 1) / per {
             return None;
         }
-        let v = unpack_nostroddle(data, entries, in_bits);
-        // remap old palette index -> canonical index
-        let mut remap = vec![0u8; n];
-        for (new_i, (_, old_i)) in ents.iter().enumerate() {
-            remap[*old_i] = new_i as u8;
-        }
         // Narrow packing: vanilla clamps linear palettes to 4 bits/entry, so
         // a 2-entry palette wastes 4x (2 KiB vs 512 B per section). Under
         // 16-entry palettes re-pack at ceillog2(n); the decoder normalizes
         // back to the vanilla width. n >= 16: ceillog2 >= 4, no change.
         let narrow = bits_for(n) < 4;
         let out_bits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+        // IDENTITY shortcut: the palette is already in canonical order and
+        // the packing width is unchanged — the vanilla longs ARE the dense
+        // stream byte-for-byte (LE), so skip unpack/remap/pack entirely.
+        // This is the hot re-save path for chunks this engine wrote.
+        let identity = !narrow
+            && in_bits == out_bits
+            && matches!(in_bits, 1 | 2 | 4 | 8 | 16 | 32)
+            && ents.iter().enumerate().all(|(i, (_, old))| *old == i);
+        if identity {
+            for l in data.as_ref() {
+                out.extend_from_slice(&l.to_le_bytes());
+            }
+            return Some((true, false));
+        }
+        let v = unpack_nostroddle(data, entries, in_bits);
+        // remap old palette index -> canonical index
+        let mut remap = vec![0u8; n];
+        for (new_i, (_, old_i)) in ents.iter().enumerate() {
+            remap[*old_i] = new_i as u8;
+        }
         if n > 256 {
             // wide palettes: remap table must be u16
             let mut remap16 = vec![0u16; n];
@@ -927,9 +1325,10 @@ pub enum Split {
         hash: Hash,
     },
     Split {
-        /// (structural hash, serialized bytes) per section, in order. Bytes
-        /// are the custom form when the shape is understood, NBT otherwise.
-        sections: Vec<(Hash, Vec<u8>)>,
+        /// (structural/content hash, section bytes) per section, in order.
+        /// Bytes are the custom form when the shape is understood, NBT
+        /// otherwise. Shared variants come from the encode cache.
+        sections: Vec<(Hash, SecBytes)>,
         tail: Vec<u8>,
     },
     /// Whole-mode field split: one part per top-level key.
@@ -1066,15 +1465,29 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
 
     let mut sections = Vec::with_capacity(list.len());
     for s in list {
+        // encode-cache: re-saving a chunk re-encodes every section; the
+        // structural hash is order-free, so unchanged sections hit the cache
+        // and skip canonicalization + bit-packing entirely.
+        let sh = structural_hash(s);
+        if let Some((h, shared)) = enc_cache_get(sh) {
+            sections.push((h, SecBytes::Shared(shared)));
+            continue;
+        }
         // custom form when possible (marker-detectable), NBT bytes otherwise.
         // v3 output is canonical, so identical content yields identical bytes
         // regardless of the original palette order -> hash the bytes.
         match section_encode(s) {
             Some(c) => {
-                let h = if c.first() == Some(&CSEC3_MAGIC) { hash_of(&c) } else { structural_hash(s) };
-                sections.push((h, c));
+                if c.first() == Some(&CSEC3_MAGIC) {
+                    let h = hash_of(&c);
+                    let arc = Arc::new(c);
+                    enc_cache_put(sh, h, arc.clone());
+                    sections.push((h, SecBytes::Shared(arc)));
+                } else {
+                    sections.push((structural_hash(s), SecBytes::Owned(c)));
+                }
             }
-            None => sections.push((structural_hash(s), to_bytes(s))),
+            None => sections.push((structural_hash(s), SecBytes::Owned(to_bytes(s)))),
         }
     }
 
@@ -1164,6 +1577,460 @@ pub fn join(sections: &[Vec<u8>], tail: &[u8]) -> Result<Vec<u8>, String> {
     }
     map.insert("sections".to_string(), Value::List(list));
     Ok(to_bytes(&Value::Compound(map)))
+}
+
+// -------------------------------------------------- fused join (BE emit) --
+//
+// The generic `join` decodes every CSEC section into a fastnbt Value tree
+// (a HashMap<String, Value> per palette entry — tens of thousands of heap
+// allocations for one 131-section chunk) and then re-serializes the whole
+// tree. That makes reads ~9x slower than vanilla zlib inflate on real
+// JJThunder worlds. `join_fused` instead walks the CSEC byte streams and
+// emits the standard big-endian NBT wire form DIRECTLY into the output
+// buffer: zero per-section Value trees, zero HashMap churn, one output
+// allocation. Output is semantically identical (same parser-visible NBT);
+// only key iteration order differs, which NBT semantics do not define.
+
+macro_rules! fdbg {
+    ($($a:tt)*) => {
+        if std::env::var("CSAVES_FUSED_DEBUG").as_deref() == Ok("1") {
+            eprintln!($($a)*);
+        }
+    };
+}
+
+fn put_be16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+fn put_be32(out: &mut Vec<u8>, v: i32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+fn put_named_key(out: &mut Vec<u8>, tag: u8, name: &str) {
+    out.push(tag);
+    let b = name.as_bytes();
+    put_be16(out, b.len() as u16);
+    out.extend_from_slice(b);
+}
+
+/// Emit a tail-side value in standard big-endian NBT (what fastnbt::to_bytes
+/// would produce; compounds emitted in sorted key order for determinism).
+fn emit_payload_be(v: &Value, out: &mut Vec<u8>) -> Option<()> {
+    match v {
+        Value::Byte(x) => out.push(*x as u8),
+        Value::Short(x) => out.extend_from_slice(&x.to_be_bytes()),
+        Value::Int(x) => out.extend_from_slice(&x.to_be_bytes()),
+        Value::Long(x) => out.extend_from_slice(&x.to_be_bytes()),
+        Value::Float(x) => out.extend_from_slice(&x.to_bits().to_be_bytes()),
+        Value::Double(x) => out.extend_from_slice(&x.to_bits().to_be_bytes()),
+        Value::ByteArray(x) => {
+            put_be32(out, x.len() as i32);
+            for b in x.as_ref() {
+                out.push(*b as u8);
+            }
+        }
+        Value::String(s) => {
+            let b = s.as_bytes();
+            if b.len() > 65535 {
+                return None;
+            }
+            put_be16(out, b.len() as u16);
+            out.extend_from_slice(b);
+        }
+        Value::List(l) => {
+            let elem = match l.first() {
+                None => 0u8,
+                Some(first) => {
+                    let t = prim_tag(first)?;
+                    if !l.iter().all(|x| prim_tag(x) == Some(t)) {
+                        return None;
+                    }
+                    t
+                }
+            };
+            out.push(elem);
+            put_be32(out, l.len() as i32);
+            for x in l {
+                emit_payload_be(x, out)?;
+            }
+        }
+        Value::Compound(m) => {
+            // sorted key order (deterministic output)
+            let mut keys: Vec<(&String, &Value)> = m.iter().collect();
+            keys.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            for (k, kv) in keys {
+                let tag = prim_tag(kv)?;
+                put_named_key(out, tag, k);
+                emit_payload_be(kv, out)?;
+            }
+            out.push(0);
+        }
+        Value::IntArray(x) => {
+            put_be32(out, x.len() as i32);
+            for i in x.as_ref() {
+                out.extend_from_slice(&i.to_be_bytes());
+            }
+        }
+        Value::LongArray(x) => {
+            put_be32(out, x.len() as i32);
+            for i in x.as_ref() {
+                out.extend_from_slice(&i.to_be_bytes());
+            }
+        }
+    }
+    Some(())
+}
+
+/// Emit one CSEC-v3 palette entry as an NBT list-element payload.
+/// `p` points at the kind byte; it is consumed here.
+/// kind 0 -> string element; kind 1/2 -> compound element.
+fn emit_pal_entry_be(b: &[u8], p: &mut usize, kind: u8, out: &mut Vec<u8>) -> Option<()> {
+    *p += 1; // the kind byte itself
+    match kind {
+        0 => {
+            let l = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p += 2;
+            put_be16(out, l as u16);
+            out.extend_from_slice(b.get(*p..*p + l)?);
+            *p += l;
+        }
+        1 | 2 => {
+            let l = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p += 2;
+            let name = b.get(*p..*p + l)?;
+            *p += l;
+            // entry payload: Name (string), then Properties (compound), then end
+            out.extend_from_slice(b"\x08\x00\x04Name");
+            put_be16(out, l as u16);
+            out.extend_from_slice(name);
+            if kind == 2 {
+                let np = *b.get(*p)?;
+                *p += 1;
+                out.extend_from_slice(b"\x0A\x00\x0AProperties");
+                for _ in 0..np {
+                    let kl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+                    *p += 2;
+                    let k = b.get(*p..*p + kl)?;
+                    *p += kl;
+                    let vl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+                    *p += 2;
+                    let v = b.get(*p..*p + vl)?;
+                    *p += vl;
+                    out.push(0x08);
+                    put_be16(out, kl as u16);
+                    out.extend_from_slice(k);
+                    put_be16(out, vl as u16);
+                    out.extend_from_slice(v);
+                }
+                out.push(0);
+            }
+            out.push(0);
+        }
+        _ => {
+            fdbg!("fused: bad pal entry kind {kind}");
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Emit one CSEC-v3 section (0xC7) as a compound list-element payload:
+/// inner named tags in sorted key order + terminator. Returns None when the
+/// shape is not representable (caller falls back to the generic join).
+fn section_emit_csec3(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let r = section_emit_csec3_inner(b, out);
+    if r.is_none() && std::env::var("CSAVES_FUSED_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "fused: section emit failed len={} f1={:02x} f2={:02x}",
+            b.len(),
+            b.get(1).copied().unwrap_or(0),
+            b.get(2).copied().unwrap_or(0)
+        );
+    }
+    r
+}
+
+fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    if *b.first()? != CSEC3_MAGIC {
+        return None;
+    }
+    let f1 = *b.get(1)?;
+    let f2 = *b.get(2)?;
+    let mut p = 3usize;
+    let y = *b.get(p)? as u8;
+    p += 1;
+
+    // collect the variable-shape parts first: palette streams + their ranges
+    // are parsed once, in stream order; emission happens in KEY order.
+    // Returns the serialized NBT payload of the {data, palette} compound.
+    fn emit_pal_data(b: &[u8], p: &mut usize, entries: usize, has_data: bool, narrow: bool) -> Option<Vec<u8>> {
+        let n = match b.get(*p..*p + 2) {
+            Some(x) => u16::from_le_bytes(x.try_into().ok()?) as usize,
+            None => {
+                fdbg!("fused: pal n oob at p={}", p);
+                return None;
+            }
+        };
+        *p += 2;
+        // entries payload first (uniform-kind-class check), header prepended
+        // after. Vanilla palettes legitimately mix kinds 1 and 2 (compound
+        // entries without/with Properties) — both are compound elements;
+        // only string (0) vs compound (1/2) cannot share one NBT list.
+        let mut ents = Vec::with_capacity(n.min(4096) * 16);
+        let mut class: Option<u8> = None; // 0 = string, 1 = compound
+        for _ in 0..n {
+            let k = *b.get(*p)?;
+            let kc = match k {
+                0 => 0u8,
+                1 | 2 => 1u8,
+                other => {
+                    fdbg!("fused: bad palette kind {other}");
+                    return None;
+                }
+            };
+            if let Some(pk) = class {
+                if pk != kc {
+                    fdbg!("fused: mixed palette classes string/compound");
+                    return None; // one NBT list cannot hold both shapes
+                }
+            }
+            class = Some(kc);
+            emit_pal_entry_be(b, p, k, &mut ents)?;
+        }
+        let elem_tag = match class {
+            None => 0x08u8, // empty palette: elem tag is arbitrary-but-stable
+            Some(0) => 0x08u8,
+            Some(1) => 0x0Au8,
+            _ => unreachable!(),
+        };
+        let mut pal = Vec::with_capacity(ents.len() + 16);
+        pal.push(0x09);
+        pal.extend_from_slice(b"\x00\x07palette");
+        pal.push(elem_tag);
+        pal.extend_from_slice(&(n as i32).to_be_bytes());
+        pal.extend_from_slice(&ents);
+        pal.push(0x00); // compound terminator for {data, palette}
+        // "data" sorts before "palette"
+        if has_data {
+            let rbits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+            let bytes = (entries * rbits as usize + 7) / 8;
+            let dense = match b.get(*p..*p + bytes) {
+                Some(d) => d,
+                None => {
+                    fdbg!("fused: data oob p={} bytes={} n={} narrow={} blen={}", p, bytes, n, narrow, b.len());
+                    return None;
+                }
+            };
+            *p += bytes;
+            let out_bits = bits_for(n).max(4);
+            let longs = dense_to_nostroddle(dense, entries, rbits, out_bits);
+            let mut data = Vec::with_capacity(8 + longs.len() * 8);
+            data.extend_from_slice(b"\x0C\x00\x04data"); // TAG_Long_Array
+            data.extend_from_slice(&(longs.len() as i32).to_be_bytes());
+            for l in &longs {
+                data.extend_from_slice(&l.to_be_bytes());
+            }
+            data.extend_from_slice(&pal);
+            return Some(data);
+        }
+        Some(pal)
+    }
+
+    // Emit in sorted key order: BlockLight < SkyLight < Y < biomes <
+    // block_states < starlight.blocklight_state < starlight.skylight_state
+    // We must parse the CSEC stream in ITS order (block_states, biomes,
+    // SkyLight, BlockLight, starlight), so buffer the parts, then emit.
+
+    // parse block_states
+    let bs_body = if f1 & 1 != 0 {
+        Some(emit_pal_data(b, &mut p, 4096, f1 & 2 != 0, f2 & 4 != 0)?)
+    } else {
+        None
+    };
+    // parse biomes
+    let bio_body = if f1 & 4 != 0 {
+        Some(emit_pal_data(b, &mut p, 64, f1 & 8 != 0, f2 & 8 != 0)?)
+    } else {
+        None
+    };
+    // SkyLight
+    enum Sky {
+        Full, // all 1
+        Zero,
+        Raw(Vec<u8>),
+        None,
+    }
+    let mut sky = Sky::None;
+    if f1 & 16 != 0 {
+        sky = Sky::Full;
+    } else if f1 & 32 != 0 {
+        sky = Sky::Zero;
+    } else if f1 & 64 != 0 {
+        let l = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        sky = Sky::Raw(b.get(p..p + l)?.to_vec());
+        p += l;
+    }
+    let mut bl: Option<Vec<u8>> = None;
+    if f1 & 128 != 0 {
+        let l = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        bl = Some(b.get(p..p + l)?.to_vec());
+        p += l;
+    }
+    let sl_state = if f2 & 1 != 0 {
+        let v = *b.get(p)?;
+        p += 1;
+        Some(v as i8 as i32)
+    } else {
+        None
+    };
+    let bl_state = if f2 & 2 != 0 {
+        let v = *b.get(p)?;
+        p += 1;
+        Some(v as i8 as i32)
+    } else {
+        None
+    };
+
+    // ---- emit ----
+    if let Some(raw) = &bl {
+        put_named_key(out, 0x07, "BlockLight");
+        put_be32(out, raw.len() as i32);
+        out.extend_from_slice(raw);
+    }
+    match sky {
+        Sky::Full => {
+            put_named_key(out, 0x07, "SkyLight");
+            put_be32(out, 2048);
+            out.resize(out.len() + 2048, 0xff);
+        }
+        Sky::Zero => {
+            put_named_key(out, 0x07, "SkyLight");
+            put_be32(out, 2048);
+            out.resize(out.len() + 2048, 0x00);
+        }
+        Sky::Raw(raw) => {
+            put_named_key(out, 0x07, "SkyLight");
+            put_be32(out, raw.len() as i32);
+            out.extend_from_slice(&raw);
+        }
+        Sky::None => {}
+    }
+    // Y (byte)
+    put_named_key(out, 0x01, "Y");
+    out.push(y);
+    // biomes
+    if let Some(body) = &bio_body {
+        put_named_key(out, 0x0A, "biomes");
+        out.extend_from_slice(body);
+    }
+    // block_states
+    if let Some(body) = &bs_body {
+        put_named_key(out, 0x0A, "block_states");
+        out.extend_from_slice(body);
+    }
+    if let Some(v) = bl_state {
+        put_named_key(out, 0x03, "starlight.blocklight_state");
+        put_be32(out, v);
+    }
+    if let Some(v) = sl_state {
+        put_named_key(out, 0x03, "starlight.skylight_state");
+        put_be32(out, v);
+    }
+    out.push(0x00); // compound terminator (list element payload end)
+    Some(())
+}
+
+/// Source for one section in a fused join: its content hash (from the
+/// recipe) and its CSEC bytes.
+pub struct SecSrc<'a> {
+    pub h: Hash,
+    pub b: &'a [u8],
+}
+
+/// Fused join: emit the full chunk NBT directly from CSEC section streams +
+/// the decoded tail. Returns None when any section is not a CSEC-v3 stream
+/// (or the shape is unexpected) — the caller then uses the generic join.
+pub fn join_fused(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
+    let tail_val: Value = fastnbt::from_bytes(tail).ok()?;
+    let Value::Compound(mut map) = tail_val else {
+        fdbg!("fused: tail not compound");
+        return None;
+    };
+    {
+        let mut tv = Value::Compound(std::mem::take(&mut map));
+        tail_decode(&mut tv);
+        map = match tv { Value::Compound(m) => m, _ => unreachable!() };
+    }
+    for (si, s) in sections.iter().enumerate() {
+        if s.b.first() != Some(&CSEC3_MAGIC) {
+            fdbg!("fused: section {si} not CSEC3 (first={:02x})", s.b.first().copied().unwrap_or(0));
+            return None;
+        }
+    }
+    let mut out = Vec::with_capacity((1 << 16).max(sections.len() * 8200));
+    out.push(0x0A); // root compound, name ""
+    put_be16(&mut out, 0);
+    // sorted tail keys with "sections" spliced at its sorted position
+    let mut keys: Vec<(&String, &Value)> = map.iter().collect();
+    keys.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut sections_done = false;
+    for (k, v) in keys {
+        if !sections_done && k.as_str() > "sections" {
+            if emit_sections_list(sections, &mut out).is_none() {
+                fdbg!("fused: sections list emit failed");
+                return None;
+            }
+            sections_done = true;
+        }
+        match prim_tag(v) {
+            Some(tag) => {
+                put_named_key(&mut out, tag, k);
+                if emit_payload_be(v, &mut out).is_none() {
+                    fdbg!("fused: tail key '{k}' emit failed");
+                    return None;
+                }
+            }
+            None => {
+                fdbg!("fused: tail key '{k}' no prim tag");
+                return None;
+            }
+        }
+    }
+    if !sections_done {
+        emit_sections_list(sections, &mut out)?;
+    }
+    out.push(0x00); // end root
+    Some(out)
+}
+
+fn emit_sections_list(sections: &[SecSrc], out: &mut Vec<u8>) -> Option<()> {
+    put_named_key(out, 0x09, "sections");
+    if sections.is_empty() {
+        // fastnbt emits elem tag 0 for an empty list
+        out.push(0x00);
+        put_be32(out, 0);
+        return Some(());
+    }
+    out.push(0x0A); // list of compounds
+    put_be32(out, sections.len() as i32);
+    for src in sections {
+        // emitted section bytes are a pure function of the CSEC stream —
+        // cache by content hash so repeat reads are a memcpy splice.
+        // (Uniform sections are shared across chunks — hot keys; caching
+        // everything measured faster than filtering "cheap" sections.)
+        if let Some(hit) = sec_emit_get(src.h) {
+            out.extend_from_slice(&hit);
+            continue;
+        }
+        let mut scratch = Vec::with_capacity(src.b.len() * 6 + 64);
+        section_emit_csec3(src.b, &mut scratch)?;
+        let arc = Arc::new(scratch);
+        sec_emit_put(src.h, arc.clone());
+        out.extend_from_slice(&arc);
+    }
+    Some(())
 }
 
 // ------------------------------------------------------- unnamed values --
@@ -1415,6 +2282,140 @@ pub fn join_fields(parts: &[FieldBytes], pos: Option<(i32, i32)>) -> Result<Vec<
 }
 
 #[cfg(test)]
+mod fused_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn compound(pairs: Vec<(&str, Value)>) -> Value {
+        let mut m = HashMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v);
+        }
+        Value::Compound(m)
+    }
+
+    fn named_sec(enc: &[u8]) -> Vec<u8> {
+        // wrap the emitted section payload as a 1-element compound list
+        let mut full = vec![0x0A, 0x00, 0x00, 0x09, 0x00, 0x08];
+        full.extend_from_slice(b"sections");
+        full.push(0x0A);
+        full.extend_from_slice(&1i32.to_be_bytes());
+        full.extend_from_slice(enc);
+        full.push(0x00);
+        full
+    }
+
+    #[test]
+    fn fused_uniform_section_roundtrip() {
+        let sec = compound(vec![
+            ("Y", Value::Byte(0)),
+            (
+                "block_states",
+                compound(vec![(
+                    "palette",
+                    Value::List(vec![compound(vec![("Name", Value::String("minecraft:stone".into()))])]),
+                )]),
+            ),
+            (
+                "biomes",
+                compound(vec![("palette", Value::List(vec![Value::String("minecraft:plains".into())]))]),
+            ),
+        ]);
+        let enc = section_encode(&sec).expect("encode");
+        let mut out = Vec::new();
+        let r = section_emit_csec3(&enc, &mut out);
+        if r.is_none() {
+            panic!("emit failed; enc={:02x?} partial={:02x?}", enc, out);
+        }
+        let full = named_sec(&out);
+        let v: Value = fastnbt::from_bytes(&full).expect("parse emitted NBT");
+        let Value::Compound(m) = v else { panic!() };
+        let Some(Value::List(l)) = m.get("sections") else { panic!() };
+        assert!(sections_semantically_equal(&l[0], &sec), "semantic mismatch");
+    }
+
+    #[test]
+    fn fused_uniform_section_with_data() {
+        // 2-entry palette with a 4096-voxel data array at vanilla width
+        let mut data: Vec<i64> = Vec::with_capacity(256);
+        for i in 0..256 {
+            data.push(if i % 2 == 0 { 0 } else { 1 });
+        }
+        let sec = compound(vec![
+            ("Y", Value::Byte(-4)),
+            (
+                "block_states",
+                compound(vec![
+                    (
+                        "palette",
+                        Value::List(vec![
+                            compound(vec![("Name", Value::String("minecraft:stone".into()))]),
+                            compound(vec![(
+                                "Name",
+                                Value::String("minecraft:deepslate".into()),
+                            )]),
+                        ]),
+                    ),
+                    ("data", Value::LongArray(fastnbt::LongArray::new(data))),
+                ]),
+            ),
+        ]);
+        let enc = section_encode(&sec).expect("encode");
+        let mut out = Vec::new();
+        let r = section_emit_csec3(&enc, &mut out);
+        if r.is_none() {
+            panic!("emit failed; enc={:02x?} partial={:02x?}", enc, out);
+        }
+        let full = named_sec(&out);
+        let v: Value = fastnbt::from_bytes(&full).expect("parse emitted NBT");
+        let Value::Compound(m) = v else { panic!() };
+        let Some(Value::List(l)) = m.get("sections") else { panic!() };
+        assert!(sections_semantically_equal(&l[0], &sec), "semantic mismatch");
+    }
+
+    #[test]
+    fn fused_join_synthetic_chunk() {
+        // full chunk: tail keys + sections -> join_fused must equal legacy join
+        let mut sections_enc: Vec<Vec<u8>> = Vec::new();
+        let mut sec_vals: Vec<Value> = Vec::new();
+        for y in 0i8..3 {
+            let sec = compound(vec![
+                ("Y", Value::Byte(y)),
+                (
+                    "block_states",
+                    compound(vec![(
+                        "palette",
+                        Value::List(vec![compound(vec![("Name", Value::String("minecraft:stone".into()))])]),
+                    )]),
+                ),
+                ("SkyLight", Value::ByteArray(fastnbt::ByteArray::new(vec![-1i8; 2048]))),
+            ]);
+            let enc = section_encode(&sec).unwrap();
+            sections_enc.push(enc);
+            sec_vals.push(sec);
+        }
+        let tail_val = compound(vec![
+            ("DataVersion", Value::Int(4435)),
+            ("Status", Value::String("minecraft:full".into())),
+            ("Heightmaps", compound(vec![(
+                "MOTION_BLOCKING",
+                Value::LongArray(fastnbt::LongArray::new(vec![7i64; 37])),
+            )])),
+        ]);
+        let tail = to_bytes(&tail_val);
+        let sources: Vec<SecSrc> = sections_enc
+            .iter()
+            .map(|s| SecSrc { h: hash_of(s), b: s.as_slice() })
+            .collect();
+        let fused = join_fused(&sources, &tail).expect("join_fused failed");
+        let legacy = join(&sections_enc, &tail).expect("legacy join failed");
+        let a: Value = fastnbt::from_bytes(&fused).unwrap();
+        let b: Value = fastnbt::from_bytes(&legacy).unwrap();
+        assert_eq!(a, b, "fused output differs semantically");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap as Map;
@@ -1447,7 +2448,7 @@ mod tests {
         let s = split(&payload, false, Some((3, 7))).unwrap();
         let Split::Split { sections, tail } = &s else { panic!("expected split") };
         assert_eq!(sections.len(), 6);
-        let sec_bytes: Vec<Vec<u8>> = sections.iter().map(|(_, b)| b.clone()).collect();
+        let sec_bytes: Vec<Vec<u8>> = sections.iter().map(|(_, b)| b.as_slice().to_vec()).collect();
         let joined = join(&sec_bytes, tail).unwrap();
         let a: Value = fastnbt::from_bytes(&payload).unwrap();
         let b: Value = fastnbt::from_bytes(&joined).unwrap();

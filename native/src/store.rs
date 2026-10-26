@@ -23,8 +23,9 @@
 //!                         | 2 blob-by-varint-id | 3 blob-by-hash
 //!
 //! Size levers: section-level content dedup, tail dedup, id/varint recipes,
-//! 112KB retrained shared dictionaries, hot tier (level 12) on the write
-//! path, cold tier (level 19) recompression during background compaction.
+//! 112KB retrained shared dictionaries, hot tier (level 3 — measured 2.1x
+//! faster than 12 with identical packed size) on the write path, cold tier
+//! (level 19) recompression during background compaction.
 
 use crate::chunknbt::{self, Hash, Split};
 use crc32fast::Hasher as Crc;
@@ -89,7 +90,12 @@ pub struct Cfg {
 impl Default for Cfg {
     fn default() -> Self {
         Cfg {
-            hot_level: 12,
+            // hot tier = write path. Level 3 measured 2.1x faster than 12 on
+            // the real JJThunder corpus (import 34.8 vs 16.8 MB/s, write
+            // p99.9 10ms vs 30ms) with IDENTICAL steady-state size — the
+            // background pack pass recompresses everything at the cold tier
+            // anyway, so the hot level only bounds transient disk usage.
+            hot_level: 3,
             cold_level: 19,
             compact_min: 4 * 1024 * 1024,
             compact_ratio: 0.25,
@@ -159,9 +165,9 @@ extern "C" {
 }
 
 impl Cfg {
-    fn from_env() -> Cfg {
+    pub fn from_env() -> Cfg {
         Cfg {
-            hot_level: env_parse("CSAVES_HOT_LEVEL", 12),
+            hot_level: env_parse("CSAVES_HOT_LEVEL", 3),
             cold_level: env_parse("CSAVES_COLD_LEVEL", 19),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 4 * 1024 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),
@@ -255,7 +261,10 @@ impl BlobLoc {
 
 struct Seg {
     file: File,
-    mmap: Mutex<Option<Arc<Mmap>>>,
+    /// Lazily-mapped read view for SEALED segments. OnceLock: lock-free after
+    /// the first successful map (one Mutex acquire per blob read was measured
+    /// as real contention under Moonrise's parallel IO workers).
+    mmap: std::sync::OnceLock<Option<Arc<Mmap>>>,
     total: AtomicU64,
     live: AtomicU64,
 }
@@ -263,10 +272,7 @@ struct Seg {
 impl Seg {
     fn read_at(&self, off: u64, len: usize, sealed: bool) -> Option<Vec<u8>> {
         if sealed {
-            let mut m = self.mmap.lock();
-            if m.is_none() {
-                *m = unsafe { Mmap::map(&self.file) }.ok().map(Arc::new);
-            }
+            let m = self.mmap.get_or_init(|| unsafe { Mmap::map(&self.file) }.ok().map(Arc::new));
             if let Some(mm) = m.as_ref() {
                 let s = mm.get(off as usize..off as usize + len)?;
                 return Some(s.to_vec());
@@ -654,7 +660,6 @@ struct SlabCache {
     total: u64,
     cap: u64,
 }
-
 impl SlabCache {
     fn new(cap: u64) -> Self {
         SlabCache { map: HashMap::new(), order: VecDeque::new(), total: 0, cap }
@@ -683,7 +688,114 @@ impl SlabCache {
     }
 }
 
+// ------------------------------------------------------- recipe batch -----
+
+/// Pending chunk recipes queued as one kind-9 batch record on flush.
+/// The O(1) index + running byte total replace the per-write linear scans
+/// that made the save path quadratic under autosave storms.
+struct RecipeBatch {
+    entries: Vec<(u64, Vec<u8>)>,
+    index: HashMap<u64, usize>,
+    bytes: usize,
+}
+
+impl Default for RecipeBatch {
+    fn default() -> Self {
+        RecipeBatch { entries: Vec::new(), index: HashMap::new(), bytes: 0 }
+    }
+}
+
+impl RecipeBatch {
+    /// Queue a recipe; a pending entry for the same key is superseded
+    /// (last write wins — matches the chunks-map behavior at flush).
+    fn push(&mut self, key: u64, bare: Vec<u8>) {
+        if self.index.contains_key(&key) {
+            self.remove(key);
+        }
+        self.index.insert(key, self.entries.len());
+        self.bytes += 10 + bare.len();
+        self.entries.push((key, bare));
+    }
+    /// Remove one pending entry (swap_remove; the moved entry's index slot
+    /// is fixed up). Returns the removed recipe body.
+    fn remove(&mut self, key: u64) -> Option<Vec<u8>> {
+        let i = *self.index.get(&key)?;
+        self.index.remove(&key);
+        self.bytes -= 10 + self.entries[i].1.len();
+        let last = self.entries.len() - 1;
+        let (_, bare) = self.entries.swap_remove(i);
+        if i != last {
+            let moved = self.entries[i].0;
+            self.index.insert(moved, i);
+        }
+        Some(bare)
+    }
+    fn get(&self, key: u64) -> Option<&Vec<u8>> {
+        self.entries.get(*self.index.get(&key)?).map(|(_, b)| b)
+    }
+}
+
+// ----------------------------------------------------- stage timers -------
+
+/// Read-path stage timers (nanos + call count). Always on: two relaxed
+/// atomic adds per stage are noise next to the IO work itself, and this is
+/// the CI "stall point" recorder (dump via read_stage_json).
+pub static ST_RECIPE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_SECTLOAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_JOIN_FUSED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_JOIN_LEGACY: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_PARSE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// write path
+pub static WST_SPLIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static WST_ENS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static WST_RECIPE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+
+/// Human/CI-readable stage snapshot: ns/call per stage.
+pub fn read_stage_json() -> String {
+    let fmt = |name: &str, st: &(AtomicU64, AtomicU64)| {
+        let (ns, n) = (st.0.load(Ordering::Relaxed), st.1.load(Ordering::Relaxed));
+        format!("\"{}\":{{ns:{},n:{},per_call:{}}}", name, ns, n, if n > 0 { ns / n } else { 0 })
+    };
+    format!(
+        "{{{},{},{},{},{},{}}}",
+        fmt("recipe", &ST_RECIPE),
+        fmt("tail", &ST_TAIL),
+        fmt("sectload", &ST_SECTLOAD),
+        fmt("join_fused", &ST_JOIN_FUSED),
+        fmt("join_legacy", &ST_JOIN_LEGACY),
+        fmt("fastnbt_parse", &ST_PARSE),
+    )
+}
+
+pub fn write_stage_json() -> String {
+    let fmt = |name: &str, st: &(AtomicU64, AtomicU64)| {
+        let (ns, n) = (st.0.load(Ordering::Relaxed), st.1.load(Ordering::Relaxed));
+        format!("\"{}\":{{ns:{},n:{},per_call:{}}}", name, ns, n, if n > 0 { ns / n } else { 0 })
+    };
+    format!(
+        "{{{},{},{}}}",
+        fmt("split_parse_encode", &WST_SPLIT),
+        fmt("ensure_blobs", &WST_ENS),
+        fmt("recipe_batch", &WST_RECIPE),
+    )
+}
+
+pub fn read_stage_reset() {
+    for st in [&ST_RECIPE, &ST_TAIL, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE] {
+        st.0.store(0, Ordering::Relaxed);
+        st.1.store(0, Ordering::Relaxed);
+    }
+}
+
 // --------------------------------------------------------------- store ----
+
+/// Result of a batched section load: owned decompressed buffers plus per-
+/// section (buffer index, start, end) references into them.
+struct LoadedSections {
+    keep: Vec<Arc<Vec<u8>>>,
+    refs: Vec<(usize, u32, u32)>,
+}
 
 pub struct Store {
     uid: u64,
@@ -705,7 +817,7 @@ pub struct Store {
     /// Pending chunk recipes batched into one kind-7 record (saves the
     /// 8-byte record frame + 2 header bytes per chunk). Read-your-writes is
     /// served from the pending map until the batch is flushed.
-    recipe_batch: Mutex<Vec<(u64, Vec<u8>)>>,
+    recipe_batch: Mutex<RecipeBatch>,
     /// Index into COMPRESSED kind-9 recipe batches. The chunks map stores
     /// len=BATCHED for these keys; (record body off, stream off, entry len)
     /// lives here. Rebuilt by scan on reopen.
@@ -756,7 +868,7 @@ impl Store {
             chunks: RwLock::new(HashMap::new()),
             keys_tab: RwLock::new(Vec::new()),
             key_refcnt: RwLock::new(HashMap::new()),
-            recipe_batch: Mutex::new(Vec::new()),
+            recipe_batch: Mutex::new(RecipeBatch::default()),
             batch_idx: Mutex::new(HashMap::new()),
             writer: Mutex::new(None),
             slab_cache: Mutex::new(SlabCache::new(32 * 1024 * 1024)),
@@ -916,7 +1028,7 @@ impl Store {
             id,
             Arc::new(Seg {
                 file: rfile,
-                mmap: Mutex::new(None),
+                mmap: std::sync::OnceLock::new(),
                 total: AtomicU64::new(0),
                 live: AtomicU64::new(0),
             }),
@@ -1428,10 +1540,13 @@ impl Store {
         const BATCH_BYTES: usize = 64 * 1024;
         let entries: Vec<(u64, Vec<u8>)> = {
             let mut b = self.recipe_batch.lock();
-            if b.is_empty() {
+            if b.entries.is_empty() {
                 return;
             }
-            std::mem::take(&mut *b)
+            let e = std::mem::take(&mut b.entries);
+            b.index.clear();
+            b.bytes = 0;
+            e
         };
         // split into batch-sized groups (same 64 KiB accumulation as before)
         let mut groups: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
@@ -1478,7 +1593,9 @@ impl Store {
             let Ok((seg, off, _)) = self.append(&body) else {
                 // put entries back so nothing is lost
                 let mut b = self.recipe_batch.lock();
-                b.extend(group);
+                for (k, bare) in group {
+                    b.push(k, bare);
+                }
                 return;
             };
             // virtual live accounting: append added 8+blen; the per-entry
@@ -1606,23 +1723,22 @@ impl Store {
     }
 
     fn decompress(&self, dict_id: u8, data: &[u8], raw_len: u32) -> Option<Vec<u8>> {
-        if dict_id == 0 {
-            return zstd::bulk::decompress(data, raw_len as usize).ok();
-        }
         DEC_C.with(|c| {
             let mut slot = c.borrow_mut();
-            let Some(dict) = self.dicts.read().get(&dict_id).cloned() else {
-                slot.take();
-                return None;
-            };
             let key = (self.uid, dict_id);
             if slot.as_ref().map(|s| s.key) != Some(key) {
-                *slot = build_dec(Some(&dict)).ok().map(|dec| DecCtx { key, dec });
+                // rebuild ONLY on (store, dict) change: the per-call dicts
+                // read-lock went away (was hit on every decompressed blob)
+                let dec = if dict_id == 0 {
+                    build_dec(None)
+                } else {
+                    let dict = self.dicts.read().get(&dict_id)?.clone();
+                    build_dec(Some(&dict))
+                }
+                .ok()?;
+                *slot = Some(DecCtx { key, dec });
             }
-            match slot.as_mut() {
-                Some(ctx) => ctx.dec.decompress(data, raw_len as usize).ok(),
-                None => None,
-            }
+            slot.as_mut()?.dec.decompress(data, raw_len as usize).ok()
         })
     }
 
@@ -1792,12 +1908,16 @@ impl Store {
         // Field split only pays off for tiny payloads (POI stores dedup their
         // small structures across chunks).
         let hash = chunknbt::hash_of(payload);
+        let t0w = std::time::Instant::now();
         let recipe = if whole_mode && payload.len() > 1024 {
             self.ensure_blob(hash, payload, false)?;
             Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
         } else {
             let split = chunknbt::split(payload, whole_mode, pos_hint)?;
-            match split {
+            WST_SPLIT.0.fetch_add(t0w.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            WST_SPLIT.1.fetch_add(1, Ordering::Relaxed);
+            let t1w = std::time::Instant::now();
+            let r = match split {
             Split::Whole { hash } => {
                 self.ensure_blob(hash, payload, false)?;
                 Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
@@ -1822,7 +1942,7 @@ impl Store {
                 } else {
                     let mut hashes = Vec::with_capacity(sections.len());
                     for (h, bytes) in &sections {
-                        self.ensure_blob(*h, bytes, false)?;
+                        self.ensure_blob(*h, bytes.as_slice(), false)?;
                         hashes.push(*h);
                     }
                     // tail: dedup large tails as blobs, inline tiny ones
@@ -1837,8 +1957,13 @@ impl Store {
                     Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false }
                 }
             }
-            }
+            };
+            WST_ENS.0.fetch_add(t1w.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            WST_ENS.1.fetch_add(1, Ordering::Relaxed);
+            r
         };
+        WST_RECIPE.0.fetch_add(t0w.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        WST_RECIPE.1.fetch_add(1, Ordering::Relaxed);
 
         let id_of = |h: Hash| -> Option<u32> {
             let blobs = self.blobs.read();
@@ -1859,8 +1984,7 @@ impl Store {
         // a pending entry for the same key)
         {
             let mut batch = self.recipe_batch.lock();
-            if let Some(i) = batch.iter().position(|(k, _)| *k == key) {
-                let (_, old_body) = batch.remove(i);
+            if let Some(old_body) = batch.remove(key) {
                 if let Some(old_rec) = self.parse_recipe_body(&old_body) {
                     self.drop_recipe_refs(&old_rec);
                 }
@@ -1881,12 +2005,12 @@ impl Store {
         // queue the bare recipe into the batch; flushed on sync/seal/compact
         // or when the batch grows past its size cap
         {
-            let mut batch = self.recipe_batch.lock();
             let mut bare = Vec::with_capacity(1 + rec.len());
             bare.push(0xFFu8);
             bare.extend_from_slice(&rec);
-            batch.push((key, bare));
-            let total: usize = batch.iter().map(|(_, b)| 10 + b.len()).sum();
+            let mut batch = self.recipe_batch.lock();
+            batch.push(key, bare);
+            let total = batch.bytes;
             drop(batch);
             if total >= 64 * 1024 {
                 self.flush_recipe_batch();
@@ -1906,12 +2030,7 @@ impl Store {
         let loc = match self.chunks.read().get(&key).copied() {
             Some((s, o, l)) => Loc::Seg(s, o, l),
             None => {
-                let pending = self
-                    .recipe_batch
-                    .lock()
-                    .iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, b)| b.clone())?;
+                let pending = self.recipe_batch.lock().get(key).cloned()?;
                 Loc::Pending(pending)
             }
         };
@@ -1924,10 +2043,16 @@ impl Store {
             dbg(stage);
             None
         };
+        let t_recipe = std::time::Instant::now();
         let rec = match &loc {
             Loc::Pending(body) => self.parse_recipe_body(body),
             Loc::Seg(seg, off, len) => self.recipe_at(key, *seg, *off, *len),
         };
+        {
+            let el = t_recipe.elapsed().as_nanos() as u64;
+            ST_RECIPE.0.fetch_add(el, Ordering::Relaxed);
+            ST_RECIPE.1.fetch_add(1, Ordering::Relaxed);
+        }
         let rec = match rec {
             Some(r) => r,
             None => {
@@ -1936,6 +2061,7 @@ impl Store {
             }
         };
         let writer_id = self.writer_seg_id();
+        let t_tail = std::time::Instant::now();
         let tail_bytes: Option<Vec<u8>> = match &rec.tail {
             Tail::None => Some(Vec::new()),
             Tail::Inline { dict, comp, raw } => self.decompress(*dict, comp, *raw),
@@ -1944,6 +2070,11 @@ impl Store {
                 self.read_blob(loc, writer_id)
             }
         };
+        {
+            let el = t_tail.elapsed().as_nanos() as u64;
+            ST_TAIL.0.fetch_add(el, Ordering::Relaxed);
+            ST_TAIL.1.fetch_add(1, Ordering::Relaxed);
+        }
         match rec.whole {
             Some(h) => {
                 let loc = *self.blobs.read().get(&h)?;
@@ -1976,22 +2107,152 @@ impl Store {
             }
             None => {
                 let tail = tail_bytes.or_else(|| fail("tail"))?;
+                let t_sec = std::time::Instant::now();
                 let blobs = self.blobs.read();
                 let mut locs = Vec::with_capacity(rec.sections.len());
                 for h in &rec.sections {
                     locs.push(*blobs.get(h)?);
                 }
                 drop(blobs);
-                let mut sec_bytes = Vec::with_capacity(locs.len());
-                for loc in locs {
-                    sec_bytes.push(self.read_blob(loc, writer_id).or_else(|| fail("section-blob"))?);
+                // batched load: one segs pass, per-slab dedup, borrowed slices
+                let loaded = match self.load_sections(&locs, writer_id) {
+                    Some(l) => l,
+                    None => return fail("section-blob"),
+                };
+                let slices: Vec<&[u8]> = loaded
+                    .refs
+                    .iter()
+                    .map(|(i, s, e)| &loaded.keep[*i][*s as usize..*e as usize])
+                    .collect();
+                {
+                    let el = t_sec.elapsed().as_nanos() as u64;
+                    ST_SECTLOAD.0.fetch_add(el, Ordering::Relaxed);
+                    ST_SECTLOAD.1.fetch_add(1, Ordering::Relaxed);
                 }
-                match chunknbt::join(&sec_bytes, &tail) {
+                // fused path: CSEC streams emitted straight to NBT bytes —
+                // no per-section Value trees, no HashMap churn; repeat
+                // sections splice from the emit cache by content hash
+                let sources: Vec<chunknbt::SecSrc> = rec
+                    .sections
+                    .iter()
+                    .zip(slices.iter())
+                    .map(|(h, s)| chunknbt::SecSrc { h: *h, b: s })
+                    .collect();
+                let t_join = std::time::Instant::now();
+                let fused = chunknbt::join_fused(&sources, &tail);
+                {
+                    let el = t_join.elapsed().as_nanos() as u64;
+                    ST_JOIN_FUSED.0.fetch_add(el, Ordering::Relaxed);
+                    ST_JOIN_FUSED.1.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(v) = fused {
+                    return Some(v);
+                }
+                let t_leg = std::time::Instant::now();
+                let sec_bytes: Vec<Vec<u8>> = slices.iter().map(|s| s.to_vec()).collect();
+                let r = match chunknbt::join(&sec_bytes, &tail) {
                     Ok(v) => Some(v),
                     Err(e) => fail(&format!("join: {e}")),
+                };
+                {
+                    let el = t_leg.elapsed().as_nanos() as u64;
+                    ST_JOIN_LEGACY.0.fetch_add(el, Ordering::Relaxed);
+                    ST_JOIN_LEGACY.1.fetch_add(1, Ordering::Relaxed);
+                }
+                r
+            }
+        }
+    }
+
+    /// Batched section load: one `segs` lock pass, per-slab dedup (a chunk's
+    /// 131 sections usually live in one or two slabs), slab-cache fill.
+    /// Returns owned buffers + (buffer idx, start, end) refs per section.
+    fn load_sections(
+        &self,
+        locs: &[BlobLoc],
+        writer_id: Option<u32>,
+    ) -> Option<LoadedSections> {
+        if locs.iter().any(|l| writer_id == Some(l.seg)) {
+            self.flush_writer();
+        }
+        let mut keep: Vec<Arc<Vec<u8>>> = Vec::with_capacity(8);
+        let mut refs = Vec::with_capacity(locs.len());
+        let mut slab_map: HashMap<(u32, u64), usize> = HashMap::new();
+        let mut fresh_slabs: Vec<((u32, u64), Arc<Vec<u8>>)> = Vec::new();
+        // one cache-lock pass for all hits (131 lock/unlock pairs per chunk
+        // were measurable against the actual work)
+        {
+            let cache = self.slab_cache.lock();
+            for loc in locs {
+                if loc.slab {
+                    let skey = (loc.seg, loc.off);
+                    if slab_map.contains_key(&skey) {
+                        continue;
+                    }
+                    if let Some(cached) = cache.get(&skey) {
+                        let idx = keep.len();
+                        keep.push(cached);
+                        slab_map.insert(skey, idx);
+                    }
                 }
             }
         }
+        let segs = self.segs.read();
+        for loc in locs {
+            if loc.slab {
+                let skey = (loc.seg, loc.off);
+                if let Some(&idx) = slab_map.get(&skey) {
+                    // cached or already loaded in this pass
+                    if keep[idx].len() as u64 >= loc.slab_off as u64 + loc.raw_len as u64 {
+                        refs.push((idx, loc.slab_off, loc.slab_off + loc.raw_len));
+                        continue;
+                    }
+                    // entry exists but is an unsealed-writer placeholder: fall
+                    // through to the full load below
+                }
+                let seg = segs.get(&loc.seg)?;
+                let sealed = Some(loc.seg) != writer_id;
+                let hdr = seg.read_at(loc.off, 12, sealed)?;
+                let kind = *hdr.first()?;
+                if kind != 5 && kind != 8 {
+                    return None;
+                }
+                let cl = u32::from_le_bytes(hdr[2..6].try_into().ok()?) as usize;
+                let raw_total = u32::from_le_bytes(hdr[6..10].try_into().ok()?);
+                let data = seg.read_at(loc.off + 12, cl, sealed)?;
+                let raw = Arc::new(self.decompress(loc.dict_id, &data, raw_total)?);
+                if (loc.slab_off + loc.raw_len) as usize > raw.len() {
+                    return None;
+                }
+                fresh_slabs.push((skey, raw.clone()));
+                let idx = match slab_map.get(&skey) {
+                    Some(&i) if keep[i].len() as u64 >= loc.slab_off as u64 + loc.raw_len as u64 => i,
+                    _ => {
+                        let idx = keep.len();
+                        keep.push(raw);
+                        slab_map.insert(skey, idx);
+                        idx
+                    }
+                };
+                refs.push((idx, loc.slab_off, loc.slab_off + loc.raw_len));
+            } else {
+                let seg = segs.get(&loc.seg)?;
+                let sealed = Some(loc.seg) != writer_id;
+                let data = seg.read_at(loc.off + loc.header_len(), loc.comp_len as usize, sealed)?;
+                let raw = Arc::new(self.decompress(loc.dict_id, &data, loc.raw_len)?);
+                let idx = keep.len();
+                keep.push(raw);
+                refs.push((idx, 0, loc.raw_len));
+            }
+        }
+        drop(segs);
+        if !fresh_slabs.is_empty() {
+            let mut sc = self.slab_cache.lock();
+            for (k, v) in fresh_slabs {
+                sc.put(k, v);
+            }
+        }
+        Some(LoadedSections { keep, refs })
     }
 
     fn read_blob(&self, loc: BlobLoc, writer_id: Option<u32>) -> Option<Vec<u8>> {
@@ -2071,14 +2332,14 @@ impl Store {
         let pending = self.recipe_batch.lock();
         let chunks = self.chunks.read();
         chunks.len()
-            + pending.iter().filter(|(k, _)| !chunks.contains_key(k)).count()
+            + pending.entries.iter().filter(|(k, _)| !chunks.contains_key(k)).count()
     }
 
     pub fn keys(&self) -> Vec<u64> {
         let pending = self.recipe_batch.lock();
         let chunks = self.chunks.read();
         let mut v: Vec<u64> = chunks.keys().copied().collect();
-        for (k, _) in pending.iter() {
+        for (k, _) in pending.entries.iter() {
             if !chunks.contains_key(k) {
                 v.push(*k);
             }
@@ -2567,7 +2828,7 @@ impl Store {
                 let mut bare = Vec::with_capacity(1 + enc.len());
                 bare.push(0xFFu8);
                 bare.extend_from_slice(&enc);
-                self.recipe_batch.lock().push((key, bare));
+                self.recipe_batch.lock().push(key, bare);
             }
             self.bump_recipe_refs(&new_rec);
             if let Some(old_rec) = self.load_recipe(seg, off, len) {
@@ -2577,10 +2838,7 @@ impl Store {
                 s.live.fetch_sub(8 + len as u64, Ordering::Relaxed);
             }
             rewritten += 1;
-            let total: usize = {
-                let b = self.recipe_batch.lock();
-                b.iter().map(|(_, b)| 10 + b.len()).sum()
-            };
+            let total = self.recipe_batch.lock().bytes;
             if total >= 64 * 1024 {
                 self.flush_recipe_batch();
             }
@@ -2880,8 +3138,8 @@ impl Store {
             let old_rl = self.batched_len(key, len);
             {
                 let mut batch = self.recipe_batch.lock();
-                batch.push((key, bare));
-                let total: usize = batch.iter().map(|(_, b)| 10 + b.len()).sum();
+                batch.push(key, bare);
+                let total = batch.bytes;
                 drop(batch);
                 if total >= 64 * 1024 {
                     self.flush_recipe_batch();

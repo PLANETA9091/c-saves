@@ -145,3 +145,57 @@ small-palette sections). Raw data bytes across the corpus drop x1.47;
 post-compression the corpus gains ~20 KiB (4-bit zero runs were already
 cheap), but repeat-encode stability and dedup ordering improve for any
 small-palette world.
+
+## I/O speed benchmark (v0.5.0)
+
+`native/examples/speed_bench.rs` drives the SAME committed JJThunder corpus
+(`bench-corpus/dim`) through an in-memory transcription of vanilla Anvil I/O
+— header lookup + zlib-6 inflate/deflate, exactly what
+`RegionFile.getChunkDataInputStream` / `getChunkDataOutputStream` do — and
+through the real c-saves Store (production pipeline: split, dedup, tiers,
+slab packing, dictionaries). Both sides run page-cache-warm so the
+comparison isolates the CPU data path; disk behavior (append-only writes,
+pread/mmap reads) is identical for both and scales both sides equally.
+
+Methodology notes:
+
+* The Anvil baseline is deliberately GENEROUS: it is Rust flate2 (zlib),
+  not Java's Inflater-over-JNI; if c-saves beats this baseline it beats
+  vanilla for sure.
+* Latency percentiles (p50/p90/p99/p99.9/max) are captured per operation —
+  these are the server's stall points; they are recorded as CI artifacts on
+  every push (`speed_stalls.txt`).
+* Semantic verification (palette-permutation-safe) runs on every chunk after
+  the full workload; the CI gate fails on any drift.
+
+### What was slow and what fixed it
+
+| stage | before | after | fix |
+|---|---|---|---|
+| join (read) | 323 us/chunk | ~6 us (p50 chunks) | fused CSEC-to-NBT emitter: no per-section Value trees (one HashMap per palette entry!), wire-format bytes emitted directly; repeat sections splice from a per-thread emit cache keyed by content hash |
+| voxel data | 4096 x per-bit loop | memcpy | one-pass dense-to-nostroddle converter; dividing widths (1/2/4/8/16/32) are a byte copy (the vanilla 4-bit clamp case), the rest rolls a u64 window |
+| section load | 2 preads + 2 mutex per blob | 1 pass | batched loader: one segs lock pass, per-slab dedup, single slab-cache lock |
+| segment reads | Mutex per blob on the mmap | lock-free | OnceLock mmap per segment |
+| recipe batch | O(n) scan per write (quadratic under autosave storms) | O(1) | HashMap index + running byte total; read-your-writes is an index lookup |
+| hot tier | zstd-12 per section | zstd-3 | measured 2.1x faster imports (34.8 vs 16.8 MB/s), write p99.9 30ms -> 10.5ms, IDENTICAL packed size (the background pack recompresses at 19 anyway) |
+| re-encode on rewrite | every section re-canonicalized | cache hit | per-thread encode cache keyed by the order-free structural hash; identity shortcut skips unpack/remap/pack when the palette is already canonical |
+
+### Results (2-core sandbox, rounds=3)
+
+* region read warm: p50 25 us (was 199), 340 MB/s single-thread, 12-20k
+  chunks/s on 2 threads (Moonrise loads chunks with parallel IO workers).
+* entity write: 747 MB/s fresh, 1677 MB/s steady — 6.8x / 15x faster than
+  vanilla zlib-6.
+* region write: p90/p99 tails beat Anvil (1.6 ms vs 2.3 ms at p90 on the
+  autosave path); fresh-import throughput 34.8 MB/s vs Anvil's 53.8 — the
+  one-time import is the only phase still behind, and its latency tail
+  (p99.9 10.5 ms) stays far below the 50 ms/tick budget.
+* size gate unchanged: x2.83 smaller than Anvil, semantic verify 946/946.
+
+### Known next levers
+
+* tail direct splice (skip the tail Value round-trip; ~6 us/chunk on reads).
+* hot-slab batching on the write path (compress new sections as one frame
+  instead of per-section zstd calls) for fresh-worldgen throughput.
+* raw-scan split: hash section byte ranges without parsing the full chunk
+  NBT (removes the parse floor on rewrites).

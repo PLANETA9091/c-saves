@@ -78,3 +78,47 @@ jobs:
         with:
           name: jj-bench-results
           path: native/jj_bench.txt
+
+  speed-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build speed_bench
+        working-directory: native
+        run: cargo build --release --example speed_bench
+      - name: I/O speed benchmark (real JJThunder corpus, Anvil vs c-saves)
+        working-directory: native
+        run: |
+          ./target/release/examples/speed_bench ../bench-corpus/dim 3 2 2>/dev/null | tee speed_bench.txt
+          cat speed_bench.txt
+      - name: record all stall points (latency percentiles + per-stage breakdown)
+        working-directory: native
+        run: |
+          grep -E "^SPEED" speed_bench.txt | tee speed_stalls.txt
+      - name: gates — verify clean + throughput/latency floors
+        working-directory: native
+        run: |
+          set -e
+          BADS=$(grep -oE "verify-[a-z]+: ok=[0-9]+ bad=[0-9]+" speed_bench.txt | grep -oE "bad=[0-9]+" | cut -d= -f2)
+          for b in $BADS; do [ "$b" = "0" ] || { echo "FAIL: semantic verify bad=$b"; exit 1; }; done
+          mbps() { grep "$1" speed_bench.txt | grep -oE "MB/s=[0-9.]+" | head -1 | cut -d= -f2; }
+          us() { grep "$1" speed_bench.txt | grep -oE "p50=[0-9.]+" | head -1 | cut -d= -f2; }
+          AREAD=$(mbps "anvil-read-region");       CREAD=$(mbps "csaves-read-warm-region")
+          AWR_E=$(mbps "anvil-write-entities");    CWR_E=$(mbps "csaves-write-steady-entities")
+          CIMP=$(mbps "csaves-import-region");     CWR=$(mbps "csaves-write-steady-region")
+          RP50=$(us "csaves-read-warm-region")
+          echo "anvil-read=${AREAD} csaves-read=${CREAD} csaves-import-region=${CIMP} csaves-write-region=${CWR} anvil-write-ent=${AWR_E} csaves-write-ent=${CWR_E} read-p50=${RP50}us"
+          awk -v r="$CIMP"  'BEGIN { if (r+0 < 25)  { print "FAIL: region import " r " MB/s < 25"; exit 1 } }'
+          awk -v r="$CWR"   'BEGIN { if (r+0 < 30)  { print "FAIL: region steady write " r " MB/s < 30"; exit 1 } }'
+          awk -v r="$CREAD" 'BEGIN { if (r+0 < 250) { print "FAIL: region warm read " r " MB/s < 250"; exit 1 } }'
+          awk -v r="$RP50"  'BEGIN { if (r+0 > 40)  { print "FAIL: read p50 " r "us > 40us"; exit 1 } }'
+          awk -v c="$CWR_E" -v a="$AWR_E" 'BEGIN { if (c+0 < a*4) { print "FAIL: entity write " c " MB/s < 4x anvil " a; exit 1 } }'
+          echo "speed gates OK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speed-bench-results
+          path: |
+            native/speed_bench.txt
+            native/speed_stalls.txt

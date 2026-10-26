@@ -106,6 +106,7 @@ fn main() {
         if let chunknbt::Split::Split { sections, tail } = split {
             let mut bytes = Vec::with_capacity(sections.len());
             for (_, b) in sections {
+                let b = b.as_slice().to_vec();
                 if seen.insert(b.clone(), ()).is_none() {
                     raw_total += b.len() as u64;
                 }
