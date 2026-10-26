@@ -2125,7 +2125,7 @@ fn emit_tail_direct(tail: &[u8], sections: &[SecSrc], out: &mut Vec<u8>) -> Opti
                     p += n;
                     if raw.first() == Some(&HMAP_MAGIC) {
                         if let Some(longs) = hmap_decode(raw) {
-                            out.push(0x12);
+                            out.push(0x0C); // TAG_Long_Array (12)
                             out.extend_from_slice(&(inl as u16).to_be_bytes());
                             out.extend_from_slice(iname);
                             out.extend_from_slice(&(longs.len() as i32).to_be_bytes());
@@ -2559,7 +2559,11 @@ mod fused_tests {
                 Value::LongArray(fastnbt::LongArray::new(vec![7i64; 37])),
             )])),
         ]);
-        let tail = to_bytes(&tail_val);
+        // the real pipeline stores the tail AFTER tail_encode (heightmaps
+        // become dense 0xC6 arrays when the values fit) — exercise that path
+        let mut tail_enc = tail_val.clone();
+        tail_encode(&mut tail_enc);
+        let tail = to_bytes(&tail_enc);
         let sources: Vec<SecSrc> = sections_enc
             .iter()
             .map(|s| SecSrc { h: hash_of(s), b: s.as_slice() })
