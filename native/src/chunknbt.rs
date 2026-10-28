@@ -658,7 +658,10 @@ fn dense_unpack(b: &[u8], n: usize, bits: u32) -> Option<Vec<u8>> {
 }
 
 /// 1.16+ no-straddle packing (vanilla layout).
-fn pack_nostroddle(entries: &[u8], bits: u32) -> Vec<i64> {
+/// Pack a byte stream into vanilla no-straddle longs (entries per long =
+/// 64/bits, zero padding at the top). Public so sibling modules' tests can
+/// build vanilla-shaped data arrays.
+pub fn pack_nostroddle(entries: &[u8], bits: u32) -> Vec<i64> {
     let per = (64 / bits) as usize;
     entries
         .chunks(per)
@@ -1102,16 +1105,23 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             64 => 4usize,
             _ => 0,
         };
+        // RLE admission rule: the raw stream must be a BLOWOUT (4x smaller
+        // AND 32+ bytes saved). Raw length alone is a poor predictor of the
+        // final packed size — dense streams of neighboring sections align
+        // inside the slab zstd window and compress cross-section, while RLE
+        // streams compress only within themselves — so modest raw wins stay
+        // dense (without the margin the real JJThunder corpus regressed
+        // x2.83 -> x2.67). Deterministic => dedup-stable.
         let mut best_len = dense.len();
         let mut best: Option<(u8, Vec<u8>)> = None;
         if side != 0 {
             let ra = rle_encode_stream(&remapped);
-            if ra.len() < best_len {
+            if ra.len() * 4 <= dense.len() && ra.len() + 32 <= dense.len() {
                 best_len = ra.len();
                 best = Some((1, ra));
             }
             let rb = rle_encode_stream(&transpose_fast_y(&remapped, side));
-            if rb.len() < best_len {
+            if rb.len() * 4 <= dense.len() && rb.len() + 32 <= dense.len() && rb.len() < best_len {
                 best_len = rb.len();
                 best = Some((2, rb));
             }
@@ -1940,7 +1950,14 @@ fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
     // collect the variable-shape parts first: palette streams + their ranges
     // are parsed once, in stream order; emission happens in KEY order.
     // Returns the serialized NBT payload of the {data, palette} compound.
-    fn emit_pal_data(b: &[u8], p: &mut usize, entries: usize, has_data: bool, narrow: bool) -> Option<Vec<u8>> {
+    fn emit_pal_data(
+        b: &[u8],
+        p: &mut usize,
+        entries: usize,
+        has_data: bool,
+        narrow: bool,
+        order: u8,
+    ) -> Option<Vec<u8>> {
         let n = match b.get(*p..*p + 2) {
             Some(x) => u16::from_le_bytes(x.try_into().ok()?) as usize,
             None => {
@@ -1989,18 +2006,55 @@ fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
         pal.push(0x00); // compound terminator for {data, palette}
         // "data" sorts before "palette"
         if has_data {
-            let rbits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
-            let bytes = (entries * rbits as usize + 7) / 8;
-            let dense = match b.get(*p..*p + bytes) {
-                Some(d) => d,
-                None => {
-                    fdbg!("fused: data oob p={} bytes={} n={} narrow={} blen={}", p, bytes, n, narrow, b.len());
+            let out_bits = bits_for(n).max(4);
+            let longs: Vec<i64> = if order != 0 {
+                // RLE form (v0.6): expand (idx, run) pairs to the canonical
+                // voxel stream, transpose back for order 2, then pack to
+                // vanilla no-straddle longs directly.
+                if n > 256 {
                     return None;
                 }
+                let side = match entries {
+                    4096 => 16usize,
+                    64 => 4usize,
+                    _ => return None,
+                };
+                let mut v: Vec<u8> = Vec::with_capacity(entries);
+                while v.len() < entries {
+                    let idx = *b.get(*p)?;
+                    *p += 1;
+                    let run = read_uvarint(b, p)? as usize;
+                    if run == 0 || v.len() + run > entries {
+                        return None;
+                    }
+                    v.resize(v.len() + run, idx);
+                }
+                let v = if order == 2 {
+                    transpose_fast_y(&v, side)
+                } else {
+                    v
+                };
+                pack_nostroddle(&v, out_bits)
+            } else {
+                let rbits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+                let bytes = (entries * rbits as usize + 7) / 8;
+                let dense = match b.get(*p..*p + bytes) {
+                    Some(d) => d,
+                    None => {
+                        fdbg!(
+                            "fused: data oob p={} bytes={} n={} narrow={} blen={}",
+                            p,
+                            bytes,
+                            n,
+                            narrow,
+                            b.len()
+                        );
+                        return None;
+                    }
+                };
+                *p += bytes;
+                dense_to_nostroddle(dense, entries, rbits, out_bits)
             };
-            *p += bytes;
-            let out_bits = bits_for(n).max(4);
-            let longs = dense_to_nostroddle(dense, entries, rbits, out_bits);
             let mut data = Vec::with_capacity(8 + longs.len() * 8);
             data.extend_from_slice(b"\x0C\x00\x04data"); // TAG_Long_Array
             data.extend_from_slice(&(longs.len() as i32).to_be_bytes());
@@ -2020,13 +2074,15 @@ fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
 
     // parse block_states
     let bs_body = if f1 & 1 != 0 {
-        Some(emit_pal_data(b, &mut p, 4096, f1 & 2 != 0, f2 & 4 != 0)?)
+        let order = (f2 >> 4) & 3;
+        Some(emit_pal_data(b, &mut p, 4096, f1 & 2 != 0, f2 & 4 != 0, order)?)
     } else {
         None
     };
     // parse biomes
     let bio_body = if f1 & 4 != 0 {
-        Some(emit_pal_data(b, &mut p, 64, f1 & 8 != 0, f2 & 8 != 0)?)
+        let order = (f2 >> 6) & 3;
+        Some(emit_pal_data(b, &mut p, 64, f1 & 8 != 0, f2 & 8 != 0, order)?)
     } else {
         None
     };
@@ -2708,6 +2764,51 @@ mod fused_tests {
     }
 
     #[test]
+    fn fused_rle_band_section() {
+        // RLE-admitted strata band: the fused emitter must expand the run
+        // stream (order 1) and emit the vanilla-width LongArray directly.
+        let sec = compound(vec![
+            ("Y", Value::Byte(7)),
+            (
+                "block_states",
+                compound(vec![
+                    (
+                        "palette",
+                        Value::List(vec![
+                            compound(vec![("Name", Value::String("minecraft:stone".into()))]),
+                            compound(vec![("Name", Value::String("minecraft:deepslate".into()))]),
+                            compound(vec![("Name", Value::String("minecraft:air".into()))]),
+                        ]),
+                    ),
+                    (
+                        "data",
+                        Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(
+                            &(0..4096)
+                                .map(|i| if i < 2048 { 0u8 } else { 1u8 })
+                                .collect::<Vec<u8>>(),
+                            2,
+                        ))),
+                    ),
+                ]),
+            ),
+        ]);
+        let enc = section_encode(&sec).expect("encode");
+        // the admission rule must actually pick RLE for this shape:
+        // dense 2-bit stream is 512B, the run stream is ~6B (blowout)
+        assert_eq!((enc[2] >> 4) & 3, 1, "band section must take vanilla-order RLE");
+        let mut out = Vec::new();
+        let r = section_emit_csec3(&enc, &mut out);
+        if r.is_none() {
+            panic!("fused emit failed on RLE section; enc={:02x?}", enc);
+        }
+        let full = named_sec(&out);
+        let v: Value = fastnbt::from_bytes(&full).expect("parse emitted NBT");
+        let Value::Compound(m) = v else { panic!() };
+        let Some(Value::List(l)) = m.get("sections") else { panic!() };
+        assert!(sections_semantically_equal(&l[0], &sec), "semantic mismatch");
+    }
+
+    #[test]
     fn fused_join_synthetic_chunk() {
         // full chunk: tail keys + sections -> join_fused must equal legacy join
         let mut sections_enc: Vec<Vec<u8>> = Vec::new();
@@ -2895,7 +2996,7 @@ mod tests {
             .collect();
         bs.insert(
             "data".to_string(),
-            Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(&entries, 2))),
+            Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(&entries, 1))),
         );
         sec.insert("block_states".to_string(), Value::Compound(bs));
         let v = Value::Compound(sec);
@@ -2934,8 +3035,10 @@ mod tests {
 
     #[test]
     fn rle_biomes_roundtrip() {
-        // Biome split at the y boundary: 64 entries, first 32 one biome.
-        // Exercises the biome RLE flag slot (f2 bits 6-7).
+        // Biome split at the y boundary: 64 entries. The 8-byte dense stream
+        // stays dense (tiny streams keep the alignment-friendly form); the
+        // test validates the biome palette/data round-trip through the new
+        // flag handling either way.
         let mut sec: Map<String, Value> = Map::new();
         sec.insert("Y".to_string(), Value::Byte(1));
         let mut bm: Map<String, Value> = Map::new();

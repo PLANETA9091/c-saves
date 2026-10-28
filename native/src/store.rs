@@ -477,6 +477,35 @@ impl Recipe {
                 let tail = parse_tail(&mut p)?;
                 Some(Recipe { whole: None, sections, tail, ..EMPTY })
             }
+            6 => {
+                // mode 6: run-length over the mode-2 delta-id stream —
+                // (zigzag delta, run count) pairs. Extreme-height worlds have
+                // long Y-runs of the same uniform section hash, so ~131 refs
+                // collapse to a dozen pairs.
+                let n = *b.get(p)? as usize;
+                p += 1;
+                let mut sections = Vec::with_capacity(n.min(255));
+                let mut prev: i64 = 0;
+                let mut total = 0usize;
+                while total < n {
+                    let d = unzigzag(get_u64(b, &mut p)?);
+                    let run = get_u64(b, &mut p)? as usize;
+                    if run == 0 || total + run > n {
+                        return None;
+                    }
+                    prev += d;
+                    let h = match id2h.get(&(prev as u32)) {
+                        Some(h) => *h,
+                        None => return None,
+                    };
+                    for _ in 0..run {
+                        sections.push(h);
+                    }
+                    total += run;
+                }
+                let tail = parse_tail(&mut p)?;
+                Some(Recipe { whole: None, sections, tail, ..EMPTY })
+            }
             _ => None,
         }
     }
@@ -529,14 +558,40 @@ impl Recipe {
         let can_id = ids.is_some();
         match (can_id, ids, &self.tail) {
             (true, Some(ids), tail) => {
-                v.push(2u8);
-                v.push(self.sections.len() as u8);
+                // mode 2: zigzag-delta id per section
+                let mut m2 = Vec::with_capacity(2 + ids.len() * 2 + 16);
+                m2.push(2u8);
+                m2.push(self.sections.len() as u8);
                 let mut prev: i64 = 0;
                 for id in &ids {
-                    put_u64(&mut v, zigzag(*id as i64 - prev));
+                    put_u64(&mut m2, zigzag(*id as i64 - prev));
                     prev = *id as i64;
                 }
-                push_tail(&mut v, tail, id_of);
+                push_tail(&mut m2, tail, id_of);
+                // mode 6: run-length encode the same stream (repeated id =>
+                // (delta, run) pairs). Smaller wins, deterministic.
+                let mut m6 = Vec::with_capacity(2 + ids.len() / 2 + 16);
+                m6.push(6u8);
+                m6.push(self.sections.len() as u8);
+                let mut prev: i64 = 0;
+                let mut i = 0usize;
+                while i < ids.len() {
+                    let d = ids[i] as i64 - prev;
+                    let mut run = 1usize;
+                    while i + run < ids.len() && ids[i + run] == ids[i] {
+                        run += 1;
+                    }
+                    put_u64(&mut m6, zigzag(d));
+                    put_u64(&mut m6, run as u64);
+                    prev = ids[i] as i64;
+                    i += run;
+                }
+                push_tail(&mut m6, tail, id_of);
+                if m6.len() < m2.len() {
+                    v.extend_from_slice(&m6);
+                } else {
+                    v.extend_from_slice(&m2);
+                }
             }
             _ => {
                 v.push(4u8);
@@ -3288,6 +3343,69 @@ pub mod tests {
         eprintln!("persist: logical {:.1} KB, disk {:.1} KB (ratio {:.2})",
             logical as f64 / 1024.0, disk as f64 / 1024.0, disk as f64 / logical as f64);
         assert!(disk < logical, "container must be smaller than logical payload");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// JJThunder-style extreme-height chunk: 131 sections dominated by long
+    /// Y-runs of identical uniform sections. Exercises recipe mode 6 (RLE
+    /// over the delta-id stream) through write, read, reopen-scan and read.
+    #[test]
+    fn recipe_mode6_rle_tall_chunk_roundtrip() {
+        let dir = temp_dir("mode6");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+
+        let uniform_section = |y: i8, block: &str| -> Value {
+            let mut sec: std::collections::HashMap<String, Value> = Default::default();
+            sec.insert("Y".to_string(), Value::Byte(y));
+            let mut bs: std::collections::HashMap<String, Value> = Default::default();
+            bs.insert(
+                "palette".to_string(),
+                Value::List(vec![Value::String(block.to_string())]),
+            );
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            Value::Compound(sec)
+        };
+        let mut root: std::collections::HashMap<String, Value> = Default::default();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut sec_list = Vec::new();
+        // y -32..-29: stone boundary sections with data; -28..71: air runs
+        for y in -32..-28i32 {
+            let mut sec: std::collections::HashMap<String, Value> = Default::default();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: std::collections::HashMap<String, Value> = Default::default();
+            // unequal counts keep the frequency-canonical palette order equal
+            // to the source order, so raw NBT equality holds after decode
+            let entries: Vec<u8> = (0..4096).map(|i| if i < 1024 { 1u8 } else { 0u8 }).collect();
+            bs.insert(
+                "palette".to_string(),
+                Value::List(vec![
+                    Value::String("minecraft:stone".to_string()),
+                    Value::String("minecraft:deepslate".to_string()),
+                ]),
+            );
+            bs.insert(
+                "data".to_string(),
+                Value::LongArray(fastnbt::LongArray::new(crate::chunknbt::pack_nostroddle(&entries, 1))),
+            );
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        for y in -28..100i32 {
+            let block = if y < 60 { "minecraft:air" } else { "minecraft:cave_air" };
+            sec_list.push(uniform_section(y as i8, block));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        let payload = fastnbt::to_bytes(&Value::Compound(root)).unwrap();
+
+        st.write_chunk(key(9, -9), &payload, false).unwrap();
+        let got = st.read_chunk(key(9, -9)).expect("read");
+        assert!(semantic(&got, &payload), "mode-6 tall chunk mismatch");
+        st.sync();
+        drop(st);
+        let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        assert_eq!(st2.chunk_count(), 1, "reopen must scan the mode-6 recipe");
+        let got2 = st2.read_chunk(key(9, -9)).expect("read after reopen");
+        assert!(semantic(&got2, &payload), "mode-6 tall chunk mismatch after reopen");
         let _ = fs::remove_dir_all(&dir);
     }
 
