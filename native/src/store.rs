@@ -567,7 +567,7 @@ impl Recipe {
                     put_u64(&mut m2, zigzag(*id as i64 - prev));
                     prev = *id as i64;
                 }
-                push_tail(&mut m2, tail, id_of);
+                push_tail(&mut m2, tail, &id_of);
                 // mode 6: run-length encode the same stream (repeated id =>
                 // (delta, run) pairs). Smaller wins, deterministic.
                 let mut m6 = Vec::with_capacity(2 + ids.len() / 2 + 16);
@@ -586,7 +586,7 @@ impl Recipe {
                     prev = ids[i] as i64;
                     i += run;
                 }
-                push_tail(&mut m6, tail, id_of);
+                push_tail(&mut m6, tail, &id_of);
                 if m6.len() < m2.len() {
                     v.extend_from_slice(&m6);
                 } else {

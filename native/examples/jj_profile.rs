@@ -404,6 +404,116 @@ fn main() {
         println!("{n:26} raw {raw:>10} -> z19 {comp:>9} (x{:.2})", *raw as f64 / (*comp).max(1) as f64);
     }
 
+    // ---- phase D: delta potential (v0.7 feasibility) ----
+    // The remaining slab bytes live in NEAR-duplicate sections (mountain
+    // strata boundaries shifted by +-1). This phase quantifies what a
+    // pack-time similarity-delta pass could save: group unique sections by
+    // canonical palette, diff each member against its group's base stream.
+    println!("\n-- delta potential (unique non-uniform sections) --");
+    {
+        use std::collections::HashMap as DMap;
+        let mut groups: DMap<u128, Vec<(u128, Vec<u8>, usize)>> = DMap::new();
+        let mut analyzed: std::collections::HashSet<u128> = Default::default();
+        for (_, _, p) in &region_chunks {
+            let Ok(v) = fastnbt::from_bytes::<Value>(p) else { continue };
+            let Value::Compound(m) = v else { continue };
+            let Some(Value::List(secs)) = m.get("sections") else { continue };
+            for s in secs {
+                let Some(enc) = c_saves::chunknbt::section_encode(s) else { continue };
+                if enc.first() != Some(&0xC7) {
+                    continue;
+                }
+                let h = c_saves::chunknbt::hash_of(&enc);
+                if !analyzed.insert(h) {
+                    continue;
+                }
+                let Some(dec) = c_saves::chunknbt::section_decode(&enc) else { continue };
+                let Value::Compound(dm) = dec else { continue };
+                let Some(Value::Compound(bs)) = dm.get("block_states") else { continue };
+                let Some(Value::List(pal)) = bs.get("palette") else { continue };
+                let n = pal.len();
+                if n == 0 || n > 256 {
+                    continue; // delta works on byte-index streams
+                }
+                let pal_bytes = fastnbt::to_bytes(&Value::List(pal.clone()));
+                let pal_hash = c_saves::chunknbt::hash_of(&pal_bytes);
+                // uniform streams cannot delta
+                let Some(Value::LongArray(la)) = bs.get("data") else { continue };
+                let bits = {
+                    let bf = {
+                        let mut b = 1u32;
+                        while (1usize << b) < n {
+                            b += 1;
+                        }
+                        b
+                    };
+                    b.max(4)
+                };
+                if la.as_ref().len() != (4096 + (64 / bits) as usize - 1) / (64 / bits) as usize {
+                    continue;
+                }
+                let stream = c_saves::chunknbt::unpack_nostroddle(la.as_ref(), 4096, bits);
+                let lo = *stream.iter().min().unwrap_or(&0);
+                let hi = *stream.iter().max().unwrap_or(&0);
+                if lo == hi {
+                    continue;
+                }
+                groups.entry(pal_hash).or_default().push((h, stream, enc.len()));
+            }
+        }
+        let mut covered = 0usize;
+        let mut bytes_now = 0u64;
+        let mut bytes_after = 0u64;
+        let mut best_groups: Vec<(usize, u64, u64)> = Vec::new();
+        for g in groups.values() {
+            if g.len() < 2 {
+                continue;
+            }
+            let (bh, bstream, _) = &g[0];
+            let mut g_now = 0u64;
+            let mut g_after = 0u64;
+            let mut g_n = 0usize;
+            for (h, st, cl) in g.iter().skip(1) {
+                if h == bh {
+                    continue;
+                }
+                let diff = bstream.iter().zip(st.iter()).filter(|(a, b)| a != b).count();
+                // delta record ~= palette prefix (20% of csec) + 2B per diff + header
+                let cost = (*cl as u64) / 5 + diff as u64 * 2 + 8;
+                g_n += 1;
+                g_now += *cl as u64;
+                g_after += cost.min(*cl as u64);
+            }
+            if g_n > 0 {
+                covered += g_n;
+                bytes_now += g_now;
+                bytes_after += g_after;
+                best_groups.push((g_n, g_now, g_after));
+            }
+        }
+        best_groups.sort_by(|a, b| (b.1 - b.2).cmp(&(a.1 - a.2)));
+        println!(
+            "delta candidates: {} members in multi-member palette groups",
+            covered
+        );
+        println!(
+            "delta potential: {} B -> {} B (x{:.2}, saving {:.1} KB)",
+            bytes_now,
+            bytes_after,
+            bytes_now as f64 / bytes_after.max(1) as f64,
+            (bytes_now - bytes_after) as f64 / 1024.0
+        );
+        for (i, (n, now, after)) in best_groups.iter().take(5).enumerate() {
+            println!(
+                "  top{}: {} members, {} -> {} B",
+                i + 1,
+                n,
+                now,
+                after
+            );
+        }
+    }
+
     // ---- phase I: production pipeline ----
     println!("\n-- import through production pipeline --");
     let cfg = Cfg {

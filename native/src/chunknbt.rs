@@ -809,7 +809,9 @@ fn nostroddle_to_dense(longs: &[i64], n: usize, bits: u32) -> Vec<u8> {
     out
 }
 
-fn unpack_nostroddle(longs: &[i64], n: usize, bits: u32) -> Vec<u8> {
+/// Unpack vanilla no-straddle longs into a byte-per-entry stream. Public so
+/// the profiler can build canonical voxel streams for delta-potential analysis.
+pub fn unpack_nostroddle(longs: &[i64], n: usize, bits: u32) -> Vec<u8> {
     let per = (64 / bits) as usize;
     let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let mut out = Vec::with_capacity(n);
