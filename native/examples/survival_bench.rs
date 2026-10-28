@@ -233,11 +233,13 @@ fn build_section(
                     // nibble packing: (y*256+z*16+x), low nibble = even x
                     let i = (dy as usize) * 256 + z * 16 + x;
                     let byte = i >> 1;
-                    if x % 2 == 0 {
-                        arr[byte] = (arr[byte] & 0xF0) | (v as u8 & 0x0F) as i8;
+                    let cur = arr[byte] as u8;
+                    let nv = if x % 2 == 0 {
+                        (cur & 0xF0) | (v as u8 & 0x0F)
                     } else {
-                        arr[byte] = ((arr[byte] as u8 & 0x0F) | ((v as u8 & 0x0F) << 4)) as i8;
-                    }
+                        (cur & 0x0F) | ((v as u8 & 0x0F) << 4)
+                    };
+                    arr[byte] = nv as i8;
                 }
             }
         }
