@@ -29,7 +29,7 @@ fn mib(b: u64) -> f64 {
 
 /// Deterministic 2D value noise in [0,1).
 fn noise2(x: i32, z: i32, seed: u64) -> f64 {
-    let mut h = x as u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ z as u64.wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ seed.wrapping_mul(0x1656_67B1_9E37_79F9);
+    let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (z as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ seed.wrapping_mul(0x1656_67B1_9E37_79F9);
     h ^= h >> 33;
     h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     h ^= h >> 33;
