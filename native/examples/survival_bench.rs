@@ -343,8 +343,8 @@ fn build_chunk(cx: i32, cz: i32) -> Vec<u8> {
     // block entities: ~2 chests per chunk near the surface
     let mut be = Vec::new();
     for k in 0..2u64 {
-        let x = cx * 16 + (hash3(cx, k, cz, 0x11) % 16) as i32;
-        let z = cz * 16 + (hash3(cx, k + 7, cz, 0x12) % 16) as i32;
+        let x = cx * 16 + (hash3(cx, k as i32, cz, 0x11) % 16) as i32;
+        let z = cz * 16 + (hash3(cx, (k + 7) as i32, cz, 0x12) % 16) as i32;
         let y = surface[(z.rem_euclid(16) * 16 + x.rem_euclid(16)) as usize];
         be.push(chest_block_entity(x, y, z, 0x13 + k));
     }
