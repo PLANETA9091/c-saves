@@ -547,11 +547,18 @@ fn main() {
     let store_dir_e = out_dir.join("store-entities");
     let _ = std::fs::remove_dir_all(&store_dir_e);
     let es = Store::open_cfg(&store_dir_e, true, bench_cfg()).unwrap();
+    // mirror the production entity-store setup (jj_profile): whole-mode,
+    // no shared dictionary, sealed before the pack pass
+    es.set_whole_mode();
     for (cx, cz, p) in &entity_chunks {
         es.write_chunk(key(*cx, *cz), p, true).unwrap();
     }
     rs.sync();
     es.sync();
+    rs.train_dict_if_needed();
+    es.train_dict_if_needed();
+    rs.seal();
+    es.seal();
     // force the pack pass (slab batching + cold tier) the way the production
     // maintenance loop does after imports — the corpus is below the
     // auto-pack watermark, so without this the blobs stay unpacked
