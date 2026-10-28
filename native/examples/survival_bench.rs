@@ -505,8 +505,13 @@ fn main() {
                 }
             }
         }
-        if let Some(bes) = m.get("block_entities") {
-            let b = fastnbt::to_bytes(bes).unwrap_or_default().len() as u64;
+        if let Some(Value::List(bes)) = m.get("block_entities") {
+            // NB: fastnbt requires a compound NBT root, so serialize each
+            // block entity separately (a bare List root is an error)
+            let b: u64 = bes
+                .iter()
+                .map(|be| fastnbt::to_bytes(be).map(|x| x.len()).unwrap_or(0) as u64)
+                .sum();
             *comp_weights.entry("block_entities").or_insert(0) += b;
         }
         if let Some(hm) = m.get("Heightmaps") {
@@ -547,6 +552,11 @@ fn main() {
     }
     rs.sync();
     es.sync();
+    // force the pack pass (slab batching + cold tier) the way the production
+    // maintenance loop does after imports — the corpus is below the
+    // auto-pack watermark, so without this the blobs stay unpacked
+    rs.request_pack();
+    es.request_pack();
     // pack + cold tier (background pass equivalence)
     loop {
         let a = rs.compact_step();
