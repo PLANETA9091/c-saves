@@ -435,7 +435,7 @@ fn main() {
                 if n == 0 || n > 256 {
                     continue; // delta works on byte-index streams
                 }
-                let pal_bytes = fastnbt::to_bytes(&Value::List(pal.clone()));
+                let pal_bytes = fastnbt::to_bytes(&Value::List(pal.clone())).unwrap_or_default();
                 let pal_hash = c_saves::chunknbt::hash_of(&pal_bytes);
                 // uniform streams cannot delta
                 let Some(Value::LongArray(la)) = bs.get("data") else { continue };
@@ -447,7 +447,7 @@ fn main() {
                         }
                         b
                     };
-                    b.max(4)
+                    bf.max(4)
                 };
                 if la.as_ref().len() != (4096 + (64 / bits) as usize - 1) / (64 / bits) as usize {
                     continue;
