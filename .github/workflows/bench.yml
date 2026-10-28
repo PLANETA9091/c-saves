@@ -79,6 +79,39 @@ jobs:
           name: jj-bench-results
           path: native/jj_bench.txt
 
+  survival-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build survival bench
+        working-directory: native
+        run: cargo build --release --example survival_bench
+      - name: realistic survival-world size bench (32x32 chunks, skylight + chests + farms)
+        working-directory: native
+        run: |
+          ./target/release/examples/survival_bench 16 12 2>&1 | tee survival_bench.txt
+          cat survival_bench.txt
+      - name: record size/stall summary
+        working-directory: native
+        run: grep -E "import\+pack|TOTAL|region :|entities:|verify|profile|enc-modes|weights" survival_bench.txt | tee survival_stalls.txt
+      - name: gate — verify clean + survival-world size floor
+        working-directory: native
+        run: |
+          grep -q "verify: ok=" survival_bench.txt || { echo "FAIL: no verify line"; exit 1; }
+          BAD=$(grep "verify:" survival_bench.txt | grep -o "bad=[0-9]*" | head -1 | cut -d= -f2)
+          [ "$BAD" = "0" ] || { echo "FAIL: semantic verification bad=$BAD"; exit 1; }
+          RATIO=$(grep "^TOTAL" survival_bench.txt | grep -o "x[0-9.]* smaller" | grep -o "[0-9.]*")
+          echo "survival corpus: ${RATIO}x smaller than Anvil"
+          awk -v r="$RATIO" 'BEGIN { if (r+0 < 3.0) { print "FAIL: ratio below 3.0x"; exit 1 } print "OK" }'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: survival-bench-results
+          path: |
+            native/survival_bench.txt
+            native/survival_stalls.txt
+
   speed-bench:
     runs-on: ubuntu-latest
     timeout-minutes: 20
