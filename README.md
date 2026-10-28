@@ -6,6 +6,24 @@ over Paper 26.x chunk IO. Worlds stay 100% byte-semantically compatible
 is radically smaller, and reads/writes stay off the server thread's critical
 path (background pack passes, bounded slab cache).
 
+## v0.6.0 (WIP, profiling-driven): section RLE forms
+
+Profiling the real JJThunder corpus showed the remaining region bytes live in
+NON-uniform terrain sections (strata boundaries, cliffs, caves). v0.6.0 adds
+two content-deterministic RLE forms next to the dense stream:
+
+* vanilla order RLE — the voxel stream has x fastest / y slowest, so
+  horizontal strata planes are contiguous: a 2048-byte 2-bit dense section
+  with two strata bands becomes ~6 raw bytes;
+* y-fast transposed RLE — one column per run, collapsing vertical walls and
+  per-column boundaries.
+
+The smallest of {dense, RLE, RLE-transposed} wins; the choice is a pure
+function of content, so dedup hashes stay stable. Noise sections (gravel
+patches, cheese caves) keep the dense form. Flag slot: CSEC3 f2 bits 4-5
+(block_states) / 6-7 (biomes); legacy v3 streams decode unchanged. Section
+slabs grew 2 MiB -> 4 MiB (longer zstd windows, same 32 MiB cache budget).
+
 ## Headline numbers (real JJThunder To The Max worlds)
 
 Large world slice — 5,108 real mountain chunks (599,984 sections,

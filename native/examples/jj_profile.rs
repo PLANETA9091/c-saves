@@ -475,6 +475,7 @@ fn main() {
     println!("region profile: {}", rs.profile_json());
     println!("entity profile: {}", es.profile_json());
     println!("entity blob histogram: {}", es.blob_histogram_json());
+    println!("region enc-modes: {}", c_saves::chunknbt::enc_mode_stats());
 
     // ---- phase V: verification (semantic equality, all chunks) ----
     // canonical section re-encoding permutes palette order (semantically

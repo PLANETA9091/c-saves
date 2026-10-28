@@ -77,7 +77,9 @@ pub struct Cfg {
     pub tail_blob_min: usize,
     /// Blobs with raw size <= this become slab members at compaction.
     pub slab_max_member: u32,
-    /// Target decompressed size of one slab record.
+    /// Target decompressed size of one slab record. Bigger frames = longer
+    /// zstd windows; 4 MiB section slabs roughly halve window-boundary losses
+    /// vs 2 MiB at unchanged cache budget (8 hot slabs in 32 MiB).
     pub slab_max_raw: usize,
     /// Target decompressed size of one whole-mode (entity/POI) slab record.
     /// Bigger frames = longer zstd windows = closer to the concatenated
@@ -105,7 +107,7 @@ impl Default for Cfg {
             dict_train: 200,
             tail_blob_min: 512,
             slab_max_member: 64 * 1024,
-            slab_max_raw: 2 * 1024 * 1024,
+            slab_max_raw: 4 * 1024 * 1024,
             slab_max_raw_whole: 4 * 1024 * 1024,
             slab_cache: 32 * 1024 * 1024,
         }
@@ -177,7 +179,7 @@ impl Cfg {
             dict_train: env_parse("CSAVES_DICT_TRAIN_BLOBS", 200),
             tail_blob_min: env_parse("CSAVES_TAIL_BLOB_MIN", 512),
             slab_max_member: env_parse("CSAVES_SLAB_MAX_MEMBER", 64 * 1024),
-            slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 2 * 1024 * 1024),
+            slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 4 * 1024 * 1024),
             slab_max_raw_whole: env_parse("CSAVES_SLAB_MAX_RAW_WHOLE", 4 * 1024 * 1024),
             slab_cache: env_parse("CSAVES_SLAB_CACHE", 32 * 1024 * 1024),
         }

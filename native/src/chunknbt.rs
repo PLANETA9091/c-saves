@@ -375,6 +375,97 @@ fn dense_unpack_wide(b: &[u8], n: usize, bits: u32) -> Option<Vec<u16>> {
     Some(out)
 }
 
+// ------------------------------------------------------ section RLE ------
+
+/// Encode-form counters (pure functions of content, so they are stable and
+/// profile-safe). Exposed via `enc_mode_stats` and printed by the profilers:
+/// they answer "which form won and where the remaining bytes live".
+pub static ST_ENC_DENSE: AtomicU64 = AtomicU64::new(0);
+pub static ST_ENC_RLE_VAN: AtomicU64 = AtomicU64::new(0);
+pub static ST_ENC_RLE_COL: AtomicU64 = AtomicU64::new(0);
+pub static ST_ENC_DENSE_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static ST_ENC_RLE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// One-line JSON summary of the encode-form counters.
+pub fn enc_mode_stats() -> String {
+    let d = ST_ENC_DENSE.load(Ordering::Relaxed);
+    let rv = ST_ENC_RLE_VAN.load(Ordering::Relaxed);
+    let rc = ST_ENC_RLE_COL.load(Ordering::Relaxed);
+    let db = ST_ENC_DENSE_BYTES.load(Ordering::Relaxed);
+    let rb = ST_ENC_RLE_BYTES.load(Ordering::Relaxed);
+    format!(
+        r#"{{"dense":{},"rle_van":{},"rle_col":{},"dense_bytes":{},"rle_bytes":{}}}"#,
+        d, rv, rc, db, rb
+    )
+}
+
+fn push_uvarint(out: &mut Vec<u8>, mut x: u64) {
+    loop {
+        let b = (x & 0x7f) as u8;
+        x >>= 7;
+        if x == 0 {
+            out.push(b);
+            break;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn read_uvarint(b: &[u8], p: &mut usize) -> Option<u64> {
+    let mut z = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *b.get(*p)?;
+        *p += 1;
+        z |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(z);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+/// RLE a canonical index stream as [idx u8][varint run] pairs. The vanilla
+/// voxel order has x fastest / y slowest, so horizontal strata planes are
+/// contiguous — one run per plane. Returns the raw stream; the caller
+/// compares its length against the dense candidate and picks the smaller.
+fn rle_encode_stream(v: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() / 4 + 16);
+    let mut i = 0usize;
+    while i < v.len() {
+        let idx = v[i];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == idx {
+            run += 1;
+        }
+        out.push(idx);
+        push_uvarint(&mut out, run as u64);
+        i += run;
+    }
+    out
+}
+
+/// Transpose a section index stream so y varies fastest (column-major):
+/// vanilla i = y*S*S + z*S + x  ->  j = x*S*S + z*S + y. In this order one
+/// column's blocks are contiguous, so vertical patterns (walls, per-column
+/// boundaries) collapse into long runs. `side` is 16 (block_states) or 4
+/// (biomes).
+fn transpose_fast_y(v: &[u8], side: usize) -> Vec<u8> {
+    let s2 = side * side;
+    let mut out = vec![0u8; v.len()];
+    for y in 0..side {
+        for z in 0..side {
+            for x in 0..side {
+                out[x * s2 + z * side + y] = v[y * s2 + z * side + x];
+            }
+        }
+    }
+    out
+}
+
 /// Decode a v3 (0xC7) section.
 fn section_decode3(b: &[u8]) -> Option<Value> {
     let f1 = *b.get(1)?;
@@ -436,6 +527,7 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
         entries: usize,
         has_data: bool,
         narrow: bool,
+        order: u8,
     ) -> Option<Value> {
         let n = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
         *p += 2;
@@ -446,18 +538,51 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
         let mut bm: std::collections::HashMap<String, Value> = Default::default();
         bm.insert("palette".to_string(), Value::List(pal));
         if has_data {
-            // narrow mode: dense stream at ceillog2(n) (encode-side choice
-            // when that beats the vanilla 4-bit clamp); output is normalized
-            // back to the vanilla-clamped width either way.
-            let rbits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
-            let bytes = (entries * rbits as usize + 7) / 8;
-            let dense = b.get(*p..*p + bytes)?;
-            *p += bytes;
-            let v = if n > 256 {
-                let v = dense_unpack_wide(dense, entries, rbits)?;
-                v.iter().map(|x| *x as u8).collect::<Vec<u8>>()
+            let side = if entries == 4096 {
+                16usize
+            } else if entries == 64 {
+                4usize
             } else {
-                dense_unpack(dense, entries, rbits)?
+                0usize
+            };
+            // RLE form (v0.6): [idx u8][varint run] pairs over the canonical
+            // index stream, in vanilla order (1) or y-fast transposed (2).
+            // Legacy v3 streams carry zeros in the order bits -> dense path.
+            let v: Vec<u8> = if order != 0 {
+                if n > 256 || side == 0 {
+                    return None; // RLE uses byte indices; never emitted for wide palettes
+                }
+                let mut vv = Vec::with_capacity(entries);
+                while vv.len() < entries {
+                    let idx = *b.get(*p)?;
+                    *p += 1;
+                    let run = read_uvarint(b, p)? as usize;
+                    if run == 0 || vv.len() + run > entries {
+                        return None;
+                    }
+                    vv.resize(vv.len() + run, idx);
+                }
+                if order == 2 {
+                    transpose_fast_y(&vv, side)
+                } else {
+                    vv
+                }
+            } else {
+                // narrow mode: dense stream at ceillog2(n) (encode-side choice
+                // when that beats the vanilla 4-bit clamp); output is normalized
+                // back to the vanilla-clamped width either way.
+                let rbits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+                let bytes = (entries * rbits as usize + 7) / 8;
+                let dense = b.get(*p..*p + bytes)?;
+                *p += bytes;
+                if n > 256 {
+                    dense_unpack_wide(dense, entries, rbits)?
+                        .iter()
+                        .map(|x| *x as u8)
+                        .collect::<Vec<u8>>()
+                } else {
+                    dense_unpack(dense, entries, rbits)?
+                }
             };
             let out_bits = bits_for(n).max(4);
             let longs = pack_nostroddle(&v, out_bits);
@@ -470,11 +595,13 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
     }
 
     if f1 & 1 != 0 {
-        let bs = dec_pal_data(b, &mut p, 4096, f1 & 2 != 0, f2 & 4 != 0)?;
+        let order = (f2 >> 4) & 3;
+        let bs = dec_pal_data(b, &mut p, 4096, f1 & 2 != 0, f2 & 4 != 0, order)?;
         sec_map.insert("block_states".to_string(), bs);
     }
     if f1 & 4 != 0 {
-        let bs = dec_pal_data(b, &mut p, 64, f1 & 8 != 0, f2 & 8 != 0)?;
+        let order = (f2 >> 6) & 3;
+        let bs = dec_pal_data(b, &mut p, 64, f1 & 8 != 0, f2 & 8 != 0, order)?;
         sec_map.insert("biomes".to_string(), bs);
     }
     if f1 & 16 != 0 {
@@ -853,9 +980,16 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
 
     // The generic enc_pal_data above cannot recover the permutation after
     // sorting, so the real implementation works on (entry, old_index) pairs.
-    // Returns (has_data, narrow): narrow = dense stream packed at ceillog2(n)
-    // because that beats the vanilla 4-bit clamp (palettes under 16 entries).
-    fn enc_pal_data_canon(out: &mut Vec<u8>, bs: &Value, entries: usize) -> Option<(bool, bool)> {
+    // Returns (has_data, f2 flag bits): dense form sets `narrow_bit` when the
+    // stream is packed at ceillog2(n) (beats the vanilla 4-bit clamp for
+    // palettes under 16 entries); RLE forms set (order << order_shift).
+    fn enc_pal_data_canon(
+        out: &mut Vec<u8>,
+        bs: &Value,
+        entries: usize,
+        narrow_bit: u8,
+        order_shift: u32,
+    ) -> Option<(bool, u8)> {
         let Value::Compound(bm) = bs else { return None };
         let Value::List(pal) = bm.get("palette")? else { return None };
         let n = pal.len();
@@ -901,7 +1035,7 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
                 if n > 1 {
                     return None;
                 }
-                return Some((false, false));
+                return Some((false, 0));
             }
         };
         let in_bits = section_data_bits(n, entries, data.len());
@@ -917,18 +1051,13 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         let out_bits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
         // IDENTITY shortcut: the palette is already in canonical order and
         // the packing width is unchanged — the vanilla longs ARE the dense
-        // stream byte-for-byte (LE), so skip unpack/remap/pack entirely.
-        // This is the hot re-save path for chunks this engine wrote.
+        // stream byte-for-byte (LE). RLE candidates are still evaluated on
+        // the unpacked stream below, so the chosen form stays a pure
+        // function of content (dedup-stable across re-saves).
         let identity = !narrow
             && in_bits == out_bits
             && matches!(in_bits, 1 | 2 | 4 | 8 | 16 | 32)
             && ents.iter().enumerate().all(|(i, (_, old))| *old == i);
-        if identity {
-            for l in data.as_ref() {
-                out.extend_from_slice(&l.to_le_bytes());
-            }
-            return Some((true, false));
-        }
         let v = unpack_nostroddle(data, entries, in_bits);
         // remap old palette index -> canonical index
         let mut remap = vec![0u8; n];
@@ -936,7 +1065,8 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             remap[*old_i] = new_i as u8;
         }
         if n > 256 {
-            // wide palettes: remap table must be u16
+            // wide palettes: remap table must be u16; RLE (byte indices)
+            // does not apply — dense only.
             let mut remap16 = vec![0u16; n];
             for (new_i, (_, old_i)) in ents.iter().enumerate() {
                 remap16[*old_i] = new_i as u16;
@@ -947,32 +1077,79 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
                 w.put(*e as u64, out_bits);
             }
             out.extend_from_slice(&w.finish());
-        } else {
-            let remapped: Vec<u8> = v.iter().map(|x| remap[*x as usize]).collect();
-            out.extend_from_slice(&dense_pack(&remapped, out_bits));
+            ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
+            return Some((true, 0));
         }
-        Some((true, narrow))
+        let remapped: Vec<u8> = v.iter().map(|x| remap[*x as usize]).collect();
+        // Dense candidate (identity => the raw vanilla longs, memcpy'd —
+        // byte-identical to what dense_pack would produce).
+        let dense: Vec<u8> = if identity {
+            let mut d = Vec::with_capacity(data.as_ref().len() * 8);
+            for l in data.as_ref() {
+                d.extend_from_slice(&l.to_le_bytes());
+            }
+            d
+        } else {
+            dense_pack(&remapped, out_bits)
+        };
+        // RLE candidates (v0.6): vanilla order collapses horizontal strata
+        // planes into single runs; the y-fast transposed stream collapses
+        // columns / vertical walls. Strictly-smaller wins, ties break toward
+        // the earlier candidate — deterministic, so identical sections keep
+        // identical bytes and the dedup hashes stay stable.
+        let side = match entries {
+            4096 => 16usize,
+            64 => 4usize,
+            _ => 0,
+        };
+        let mut best_len = dense.len();
+        let mut best: Option<(u8, Vec<u8>)> = None;
+        if side != 0 {
+            let ra = rle_encode_stream(&remapped);
+            if ra.len() < best_len {
+                best_len = ra.len();
+                best = Some((1, ra));
+            }
+            let rb = rle_encode_stream(&transpose_fast_y(&remapped, side));
+            if rb.len() < best_len {
+                best_len = rb.len();
+                best = Some((2, rb));
+            }
+        }
+        match best {
+            None => {
+                out.extend_from_slice(&dense);
+                ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
+                ST_ENC_DENSE_BYTES.fetch_add(dense.len() as u64, Ordering::Relaxed);
+                Some((true, if narrow { narrow_bit } else { 0 }))
+            }
+            Some((ord, bytes)) => {
+                out.extend_from_slice(&bytes);
+                ST_ENC_RLE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                match ord {
+                    1 => ST_ENC_RLE_VAN.fetch_add(1, Ordering::Relaxed),
+                    _ => ST_ENC_RLE_COL.fetch_add(1, Ordering::Relaxed),
+                };
+                Some((true, ord << order_shift))
+            }
+        }
     }
 
     if let Some(bs) = m.get("block_states") {
-        let (has_data, narrow) = enc_pal_data_canon(&mut out, bs, 4096)?;
+        let (has_data, f2b) = enc_pal_data_canon(&mut out, bs, 4096, 4, 4)?;
         f1 |= 1;
         if has_data {
             f1 |= 2;
         }
-        if narrow {
-            f2 |= 4;
-        }
+        f2 |= f2b;
     }
     if let Some(bs) = m.get("biomes") {
-        let (has_data, narrow) = enc_pal_data_canon(&mut out, bs, 64)?;
+        let (has_data, f2b) = enc_pal_data_canon(&mut out, bs, 64, 8, 6)?;
         f1 |= 4;
         if has_data {
             f1 |= 8;
         }
-        if narrow {
-            f2 |= 8;
-        }
+        f2 |= f2b;
     }
     for (key, uni_bit, raw_bit, all) in [
         ("SkyLight", 16u8, 64u8, 0xffu8),
@@ -2668,6 +2845,115 @@ mod tests {
         let s = split(&payload, false, Some((3, 7))).unwrap();
         let Split::Split { sections, .. } = s else { panic!("empty list must still split") };
         assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn rle_strata_band_section() {
+        // Horizontal strata: vanilla order (x fastest, y slowest) puts 8 full
+        // stone planes then 8 air planes in the stream => two giant runs.
+        // RLE must win over the 512-byte dense 2-bit stream and round-trip.
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(9));
+        let mut bs: Map<String, Value> = Map::new();
+        let mut pal = Vec::new();
+        for n in ["minecraft:stone", "minecraft:air", "minecraft:diamond_ore"] {
+            pal.push(Value::String(n.to_string()));
+        }
+        bs.insert("palette".to_string(), Value::List(pal));
+        let entries: Vec<u8> = (0..4096).map(|i| if i < 2048 { 0u8 } else { 1u8 }).collect();
+        bs.insert(
+            "data".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(&entries, 2))),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let v = Value::Compound(sec);
+        let enc = section_encode(&v).unwrap();
+        let dec = section_decode(&enc).unwrap();
+        assert!(sections_semantically_equal(&v, &dec), "band section must round-trip");
+        assert!(enc.len() < 120, "band RLE should be tiny, got {}", enc.len());
+    }
+
+    #[test]
+    fn rle_terrace_section() {
+        // Terraced boundary: height depends on z only (8 planes below, a 4-plane
+        // step, air above). Vanilla-order RLE collapses every y-plane into 1-2
+        // runs (~20 runs total); must beat the 512-byte dense stream.
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(-2));
+        let mut bs: Map<String, Value> = Map::new();
+        let mut pal = Vec::new();
+        for n in ["minecraft:stone", "minecraft:air"] {
+            pal.push(Value::String(n.to_string()));
+        }
+        bs.insert("palette".to_string(), Value::List(pal));
+        let entries: Vec<u8> = (0..4096)
+            .map(|i| {
+                let z = (i >> 4) & 15;
+                let y = (i >> 8) & 15;
+                if (y as usize) < 8 + 4 * ((z as usize) / 8) { 0u8 } else { 1u8 }
+            })
+            .collect();
+        bs.insert(
+            "data".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(&entries, 2))),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let v = Value::Compound(sec);
+        let enc = section_encode(&v).unwrap();
+        let dec = section_decode(&enc).unwrap();
+        assert!(sections_semantically_equal(&v, &dec), "terrace section must round-trip");
+        assert!(enc.len() < 256, "terrace RLE should be small, got {}", enc.len());
+    }
+
+    #[test]
+    fn rle_deterministic_noise_prefers_dense() {
+        // Run-of-1 noise: RLE would explode (2 bytes per voxel); the dense
+        // form must win, and re-encoding must be byte-identical (dedup
+        // stability).
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(3));
+        let mut bs: Map<String, Value> = Map::new();
+        let mut pal = Vec::new();
+        for n in ["minecraft:stone", "minecraft:deepslate", "minecraft:gravel"] {
+            pal.push(Value::String(n.to_string()));
+        }
+        bs.insert("palette".to_string(), Value::List(pal));
+        let entries: Vec<u8> = (0..4096).map(|i| (i * 7 % 3) as u8).collect();
+        bs.insert(
+            "data".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(&entries, 2))),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let v = Value::Compound(sec);
+        let e1 = section_encode(&v).unwrap();
+        let e2 = section_encode(&v).unwrap();
+        assert_eq!(e1, e2, "encode must be content-deterministic");
+        let dec = section_decode(&e1).unwrap();
+        assert!(sections_semantically_equal(&v, &dec));
+    }
+
+    #[test]
+    fn rle_biomes_roundtrip() {
+        // Biome split at the y boundary: 64 entries, first 32 one biome.
+        // Exercises the biome RLE flag slot (f2 bits 6-7).
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(1));
+        let mut bm: Map<String, Value> = Map::new();
+        let mut pal = Vec::new();
+        for n in ["minecraft:plains", "minecraft:desert"] {
+            pal.push(Value::String(n.to_string()));
+        }
+        bm.insert("palette".to_string(), Value::List(pal));
+        let entries: Vec<u8> = (0..64).map(|i| if i < 32 { 0u8 } else { 1u8 }).collect();
+        bm.insert(
+            "data".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(&entries, 1))),
+        );
+        sec.insert("biomes".to_string(), Value::Compound(bm));
+        let v = Value::Compound(sec);
+        let enc = section_encode(&v).unwrap();
+        let dec = section_decode(&enc).unwrap();
+        assert!(sections_semantically_equal(&v, &dec), "biome RLE must round-trip");
     }
 }
 
