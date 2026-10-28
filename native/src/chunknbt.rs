@@ -1199,10 +1199,889 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Semantic equality for section compounds: block/biome palettes are pure
-/// lookup tables, so only the EXPANDED state vectors matter. Canonical
-/// re-encoding legitimately permutes palette order; use this instead of
-/// structural equality wherever decoded sections are compared.
+// ------------------------------------------------- shift-ref codec (v0.7) --
+
+/// Shift-ref section marker: a section whose block_states data equals a
+/// LOWER section of the SAME chunk shifted up by k planes, plus its top
+/// k planes stored explicitly. Profiling the real JJThunder corpus showed
+/// 96.3% of dense sections match this shape (mountain strata repeat
+/// vertically with smoothly varying surface heights) — the ref replaces a
+/// ~1.4 KB dense stream with ~15-30 bytes.
+const CSECS_MAGIC: u8 = 0xC9;
+
+pub static ST_ENC_SHIFT: AtomicU64 = AtomicU64::new(0);
+pub static ST_ENC_SHIFT_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_RESOLVED: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_SECS_OK: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_CAND: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_PLANE0: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_FULL: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_REJECT: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_KSUM: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_DENSE1ST: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_DENSE_NOMATCH: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_DENSE_MATCH: AtomicU64 = AtomicU64::new(0);
+
+/// Identity key bytes for one palette entry (order-free, canonical):
+/// [plain][name][0x00][k1=v1 0x1f k2=v2 ...]. Two entries are the same block
+/// state iff these bytes are equal.
+fn pal_entry_identity(v: &Value) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(32);
+    match v {
+        Value::String(s) => {
+            out.push(1u8);
+            out.extend_from_slice(s.as_bytes());
+        }
+        Value::Compound(cm) => {
+            let Value::String(name) = cm.get("Name")? else { return None };
+            out.push(0u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(0x00);
+            let mut props: Vec<(String, String)> = Vec::new();
+            match cm.get("Properties") {
+                Some(Value::Compound(pn)) => {
+                    for (k, kv) in pn {
+                        let Value::String(vv) = kv else { return None };
+                        props.push((k.clone(), vv.clone()));
+                    }
+                }
+                None => {}
+                _ => return None,
+            }
+            props.sort();
+            for (i, (k, vv)) in props.iter().enumerate() {
+                if i > 0 {
+                    out.push(0x1f);
+                }
+                out.extend_from_slice(k.as_bytes());
+                out.push(b'=');
+                out.extend_from_slice(vv.as_bytes());
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// put_entry-form bytes for one palette entry (the CSEC wire encoding,
+/// mirrored standalone so the shift pass can write extras without nesting).
+fn put_entry_standalone(v: &Value, out: &mut Vec<u8>) -> Option<()> {
+    match v {
+        Value::String(s) => {
+            let nb = s.as_bytes();
+            if nb.len() > 65535 {
+                return None;
+            }
+            out.push(0u8);
+            out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            out.extend_from_slice(nb);
+        }
+        Value::Compound(cm) => {
+            let Value::String(name) = cm.get("Name")? else { return None };
+            let nb = name.as_bytes();
+            let mut props: Vec<(String, String)> = Vec::new();
+            match cm.get("Properties") {
+                Some(Value::Compound(pn)) => {
+                    for (k, kv) in pn {
+                        let Value::String(vv) = kv else { return None };
+                        props.push((k.clone(), vv.clone()));
+                    }
+                }
+                None => {}
+                _ => return None,
+            }
+            props.sort();
+            if props.is_empty() {
+                out.push(1u8);
+            } else {
+                out.push(2u8);
+            }
+            if nb.len() > 65535 || props.len() > 255 {
+                return None;
+            }
+            out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            out.extend_from_slice(nb);
+            if !props.is_empty() {
+                out.push(props.len() as u8);
+            }
+            for (k, vv) in &props {
+                let kb = k.as_bytes();
+                let vb = vv.as_bytes();
+                if kb.len() > 65535 || vb.len() > 65535 {
+                    return None;
+                }
+                out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+                out.extend_from_slice(kb);
+                out.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+                out.extend_from_slice(vb);
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Inverse of put_entry (standalone): parse one palette entry.
+fn parse_entry_standalone(b: &[u8], p: &mut usize) -> Option<Value> {
+    let kind = *b.get(*p)?;
+    *p += 1;
+    let r16 = |p: &mut usize| -> Option<usize> {
+        let s = *p;
+        let v = u16::from_le_bytes(b.get(s..s + 2)?.try_into().ok()?) as usize;
+        *p += 2;
+        Some(v)
+    };
+    match kind {
+        0 => {
+            let n = r16(p)?;
+            let s = b.get(*p..*p + n)?.to_vec();
+            *p += n;
+            Some(Value::String(String::from_utf8(s).ok()?))
+        }
+        1 | 2 => {
+            let n = r16(p)?;
+            let name = String::from_utf8(b.get(*p..*p + n)?.to_vec()).ok()?;
+            *p += n;
+            let mut props: std::collections::HashMap<String, Value> = Default::default();
+            if kind == 2 {
+                let np = *b.get(*p)?;
+                *p += 1;
+                for _ in 0..np {
+                    let kn = r16(p)?;
+                    let k = String::from_utf8(b.get(*p..*p + kn)?.to_vec()).ok()?;
+                    *p += kn;
+                    let vn = r16(p)?;
+                    let v = String::from_utf8(b.get(*p..*p + vn)?.to_vec()).ok()?;
+                    *p += vn;
+                    props.insert(k, Value::String(v));
+                }
+            }
+            let mut cm: std::collections::HashMap<String, Value> = Default::default();
+            cm.insert("Name".to_string(), Value::String(name));
+            if kind == 2 {
+                cm.insert("Properties".to_string(), Value::Compound(props));
+            }
+            Some(Value::Compound(cm))
+        }
+        _ => None,
+    }
+}
+
+/// Unpack a vanilla no-straddle long array to u32 entries (handles wide
+/// palettes where canonical indices exceed u8).
+fn vanilla_unpack_wide(la: &[i64], n: usize, bits: u32) -> Vec<u32> {
+    let epl = (64 / bits) as usize;
+    let mut out = vec![0u32; n];
+    for (i, e) in out.iter_mut().enumerate() {
+        let l = la[i / epl] as u64;
+        let sh = (i % epl) as u32 * bits;
+        *e = ((l >> sh) & ((1u64 << bits) - 1)) as u32;
+    }
+    out
+}
+
+/// Pack u32 entries into a vanilla no-straddle long array (zero padding).
+fn vanilla_pack_wide(entries: &[u32], bits: u32) -> Vec<i64> {
+    let epl = (64 / bits) as usize;
+    let mut out = vec![0i64; entries.len().div_ceil(epl)];
+    for (i, &e) in entries.iter().enumerate() {
+        out[i / epl] |= (e as i64) << ((i % epl) as u32 * bits);
+    }
+    out
+}
+
+/// Per-section view used by the shift pass: identity vector (chunk-global
+/// block-state ids), original palette entry identity bytes, canonical order
+/// of the original palette (mirrors enc_pal_data_canon exactly).
+struct ShiftSec {
+    ident: Vec<u32>,
+    /// per-plane fingerprints of `ident` (cheap reject for shift matching)
+    plane_fp: [u64; 16],
+    /// canonical position (in the stored CSEC3 palette) of each original
+    /// palette index — ref-space mapping for targets
+    canon_of_orig: Vec<u32>,
+    /// chunk-global identity id of each ORIGINAL palette entry
+    id_of_orig: Vec<u32>,
+    n: usize,
+}
+/// Build the ShiftSec for one section Value (None = not usable).
+fn shift_sec_of(s: &Value, tab: &mut HashMap<Vec<u8>, u32>) -> Option<ShiftSec> {
+    let Value::Compound(m) = s else { return None };
+    let bs = m.get("block_states")?;
+    let Value::Compound(bm) = bs else { return None };
+    let Value::List(pal) = bm.get("palette")? else { return None };
+    let n = pal.len();
+    if n == 0 || n > 65535 {
+        return None;
+    }
+    let mut entry_id: Vec<u32> = Vec::with_capacity(n);
+    let mut id_of_orig = vec![0u32; n];
+    for (i, p) in pal.iter().enumerate() {
+        let key = pal_entry_identity(p)?;
+        let nid = tab.len() as u32;
+        let id = *tab.entry(key).or_insert(nid);
+        id_of_orig[i] = id;
+        entry_id.push(id);
+    }
+    let _ = entry_id;
+    let mut ident = vec![0u32; 4096];
+    match bm.get("data") {
+        Some(Value::LongArray(la)) => {
+            let bits = section_data_bits(n, 4096, la.as_ref().len());
+            let per = (64 / bits) as usize;
+            if la.as_ref().len() != (4096 + per - 1) / per {
+                return None;
+            }
+            for (i, v) in unpack_nostroddle(la.as_ref(), 4096, bits).into_iter().enumerate() {
+                let o = v as usize;
+                if o >= n {
+                    return None;
+                }
+                ident[i] = id_of_orig[o];
+            }
+        }
+        Some(_) => return None,
+        None => {
+            if n > 1 {
+                return None;
+            }
+            ident.iter_mut().for_each(|x| *x = id_of_orig[0]);
+        }
+    }
+    // canonical order of the original palette, mirroring enc_pal_data_canon:
+    // counts from the vanilla data (truncated u8 unpack, same as enc), sort
+    // by (count desc, (plain, name, props) asc).
+    let mut counts = vec![0u32; n];
+    if let Some(Value::LongArray(la)) = bm.get("data") {
+        let bits = section_data_bits(n, 4096, la.as_ref().len());
+        let per = (64 / bits) as usize;
+        if la.as_ref().len() == (4096 + per - 1) / per {
+            for v in unpack_nostroddle(la.as_ref(), 4096, bits) {
+                if (v as usize) < n {
+                    counts[v as usize] += 1;
+                }
+            }
+        }
+    }
+    // precompute sort keys to avoid borrows crossing the sort
+    let keys: Vec<(bool, String, Vec<(String, String)>)> = (0..n)
+        .map(|i| match &pal[i] {
+            Value::String(s) => (true, s.clone(), Vec::new()),
+            Value::Compound(cm) => {
+                let name = match cm.get("Name") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let mut ps: Vec<(String, String)> = match cm.get("Properties") {
+                    Some(Value::Compound(pn)) => pn
+                        .iter()
+                        .filter_map(|(k, kv)| match kv {
+                            Value::String(vv) => Some((k.clone(), vv.clone())),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                ps.sort();
+                (false, name, ps)
+            }
+            _ => (false, String::new(), Vec::new()),
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        counts[b]
+            .cmp(&counts[a])
+            .then_with(|| keys[a].cmp(&keys[b]))
+    });
+    let mut canon_of_orig = vec![0u32; n];
+    for (pos, &oi) in order.iter().enumerate() {
+        canon_of_orig[oi] = pos as u32;
+    }
+    let mut plane_fp = [0u64; 16];
+    for (py, fp) in plane_fp.iter_mut().enumerate() {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &x in &ident[py * 256..(py + 1) * 256] {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        *fp = h;
+    }
+    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
+}
+
+/// The shift pass: replace dense CSEC3 sections with shift refs where a
+/// lower section of this chunk contains them shifted by k planes. Runs on
+/// the freshly split section list (Values in `vals` are parallel to
+/// `sections`). Never fails: sections that do not qualify stay untouched.
+pub static ST_SHIFT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_TAIL_NS: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+
+fn shift_ref_pass(sections: &mut [(Hash, SecBytes)], vals: &[Value], cache_hit: &[bool]) {
+    let t_all = std::time::Instant::now();
+    const MAX_K: usize = 15;
+    const CANDIDATES: usize = 64;
+    const MIN_WIN: usize = 256; // at least one plane must match
+    let n_sec = sections.len().min(vals.len());
+    if n_sec < 2 {
+        return;
+    }
+    let mut tab: HashMap<Vec<u8>, u32> = HashMap::new();
+    // build ShiftSec once per DISTINCT section content (structural hash):
+    // chunks repeat the same section many times (uniform runs), and the
+    // unpack+canonical+fp work is pure content — never rebuild it.
+    // Sections with tiny members (uniform / RLE-collapsed) are excluded
+    // entirely: their matches can never clear the admission rule (the ref
+    // carries at least the header + tail the member already has), and they
+    // are the majority of distinct contents, so this cuts most build cost.
+    const MIN_MEMBER: usize = 512;
+    let mut meta_cache: HashMap<Hash, Arc<ShiftSec>> = HashMap::new();
+    let mut secs: Vec<Option<Arc<ShiftSec>>> = Vec::with_capacity(n_sec);
+    let mut is_ref: Vec<bool> = vec![false; n_sec];
+    for i in 0..n_sec {
+        let (csec3, mlen) = match &sections[i].1 {
+            SecBytes::Shared(a) => (a.first() == Some(&CSEC3_MAGIC), a.len()),
+            SecBytes::Owned(b) => (b.first() == Some(&CSEC3_MAGIC), b.len()),
+        };
+        let sec = if csec3 && mlen >= MIN_MEMBER {
+            match meta_cache.get(&sections[i].0) {
+                Some(a) => Some(a.clone()),
+                None => match shift_sec_of(&vals[i], &mut tab) {
+                    Some(ss) => {
+                        let a = Arc::new(ss);
+                        meta_cache.insert(sections[i].0, a.clone());
+                        Some(a)
+                    }
+                    None => None,
+                },
+            }
+        } else {
+            None
+        };
+        if sec.is_some() {
+            ST_SHIFT_SECS_OK.fetch_add(1, Ordering::Relaxed);
+        }
+        secs.push(sec);
+    }
+    let t_build = t_all.elapsed().as_nanos() as u64;
+    ST_SHIFT_BUILD_NS.fetch_add(t_build, Ordering::Relaxed);
+    for i in 0..n_sec {
+        if cache_hit.get(i).copied().unwrap_or(false) {
+            continue; // cross-chunk-shared content: full member dedups for free
+        }
+        let full_len = match &sections[i].1 {
+            SecBytes::Shared(a) => a.len(),
+            SecBytes::Owned(b) => b.len(),
+        };
+        if full_len < MIN_MEMBER {
+            continue; // tiny members cannot be beaten by a ref
+        }
+        let Some(ss) = &secs[i] else { continue };
+        // candidate targets: nearest previous full sections, deduped by
+        // content hash (repeated uniform sections would otherwise burn the
+        // candidate budget before the true dense target is reached).
+        // Selection is by SMALLEST ESTIMATED REF COST, not smallest k: a
+        // uniform target matching at k=1 stores k*256 top-plane entries at
+        // the section's palette width, which can dwarf a dense target's ref
+        // at larger k with a narrow top palette.
+        let mut best: Option<(u64, usize, usize)> = None; // (cost, k, j)
+        let mut seen_ids: HashMap<Hash, ()> = HashMap::new();
+        let mut seen = 0usize;
+        for j in (0..i).rev() {
+            if seen >= CANDIDATES {
+                break;
+            }
+            if is_ref[j] {
+                continue;
+            }
+            let Some(ts) = &secs[j] else { continue };
+            // strict content dedup: identical candidates give identical
+            // match results, so only distinct contents consume the budget
+            if seen_ids.insert(sections[j].0, ()).is_some() {
+                continue;
+            }
+            seen += 1;
+            for k in 1..=MAX_K {
+                let win = 4096 - k * 256;
+                if win < MIN_WIN {
+                    break;
+                }
+                ST_SHIFT_CAND.fetch_add(1, Ordering::Relaxed);
+                // fingerprint pre-filter: plane p of s must equal plane p+k
+                // of t for all p < 16-k; u64 compares reject ~ instantly
+                let planes = 16 - k;
+                if (0..planes).any(|py| ss.plane_fp[py] != ts.plane_fp[py + k]) {
+                    continue;
+                }
+                ST_SHIFT_PLANE0.fetch_add(1, Ordering::Relaxed);
+                if ss.ident[0..win] == ts.ident[k * 256..] {
+                    ST_SHIFT_FULL.fetch_add(1, Ordering::Relaxed);
+                    // estimated ref cost: header + top planes at the target
+                    // palette width (extras are rare and add a small term)
+                    let cost = 11u64
+                        + ((k * 256) as u64 * bits_for(ts.n) as u64).div_ceil(8);
+                    if best.map(|(bc, _, _)| cost < bc).unwrap_or(true) {
+                        best = Some((cost, k, j));
+                    }
+                    break;
+                }
+            }
+        }
+        let Some((_, k, j)) = best else {
+            if full_len > 1000 {
+                ST_SHIFT_DENSE1ST.fetch_add(1, Ordering::Relaxed);
+                ST_SHIFT_DENSE_NOMATCH.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        };
+        if full_len > 1000 {
+            ST_SHIFT_DENSE1ST.fetch_add(1, Ordering::Relaxed);
+            ST_SHIFT_DENSE_MATCH.fetch_add(1, Ordering::Relaxed);
+        }
+        ST_SHIFT_KSUM.fetch_add(k as u64, Ordering::Relaxed);
+        let t_tail0 = t_all.elapsed().as_nanos() as u64;        let tj = secs[j].as_ref().unwrap();
+        let kw = k * 256;
+        let n_t = tj.n;
+        if n_t + 255 > 65535 {
+            continue;
+        }
+        // chunk id -> target ORIGINAL palette index (for ref-space mapping)
+        let mut t_rev: HashMap<u32, usize> = HashMap::with_capacity(n_t);
+        for (oi, &id) in tj.id_of_orig.iter().enumerate() {
+            t_rev.entry(id).or_insert(oi);
+        }
+        // ref-space mapping of the section's top planes; extras = identities
+        // not present in the target palette, numbered by first appearance
+        let mut extra_of_id: HashMap<u32, u32> = HashMap::new();
+        let mut extras: Vec<usize> = Vec::new(); // s's ORIGINAL palette positions
+        let mut top: Vec<u32> = Vec::with_capacity(kw);
+        let mut ok = true;
+        for &x in &ss.ident[4096 - kw..] {
+            let v = match t_rev.get(&x) {
+                Some(&oi) => tj.canon_of_orig[oi],
+                None => {
+                    let ne = extra_of_id.len() as u32;
+                    let e = *extra_of_id.entry(x).or_insert(ne);
+                    if e == ne {
+                        // remember which original palette position this is
+                        match ss.id_of_orig.iter().position(|&y| y == x) {
+                            Some(pos) => extras.push(pos),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    n_t as u32 + e
+                }
+            };
+            top.push(v);
+        }
+        if !ok || n_t + extras.len() > 65535 {
+            continue;
+        }
+        // non-block_states fields: re-encode the section Value without
+        // block_states (f1 block_states bits stay clear)
+        let s2 = match &vals[i] {
+            Value::Compound(m) => {
+                let mut mm = m.clone();
+                if mm.remove("block_states").is_none() {
+                    continue;
+                }
+                Value::Compound(mm)
+            }
+            _ => continue,
+        };
+        let csec2 = match section_encode(&s2) {
+            Some(c) if c.first() == Some(&CSEC3_MAGIC) && c.len() >= 4 => c,
+            _ => continue,
+        };
+        // assemble: [0xC9][t u16][k u8][f1'][f2'][n_extra u16][extras]
+        //           [top_kind + payload][Y + fields...]  (csec2[3..] = Y onward)
+        let n_ref = n_t + extras.len();
+        let mut mbr: Vec<u8> = Vec::with_capacity(64);
+        mbr.push(CSECS_MAGIC);
+        mbr.extend_from_slice(&(j as u16).to_le_bytes());
+        mbr.push(k as u8);
+        mbr.extend_from_slice(&csec2[1..3]);
+        mbr.extend_from_slice(&(extras.len() as u16).to_le_bytes());
+        // extras in first-appearance order (must match ref-space numbering)
+        'ex: for &pos in &extras {
+            let Value::Compound(m) = &vals[i] else { break 'ex };
+            let Some(Value::Compound(bm)) = m.get("block_states") else { break 'ex };
+            let Some(Value::List(pal)) = bm.get("palette") else { break 'ex };
+            if put_entry_standalone(&pal[pos], &mut mbr).is_none() {
+                break 'ex;
+            }
+        }
+        let uniform = top.iter().all(|&v| v == top[0]) && top[0] < 256 && extras.is_empty();
+        // top payload: pick the smallest of uniform / packed / RLE forms
+        let bits = bits_for(n_ref);
+        let packed: Vec<u8> = vanilla_pack_wide(&top, bits)
+            .iter()
+            .flat_map(|l| l.to_le_bytes())
+            .collect();
+        let mut rle: Vec<u8> = Vec::new();
+        {
+            let mut i = 0usize;
+            while i < top.len() {
+                let v = top[i];
+                let mut run = 1usize;
+                while i + run < top.len() && top[i + run] == v {
+                    run += 1;
+                }
+                let mut z = (run - 1) as u64;
+                loop {
+                    let b = (z & 0x7f) as u8;
+                    z >>= 7;
+                    if z == 0 {
+                        rle.push(b);
+                        break;
+                    }
+                    rle.push(b | 0x80);
+                }
+                let mut z = v as u64;
+                loop {
+                    let b = (z & 0x7f) as u8;
+                    z >>= 7;
+                    if z == 0 {
+                        rle.push(b);
+                        break;
+                    }
+                    rle.push(b | 0x80);
+                }
+                i += run;
+            }
+        }
+        if uniform {
+            mbr.push(0u8);
+            mbr.push(top[0] as u8);
+        } else if rle.len() < packed.len() {
+            mbr.push(2u8);
+            mbr.extend_from_slice(&rle);
+        } else {
+            mbr.push(1u8);
+            mbr.extend_from_slice(&packed);
+        }
+        mbr.extend_from_slice(&csec2[3..]);
+        // admission: the ref must clearly beat the full member POST-COMPRESSION.
+        // Slab zstd compresses dense member payloads ~5x (cross-section
+        // matches) while small ref payloads compress ~2.5x, so the ref wins
+        // when 5*mbr < 2*full, i.e. mbr + margin < 0.4*full (the v0.6.1
+        // lesson: raw-length comparisons mislead admission).
+        if mbr.len() + 32 < full_len * 2 / 5 {
+            ST_ENC_SHIFT.fetch_add(1, Ordering::Relaxed);
+            ST_ENC_SHIFT_BYTES.fetch_add(mbr.len() as u64, Ordering::Relaxed);
+            sections[i].0 = hash_of(&mbr);
+            sections[i].1 = SecBytes::Owned(mbr);
+            is_ref[i] = true;
+        } else {
+            ST_SHIFT_REJECT.fetch_add(1, Ordering::Relaxed);
+            if std::env::var("CSAVES_SHIFT_DEBUG").as_deref() == Ok("1")
+                && full_len > 1000
+                && ST_SHIFT_REJECT.load(Ordering::Relaxed) < 4000
+            {
+                eprintln!(
+                    "shift REJECT: k={k} mbr={} full={} n_t={n_t} extras={} tail_len={}",
+                    mbr.len(),
+                    full_len,
+                    extras.len(),
+                    csec2.len().saturating_sub(3)
+                );
+            }
+        }
+        ST_SHIFT_TAIL_NS.fetch_add(t_all.elapsed().as_nanos() as u64 - t_tail0, Ordering::Relaxed);
+    }
+    let total = t_all.elapsed().as_nanos() as u64;
+    ST_SHIFT_TOTAL_NS.fetch_add(total, Ordering::Relaxed);
+}
+
+// ------------------------------------------------------ shift resolution --
+
+/// Bounded FIFO cache of RESOLVED shift sections, keyed by
+/// (member hash, target hash). The resolution output is a pure function of
+/// those two byte strings, so cache hits are always exact.
+struct ShiftResolveCache {
+    map: HashMap<u128, Arc<Vec<u8>>>,
+    order: VecDeque<(u128, u32)>,
+    total: u64,
+    cap: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+static SHIFT_CACHE: Mutex<Option<ShiftResolveCache>> = Mutex::new(None);
+
+fn shift_cache_cap() -> u64 {
+    const DEFAULT_MB: u64 = 32;
+    std::env::var("CSAVES_SHIFT_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(DEFAULT_MB * 1024 * 1024)
+}
+
+fn shift_cache_get(key: u128) -> Option<Arc<Vec<u8>>> {
+    let mut g = SHIFT_CACHE.lock();
+    let c = g.as_mut()?;
+    match c.map.get(&key) {
+        Some(v) => {
+            c.hits.fetch_add(1, Ordering::Relaxed);
+            Some(v.clone())
+        }
+        None => {
+            c.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+fn shift_cache_put(key: u128, v: Arc<Vec<u8>>) {
+    let mut g = SHIFT_CACHE.lock();
+    let c = g.get_or_insert_with(|| ShiftResolveCache {
+        map: HashMap::new(),
+        order: VecDeque::new(),
+        total: 0,
+        cap: shift_cache_cap(),
+        hits: AtomicU64::new(0),
+        misses: AtomicU64::new(0),
+    });
+    let sz = v.len() as u64;
+    if sz > c.cap {
+        return;
+    }
+    if c.map.insert(key, v).is_none() {
+        c.order.push_front((key, sz as u32));
+        c.total += sz;
+        while c.total > c.cap {
+            if let Some((ek, esz)) = c.order.pop_back() {
+                if c.map.remove(&ek).is_some() {
+                    c.total -= esz as u64;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Resolve every shift-ref member against its chunk-local target.
+/// Returns a parallel vec: Some((rekey, resolved CSEC3 bytes)) for shift
+/// members, None for everything else. `Err` (None return) = corruption.
+/// The rekey mixes member+target hashes so downstream content-keyed caches
+/// (the fused emit cache) stay correct: identical member bytes with
+/// different local targets never share a key.
+pub fn resolve_shifts(
+    sections: &[&[u8]],
+    hashes: &[Hash],
+) -> Option<Vec<Option<(Hash, Arc<Vec<u8>>)>>> {
+    let has_ref = sections.iter().any(|s| s.first() == Some(&CSECS_MAGIC));
+    if !has_ref {
+        // parallel "no replacements" vec (caller zips it with the sections)
+        return Some(vec![None; sections.len()]);
+    }
+    let mut out: Vec<Option<(Hash, Arc<Vec<u8>>)>> = Vec::with_capacity(sections.len());
+    for (i, s) in sections.iter().enumerate() {
+        if s.first() != Some(&CSECS_MAGIC) {
+            out.push(None);
+            continue;
+        }
+        if s.len() < 7 {
+            return None;
+        }
+        let t = u16::from_le_bytes([s[1], s[2]]) as usize;
+        let k = s[3] as usize;
+        if t >= sections.len() || t == i || k == 0 || k > 15 {
+            return None;
+        }
+        let target = sections[t];
+        if target.first() != Some(&CSEC3_MAGIC) {
+            return None;
+        }
+        let h_member = hashes.get(i).copied().unwrap_or(0);
+        let h_target = hashes.get(t).copied().unwrap_or(0);
+        let key = h_member ^ h_target.rotate_left(64);
+        let resolved = match shift_cache_get(key) {
+            Some(a) => a,
+            None => match resolve_one(s, target) {
+                Some(b) => {
+                    let b = Arc::new(b);
+                    shift_cache_put(key, b.clone());
+                    b
+                }
+                None => {
+                    if std::env::var("CSAVES_SHIFT_DEBUG").as_deref() == Ok("1") {
+                        eprintln!(
+                            "resolve_shifts: ref at section {i} (t={t}, k={k}) failed to resolve; head={:02x?}",
+                            &s[..s.len().min(24)]
+                        );
+                    }
+                    return None;
+                }
+            },
+        };
+        ST_SHIFT_RESOLVED.fetch_add(1, Ordering::Relaxed);
+        out.push(Some((key, resolved)));
+    }
+    Some(out)
+}
+
+/// Expand one shift-ref member into a canonical CSEC3 section.
+/// Member layout: [0xC9][t u16][k u8][f1'][f2'][n_extra u16][extras...]
+///                [top_kind + payload][Y i8 + fields...]  (CSEC3 tail).
+fn resolve_one(member: &[u8], target: &[u8]) -> Option<Vec<u8>> {
+    let k = member[3] as usize;
+    let f1 = member[4];
+    let f2 = member[5];
+    let mut p = 6usize;
+    let n_extra = u16::from_le_bytes(member.get(p..p + 2)?.try_into().ok()?) as usize;
+    p += 2;
+    let mut extras: Vec<Value> = Vec::with_capacity(n_extra);
+    for _ in 0..n_extra {
+        extras.push(parse_entry_standalone(member, &mut p)?);
+    }
+    let top_kind = *member.get(p)?;
+    p += 1;
+    if std::env::var("CSAVES_SHIFT_DEBUG").as_deref() == Ok("1") { eprintln!("resolve_one: k={k} f1={f1:02x} f2={f2:02x} n_extra={n_extra} top_kind={top_kind} p={p} mlen={}", member.len()); }
+    // decode the target's canonical palette + data
+    let tv = section_decode(target)?;
+    let Value::Compound(tm) = &tv else { return None };
+    let Some(Value::Compound(bst)) = tm.get("block_states") else { return None };
+    let Some(Value::List(tpal)) = bst.get("palette") else { return None };
+    let n_t = tpal.len();
+    if n_t == 0 || n_t > 65535 {
+        return None;
+    }
+    let t_canon: Vec<u32> = match bst.get("data") {
+        Some(Value::LongArray(la)) => {
+            let bits = section_data_bits(n_t, 4096, la.as_ref().len());
+            let per = (64 / bits) as usize;
+            if std::env::var("CSAVES_SHIFT_DEBUG").as_deref() == Ok("1") { eprintln!("resolve_one: n_t={n_t} la={} bits={bits} expect={}", la.as_ref().len(), (4096 + per - 1) / per); }
+            if la.as_ref().len() != (4096 + per - 1) / per {
+                return None;
+            }
+            let v = vanilla_unpack_wide(la.as_ref(), 4096, bits);
+            if v.iter().any(|&x| x as usize >= n_t) {
+                return None;
+            }
+            v
+        }
+        Some(_) => return None,
+        None => {
+            if n_t > 1 {
+                return None;
+            }
+            vec![0u32; 4096]
+        }
+    };
+    let n_ref = n_t + n_extra;
+    if n_ref > 65535 {
+        return None;
+    }
+    let kw = k * 256;
+    let mut ref_data: Vec<u32> = Vec::with_capacity(4096);
+    for i in 0..4096 - kw {
+        ref_data.push(t_canon[i + kw]);
+    }
+    match top_kind {
+        0 => {
+            let v = *member.get(p)? as u32;
+            p += 1;
+            if v as usize >= n_ref {
+                return None;
+            }
+            ref_data.resize(4096, v);
+        }
+        1 => {
+            let bits = bits_for(n_ref);
+            let longs = kw.div_ceil((64 / bits) as usize);
+            let mut lb = Vec::with_capacity(longs);
+            for li in 0..longs {
+                let o = p + li * 8;
+                lb.push(i64::from_le_bytes(
+                    member.get(o..o + 8)?.try_into().ok()?,
+                ));
+            }
+            p += longs * 8;
+            let topv = vanilla_unpack_wide(&lb, kw, bits);
+            if topv.iter().any(|&v| v as usize >= n_ref) {
+                return None;
+            }
+            ref_data.extend_from_slice(&topv);
+        }
+        2 => {
+            // RLE runs: (varint run-1, varint value) pairs filling kw entries
+            let mut rd = |p: &mut usize| -> Option<u64> {
+                let mut z = 0u64;
+                let mut sh = 0u32;
+                loop {
+                    let byte = *member.get(*p)?;
+                    *p += 1;
+                    z |= ((byte & 0x7f) as u64) << sh;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                    sh += 7;
+                    if sh > 63 {
+                        return None;
+                    }
+                }
+                Some(z)
+            };
+            let mut filled = 0usize;
+            while filled < kw {
+                let run = rd(&mut p)? as usize + 1;
+                let v = rd(&mut p)? as u32;
+                if v as usize >= n_ref || filled + run > kw {
+                    return None;
+                }
+                ref_data.resize(ref_data.len() + run, v);
+                filled += run;
+            }
+        }
+        _ => return None,
+    }
+    // rebuild the section: everything except block_states comes from the
+    // member's CSEC3-style tail; block_states is derived from the target
+    let fake = {
+        let mut v = Vec::with_capacity(member.len() - p + 3);
+        v.push(CSEC3_MAGIC);
+        v.push(f1);
+        v.push(f2);
+        v.extend_from_slice(&member[p..]);
+        v
+    };
+    let mut sv = section_decode(&fake)?;
+    let Value::Compound(smap) = &mut sv else { return None };
+    if smap.contains_key("block_states") {
+        if std::env::var("CSAVES_SHIFT_DEBUG").as_deref() == Ok("1") { eprintln!("resolve_one: fake still has block_states (f1={f1:02x})"); }
+        return None;
+    }
+    let mut pal: Vec<Value> = tpal.iter().cloned().collect();
+    pal.extend(extras);
+    let mut bs: HashMap<String, Value> = HashMap::new();
+    bs.insert("palette".to_string(), Value::List(pal));
+    if n_ref > 1 {
+        let bits = bits_for(n_ref).max(4);
+        let la = if bits <= 8 {
+            let u8s: Vec<u8> = ref_data.iter().map(|&x| x as u8).collect();
+            pack_nostroddle(&u8s, bits)
+        } else {
+            vanilla_pack_wide(&ref_data, bits)
+        };
+        bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(la)));
+    }
+    smap.insert("block_states".to_string(), Value::Compound(bs));
+    let r = section_encode(&sv);
+    if r.is_none() && std::env::var("CSAVES_SHIFT_DEBUG").as_deref() == Ok("1") {
+        if let Value::Compound(mm) = &sv {
+            eprintln!("resolve_one: final section_encode FAILED (n_ref={n_ref}, keys={:?})", mm.keys().collect::<Vec<_>>());
+        }
+    }
+    r
+}
+
 pub fn sections_semantically_equal(a: &Value, b: &Value) -> bool {
     let (Value::Compound(ma), Value::Compound(mb)) = (a, b) else { return a == b };
     if ma.len() != mb.len() {
@@ -1653,12 +2532,14 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
     };
 
     let mut sections = Vec::with_capacity(list.len());
+    let mut cache_hit = vec![false; list.len()];
     for s in list {
         // encode-cache: re-saving a chunk re-encodes every section; the
         // structural hash is order-free, so unchanged sections hit the cache
         // and skip canonicalization + bit-packing entirely.
         let sh = structural_hash(s);
         if let Some((h, shared)) = enc_cache_get(sh) {
+            cache_hit[sections.len()] = true;
             sections.push((h, SecBytes::Shared(shared)));
             continue;
         }
@@ -1678,6 +2559,15 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
             }
             None => sections.push((structural_hash(s), SecBytes::Owned(to_bytes(s)))),
         }
+    }
+    // shift-ref pass (v0.7): collapse sections that are vertical shifts of a
+    // lower section of this chunk (mountain strata / ocean floors / cave
+    // ceilings) into ~15-30 byte refs; the top k planes stay explicit.
+    // Sections whose content was seen in an earlier chunk (enc-cache hit)
+    // are skipped: their full members dedup across chunks for free, which
+    // always beats a chunk-local ref. CSAVES_NO_SHIFT=1 disables the pass.
+    if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
+        shift_ref_pass(&mut sections, list, &cache_hit);
     }
 
     let mut tail_map = map.clone();
@@ -3264,5 +4154,159 @@ mod codec_tests {
         let a: Value = fastnbt::from_bytes(&payload).unwrap();
         let b: Value = fastnbt::from_bytes(&out).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Build a shift-structured chunk: target at list pos 0, shifted section
+    /// at pos 1 (upper window of target, k planes), optional extra block in
+    /// the top planes, explicit Y list.
+    fn shift_structured_chunk(k: usize, extra_in_top: bool) -> Vec<u8> {
+        let pack = |e: &[u32]| -> Vec<i64> {
+            let bits = 2u32;
+            let per = (64 / bits) as usize;
+            let mut out = vec![0i64; e.len().div_ceil(per)];
+            for (i, &v) in e.iter().enumerate() {
+                out[i / per] |= (v as i64) << ((i % per) as u32 * bits);
+            }
+            out
+        };
+        let t_entries: Vec<u32> = (0..4096)
+            .map(|i| {
+                let x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x12345);
+                ((x >> 33) % 3) as u32
+            })
+            .collect();
+        let mk = |y: i8, data: Vec<i64>, extra: bool| {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = vec![
+                Value::String("minecraft:stone".to_string()),
+                Value::String("minecraft:deepslate".to_string()),
+                Value::String("minecraft:air".to_string()),
+            ];
+            if extra {
+                pal.push(Value::String("minecraft:gold_ore".to_string()));
+            }
+            bs.insert("palette".to_string(), Value::List(pal));
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            Value::Compound(sec)
+        };
+        let mut sec_list = vec![mk(2, pack(&t_entries), false)];
+        let mut s_entries: Vec<u32> = Vec::with_capacity(4096);
+        s_entries.extend_from_slice(&t_entries[k * 256..]);
+        // top planes: air (2), or gold ore (3, extra) every 64th voxel
+        if extra_in_top {
+            let mut v: Vec<u32> = vec![2; k * 256];
+            for (i, x) in v.iter_mut().enumerate() {
+                if i % 64 == 0 {
+                    *x = 3;
+                }
+            }
+            s_entries.extend_from_slice(&v);
+        } else {
+            s_entries.resize(4096, 2);
+        }
+        sec_list.push(mk(3, pack(&s_entries), extra_in_top));
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        root.insert("sections".to_string(), Value::List(sec_list));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    fn div_ceil_compat(a: usize, b: usize) -> usize {
+        a.div_ceil(b)
+    }
+
+    #[test]
+    fn shift_ref_split_and_resolve() {
+        for (k, extra) in [(4usize, false), (1, false), (15, false), (4, true), (1, true)] {
+            let payload = shift_structured_chunk(k, extra);
+            let split = split(&payload, false, Some((3, 4))).unwrap();
+            let (sections, tail) = match &split {
+                Split::Split { sections, tail } => (sections, tail),
+                _ => panic!("expected split"),
+            };
+            assert_eq!(sections.len(), 2);
+            assert!(sections[0].1.as_slice().first() == Some(&CSEC3_MAGIC));
+            assert_eq!(sections[1].1.as_slice().first(), Some(&CSECS_MAGIC), "k={k} extra={extra}: no ref");
+            assert!(sections[1].1.as_slice().len() < 300, "ref must be tiny");
+            let refs: Vec<&[u8]> = sections.iter().map(|(_, sb)| sb.as_slice()).collect();
+            let hashes: Vec<Hash> = sections.iter().map(|(h, _)| *h).collect();
+            let res = resolve_shifts(&refs, &hashes).expect("resolve");
+            let got = res[1].as_ref().expect("sec1 resolved").1.clone();
+            let sv = section_decode(&got).expect("decode resolved");
+            let root: Value = fastnbt::from_bytes(&payload).unwrap();
+            let Value::Compound(m) = &root else { panic!() };
+            let Some(Value::List(list)) = m.get("sections") else { panic!() };
+            assert!(
+                sections_semantically_equal(&list[1], &sv),
+                "k={k} extra={extra}: resolved section not semantic-equal"
+            );
+            // legacy join requires pre-resolved members (the store resolves
+            // before joining); resolve here and join the expanded list
+            let res = resolve_shifts(&refs, &hashes).expect("resolve");
+            let expanded: Vec<Vec<u8>> = sections
+                .iter()
+                .zip(res.iter())
+                .map(|((_, sb), r)| match r {
+                    Some((_, b)) => b.as_ref().clone(),
+                    None => sb.as_slice().to_vec(),
+                })
+                .collect();
+            assert!(join(&expanded, tail).is_ok());
+        }
+    }
+
+    #[test]
+    fn shift_ref_rekey_differs_by_target() {
+        // two chunks with identical ref members but different targets must
+        // resolve to different content and different cache keys
+        let payload = shift_structured_chunk(4, false);
+        let s1 = split(&payload, false, Some((0, 0))).unwrap();
+        // fresh thread: the encode cache is thread-local and would mark the
+        // sections as cross-chunk-shared, skipping the shift conversion
+        let p2 = payload.clone();
+        let s2 = std::thread::spawn(move || split(&p2, false, Some((5, 5))).unwrap())
+            .join()
+            .unwrap();
+        let (a, b) = match (&s1, &s2) {
+            (Split::Split { sections: a, .. }, Split::Split { sections: b, .. }) => (a, b),
+            _ => panic!(),
+        };
+        // identical member bytes (position-independent ref) => same hash
+        assert_eq!(a[1].0, b[1].0, "ref member hash must be position-independent");
+        let ra: Vec<&[u8]> = a.iter().map(|(_, sb)| sb.as_slice()).collect();
+        let rb: Vec<&[u8]> = b.iter().map(|(_, sb)| sb.as_slice()).collect();
+        let ha: Vec<Hash> = a.iter().map(|(h, _)| *h).collect();
+        let hb: Vec<Hash> = b.iter().map(|(h, _)| *h).collect();
+        let ra_res = resolve_shifts(&ra, &ha).unwrap();
+        let rb_res = resolve_shifts(&rb, &hb).unwrap();
+        let (ka, _) = ra_res[1].as_ref().unwrap();
+        let (kb, _) = rb_res[1].as_ref().unwrap();
+        // same target content here, so same key is correct
+        assert_eq!(ka, kb);
+    }
+
+    #[test]
+    fn shift_ref_corruption_fails_loudly() {
+        let payload = shift_structured_chunk(4, false);
+        let split = split(&payload, false, Some((0, 0))).unwrap();
+        let sections = match &split {
+            Split::Split { sections, .. } => sections.clone(),
+            _ => panic!(),
+        };
+        let mut refs: Vec<Vec<u8>> = sections.iter().map(|(_, sb)| sb.as_slice().to_vec()).collect();
+        // corrupt the target position (out of range)
+        refs[1][1] = 0xff;
+        refs[1][2] = 0xff;
+        let slices: Vec<&[u8]> = refs.iter().map(|b| b.as_slice()).collect();
+        let hashes: Vec<Hash> = sections.iter().map(|(h, _)| *h).collect();
+        assert!(resolve_shifts(&slices, &hashes).is_none(), "bad target must fail");
+        // k out of range
+        let mut refs2: Vec<Vec<u8>> = sections.iter().map(|(_, sb)| sb.as_slice().to_vec()).collect();
+        refs2[1][3] = 16;
+        let slices2: Vec<&[u8]> = refs2.iter().map(|b| b.as_slice()).collect();
+        assert!(resolve_shifts(&slices2, &hashes).is_none(), "k=16 must fail");
     }
 }

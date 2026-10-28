@@ -31,12 +31,12 @@ The profile reports, byte-exactly:
    (split → CSEC-v3 encode → dedup → dict → hot tier → pack pass → cold tier),
 3. full semantic verification of every chunk (must be `bad=0`).
 
-Current results on the corpus (v0.5.1):
+Current results on the corpus (v0.7.0):
 
 ```
-region  : anvil 4.47 MiB -> c-saves 1.61 MiB  (x2.78 smaller)
+region  : anvil 4.47 MiB -> c-saves 1.55 MiB  (x2.88 smaller)
 entities: anvil 0.93 MiB -> c-saves 0.30 MiB  (x3.13 smaller)
-TOTAL   : anvil 5.39 MiB -> c-saves 1.91 MiB  (x2.83 smaller)
+TOTAL   : anvil 5.39 MiB -> c-saves 1.85 MiB  (x2.92 smaller)
 verify: ok=946 bad=0
 ```
 
@@ -204,3 +204,50 @@ Methodology notes:
   instead of per-section zstd calls) for fresh-worldgen throughput.
 * raw-scan split: hash section byte ranges without parsing the full chunk
   NBT (removes the parse floor on rewrites).
+
+## v0.7.0: post-compression attribution, shift-ref codec, 8 MiB slab frames
+
+A new attribution experiment (`examples/jj_exp3.rs`) compressed every
+component class separately at zstd-19 and measured where the container bytes
+actually live:
+
+* dense `block_states` data streams: **1.05 MB of the 1.63 MB region
+  container** (zstd already achieves 0.50 bits/voxel — BELOW the order-1
+  conditional entropy of 1.09, i.e. the redundancy is long-range LZ structure,
+  not local predictability; rANS/context coding and zstd dictionaries were
+  measured and all lose: x0.75-1.12 vs plain z19 concat).
+* biomes compress to 26 KB, palettes to 29 KB, heightmaps (delta-coded) to
+  25 KB — all minor.
+
+An earlier shift-match experiment reported 96.3% of dense sections matching a
+vertical shift of a lower section; that number was an artifact (k=16 compared
+empty slices — vacuously true). The true rate on this corpus is ~9%: JJThunder
+mountains separate their dense (surface-transition) sections by 50-150 planes
+of uniform stone, beyond the k<=15 window where a ref still pays for its
+explicit top planes.
+
+What shipped anyway (it is nearly free and pulls real weight on layered
+terrain — ocean floors, beaches, terraces — common in survival worlds):
+
+1. **Shift-ref sections (CSEC 0xC9)** — a section whose lower 4096-k*256
+   voxels equal a lower section of the SAME chunk shifted up by k planes
+   stores `[0xC9][target u16][k u8][f1'][f2'][n_extra][extras][top_kind
+   uniform/packed/RLE][CSEC3 tail without block_states]`. The resolver
+   rebuilds the canonical CSEC3 from the target's palette + the ref's top
+   planes; resolution is a pure function of (member bytes, target bytes) and
+   is cached under a mixed (member,target) key so content-keyed caches stay
+   correct. Encode-side admission requires the ref to beat the member's
+   POST-COMPRESSION contribution (mbr + 32 < 0.4 * full_len; the v0.6.1
+   raw-length lesson applies); only first-occurrence content is converted
+   (cross-chunk-shared members dedup for free, which always beats a local
+   ref); candidates are deduped by content hash and pre-filtered with
+   per-plane u64 fingerprints; sections with members < 512 B never
+   participate. `CSAVES_NO_SHIFT=1` disables the pass.
+2. **8 MiB slab frames** (was 4 MiB) — the wider zstd window lifts the real
+   corpus from x2.76 to x2.88 region / x2.92 total with the slab cache budget
+   unchanged (32 MiB); cold-miss decompression stays ~7 ms, inside the tick
+   budget. `jj_profile` now respects the production default instead of its
+   old 512 KiB override.
+3. Import throughput recovered to ~26 MB/s on the 2-core CI sandbox (the
+   naive shift pass cost 2x; member-size gating + per-chunk ShiftSec cache +
+   fingerprint pre-filter brought it back above the 25 MB/s gate).

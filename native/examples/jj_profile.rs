@@ -523,7 +523,7 @@ fn main() {
         slab_max_raw: std::env::var("CSAVES_SLAB_MAX_RAW")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(512 * 1024),
+            .unwrap_or(Cfg::default().slab_max_raw),
         ..Cfg::default()
     };
     let rs = Store::open_cfg(&out.join("region"), true, cfg.clone()).unwrap();

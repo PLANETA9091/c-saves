@@ -107,7 +107,7 @@ impl Default for Cfg {
             dict_train: 200,
             tail_blob_min: 512,
             slab_max_member: 64 * 1024,
-            slab_max_raw: 4 * 1024 * 1024,
+            slab_max_raw: 8 * 1024 * 1024,
             slab_max_raw_whole: 4 * 1024 * 1024,
             slab_cache: 32 * 1024 * 1024,
         }
@@ -179,7 +179,7 @@ impl Cfg {
             dict_train: env_parse("CSAVES_DICT_TRAIN_BLOBS", 200),
             tail_blob_min: env_parse("CSAVES_TAIL_BLOB_MIN", 512),
             slab_max_member: env_parse("CSAVES_SLAB_MAX_MEMBER", 64 * 1024),
-            slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 4 * 1024 * 1024),
+            slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 8 * 1024 * 1024),
             slab_max_raw_whole: env_parse("CSAVES_SLAB_MAX_RAW_WHOLE", 4 * 1024 * 1024),
             slab_cache: env_parse("CSAVES_SLAB_CACHE", 32 * 1024 * 1024),
         }
@@ -2186,11 +2186,44 @@ impl Store {
                     ST_SECTLOAD.0.fetch_add(el, Ordering::Relaxed);
                     ST_SECTLOAD.1.fetch_add(1, Ordering::Relaxed);
                 }
+                // shift-ref resolution (v0.7): [0xC9] members expand to
+                // canonical CSEC3 against their chunk-local target; keys are
+                // re-mixed so the fused emit cache stays content-keyed.
+                let resolved = match chunknbt::resolve_shifts(&slices, &rec.sections) {
+                    Some(r) => r,
+                    None => return fail("shift-resolve"),
+                };
+                let any_shift = !resolved.is_empty();
+                let mut shift_store: Vec<Arc<Vec<u8>>> = Vec::new();
+                let mut keys: Vec<chunknbt::Hash> = Vec::with_capacity(rec.sections.len());
+                for (i, r) in resolved.iter().enumerate() {
+                    match r {
+                        Some((nk, b)) => {
+                            shift_store.push(b.clone());
+                            keys.push(*nk);
+                        }
+                        None => keys.push(rec.sections[i]),
+                    }
+                }
+                let slices: Vec<&[u8]> = if any_shift {
+                    let mut v = Vec::with_capacity(slices.len());
+                    let mut si = 0usize;
+                    for (i, s) in slices.iter().enumerate() {
+                        if resolved[i].is_some() {
+                            v.push(shift_store[si].as_slice());
+                            si += 1;
+                        } else {
+                            v.push(s);
+                        }
+                    }
+                    v
+                } else {
+                    slices
+                };
                 // fused path: CSEC streams emitted straight to NBT bytes —
                 // no per-section Value trees, no HashMap churn; repeat
                 // sections splice from the emit cache by content hash
-                let sources: Vec<chunknbt::SecSrc> = rec
-                    .sections
+                let sources: Vec<chunknbt::SecSrc> = keys
                     .iter()
                     .zip(slices.iter())
                     .map(|(h, s)| chunknbt::SecSrc { h: *h, b: s })
