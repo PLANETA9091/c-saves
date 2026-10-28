@@ -3374,7 +3374,10 @@ pub mod tests {
             sec.insert("Y".to_string(), Value::Byte(y as i8));
             let mut bs: std::collections::HashMap<String, Value> = Default::default();
             // unequal counts keep the frequency-canonical palette order equal
-            // to the source order, so raw NBT equality holds after decode
+            // to the source order, so raw NBT equality holds after decode.
+            // Pack at the vanilla-clamped 4-bit width: the decoder normalizes
+            // narrow streams back to max(4, bits) — the input must already be
+            // in that shape for raw equality.
             let entries: Vec<u8> = (0..4096).map(|i| if i < 1024 { 1u8 } else { 0u8 }).collect();
             bs.insert(
                 "palette".to_string(),
@@ -3385,7 +3388,9 @@ pub mod tests {
             );
             bs.insert(
                 "data".to_string(),
-                Value::LongArray(fastnbt::LongArray::new(crate::chunknbt::pack_nostroddle(&entries, 1))),
+                Value::LongArray(fastnbt::LongArray::new(crate::chunknbt::pack_nostroddle(
+                    &entries, 4,
+                ))),
             );
             sec.insert("block_states".to_string(), Value::Compound(bs));
             sec_list.push(Value::Compound(sec));
