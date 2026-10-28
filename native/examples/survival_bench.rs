@@ -677,7 +677,6 @@ fn chunk_semantic(a: &[u8], b: &[u8]) -> bool {
 
 fn bench_cfg() -> Cfg {
     Cfg {
-        compact_min: 512 * 1024,
         compact_ratio: 0.30,
         dict_train: 40,
         ..Cfg::default()

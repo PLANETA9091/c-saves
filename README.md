@@ -37,7 +37,8 @@ Large world slice — 5,108 real mountain chunks (599,984 sections,
 
 32x32-chunk corpus (committed under `bench-corpus/`, CI-verified every
 push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
-slab frames + shift-ref section codec).
+slab frames + shift-ref section codec). Survival-shaped corpus (chests,
+farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
 Synthetic Tectonic-style wgen bench (4096 chunks): compact container =
 **x0.08 of Anvil** (x173 vs logical).

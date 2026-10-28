@@ -99,7 +99,7 @@ impl Default for Cfg {
             // anyway, so the hot level only bounds transient disk usage.
             hot_level: 3,
             cold_level: 19,
-            compact_min: 4 * 1024 * 1024,
+            compact_min: 64 * 1024,
             compact_ratio: 0.25,
             auto_pack_bytes: 4 * 1024 * 1024,
             slab_max_member_whole: 1024 * 1024,
@@ -171,7 +171,7 @@ impl Cfg {
         Cfg {
             hot_level: env_parse("CSAVES_HOT_LEVEL", 3),
             cold_level: env_parse("CSAVES_COLD_LEVEL", 19),
-            compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 4 * 1024 * 1024),
+            compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 64 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),
             auto_pack_bytes: env_parse("CSAVES_AUTO_PACK_BYTES", 4 * 1024 * 1024),
             slab_max_member_whole: env_parse("CSAVES_SLAB_MAX_MEMBER_WHOLE", 1024 * 1024),

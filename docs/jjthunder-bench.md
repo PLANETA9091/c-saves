@@ -251,3 +251,23 @@ terrain — ocean floors, beaches, terraces — common in survival worlds):
 3. Import throughput recovered to ~26 MB/s on the 2-core CI sandbox (the
    naive shift pass cost 2x; member-size gating + per-chunk ShiftSec cache +
    fingerprint pre-filter brought it back above the 25 MB/s gate).
+
+## v0.7.1: compact_min 4 MiB -> 64 KiB — small stores kept 70% dead bytes
+
+The survival bench exposed a production bug the JJ corpus never showed: after
+the pack pass moves blobs into slab frames, the source segment keeps its dead
+bytes until a full rewrite, and `compact_min` (4 MiB default) EXEMPTED every
+segment smaller than that from rewrites. Any entity/POI store whose segments
+stay in the hundreds-of-KiB range — i.e. most survival worlds' entity stores —
+kept ~70% garbage permanently (survival entities measured x0.64 vs Anvil,
+WORSE than vanilla while the slab frame itself sat at the zstd-19 floor).
+
+With `compact_min: 64 KiB` a full rewrite of a dead segment costs ~1 ms, so
+the churn guard is pointless at the old scale; the survival entity store now
+settles at the compression floor:
+
+* survival corpus: entities x0.64 -> **x1.94**, TOTAL x3.34 -> **x4.00**
+* synthetic farm-entity probe: 283 KB -> 82 KB (z19 concat floor 77 KB)
+* JJThunder corpus unchanged (x2.92 total; its stores were already above the
+  old threshold), tests 36/36, verify clean, import 25.7 MB/s, warm reads
+  1.6x anvil.
