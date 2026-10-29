@@ -23,16 +23,12 @@ fn mib(b: u64) -> f64 {
     b as f64 / 1048576.0
 }
 
-fn key(cx: i32, cz: i32) -> u64 {
-    ((cx as u64) << 32) | (cz as u64 & 0xffff_ffff)
-}
-
-fn load_mca(path: &Path) -> Vec<(i32, i32, Vec<u8>)> {
-    let name = path.file_name().unwrap().to_string_lossy().to_string();
-    let parts: Vec<&str> = name.trim_end_matches(".mca").split('.').collect();
-    if parts.len() != 3 {
-        return vec![];
-    }
+fn load_mca(path: &Path) -> Vec<(usize, Vec<u8>)> {
+    // NOTE: chunk keys are (file_index, slot) — the header bytes at
+    // off+8/off+12 are NOT coordinates (Paper emits root NBT fields in
+    // HashMap order, so a fixed offset yields garbage that COLLIDES across
+    // 262k chunks and silently overwrote ~9% of the store on verify).
+    let _name = path.file_name().unwrap().to_string_lossy().to_string();
     let Ok(data) = std::fs::read(path) else { return vec![] };
     if data.len() < 8192 {
         return vec![];
@@ -82,9 +78,7 @@ fn load_mca(path: &Path) -> Vec<(i32, i32, Vec<u8>)> {
             3 => data[off + 5..off + 4 + len].to_vec(),
             _ => continue,
         };
-        let cx = i32::from_be_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
-        let cz = i32::from_be_bytes([data[off + 12], data[off + 13], data[off + 14], data[off + 15]]);
-        out.push((cx, cz, payload));
+        out.push((i, payload));
     }
     out
 }
@@ -253,28 +247,30 @@ fn main() {
     let mut n_ent_chunks = 0u64;
     let mut raw_ent = 0u64;
     let t0 = std::time::Instant::now();
-    for f in &region_files {
+    for (fidx, f) in region_files.iter().enumerate() {
         if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
             continue;
         }
-        for (cx, cz, payload) in load_mca(f) {
+        for (slot, payload) in load_mca(f) {
             classify_chunk(&payload, &mut comps);
             raw_region += payload.len() as u64;
             n_region_chunks += 1;
-            if rs.write_chunk(key(cx, cz), &payload, false).is_err() {
-                eprintln!("write failed chunk ({cx},{cz})");
+            let k = ((fidx as u64) << 10) | slot as u64;
+            if rs.write_chunk(k, &payload, false).is_err() {
+                eprintln!("write failed chunk file={fidx} slot={slot}");
             }
         }
     }
-    for f in &ent_files {
+    for (fidx, f) in ent_files.iter().enumerate() {
         if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
             continue;
         }
-        for (cx, cz, payload) in load_mca(f) {
+        for (slot, payload) in load_mca(f) {
             classify_entities(&payload, &mut comps);
             raw_ent += payload.len() as u64;
             n_ent_chunks += 1;
-            let _ = es.write_chunk(key(cx, cz), &payload, true);
+            let k = ((fidx as u64) << 10) | slot as u64;
+            let _ = es.write_chunk(k, &payload, true);
         }
     }
     rs.sync();
@@ -360,43 +356,45 @@ fn main() {
     let mut ok = 0usize;
     let mut bad = 0usize;
     let mut seen = 0usize;
-    for f in &region_files {
+    for (fidx, f) in region_files.iter().enumerate() {
         if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
             continue;
         }
-        for (cx, cz, payload) in load_mca(f) {
+        for (slot, payload) in load_mca(f) {
             seen += 1;
             if sample > 1 && seen % sample != 1 {
                 continue;
             }
-            match rs.read_chunk(key(cx, cz)) {
+            let k = ((fidx as u64) << 10) | slot as u64;
+            match rs.read_chunk(k) {
                 Some(d) => {
                     if chunk_semantic(&payload, &d) {
                         ok += 1;
                     } else {
                         bad += 1;
                         if bad <= 3 {
-                            eprintln!("semantic MISMATCH region chunk ({cx},{cz})");
+                            eprintln!("semantic MISMATCH region file={fidx} slot={slot}");
                         }
                     }
                 }
                 None => {
                     bad += 1;
-                    eprintln!("region MISSING chunk ({cx},{cz})");
+                    eprintln!("region MISSING file={fidx} slot={slot}");
                 }
             }
         }
     }
-    for f in &ent_files {
+    for (fidx, f) in ent_files.iter().enumerate() {
         if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
             continue;
         }
-        for (cx, cz, payload) in load_mca(f) {
+        for (slot, payload) in load_mca(f) {
             seen += 1;
             if sample > 1 && seen % sample != 1 {
                 continue;
             }
-            match es.read_chunk(key(cx, cz)) {
+            let k = ((fidx as u64) << 10) | slot as u64;
+            match es.read_chunk(k) {
                 Some(d) => {
                     let va: Value = fastnbt::from_bytes(&payload).unwrap();
                     let vb: Value = fastnbt::from_bytes(&d).unwrap();
@@ -405,13 +403,13 @@ fn main() {
                     } else {
                         bad += 1;
                         if bad <= 3 {
-                            eprintln!("semantic MISMATCH entity chunk ({cx},{cz})");
+                            eprintln!("semantic MISMATCH entity file={fidx} slot={slot}");
                         }
                     }
                 }
                 None => {
                     bad += 1;
-                    eprintln!("entity MISSING chunk ({cx},{cz})");
+                    eprintln!("entity MISSING file={fidx} slot={slot}");
                 }
             }
         }
