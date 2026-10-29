@@ -159,11 +159,14 @@ jobs:
         run: |
           cd native
           cargo build --release --example jj_profile
+          cargo build --release --example real_exp
           CSAVES_VERIFY_SAMPLE=10 ./target/release/examples/jj_profile \
             ../jjserver/jjworld/dimensions/minecraft/overworld 2>jj_err.txt | tee surv_big.txt
           grep -E "^TOTAL|verify:" surv_big.txt
           BAD=$(grep "verify:" surv_big.txt | grep -o "bad=[0-9]*" | cut -d= -f2)
           [ "$BAD" = "0" ] || { echo "FAIL: semantic verification bad=$BAD"; exit 1; }
+          ./target/release/examples/real_exp \
+            ../jjserver/jjworld/dimensions/minecraft/overworld 2>real_exp_err.txt | tee real_exp.txt
 
       - name: verdict
         run: |
@@ -176,5 +179,6 @@ jobs:
           name: bigworld-survival-results
           path: |
             native/surv_big.txt
+            native/real_exp.txt
             native/jj_err.txt
           retention-days: 30
