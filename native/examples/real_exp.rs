@@ -13,7 +13,7 @@
 use fastnbt::Value;
 use std::collections::HashMap as Map;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 fn z19(data: &[u8]) -> u64 {
@@ -266,7 +266,7 @@ fn main() {
                 }
                 for k in ["SkyLight", "BlockLight"] {
                     if let Some(Value::ByteArray(ba)) = sm.get(k) {
-                        let b = ba.as_ref();
+                        let b: Vec<u8> = ba.as_ref().iter().map(|x| *x as u8).collect();
                         sec.light_bytes += b.len() as u64;
                         add("light", &b, &mut streams);
                     }
@@ -368,7 +368,7 @@ fn main() {
             n,
             raw,
             z,
-            *raw as f64 / n.max(1) as f64
+            *raw as f64 / (*n).max(1) as f64
         )
         .unwrap();
     }
