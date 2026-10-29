@@ -1517,8 +1517,22 @@ impl Store {
                 *live_by_seg.entry(loc.seg).or_default() += loc.body_len();
             }
         }
-        for (_k, seg, off, len) in recipe_entries {
-            if let Some(rec) = self.load_recipe(seg, off, len) {
+        for (k, seg, off, len) in recipe_entries {
+            // BATCHED recipes must resolve through the kind-9 batch index —
+            // load_recipe reads `len` raw bytes at `off`, and BATCHED is a
+            // sentinel, not a length. Resolving them with load_recipe
+            // silently dropped EVERY batched recipe's refcounts at reopen
+            // (refs rebuilt as 0), so the first full rewrite cycle
+            // superseded recipes down to refs=0 and evicted live blobs that
+            // other still-unrewritten recipes referenced (dangling ids,
+            // unreadable chunks — exposed by the unchanged-write fast path,
+            // masked before it because full rewrites re-created the blobs).
+            let rec = if len == BATCHED {
+                self.recipe_at(k, seg, off, len)
+            } else {
+                self.load_recipe(seg, off, len)
+            };
+            if let Some(rec) = rec {
                 let mut blobs = self.blobs.write();
                 for h in rec.blob_hashes() {
                     if let Some(loc) = blobs.get_mut(&h) {
@@ -1554,7 +1568,9 @@ impl Store {
         if len != BATCHED {
             return self.load_recipe(seg, off, len);
         }
-        let (boff, soff, rl) = *self.batch_idx.lock().get(&key)?;
+        let Some((boff, soff, rl)) = self.batch_idx.lock().get(&key).copied() else {
+            return None;
+        };
         if Some(seg) == self.writer_seg_id() {
             self.flush_writer();
         }
@@ -1997,10 +2013,19 @@ impl Store {
         let hash = chunknbt::hash_of(payload);
         {
             // unchanged-payload fast path: Paper's autosave re-serializes
-            // every loaded chunk each cycle even when nothing changed; the
-            // existing recipe is already correct, so return without parse,
-            // encode, or IO (Anvil inflates+deflates the same bytes).
-            if self.last_written.lock().get(&key) == Some(&hash) {
+            // every loaded chunk each cycle even when nothing changed; when
+            // the payload hash matches the last write, the full
+            // parse/encode/append pipeline is redundant (Anvil still pays
+            // inflate+deflate for the same bytes). The fast path is
+            // SELF-HEALING: it re-reads the stored chunk (a decompress, not
+            // a re-encode) and falls through to the full write if anything
+            // is unreadable, so a lost/evicted backing blob is repaired
+            // from the payload the server just handed us. CSAVES_NO_SKIP=1
+            // disables (debug/bisect).
+            if std::env::var("CSAVES_NO_SKIP").as_deref() != Ok("1")
+                && self.last_written.lock().get(&key) == Some(&hash)
+                && self.chunk_intact(key)
+            {
                 ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
@@ -2122,6 +2147,32 @@ impl Store {
         Ok(())
     }
 
+    /// Cheap integrity probe: does the chunk's recipe resolve AND do all
+    /// blobs it references still exist? No decompress, no join — a few map
+    /// lookups. Used by the unchanged-write fast path: catches recipes whose
+    /// backing blobs were evicted (dangling ids) without paying a full read.
+    pub fn chunk_intact(&self, key: u64) -> bool {
+        enum Loc {
+            Seg(u32, u64, u32),
+            Pending(Vec<u8>),
+        }
+        // pending batch first (read-your-writes — see read_chunk)
+        let loc = match self.recipe_batch.lock().get(key).cloned() {
+            Some(p) => Loc::Pending(p),
+            None => match self.chunks.read().get(&key).copied() {
+                Some((s, o, l)) => Loc::Seg(s, o, l),
+                None => return false,
+            },
+        };
+        let rec = match &loc {
+            Loc::Pending(body) => self.parse_recipe_body(body),
+            Loc::Seg(seg, off, len) => self.recipe_at(key, *seg, *off, *len),
+        };
+        let Some(rec) = rec else { return false };
+        let blobs = self.blobs.read();
+        rec.blob_hashes().iter().all(|h| blobs.contains_key(h))
+    }
+
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
     pub fn read_chunk(&self, key: u64) -> Option<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -2130,12 +2181,16 @@ impl Store {
             Seg(u32, u64, u32),
             Pending(Vec<u8>),
         }
-        let loc = match self.chunks.read().get(&key).copied() {
-            Some((s, o, l)) => Loc::Seg(s, o, l),
-            None => {
-                let pending = self.recipe_batch.lock().get(key).cloned()?;
-                Loc::Pending(pending)
-            }
+        // READ-YOUR-WRITES: the pending batch wins over the committed
+        // chunks-map entry. A rewrite of a BATCHED chunk removes its batch_idx
+        // entry at supersede time, so the stale committed pointer is
+        // unreadable until the next flush — the pending recipe is the truth.
+        let loc = match self.recipe_batch.lock().get(key).cloned() {
+            Some(pending) => Loc::Pending(pending),
+            None => match self.chunks.read().get(&key).copied() {
+                Some((s, o, l)) => Loc::Seg(s, o, l),
+                None => return None,
+            },
         };
         let dbg = |stage: &str| {
             if std::env::var("CSAVES_READ_DEBUG").map(|v| v == "1").unwrap_or(false) {
@@ -3394,6 +3449,46 @@ pub mod tests {
         let va: Value = fastnbt::from_bytes(a).unwrap();
         let vb: Value = fastnbt::from_bytes(b).unwrap();
         va == vb
+    }
+
+    #[test]
+    fn shared_sections_pack_rewrite_roundtrip() {
+        // Regression guard for the ref-loss the unchanged-write fast path
+        // exposed on the speed bench: many chunks share section blobs;
+        // import -> pack -> full rewrite rounds must keep EVERY chunk
+        // readable with identical content.
+        let dir = temp_dir("shared-pack-rewrite");
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        let n = 40usize;
+        let payloads: Vec<Vec<u8>> = (0..n).map(|i| chunk_payload((i % 8) as i32, (i / 8) as i32, (i % 5) as u64)).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            s.write_chunk(i as u64, p, false).unwrap();
+        }
+        s.sync();
+        s.seal();
+        s.request_pack();
+        loop {
+            if !s.compact_step() {
+                break;
+            }
+        }
+        s.sync();
+        // reopen (fresh caches, recipes + refs rebuilt from disk)
+        drop(s);
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            assert!(semantic(&s.read_chunk(i as u64).unwrap(), p), "post-pack-reopen chunk {i}");
+        }
+        // rewrite rounds (the speed-bench G model)
+        for _ in 0..3 {
+            for (i, p) in payloads.iter().enumerate() {
+                s.write_chunk(i as u64, p, false).unwrap();
+            }
+        }
+        s.sync();
+        for (i, p) in payloads.iter().enumerate() {
+            assert!(semantic(&s.read_chunk(i as u64).unwrap(), p), "post-rewrite chunk {i}");
+        }
     }
 
     #[test]

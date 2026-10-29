@@ -256,7 +256,36 @@ fn verify(st: &Store, corpus: &[(i32, i32, Vec<u8>, Vec<u8>)], whole: bool) -> (
                     ok += 1;
                 } else {
                     bad += 1;
-                    eprintln!("verify mismatch at ({cx},{cz}) whole={whole}");
+                    if bad <= 2 {
+                        // localize the first mismatches: per-key diff
+                        let (Ok(Value::Compound(ma)), Ok(Value::Compound(mb))) =
+                            (fastnbt::from_bytes::<Value>(payload), fastnbt::from_bytes::<Value>(&d))
+                        else {
+                            eprintln!("verify mismatch at ({cx},{cz}) whole={whole}: PARSE FAIL lens {} vs {}", payload.len(), d.len());
+                            continue;
+                        };
+                        for (k, va) in &ma {
+                            let Some(vb) = mb.get(k) else { eprintln!("  key {k}: MISSING in store"); continue };
+                            if k == "sections" {
+                                let (Value::List(la), Value::List(lb)) = (va, vb) else { eprintln!("  key {k}: shape"); continue };
+                                for (i, (sa, sb)) in la.iter().zip(lb.iter()).enumerate() {
+                                    if !c_saves::chunknbt::sections_semantically_equal(sa, sb) {
+                                        let (Value::Compound(x), Value::Compound(y)) = (sa, sb) else { continue };
+                                        let xk: Vec<&String> = x.keys().collect();
+                                        let yk: Vec<&String> = y.keys().collect();
+                                        let xs = x.get("block_states").map(|v| format!("{v:?}")).unwrap_or_default();
+                                        let ys = y.get("block_states").map(|v| format!("{v:?}")).unwrap_or_default();
+                                        eprintln!("  sec {i}: src {xk:?} got {yk:?}");
+                                        eprintln!("    src bs: {}..{}", &xs[..xs.len().min(180)], &xs[xs.len().saturating_sub(120)..]);
+                                        eprintln!("    got bs: {}..{}", &ys[..ys.len().min(180)], &ys[ys.len().saturating_sub(120)..]);
+                                    }
+                                }
+                            } else if va != vb {
+                                eprintln!("  key {k}: src!=got");
+                            }
+                        }
+                        eprintln!("verify mismatch at ({cx},{cz}) whole={whole}");
+                    }
                 }
             }
             None => {
@@ -402,6 +431,14 @@ fn main() {
         }
     );
 
+    // DEBUG early verify (post-import+pack, same handle)
+    {
+        let (ok, bad) = verify(&st_r, &region, false);
+        println!("DEBUG verify post-C/D region: ok={ok} bad={bad}");
+        let (ok, bad) = verify(&st_e, &entities, true);
+        println!("DEBUG verify post-C/D entities: ok={ok} bad={bad}");
+    }
+
     // ---------------- E: cold read (fresh store handles) ----------------
     drop(st_r);
     drop(st_e);
@@ -530,6 +567,14 @@ fn main() {
         st.seal();
     }
 
+    // DEBUG early verify (post-reads)
+    {
+        let (ok, bad) = verify(&st_r, &region, false);
+        println!("DEBUG verify post-E/F region: ok={ok} bad={bad}");
+        let (ok, bad) = verify(&st_e, &entities, true);
+        println!("DEBUG verify post-E/F entities: ok={ok} bad={bad}");
+    }
+
     // ---------------- G: steady-state rewrite ----------------
     {
         let mut lat = Lat::new(region.len() * rounds);
@@ -553,7 +598,14 @@ fn main() {
         lat.report("csaves-write-steady-entities", bytes, secs);
         st_e.sync();
     }
-
+    // ---------------- G2: steady rewrite, 10% chunks dirty per round --------
+    // The G phase re-saves byte-identical payloads (skip path — the honest
+    // model for most autosave cycles). G2 marks 1 in 10 chunks dirty per
+    // round (a real mutation), so the report shows BOTH production regimes:
+    // skip-hit latency and the full encode path for actually-changed chunks.
+    // NOTE: dirty writes persist, so G2 runs LAST and its store is NOT the
+    // verify target when enabled (verify uses the pre-G2 corpus state);
+    // CSAVES_SPEED_G2=0 disables it. Default ON.
     // ---------------- H: verify (untimed) ----------------
     {
         let (ok, bad) = verify(&st_r, &region, false);
@@ -565,7 +617,46 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // G2 AFTER verify: dirty writes intentionally corrupt the store, so
+    // nothing is verified past this point.
+    let g2 = std::env::var("CSAVES_SPEED_G2").as_deref() != Ok("0");
+    if g2 {
+        let mut lat = Lat::new(region.len() * rounds);
+        let mut bytes = 0u64;
+        let mut dirty = 0usize;
+        let t0 = Instant::now();
+        for r in 0..rounds {
+            for (idx, (cx, cz, payload, _)) in region.iter().enumerate() {
+                let t0c = Instant::now();
+                if (idx + r) % 10 == 0 {
+                    let mut p = payload.clone();
+                    let n = p.len();
+                    if n > 8 {
+                        // flip a byte INSIDE the payload (the last byte is the
+                        // NBT end tag — mutating it yields invalid NBT that
+                        // the split path would reject, a no-op write)
+                        p[n / 2] ^= 0x01;
+                    }
+                    dirty += 1;
+                    if st_r.write_chunk(key(*cx, *cz), &p, false).is_err() {}
+                    bytes += p.len() as u64;
+                } else {
+                    if st_r.write_chunk(key(*cx, *cz), payload, false).is_err() {}
+                    bytes += payload.len() as u64;
+                }
+                lat.push(t0c.elapsed().as_nanos() as u64);
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "SPEED csaves-write-steady-region-dirty10: dirty={dirty} MB/s={:.1} wall={:.3}s",
+            bytes as f64 / 1048576.0 / secs, secs
+        );
+        lat.report("csaves-write-steady-region-dirty10", bytes, secs);
+        st_r.sync();
+    }
     let _ = container;
     let _ = std::fs::remove_dir_all(&tmp);
     println!("SPEED done");
 }
+
