@@ -33,11 +33,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
-      - name: download Paper 26.2 (vanilla terrain, no datapack)
+      - name: download Paper 26.3 (vanilla terrain, no datapack)
         run: |
           mkdir -p jjserver && cd jjserver
-          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/3cce0a4922baf79bd8e1275ee5ff9f073f24675770e09b0d4be9442d513e7a6b/paper-26.2-134.jar"
-          echo "3cce0a4922baf79bd8e1275ee5ff9f073f24675770e09b0d4be9442d513e7a6b  paper.jar" | sha256sum -c -
+          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15/paper-26.3-227.jar"
+          echo "416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15  paper.jar" | sha256sum -c -
           mkdir -p config
           echo "eula=true" > eula.txt
           printf 'rcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=4\nsimulation-distance=4\nsync-chunk-writes=true\nlevel-name=jjworld\n' > server.properties
@@ -133,8 +133,8 @@ jobs:
       - name: setup server + scatter chests + spawn 20k entities
         working-directory: jjserver
         run: |
-          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/3cce0a4922baf79bd8e1275ee5ff9f073f24675770e09b0d4be9442d513e7a6b/paper-26.2-134.jar"
-          echo "3cce0a4922baf79bd8e1275ee5ff9f073f24675770e09b0d4be9442d513e7a6b  paper.jar" | sha256sum -c -
+          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15/paper-26.3-227.jar"
+          echo "416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15  paper.jar" | sha256sum -c -
           mkdir -p config
           echo "eula=true" > eula.txt
           printf 'rcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=4\nsimulation-distance=4\nsync-chunk-writes=true\nlevel-name=jjworld\n' > server.properties
