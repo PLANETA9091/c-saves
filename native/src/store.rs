@@ -3196,39 +3196,27 @@ impl Store {
     /// segment (continuous pack pass).
     fn pack_segment(&self, worst_id: u32, drop_seg: bool) -> bool {
         self.pack_requested.store(false, Ordering::Relaxed);
-        // Locality-ordered victims: walk live recipes in chunk-key order and
-        // collect their blobs in section (Y) order, so sections of one chunk
-        // become adjacent slab members. Measured -17% slab bytes vs map-order
-        // packing (same-chunk sections share palettes and data texture).
-        let mut victims: Vec<(Hash, BlobLoc)> = Vec::new();
-        {
+        // Locality-ordered victims: take the segment's blobs DIRECTLY from
+        // the blobs map and sort by blob id — blob ids are allocated in
+        // section order as chunks are written, so id order approximates
+        // chunk-key/section order (same-chunk sections become adjacent slab
+        // members). The previous recipe-walk collected the same set but paid
+        // a full chunks-map sort + recipe_at decompress per PACKED SEGMENT:
+        // on a 262k-chunk world that was O(segments x chunks) batch
+        // decompresses (~40+ min of drain). Measured -17% slab bytes came
+        // from the locality itself, which id order preserves.
+        let mut victims: Vec<(Hash, BlobLoc)> = {
             let blobs = self.blobs.read();
-            let mut seen: std::collections::HashSet<Hash> = std::collections::HashSet::new();
-            {
-                let chunks = self.chunks.read();
-                let mut keys: Vec<u64> = chunks.keys().copied().collect();
-                keys.sort_unstable();
-                for k in keys {
-                    let Some((seg, off, len)) = chunks.get(&k).copied() else { continue };
-                    let Some(rec) = self.recipe_at(k, seg, off, len) else { continue };
-                    for h in rec.blob_hashes() {
-                        if seen.insert(h) {
-                            if let Some(l) = blobs.get(&h) {
-                                if l.seg == worst_id && (drop_seg || !(l.slab || l.cold)) {
-                                    victims.push((h, *l));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // hot blobs not covered by any live recipe (orphans) go last
-            for (h, l) in blobs.iter() {
-                if l.seg == worst_id && !seen.contains(h) && (drop_seg || !(l.slab || l.cold)) {
-                    victims.push((*h, *l));
-                }
-            }
-        }
+            let mut v: Vec<(Hash, BlobLoc)> = blobs
+                .iter()
+                .filter(|(_, l)| {
+                    l.seg == worst_id && (drop_seg || !(l.slab || l.cold))
+                })
+                .map(|(h, l)| (*h, *l))
+                .collect();
+            v.sort_by_key(|(_, l)| (l.id, l.off));
+            v
+        };
         let mut cands: Vec<(Hash, u32, BlobLoc, Vec<u8>)> = Vec::new();
         let mut cand_bytes = 0usize;
         let mut did = false;
