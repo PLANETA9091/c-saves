@@ -385,6 +385,9 @@ pub static ST_ENC_RLE_VAN: AtomicU64 = AtomicU64::new(0);
 pub static ST_ENC_RLE_COL: AtomicU64 = AtomicU64::new(0);
 pub static ST_ENC_DENSE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static ST_ENC_RLE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Sections rejected by the encode sanity check (voxel index outside the
+/// palette — malformed source bytes); they fall back to raw NBT storage.
+pub static ST_ENC_FALLBACK: AtomicU64 = AtomicU64::new(0);
 
 /// One-line JSON summary of the encode-form counters.
 pub fn enc_mode_stats() -> String {
@@ -393,9 +396,10 @@ pub fn enc_mode_stats() -> String {
     let rc = ST_ENC_RLE_COL.load(Ordering::Relaxed);
     let db = ST_ENC_DENSE_BYTES.load(Ordering::Relaxed);
     let rb = ST_ENC_RLE_BYTES.load(Ordering::Relaxed);
+    let fb = ST_ENC_FALLBACK.load(Ordering::Relaxed);
     format!(
-        r#"{{"dense":{},"rle_van":{},"rle_col":{},"dense_bytes":{},"rle_bytes":{}}}"#,
-        d, rv, rc, db, rb
+        r#"{{"dense":{},"rle_van":{},"rle_col":{},"dense_bytes":{},"rle_bytes":{},"fallback":{}}}"#,
+        d, rv, rc, db, rb, fb
     )
 }
 
@@ -1094,6 +1098,15 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             && matches!(in_bits, 1 | 2 | 4 | 8 | 16 | 32)
             && ents.iter().enumerate().all(|(i, (_, old))| *old == i);
         let v = unpack_nostroddle(data, entries, in_bits);
+        // sanity: every voxel index must be inside the palette. Valid vanilla
+        // data always is; a mismatch means malformed/mutated source bytes
+        // (garbage in unused codes). Fall back to raw NBT storage instead of
+        // panicking on the server thread — the section just loses the CSEC
+        // savings, semantics are untouched.
+        if v.iter().any(|x| (*x as usize) >= n) {
+            ST_ENC_FALLBACK.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         // remap old palette index -> canonical index
         let mut remap = vec![0u8; n];
         for (new_i, (_, old_i)) in ents.iter().enumerate() {
