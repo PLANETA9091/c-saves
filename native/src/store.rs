@@ -2041,7 +2041,11 @@ impl Store {
             WST_ENS.1.fetch_add(1, Ordering::Relaxed);
             r
         };
-        WST_RECIPE.0.fetch_add(t0w.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // recipe_batch stage = recipe encode + supersede + pending push ONLY
+        // (was measured from t0w, i.e. cumulative over split+ensure — the
+        // SPEED stages-import JSON used to misattribute ~49% of import wall
+        // time to this stage; the real cost lives in split_parse_encode).
+        let t2w = std::time::Instant::now();
         WST_RECIPE.1.fetch_add(1, Ordering::Relaxed);
 
         let id_of = |h: Hash| -> Option<u32> {
@@ -2095,6 +2099,7 @@ impl Store {
                 self.flush_recipe_batch();
             }
         }
+        WST_RECIPE.0.fetch_add(t2w.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(())
     }
 
