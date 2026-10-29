@@ -344,6 +344,7 @@ fn main() {
         let secs = t0.elapsed().as_secs_f64();
         lat.report("csaves-import-region", region_raw, secs);
         println!("SPEED stages-import: {}", c_saves::store::write_stage_json());
+        println!("SPEED stages-split: {}", c_saves::chunknbt::split_stage_json());
     }
     {
         let mut lat = Lat::new(entities.len());

@@ -399,6 +399,36 @@ pub fn enc_mode_stats() -> String {
     )
 }
 
+// ------------------------------------------------ split stage timers --
+// Import-path profiling: where does split() wall time go (fresh imports;
+// repeat saves hit the encode cache and collapse into SPLT_SECS).
+static SPLT_PARSE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static SPLT_SECS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static SPLT_SHIFT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static SPLT_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+
+/// One-line JSON summary of the split-path stage timers (nanos, calls).
+pub fn split_stage_json() -> String {
+    fn f(name: &str, t: &(AtomicU64, AtomicU64)) -> String {
+        let ns = t.0.load(Ordering::Relaxed);
+        let n = t.1.load(Ordering::Relaxed);
+        format!(
+            r#"{}":{{ns:{},n:{},per_call:{}}}"#,
+            name,
+            ns,
+            n,
+            ns.checked_div(n.max(1)).unwrap_or(0)
+        )
+    }
+    format!(
+        "{{{},{},{},{}}}",
+        f("parse", &SPLT_PARSE),
+        f("sections", &SPLT_SECS),
+        f("shift", &SPLT_SHIFT),
+        f("tail", &SPLT_TAIL)
+    )
+}
+
 fn push_uvarint(out: &mut Vec<u8>, mut x: u64) {
     loop {
         let b = (x & 0x7f) as u8;
@@ -2523,7 +2553,10 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
     if whole_mode {
         return whole_split(payload, pos_hint);
     }
+    let t_sp = std::time::Instant::now();
     let root: Value = fastnbt::from_bytes(payload).map_err(|e| format!("nbt parse: {e}"))?;
+    SPLT_PARSE.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SPLT_PARSE.1.fetch_add(1, Ordering::Relaxed);
     let Value::Compound(map) = &root else {
         return Ok(Split::Whole { hash: hash_of(payload) });
     };
@@ -2531,6 +2564,7 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
         return whole_split(payload, pos_hint);
     };
 
+    let t_ss = std::time::Instant::now();
     let mut sections = Vec::with_capacity(list.len());
     let mut cache_hit = vec![false; list.len()];
     for s in list {
@@ -2569,12 +2603,17 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
     if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
         shift_ref_pass(&mut sections, list, &cache_hit);
     }
+    SPLT_SECS.0.fetch_add(t_ss.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SPLT_SECS.1.fetch_add(1, Ordering::Relaxed);
 
+    let t_sh = std::time::Instant::now();
     let mut tail_map = map.clone();
     tail_map.remove("sections");
     let mut tail_val = Value::Compound(tail_map);
     tail_encode(&mut tail_val);
     let tail = to_bytes(&tail_val);
+    SPLT_TAIL.0.fetch_add(t_sh.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SPLT_TAIL.1.fetch_add(1, Ordering::Relaxed);
 
     Ok(Split::Split { sections, tail })
 }
