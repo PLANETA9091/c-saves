@@ -137,7 +137,7 @@ fn classify_chunk(p: &[u8], c: &mut Comps) {
                 if let Some(bs) = sm.get("block_states") {
                     if let Value::Compound(bm) = bs {
                         if let Some(Value::LongArray(la)) = bm.get("data") {
-                            c.sec_bs_data += la.as_ref().len() * 8;
+                            c.sec_bs_data += (la.as_ref().len() * 8) as u64;
                             known += (la.as_ref().len() * 8) as u64;
                         }
                         if let Some(pal) = bm.get("palette") {
@@ -188,7 +188,7 @@ fn classify_chunk(p: &[u8], c: &mut Comps) {
         // approximate: name keys overhead — fold into t_other below
     }
     let tail_total = {
-        let Value::Compound(mut tm) = m.clone() else { return };
+        let mut tm = m.clone();
         tm.remove("sections");
         comp_bytes(&Value::Compound(tm))
     };
