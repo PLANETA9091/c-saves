@@ -28,6 +28,20 @@ on a REAL survival world (`bigworld-survival` workflow: 512x512 vanilla
 chunks + 2000 NBT loot chests + 20k entities, Paper 26.3). `real_exp` breaks
 that corpus down by class, chunk-dedup rate, entity kind and BE family.
 
+## v0.9.0: light-uniform codec + bigworld pack-drain fix
+
+The 512x512-chunk real JJThunder world (261,542 chunks) measured **31.8% of
+all raw NBT bytes in light arrays** (SkyLight 1.64 GB + BlockLight 2.01 GB).
+CSEC v4 (0xC8, third flag byte) collapses all-0 BlockLight (the underground
+majority — previously 2048 RAW bytes per section) and all-0/all-1 SkyLight to
+flag bits; streams without v4 features stay byte-identical v3 so dedup hashes
+are stable. Also: the bigworld pack drain now re-requests a pack before every
+compact step (the old loop stopped after one segment and left the 2 GB hot
+tier unpacked at z3), `big_profile` scans EVERY written key for integrity
+(self-heal re-import isolates pack-loss vs write-loss), and the palette
+attribution bug is fixed (fastnbt `to_bytes` needs a compound root; bare
+lists measured 0 and dumped ~1.86 GB of palettes into `sec_other`).
+
 ## v0.6.0 (WIP, profiling-driven): section RLE forms
 
 Profiling the real JJThunder corpus showed the remaining region bytes live in

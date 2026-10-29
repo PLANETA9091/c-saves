@@ -257,6 +257,15 @@ pub fn enc_cache_stats() -> (u64, u64) {
 
 const CSEC_MAGIC: u8 = 0xC5; // legacy v1/v2 sections (read-only)
 const CSEC3_MAGIC: u8 = 0xC7; // v3: compound palettes + starlight + canonical order
+/// v4 (0xC8): adds a third flag byte for light-uniform forms (the flags1/2
+/// bit budget is exhausted). Layout [0xC8][f1][f2][f3][y as i8]...; f3 bit0
+/// BlockLight all-0, bit1 reserved. Streams without f3 features stay 0xC7
+/// (byte-identical to v3), so dedup hashes and legacy decoders are stable.
+const CSEC4_MAGIC: u8 = 0xC8;
+/// True when the slice is a CSEC v3/v4 stream (0xC7 or 0xC8).
+fn is_csec4(b: Option<&u8>) -> bool {
+    matches!(b, Some(&CSEC3_MAGIC) | Some(&CSEC4_MAGIC))
+}
 const HMAP_MAGIC: u8 = 0xC6; // repacked heightmap ByteArray marker
 
 fn bits_for(n: usize) -> u32 {
@@ -505,6 +514,11 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
     let f1 = *b.get(1)?;
     let f2 = *b.get(2)?;
     let mut p = 3usize;
+    let mut f3 = 0u8;
+    if b[0] == CSEC4_MAGIC {
+        f3 = *b.get(p)?;
+        p += 1;
+    }
     let y = *b.get(p)? as i8;
     p += 1;
     let mut sec_map: std::collections::HashMap<String, Value> = Default::default();
@@ -661,6 +675,8 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
             "BlockLight".to_string(),
             Value::ByteArray(fastnbt::ByteArray::new(arr.iter().map(|x| *x as i8).collect())),
         );
+    } else if f3 & 1 != 0 {
+        sec_map.insert("BlockLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![0; 2048])));
     }
     if f2 & 1 != 0 {
         let v = *b.get(p)?;
@@ -900,9 +916,11 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         Some(Value::Byte(b)) => *b,
         _ => return None,
     };
-    let mut out = vec![CSEC3_MAGIC, 0u8, 0u8, y as u8];
+    // 5-byte v4 header; patched down to the 4-byte v3 form when f3 stays 0.
+    let mut out = vec![CSEC4_MAGIC, 0u8, 0u8, 0u8, y as u8];
     let mut f1 = 0u8;
     let mut f2 = 0u8;
+    let mut f3 = 0u8;
 
     /// One palette entry, normalized from either the string form or the
     /// modern compound form {Name, Properties}.
@@ -1206,14 +1224,24 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         }
         f2 |= f2b;
     }
-    for (key, uni_bit, raw_bit, all) in [
-        ("SkyLight", 16u8, 64u8, 0xffu8),
-        ("BlockLight", 0u8, 128u8, 0u8),
+    for (key, uni_bit, raw_bit, all, zero_to_f3) in [
+        ("SkyLight", 16u8, 64u8, 0xffu8, false),
+        ("BlockLight", 0u8, 128u8, 0u8, true),
     ] {
         let Some(Value::ByteArray(ba)) = m.get(key) else { continue };
         let b: Vec<u8> = ba.as_ref().iter().map(|x| *x as u8).collect();
-        if uni_bit != 0 && b.iter().all(|x| *x == all) {
+        // Uniform forms require the standard 2048-byte light array (custom
+        // world heights do not change section light size, but stay safe).
+        if b.len() == 2048 && uni_bit != 0 && b.iter().all(|x| *x == all) {
             f1 |= uni_bit;
+        } else if b.len() == 2048 && b.iter().all(|x| *x == 0u8) {
+            // all-0 light: SkyLight has the dedicated flags1 bit5; BlockLight
+            // (no free flags1 bit) moves to flags3 bit0 (v4).
+            if zero_to_f3 {
+                f3 |= 1;
+            } else {
+                f1 |= 32u8;
+            }
         } else {
             if b.len() > 65535 {
                 return None;
@@ -1239,6 +1267,13 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
     }
     out[1] = f1;
     out[2] = f2;
+    if f3 == 0 {
+        // no v4 features: collapse to the byte-identical v3 wire form
+        out[0] = CSEC3_MAGIC;
+        out.remove(3);
+    } else {
+        out[3] = f3;
+    }
     Some(out)
 }
 
@@ -1251,6 +1286,10 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
 /// vertically with smoothly varying surface heights) — the ref replaces a
 /// ~1.4 KB dense stream with ~15-30 bytes.
 const CSECS_MAGIC: u8 = 0xC9;
+/// Shift-ref member with a v4 (f3-carrying) tail: layout
+/// [0xCA][t u16][k u8][f1'][f2'][f3'][n_extra u16]... — same as 0xC9 plus
+/// the f3' byte (the tail's section_encode output was 0xC8).
+const CSECS4_MAGIC: u8 = 0xCA;
 
 pub static ST_ENC_SHIFT: AtomicU64 = AtomicU64::new(0);
 pub static ST_ENC_SHIFT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -1584,8 +1623,8 @@ fn shift_ref_pass(sections: &mut [(Hash, SecBytes)], vals: &[Value], cache_hit: 
     let mut is_ref: Vec<bool> = vec![false; n_sec];
     for i in 0..n_sec {
         let (csec3, mlen) = match &sections[i].1 {
-            SecBytes::Shared(a) => (a.first() == Some(&CSEC3_MAGIC), a.len()),
-            SecBytes::Owned(b) => (b.first() == Some(&CSEC3_MAGIC), b.len()),
+            SecBytes::Shared(a) => (is_csec4(a.first()), a.len()),
+            SecBytes::Owned(b) => (is_csec4(b.first()), b.len()),
         };
         let sec = if csec3 && mlen >= MIN_MEMBER {
             match meta_cache.get(&sections[i].0) {
@@ -1737,17 +1776,27 @@ fn shift_ref_pass(sections: &mut [(Hash, SecBytes)], vals: &[Value], cache_hit: 
             _ => continue,
         };
         let csec2 = match section_encode(&s2) {
-            Some(c) if c.first() == Some(&CSEC3_MAGIC) && c.len() >= 4 => c,
+            Some(c) if is_csec4(c.first()) && c.len() >= 4 => c,
             _ => continue,
         };
-        // assemble: [0xC9][t u16][k u8][f1'][f2'][n_extra u16][extras]
-        //           [top_kind + payload][Y + fields...]  (csec2[3..] = Y onward)
+        let c4 = csec2[0] == CSEC4_MAGIC;
+        let tail_at = if c4 { 4usize } else { 3usize };
+        // assemble: [0xC9/0xCA][t u16][k u8][f1'][f2'][f3'?][n_extra u16]
+        //           [extras][top_kind + payload][Y + fields...]
+        //           (csec2[tail_at..] = Y onward)
         let n_ref = n_t + extras.len();
         let mut mbr: Vec<u8> = Vec::with_capacity(64);
-        mbr.push(CSECS_MAGIC);
+        if c4 {
+            mbr.push(CSECS4_MAGIC);
+        } else {
+            mbr.push(CSECS_MAGIC);
+        }
         mbr.extend_from_slice(&(j as u16).to_le_bytes());
         mbr.push(k as u8);
         mbr.extend_from_slice(&csec2[1..3]);
+        if c4 {
+            mbr.push(csec2[3]);
+        }
         mbr.extend_from_slice(&(extras.len() as u16).to_le_bytes());
         // extras in first-appearance order (must match ref-space numbering)
         'ex: for &pos in &extras {
@@ -1807,7 +1856,7 @@ fn shift_ref_pass(sections: &mut [(Hash, SecBytes)], vals: &[Value], cache_hit: 
             mbr.push(1u8);
             mbr.extend_from_slice(&packed);
         }
-        mbr.extend_from_slice(&csec2[3..]);
+        mbr.extend_from_slice(&csec2[tail_at..]);
         // admission: the ref must clearly beat the full member POST-COMPRESSION.
         // Slab zstd compresses dense member payloads ~5x (cross-section
         // matches) while small ref payloads compress ~2.5x, so the ref wins
@@ -1919,14 +1968,16 @@ pub fn resolve_shifts(
     sections: &[&[u8]],
     hashes: &[Hash],
 ) -> Option<Vec<Option<(Hash, Arc<Vec<u8>>)>>> {
-    let has_ref = sections.iter().any(|s| s.first() == Some(&CSECS_MAGIC));
+    let has_ref = sections
+        .iter()
+        .any(|s| s.first() == Some(&CSECS_MAGIC) || s.first() == Some(&CSECS4_MAGIC));
     if !has_ref {
         // parallel "no replacements" vec (caller zips it with the sections)
         return Some(vec![None; sections.len()]);
     }
     let mut out: Vec<Option<(Hash, Arc<Vec<u8>>)>> = Vec::with_capacity(sections.len());
     for (i, s) in sections.iter().enumerate() {
-        if s.first() != Some(&CSECS_MAGIC) {
+        if s.first() != Some(&CSECS_MAGIC) && s.first() != Some(&CSECS4_MAGIC) {
             out.push(None);
             continue;
         }
@@ -1939,7 +1990,7 @@ pub fn resolve_shifts(
             return None;
         }
         let target = sections[t];
-        if target.first() != Some(&CSEC3_MAGIC) {
+        if !is_csec4(target.first()) {
             return None;
         }
         let h_member = hashes.get(i).copied().unwrap_or(0);
@@ -1974,10 +2025,12 @@ pub fn resolve_shifts(
 /// Member layout: [0xC9][t u16][k u8][f1'][f2'][n_extra u16][extras...]
 ///                [top_kind + payload][Y i8 + fields...]  (CSEC3 tail).
 fn resolve_one(member: &[u8], target: &[u8]) -> Option<Vec<u8>> {
+    let c4 = member[0] == CSECS4_MAGIC;
     let k = member[3] as usize;
     let f1 = member[4];
     let f2 = member[5];
-    let mut p = 6usize;
+    let f3 = if c4 { member[6] } else { 0u8 };
+    let mut p = if c4 { 7usize } else { 6usize };
     let n_extra = u16::from_le_bytes(member.get(p..p + 2)?.try_into().ok()?) as usize;
     p += 2;
     let mut extras: Vec<Value> = Vec::with_capacity(n_extra);
@@ -2086,12 +2139,19 @@ fn resolve_one(member: &[u8], target: &[u8]) -> Option<Vec<u8>> {
         _ => return None,
     }
     // rebuild the section: everything except block_states comes from the
-    // member's CSEC3-style tail; block_states is derived from the target
+    // member's CSEC3/4-style tail; block_states is derived from the target
     let fake = {
-        let mut v = Vec::with_capacity(member.len() - p + 3);
-        v.push(CSEC3_MAGIC);
-        v.push(f1);
-        v.push(f2);
+        let mut v = Vec::with_capacity(member.len() - p + 4);
+        if c4 {
+            v.push(CSEC4_MAGIC);
+            v.push(f1);
+            v.push(f2);
+            v.push(f3);
+        } else {
+            v.push(CSEC3_MAGIC);
+            v.push(f1);
+            v.push(f2);
+        }
         v.extend_from_slice(&member[p..]);
         v
     };
@@ -2208,7 +2268,7 @@ fn pal_semantic_equal(a: &Value, b: &Value, entries: usize) -> bool {
 
 /// Decode the custom section form back to the exact NBT value.
 pub fn section_decode(b: &[u8]) -> Option<Value> {
-    if b.first() == Some(&CSEC3_MAGIC) {
+    if is_csec4(b.first()) {
         return section_decode3(b);
     }
     if b.first() != Some(&CSEC_MAGIC) || b.len() < 3 {
@@ -2612,7 +2672,7 @@ fn split_parsed(
             // regardless of the original palette order -> hash the bytes.
             match section_encode(s) {
                 Some(c) => {
-                    if c.first() == Some(&CSEC3_MAGIC) {
+                    if is_csec4(c.first()) {
                         let h = hash_of(&c);
                         let arc = Arc::new(c);
                         enc_cache_put(sh, h, arc.clone());
@@ -2724,7 +2784,7 @@ pub fn join(sections: &[Vec<u8>], tail: &[u8]) -> Result<Vec<u8>, String> {
     }
     let mut list = Vec::with_capacity(sections.len());
     for s in sections {
-        let v = if s.first() == Some(&CSEC_MAGIC) || s.first() == Some(&CSEC3_MAGIC) {
+        let v = if s.first() == Some(&CSEC_MAGIC) || is_csec4(s.first()) {
             section_decode(s).ok_or("bad csec section")?
         } else {
             fastnbt::from_bytes(s).map_err(|e| format!("section parse: {e}"))?
@@ -2907,12 +2967,17 @@ fn section_emit_csec3(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
 }
 
 fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
-    if *b.first()? != CSEC3_MAGIC {
+    if !is_csec4(b.first()) {
         return None;
     }
     let f1 = *b.get(1)?;
     let f2 = *b.get(2)?;
     let mut p = 3usize;
+    let mut f3 = 0u8;
+    if b[0] == CSEC4_MAGIC {
+        f3 = *b.get(p)?;
+        p += 1;
+    }
     let y = *b.get(p)? as u8;
     p += 1;
 
@@ -3074,11 +3139,14 @@ fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
         p += l;
     }
     let mut bl: Option<Vec<u8>> = None;
+    let mut bl_uniform0 = false;
     if f1 & 128 != 0 {
         let l = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
         p += 2;
         bl = Some(b.get(p..p + l)?.to_vec());
         p += l;
+    } else if f3 & 1 != 0 {
+        bl_uniform0 = true;
     }
     let sl_state = if f2 & 1 != 0 {
         let v = *b.get(p)?;
@@ -3100,6 +3168,10 @@ fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
         put_named_key(out, 0x07, "BlockLight");
         put_be32(out, raw.len() as i32);
         out.extend_from_slice(raw);
+    } else if bl_uniform0 {
+        put_named_key(out, 0x07, "BlockLight");
+        put_be32(out, 2048);
+        out.resize(out.len() + 2048, 0x00);
     }
     match sky {
         Sky::Full => {
@@ -3156,8 +3228,8 @@ pub struct SecSrc<'a> {
 /// (or the shape is unexpected) — the caller then uses the generic join.
 pub fn join_fused(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
     for (si, s) in sections.iter().enumerate() {
-        if s.b.first() != Some(&CSEC3_MAGIC) {
-            fdbg!("fused: section {si} not CSEC3 (first={:02x})", s.b.first().copied().unwrap_or(0));
+        if !is_csec4(s.b.first()) {
+            fdbg!("fused: section {si} not CSEC3/4 (first={:02x})", s.b.first().copied().unwrap_or(0));
             return None;
         }
     }
@@ -4156,6 +4228,95 @@ mod codec_tests {
         let enc = section_encode(&Value::Compound(sec.clone())).expect("starlight keys must encode");
         let dec = section_decode(&enc).unwrap();
         assert!(sections_semantically_equal(&dec, &Value::Compound(sec)));
+    }
+
+    #[test]
+    fn csec4_light_uniforms_roundtrip() {
+        // all-0 BlockLight (the underground majority) + all-0 SkyLight must
+        // collapse to flag bits, not 2048 raw bytes each.
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(-8));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert(
+            "palette".to_string(),
+            Value::List(vec![Value::String("minecraft:deepslate".into())]),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        sec.insert("SkyLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![0; 2048])));
+        sec.insert(
+            "BlockLight".to_string(),
+            Value::ByteArray(fastnbt::ByteArray::new(vec![0; 2048])),
+        );
+        let enc = section_encode(&Value::Compound(sec.clone())).expect("uniform lights encode");
+        assert_eq!(enc[0], CSEC4_MAGIC, "BlockLight all-0 must upgrade to v4");
+        assert_eq!(enc[3] & 1, 1, "f3 bit0 = BlockLight all-0");
+        assert_eq!(enc[1] & 32, 32, "f1 bit5 = SkyLight all-0");
+        // no raw light payloads: stream stays tiny
+        assert!(enc.len() < 64, "uniform-light section must not carry 2048B arrays, len={}", enc.len());
+        let dec = section_decode(&enc).unwrap();
+        assert!(sections_semantically_equal(&dec, &Value::Compound(sec)));
+        // byte-exact semantic check (semantic equality already covers the
+        // maps; assert the light arrays byte-for-byte too)
+        if let Value::Compound(dm) = dec {
+            if let Some(Value::ByteArray(bl)) = dm.get("BlockLight") {
+                assert!(bl.as_ref().iter().all(|x| *x == 0));
+                assert_eq!(bl.as_ref().len(), 2048);
+            } else {
+                panic!("BlockLight missing after decode");
+            }
+        }
+    }
+
+    #[test]
+    fn csec4_sky_full_stays_v3() {
+        // all-1 SkyLight + NO BlockLight key: pure v3 (f3 unused) — wire form
+        // must stay byte-identical to the old encoder output.
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(100));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert(
+            "palette".to_string(),
+            Value::List(vec![Value::String("minecraft:air".into())]),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        sec.insert("SkyLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![-1; 2048])));
+        let enc = section_encode(&Value::Compound(sec.clone())).expect("sky-full encodes");
+        assert_eq!(enc[0], CSEC3_MAGIC, "no v4 features => byte-identical v3 stream");
+        let dec = section_decode(&enc).unwrap();
+        assert!(sections_semantically_equal(&dec, &Value::Compound(sec)));
+    }
+
+    #[test]
+    fn csec4_partial_light_stays_raw() {
+        // non-uniform light arrays must keep the raw form (and v3 when no
+        // f3 feature is triggered — raw SkyLight/BlockLight live in f1).
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(10));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert(
+            "palette".to_string(),
+            Value::List(vec![Value::String("minecraft:stone".into())]),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let mut sk = vec![0u8; 2048];
+        sk[100] = 7; // one lit byte
+        sec.insert("SkyLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(sk.iter().map(|x| *x as i8).collect())));
+        sec.insert(
+            "BlockLight".to_string(),
+            Value::ByteArray(fastnbt::ByteArray::new(vec![0; 2048])),
+        );
+        let enc = section_encode(&Value::Compound(sec.clone())).expect("partial light encodes");
+        assert_eq!(enc[0], CSEC4_MAGIC, "BlockLight all-0 still upgrades to v4");
+        assert_eq!(enc[1] & 64, 64, "SkyLight raw");
+        let dec = section_decode(&enc).unwrap();
+        if let Value::Compound(dm) = dec {
+            if let Some(Value::ByteArray(sk2)) = dm.get("SkyLight") {
+                assert_eq!(sk2.as_ref().len(), 2048);
+                assert_eq!(sk2.as_ref()[100], 7);
+            } else {
+                panic!("SkyLight missing after decode");
+            }
+        }
     }
 
     #[test]

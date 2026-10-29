@@ -102,7 +102,19 @@ fn mca_on_disk(dir: &Path) -> u64 {
 // -------------------------------------------------------- classification ---
 
 fn val_bytes(v: &Value) -> u64 {
-    fastnbt::to_bytes(v).map(|b| b.len() as u64).unwrap_or(0)
+    // fastnbt requires a compound root: bare Lists (palettes) fail and
+    // silently measured 0. Wrap, then strip the 5-byte wrapper.
+    match v {
+        Value::Compound(_) => fastnbt::to_bytes(v).map(|b| b.len() as u64).unwrap_or(0),
+        _ => {
+            let mut m = std::collections::HashMap::new();
+            m.insert("p".to_string(), v.clone());
+            match fastnbt::to_bytes(&Value::Compound(m)) {
+                Ok(b) => (b.len() as u64).saturating_sub(5),
+                Err(_) => 0,
+            }
+        }
+    }
 }
 
 fn pal_data_stats(bs: &Value) -> (u64, u64) {
@@ -420,7 +432,7 @@ fn main() {
             let Some(Value::List(secs)) = m.get("sections") else { continue };
             for s in secs {
                 let Some(enc) = c_saves::chunknbt::section_encode(s) else { continue };
-                if enc.first() != Some(&0xC7) {
+                if !matches!(enc.first(), Some(&0xC7) | Some(&0xC8)) {
                     continue;
                 }
                 let h = c_saves::chunknbt::hash_of(&enc);

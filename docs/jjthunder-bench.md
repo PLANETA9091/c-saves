@@ -271,3 +271,40 @@ settles at the compression floor:
 * JJThunder corpus unchanged (x2.92 total; its stores were already above the
   old threshold), tests 36/36, verify clean, import 25.7 MB/s, warm reads
   1.6x anvil.
+
+## v0.9.0: light-uniform codec (CSEC v4 0xC8) + bigworld pack-drain fix
+
+The 512x512 real-survival attribution (`bigworld-survival`) measured the raw
+component weights of a 261,542-chunk JJThunder world (11.5 GB raw NBT):
+
+* block_states data 5.15 GB (44.7%), **SkyLight 1.64 GB + BlockLight 2.01 GB
+  (31.8%!)**, sec_other 1.86 GB, Heightmaps 335 MB, biomes 316 MB.
+
+Three fixes shipped against that attribution:
+
+1. **CSEC v4 (0xC8)** — the flags1/flags2 bit budget was exhausted, so a
+   third flag byte is introduced: `[0xC8][f1][f2][f3][y]`. f3 bit0 =
+   BlockLight all-0 (previously stored RAW — 2048 B per underground section,
+   the single biggest waste in deep mountain worlds). SkyLight all-0 now sets
+   the reserved f1 bit5 (decoder already understood it; the encoder never
+   set it). Streams without v4 features stay byte-identical v3 (0xC7), so
+   dedup hashes are stable. Shift-ref members whose tail encodes as v4 use
+   the new 0xCA member magic (`[0xCA][t u16][k u8][f1'][f2'][f3']...`).
+   Uniform forms require the standard 2048-byte light length (safe guard).
+2. **bigworld pack-drain fix** — the pack waves ran
+   `request_pack(); loop { compact_step() }`, but `pack_segment` CLEARS
+   pack_requested at entry and `pack_fallback` re-bases the auto-pack
+   watermark after every call, so the loop stopped after ONE segment: the
+   2 GB hot tier stayed per-section z3 (container 1629 MiB instead of the
+   packed ~x3). The drain now re-requests a pack before every compact step
+   until no hot blobs remain.
+3. **Palette attribution fix** — `fastnbt::to_bytes` requires a compound
+   root; bare Lists (block_states palettes) failed and measured 0 bytes,
+   silently dumping ~1.86 GB of palette weight into `sec_other`. Both
+   profilers wrap non-compound roots and strip the 5-byte wrapper.
+
+`big_profile` additionally gained a full-key integrity scan (every written
+region key is read back) with a self-heal re-import loop (max 2 rounds) that
+isolates pack-loss vs write-loss, and drains/steps/waves/profile are printed
+to stdout so the CI log carries the full pack story. The workflow now
+uploads artifacts `if: always()`.

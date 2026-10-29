@@ -115,7 +115,21 @@ impl Comps {
 }
 
 fn comp_bytes(v: &Value) -> u64 {
-    fastnbt::to_bytes(v).map(|b| b.len() as u64).unwrap_or(0)
+    // fastnbt requires a COMPOUND root: a bare List (e.g. block_states
+    // palette) fails to serialize and previously returned 0 — the whole
+    // palette weight silently landed in sec_other. Wrap, then strip the
+    // 5-byte wrapper (type byte + name-len + name 'p' + end tag).
+    match v {
+        Value::Compound(_) => fastnbt::to_bytes(v).map(|b| b.len() as u64).unwrap_or(0),
+        _ => {
+            let mut m = Map::new();
+            m.insert("p".to_string(), v.clone());
+            match fastnbt::to_bytes(&Value::Compound(m)) {
+                Ok(b) => (b.len() as u64).saturating_sub(5),
+                Err(_) => 0,
+            }
+        }
+    }
 }
 
 fn classify_chunk(p: &[u8], c: &mut Comps) {
@@ -206,6 +220,33 @@ fn bench_cfg() -> Cfg {
     }
 }
 
+/// Drain the hot tier: re-request a pack before every compact_step so the
+/// pack path (not the dead-ratio path, not optimize_fields) is taken until
+/// no hot blobs remain. The old `request_pack(); loop { if !step break }`
+/// stopped after ONE segment: pack_segment clears pack_requested at entry
+/// and pack_fallback re-bases the auto-pack watermark, so the next step saw
+/// nothing to do and returned false — 2 GB of z3 hot blobs never packed.
+fn drain(s: &Store, label: &str) {
+    let mut steps = 0u64;
+    let t0 = std::time::Instant::now();
+    loop {
+        s.request_pack();
+        if !s.compact_step() {
+            break;
+        }
+        steps += 1;
+        if steps == 200_000 {
+            println!("{label}: STEP CAP hit at {} MiB", s.disk_bytes() / 1048576);
+            break;
+        }
+    }
+    println!(
+        "{label}: drained in {steps} steps ({:.1}s), store {} MiB",
+        t0.elapsed().as_secs_f64(),
+        s.disk_bytes() / 1048576
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dim = PathBuf::from(args.get(1).cloned().unwrap_or_default());
@@ -246,6 +287,8 @@ fn main() {
     let mut raw_region = 0u64;
     let mut n_ent_chunks = 0u64;
     let mut raw_ent = 0u64;
+    let mut write_fail = 0u64;
+    let mut region_keys: Vec<u64> = Vec::new();
     let t0 = std::time::Instant::now();
     let mut pack_waves = 0u64;
     for (fidx, f) in region_files.iter().enumerate() {
@@ -259,25 +302,16 @@ fn main() {
             let k = ((fidx as u64) << 10) | slot as u64;
             if rs.write_chunk(k, &payload, false).is_err() {
                 eprintln!("write failed chunk file={fidx} slot={slot}");
+                write_fail += 1;
             }
+            region_keys.push(k);
             // intermittent pack waves: draining the hot tier in 64k-chunk
             // installments keeps slab frames + segment rolls bounded — one
             // giant end-of-import pack on a 2 GB hot tier lost members
             // (verify MISSING) and left per-section z3 blobs on disk
             if n_region_chunks % 65536 == 0 {
-                rs.request_pack();
-                loop {
-                    if !rs.compact_step() {
-                        break;
-                    }
-                }
+                drain(&rs, "wave");
                 pack_waves += 1;
-                eprintln!(
-                    "pack wave {} after {} chunks: region store now {} MiB",
-                    pack_waves,
-                    n_region_chunks,
-                    rs.disk_bytes() / 1048576
-                );
             }
         }
     }
@@ -299,15 +333,63 @@ fn main() {
     es.train_dict_if_needed();
     rs.seal();
     es.seal();
-    rs.request_pack();
-    es.request_pack();
+    drain(&rs, "final region");
+    drain(&es, "final entities");
+
+    // ---- integrity: read back EVERY written region key (no compare — cheap
+    // decompress only), count and re-write any losses, re-drain. Isolates
+    // pack-vs-write loss: heal rounds that stick mean a pack bug; losses that
+    // reappear right after a clean re-write mean a write-path bug.
+    let mut healed_rounds = 0u64;
     loop {
-        let a = rs.compact_step();
-        let b = es.compact_step();
-        if !a && !b {
+        let mut missing: Vec<u64> = Vec::new();
+        for &k in &region_keys {
+            if rs.read_chunk(k).is_none() {
+                missing.push(k);
+            }
+        }
+        println!(
+            "integrity: {}/{} region keys readable (missing {})",
+            region_keys.len() - missing.len(),
+            region_keys.len(),
+            missing.len()
+        );
+        if missing.is_empty() || healed_rounds >= 2 {
+            if !missing.is_empty() {
+                println!("integrity: GIVING UP with {} missing", missing.len());
+            }
             break;
         }
+        healed_rounds += 1;
+        println!("integrity: heal round {healed_rounds} — re-writing {} chunks", missing.len());
+        // re-read the payloads from the anvil source by key
+        let by_key: std::collections::HashMap<u64, Vec<u8>> = region_files
+            .iter()
+            .enumerate()
+            .flat_map(|(fidx, f)| {
+                if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
+                    return Vec::new();
+                }
+                load_mca(f)
+                    .into_iter()
+                    .map(move |(slot, payload)| (((fidx as u64) << 10) | slot as u64, payload))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut rew = 0usize;
+        for &k in &missing {
+            if let Some(p) = by_key.get(&k) {
+                if rs.write_chunk(k, p, false).is_ok() {
+                    rew += 1;
+                }
+            }
+        }
+        println!("integrity: re-wrote {rew}");
+        rs.sync();
+        rs.seal();
+        drain(&rs, "post-heal");
     }
+
     let rd = rs.disk_bytes();
     let ed = es.disk_bytes();
     let secs = t0.elapsed().as_secs_f64();
@@ -320,12 +402,13 @@ fn main() {
         mib(anvil_ent)
     );
     println!(
-        "import+pack: {:.0} chunks/s over {:.1}s | c-saves: region {:.2} MiB, entities {:.2} MiB",
+        "import+pack: {:.0} chunks/s over {:.1}s | c-saves: region {:.2} MiB, entities {:.2} MiB | waves {pack_waves} write_fail {write_fail} heal_rounds {healed_rounds}",
         (n_region_chunks + n_ent_chunks) as f64 / secs,
         secs,
         mib(rd),
         mib(ed)
     );
+    println!("region store profile: {}", rs.profile_json());
 
     println!("\n-- component weights (raw NBT bytes) --");
     let rows: Vec<(&str, u64)> = vec![
