@@ -112,6 +112,25 @@ jobs:
             native/survival_bench.txt
             native/survival_stalls.txt
 
+  survival-exp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build survival_exp
+        working-directory: native
+        run: cargo build --release --example survival_exp
+      - name: survival attribution + codec-lever prediction (48x48 chunks)
+        working-directory: native
+        run: |
+          ./target/release/examples/survival_exp 24 2>&1 | tee survival_exp.txt
+          cat survival_exp.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: survival-exp-results
+          path: native/survival_exp.txt
+
   speed-bench:
     runs-on: ubuntu-latest
     timeout-minutes: 20
