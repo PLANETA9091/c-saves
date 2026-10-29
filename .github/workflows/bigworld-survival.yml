@@ -127,33 +127,16 @@ jobs:
             fi
           done
           COUNT=$(ls "$R" | wc -l)
-          echo "region files: $COUNT (expect 64)"
-          [ "$COUNT" = "64" ] || echo "::warning::expected 64 region files, got $COUNT"
+          echo "region files: $COUNT (expect 256 = 16 tiles x 16 region files)"
+          [ "$COUNT" = "256" ] || echo "::warning::expected 256 region files, got $COUNT"
 
-      - name: setup server + scatter chests + spawn 20k entities
-        working-directory: jjserver
+      - name: enrich merged world (chests + entities, no server needed)
         run: |
-          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15/paper-26.3-227.jar"
-          echo "416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15  paper.jar" | sha256sum -c -
-          mkdir -p config
-          echo "eula=true" > eula.txt
-          printf 'rcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=4\nsimulation-distance=4\nsync-chunk-writes=true\nlevel-name=jjworld\n' > server.properties
-          printf '_version: 29\nwatchdog:\n  enable: false\n' > config/paper-global.yml
-          java -Xms1G -Xmx8G -jar paper.jar nogui > server.log 2>&1 &
-          for i in $(seq 1 420); do grep -q 'Done (' server.log 2>/dev/null && break; sleep 1; done
-          grep -q 'Done (' server.log || { echo BOOT_FAIL; tail -20 server.log; exit 1; }
-          python3 ../scripts/jj/rcon.py "forceload add -512 -512 511 511" || true
-          sleep 120
-          # no fall damage for the spawn-plane entity corpus; keep natural spawns
-          python3 ../scripts/jj/rcon.py "gamerule doFallDamage false" || true
-          python3 ../scripts/jj/chests.py ${{ inputs.chests || 2000 }} 250 2>&1 | tail -6
-          python3 ../scripts/jj/entities20k.py 2>&1 | tail -4
-          python3 ../scripts/jj/rcon.py "forceload remove all" || true
-          python3 ../scripts/jj/rcon.py "save-all flush" || true
-          sleep 3
-          python3 ../scripts/jj/rcon.py "stop" || true
-          sleep 10
-          du -sh jjworld/dimensions/minecraft/overworld/* || true
+          cd native
+          cargo build --release --example enrich
+          ./target/release/examples/enrich \
+            ../jjserver/jjworld/dimensions/minecraft/overworld 2000 20000 250
+          du -sh ../jjserver/jjworld/dimensions/minecraft/overworld/* || true
 
       - name: build + run the comparison + class attribution
         run: |
