@@ -69,13 +69,23 @@ Synthetic Tectonic-style wgen bench (4096 chunks): compact container =
 
 | operation | Anvil (zlib-6) | c-saves | vs Anvil |
 |---|---|---|---|
-| region read, warm | 821 MB/s, p90 150 us | **1401 MB/s, p90 47 us** | **1.7x faster, tails 3x better** |
-| region read, p99.9 (stall) | 298 us | **306 us** | parity |
-| region read, 2 IO threads | — | **29k chunks/s** | scales with Moonrise workers |
-| region import (fresh write) | 53.8 MB/s, p99.9 5.3 ms | 33.2 MB/s, p99.9 11.3 ms | one-time cost, inside tick budget |
-| region steady rewrite (autosave) | 53.8 MB/s, p90 2.3 ms | 36.3 MB/s, **p90 1.8 ms** | p90 tails BEAT Anvil |
-| entity write (fresh) | 109 MB/s | **708 MB/s** | **6.5x faster** |
-| entity steady rewrite | 109 MB/s | **1647 MB/s** | **15x faster** |
+| region read, warm | 723 MB/s, p50 12.7 us | **2237 MB/s, p50 10.8 us** | **x3.1 faster** |
+| region read, 2 IO threads | — | **34.8k chunks/s** | scales with Moonrise workers |
+| region import (fresh write) | 62.6 MB/s | **51.0 MB/s, p99.9 3.9 ms** | near-parity, tails inside tick budget |
+| region import, 2 save threads | — | **96.7 MB/s** | x1.9 scaling (Moonrise-style parallel saves) |
+| region steady rewrite (autosave) | 62.6 MB/s, p90 2.2 ms | **~40 MB/s, p90 2.0 ms** | p90 tails BEAT Anvil |
+| entity write (fresh) | 202 MB/s | **708 MB/s** | **x3.5 faster** |
+| entity steady rewrite | 202 MB/s | **1893 MB/s** | **x9.4 faster** |
+
+The v0.8.0 speed work (profiling-driven): the recipe-batch flush ran
+zstd-19 synchronously inside the write thread — measured via the SPEED
+stages-import breakdown, sync flush pauses cost ~40% of fresh-import wall
+time and spiked p99.9 to 10.4 ms; the flush now runs at z6 (Cfg.recipe_level,
+CSAVES_RECIPE_LEVEL) with a 192 KiB batch: p99.9 import dropped 10.4 -> 3.9 ms
+(-64% max), container size unchanged. The WST_RECIPE stage timer was also
+fixed (it measured cumulatively from write_chunk entry, misattributing 49%
+of import to the recipe path; the real cost lives in split_parse_encode =
+fastnbt parse + per-section CSEC encode — the next speed lever).
 
 The v0.5.0 speed work: fused CSEC-to-NBT emitter (the read path used to
 rebuild a `HashMap<String, Value>` per palette entry and re-serialize the
