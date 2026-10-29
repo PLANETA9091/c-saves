@@ -487,6 +487,48 @@ fn main() {
         );
     }
 
+    // multi-threaded import (server-like: Moonrise saves chunks from a pool
+    // of IO workers — production write_chunk concurrency, not the
+    // single-thread CI import loop). Fresh store, work-stealing by index.
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let mdir = tmp.join("region-mt");
+        let _ = std::fs::remove_dir_all(&mdir);
+        let st = Store::open_cfg(&mdir, true, Cfg::from_env()).unwrap();
+        let corpus = Arc::new(region.clone());
+        let next = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut hs = Vec::new();
+        let t0 = Instant::now();
+        for _t in 0..threads {
+            let st = st.clone();
+            let corpus = corpus.clone();
+            let next = next.clone();
+            let done = done.clone();
+            hs.push(std::thread::spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= corpus.len() {
+                    break;
+                }
+                let (cx, cz, payload, _) = &corpus[i];
+                st.write_chunk(key(*cx, *cz), payload, false).unwrap();
+                done.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let n = done.load(Ordering::Relaxed);
+        println!(
+            "SPEED csaves-import-mt-region: threads={threads} ops={n} MB/s={:.1} wall={:.3}s",
+            region_raw as f64 / 1048576.0 / secs, secs
+        );
+        st.sync();
+        st.seal();
+    }
+
     // ---------------- G: steady-state rewrite ----------------
     {
         let mut lat = Lat::new(region.len() * rounds);
