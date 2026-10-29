@@ -308,3 +308,36 @@ region key is read back) with a self-heal re-import loop (max 2 rounds) that
 isolates pack-loss vs write-loss, and drains/steps/waves/profile are printed
 to stdout so the CI log carries the full pack story. The workflow now
 uploads artifacts `if: always()`.
+
+## v0.9.1 addendum: correctness round found by the autosave fast path
+
+The unchanged-write fast path (hash match against the last write → O(1),
+where Anvil pays inflate+deflate) exposed two latent corruption bugs and one
+operational hazard:
+
+1. **scan() refcount rebuild**: the reopen pass resolved BATCHED recipes
+   with `load_recipe`, which cannot follow the kind-9 batch index (BATCHED
+   is a sentinel, not a length) — every batched recipe's refcount was
+   rebuilt as 0. The first full-rewrite cycle then superseded recipes down
+   to refs=0 and evicted LIVE blobs that other, still-unrewritten recipes
+   referenced → dangling ids → unreadable chunks. Masked for months because
+   the same rewrites re-created the blobs; any chunk NOT rewritten after a
+   restart would break. Resolved through `recipe_at`.
+2. **read-your-writes**: a BATCHED rewrite removes its batch_idx entry at
+   supersede time, so reads hitting the stale committed pointer returned
+   None until the next flush. The pending recipe batch now wins.
+3. **strip is per-call**: the background import strips derived light; the
+   live server's saves must NOT (relit light is stored, never recomputed).
+   The first implementation used a process-global flag that would have
+   leaked the import's strip into runtime saves — a relight-on-every-load
+   loop. Now `split(..., strip)` / `Store::write_chunk_import`.
+
+The fast path is SELF-HEALING: on a hash match it probes `chunk_intact()`
+(recipe resolves + every referenced blob is live — pure map lookups via the
+probe cache) and falls through to the full write on any damage.
+
+Drain speed: `pack_segment` victims come from the blobs map sorted by blob
+id (ids allocate in section write order ≈ chunk locality — same-chunk
+sections still land in one slab frame) instead of a per-segment full
+chunks-map sort + per-key `recipe_at`. The 262k-chunk world's pack pass was
+O(segments × chunks) batch decompresses (~40+ min); now O(blobs log blobs).
