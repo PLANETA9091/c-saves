@@ -102,7 +102,7 @@ fn main() {
     let mut seen: Map<Vec<u8>, ()> = Map::new();
     let mut raw_total = 0u64;
     for (cx, cz, p) in &chunks {
-        let split = chunknbt::split(p, false, Some((*cx, *cz))).unwrap();
+        let split = chunknbt::split(p, false, Some((*cx, *cz)), false).unwrap();
         if let chunknbt::Split::Split { sections, tail } = split {
             let mut bytes = Vec::with_capacity(sections.len());
             for (_, b) in sections {
@@ -227,7 +227,7 @@ fn main() {
         ent_chunks.sort_by_key(|(cx, cz, _)| (*cx, *cz));
         let mut ent_stream: Vec<(u64, Vec<u8>)> = Vec::new();
         for (cx, cz, p) in &ent_chunks {
-            if let chunknbt::Split::Fields { parts, .. } = chunknbt::split(p, true, Some((*cx, *cz))).unwrap() {
+            if let chunknbt::Split::Fields { parts, .. } = chunknbt::split(p, true, Some((*cx, *cz)), false).unwrap() {
                 for part in parts {
                     if !part.inline { ent_stream.push((key(*cx, *cz), part.bytes)); }
                 }

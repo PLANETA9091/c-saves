@@ -283,7 +283,7 @@ fn main() {
     es.set_whole_mode();
     // models the production IMPORT path: derived light stripped (relight on
     // load, vanilla-standard); the verify comparator strips the source side.
-    c_saves::chunknbt::set_strip_light(true);
+    let strip = !matches!(std::env::var("CSAVES_KEEP_LIGHT").as_deref(), Ok("1"));
 
     let mut comps = Comps::default();
     let mut n_region_chunks = 0u64;
@@ -303,7 +303,7 @@ fn main() {
             raw_region += payload.len() as u64;
             n_region_chunks += 1;
             let k = ((fidx as u64) << 10) | slot as u64;
-            if rs.write_chunk(k, &payload, false).is_err() {
+            if rs.write_chunk_stripped(k, &payload, strip).is_err() {
                 eprintln!("write failed chunk file={fidx} slot={slot}");
                 write_fail += 1;
             }
@@ -375,7 +375,7 @@ fn main() {
             }
             for (slot, payload) in load_mca(f) {
                 let k = ((fidx as u64) << 10) | slot as u64;
-                if missing_set.contains(&k) && rs.write_chunk(k, &payload, false).is_ok() {
+                if missing_set.contains(&k) && rs.write_chunk_stripped(k, &payload, strip).is_ok() {
                     rew += 1;
                     if rew == missing.len() {
                         break 'files;
@@ -470,7 +470,7 @@ fn main() {
             let k = ((fidx as u64) << 10) | slot as u64;
             match rs.read_chunk(k) {
                 Some(d) => {
-                    if chunk_semantic(&payload, &d) {
+                    if chunk_semantic(&payload, &d, strip) {
                         ok += 1;
                     } else {
                         bad += 1;
@@ -537,10 +537,10 @@ fn dir_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn chunk_semantic(a: &[u8], b: &[u8]) -> bool {
+fn chunk_semantic(a: &[u8], b: &[u8], strip: bool) -> bool {
     let Ok(mut va) = fastnbt::from_bytes::<Value>(a) else { return false };
     let Ok(vb) = fastnbt::from_bytes::<Value>(b) else { return false };
-    if c_saves::chunknbt::strip_light_on() {
+    if strip {
         c_saves::chunknbt::strip_derived_chunk(&mut va);
     }
     let Value::Compound(ma) = &va else { return va == vb };

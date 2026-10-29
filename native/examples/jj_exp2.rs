@@ -132,7 +132,7 @@ fn main() {
     let mut g_parts = 0usize;
     for (cx, cz, p) in &chunks {
         if let Ok(c_saves::chunknbt::Split::Fields { parts, .. }) =
-            c_saves::chunknbt::split(p, true, Some((*cx, *cz)))
+            c_saves::chunknbt::split(p, true, Some((*cx, *cz)), false)
         {
             for part in parts {
                 if !part.inline {
@@ -163,7 +163,7 @@ fn main() {
         }
     }
     if let Ok(c_saves::chunknbt::Split::Fields { parts, .. }) =
-        c_saves::chunknbt::split(hp, true, Some((*hx, *hz)))
+        c_saves::chunknbt::split(hp, true, Some((*hx, *hz)), false)
     {
         for part in &parts {
             if !part.inline {
@@ -185,7 +185,7 @@ fn main() {
     let grab = |idx: usize| -> Option<Vec<u8>> {
         let (cx, cz, p) = &chunks[idx];
         if let Ok(c_saves::chunknbt::Split::Fields { parts, .. }) =
-            c_saves::chunknbt::split(p, true, Some((*cx, *cz)))
+            c_saves::chunknbt::split(p, true, Some((*cx, *cz)), false)
         {
             for part in parts {
                 if !part.inline {
@@ -291,7 +291,7 @@ fn main() {
 
     // F: what does the engine actually store? split a few chunks whole-mode
     for (cx, cz, p) in chunks.iter().take(3) {
-        match c_saves::chunknbt::split(p, true, Some((*cx, *cz))) {
+        match c_saves::chunknbt::split(p, true, Some((*cx, *cz)), false) {
             Ok(c_saves::chunknbt::Split::Fields { parts, pos_from_key }) => {
                 println!("chunk ({cx},{cz}): Fields n={} pos_from_key={pos_from_key}", parts.len());
                 for part in &parts {

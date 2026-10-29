@@ -541,11 +541,11 @@ fn main() {
     // the bench models the PRODUCTION import path: derived light is stripped
     // (server relights from isLightOn=0 — vanilla-standard). Comparisons
     // below strip the source side to stay apples-to-apples.
-    c_saves::chunknbt::set_strip_light(true);
+    let strip = !matches!(std::env::var("CSAVES_KEEP_LIGHT").as_deref(), Ok("1"));
     es.set_whole_mode();
     let t0 = std::time::Instant::now();
     for (cx, cz, p) in &region_chunks {
-        rs.write_chunk(key(*cx, *cz), p, false).unwrap();
+        rs.write_chunk_stripped(key(*cx, *cz), p, strip).unwrap();
     }
     for (cx, cz, p) in &entity_chunks {
         es.write_chunk(key(*cx, *cz), p, true).unwrap();
@@ -611,7 +611,7 @@ fn main() {
         else {
             return false;
         };
-        if c_saves::chunknbt::strip_light_on() {
+        if strip {
             // the stored side has derived light stripped; strip the source
             // too — light is recomputed by the server (isLightOn=0)
             c_saves::chunknbt::strip_derived_chunk(&mut ma);

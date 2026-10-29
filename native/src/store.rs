@@ -2008,6 +2008,29 @@ impl Store {
     /// Store one chunk payload. `whole_mode` is used for entity/poi payloads
     /// and as a fallback when the chunk has no section structure.
     pub fn write_chunk(&self, key: u64, payload: &[u8], whole_mode: bool) -> Result<(), String> {
+        self.write_chunk_mode(key, payload, whole_mode, false)
+    }
+
+    /// Import-path write: strips derived light (the server relights from
+    /// isLightOn=0 — vanilla-standard). Runtime saves MUST use write_chunk:
+    /// relit light handed back by Paper is stored, never recomputed again.
+    pub fn write_chunk_import(&self, key: u64, payload: &[u8]) -> Result<(), String> {
+        self.write_chunk_mode(key, payload, false, true)
+    }
+
+    /// Bench/import-model write with an explicit strip decision (models
+    /// write_chunk_import while letting benchmarks toggle the mode).
+    pub fn write_chunk_stripped(&self, key: u64, payload: &[u8], strip: bool) -> Result<(), String> {
+        self.write_chunk_mode(key, payload, false, strip)
+    }
+
+    fn write_chunk_mode(
+        &self,
+        key: u64,
+        payload: &[u8],
+        whole_mode: bool,
+        strip: bool,
+    ) -> Result<(), String> {
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.logical_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
         let pos_hint = Some(((key >> 32) as i32, (key & 0xffff_ffff) as i32));
@@ -2044,7 +2067,7 @@ impl Store {
             self.ensure_blob(hash, payload, false)?;
             Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
         } else {
-            let split = chunknbt::split(payload, whole_mode, pos_hint)?;
+            let split = chunknbt::split(payload, whole_mode, pos_hint, strip)?;
             WST_SPLIT.0.fetch_add(t0w.elapsed().as_nanos() as u64, Ordering::Relaxed);
             WST_SPLIT.1.fetch_add(1, Ordering::Relaxed);
             let t1w = std::time::Instant::now();

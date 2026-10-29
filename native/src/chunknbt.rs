@@ -277,16 +277,11 @@ const HMAP_MAGIC: u8 = 0xC6; // repacked heightmap ByteArray marker
 // The IMPORT path strips by default (the 261k-chunk world measured 31.8% of
 // raw NBT bytes in light arrays); the RUNTIME write path keeps whatever the
 // server hands us so relit light is stored and never recomputed again.
-static STRIP_LIGHT: AtomicBool = AtomicBool::new(false);
-
-pub fn set_strip_light(on: bool) {
-    STRIP_LIGHT.store(on, Ordering::Relaxed);
-}
-
-pub fn strip_light_on() -> bool {
-    !matches!(std::env::var("CSAVES_KEEP_LIGHT").as_deref(), Ok("1"))
-        && STRIP_LIGHT.load(Ordering::Relaxed)
-}
+// The strip mode is a PER-CALL decision (split's `strip` parameter), not a
+// process-global: the background legacy import and the live server's saves
+// share one Store, and a global flag would leak the import's strip into
+// runtime saves — stripping relit light forever (a relight-on-every-load
+// loop). CSAVES_KEEP_LIGHT=1 forces the import paths to keep light.
 
 /// Remove derived light fields from one section compound.
 pub fn strip_derived_section(sec: &mut Value) {
@@ -2666,7 +2661,12 @@ fn feed(h: &mut Xxh3, v: &Value) {
 /// (cx, cz) of the chunk key; when the payload carries a redundant
 /// `Position: [Int cx, Int 0, Int cz]` marker (entity-chunk format) it is
 /// stripped from the recipe and reconstructed on read.
-pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> Result<Split, String> {
+pub fn split(
+    payload: &[u8],
+    whole_mode: bool,
+    pos_hint: Option<(i32, i32)>,
+    strip: bool,
+) -> Result<Split, String> {
     if whole_mode {
         return whole_split(payload, pos_hint);
     }
@@ -2674,7 +2674,7 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
     let root: Value = fastnbt::from_bytes(payload).map_err(|e| format!("nbt parse: {e}"))?;
     SPLT_PARSE.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_PARSE.1.fetch_add(1, Ordering::Relaxed);
-    split_parsed(payload, pos_hint, root)
+    split_parsed(payload, pos_hint, root, strip)
 }
 
 /// Sectioned split over an ALREADY-parsed chunk (root is consumed for the
@@ -2683,6 +2683,7 @@ fn split_parsed(
     payload: &[u8],
     pos_hint: Option<(i32, i32)>,
     mut root: Value,
+    strip: bool,
 ) -> Result<Split, String> {
     let has_sections = match &root {
         Value::Compound(map) => matches!(map.get("sections"), Some(Value::List(_))),
@@ -2694,7 +2695,7 @@ fn split_parsed(
 
     let t_ss = std::time::Instant::now();
     let mut sections;
-    let strip = strip_light_on();
+    let strip = strip && !matches!(std::env::var("CSAVES_KEEP_LIGHT").as_deref(), Ok("1"));
     {
         let Value::Compound(map) = &mut root else { unreachable!("checked above") };
         let Some(Value::List(list)) = map.get_mut("sections") else {
@@ -3984,7 +3985,7 @@ mod tests {
     #[test]
     fn roundtrip_semantic_equality() {
         let payload = sample_chunk(6, "Test");
-        let s = split(&payload, false, Some((3, 7))).unwrap();
+        let s = split(&payload, false, Some((3, 7)), false).unwrap();
         let Split::Split { sections, tail } = &s else { panic!("expected split") };
         assert_eq!(sections.len(), 6);
         let sec_bytes: Vec<Vec<u8>> = sections.iter().map(|(_, b)| b.as_slice().to_vec()).collect();
@@ -3996,8 +3997,8 @@ mod tests {
 
     #[test]
     fn dedup_identical_sections_across_chunks() {
-        let s1 = split(&sample_chunk(8, "T"), false, None).unwrap();
-        let s2 = split(&sample_chunk(8, "T"), false, None).unwrap();
+        let s1 = split(&sample_chunk(8, "T"), false, None, false).unwrap();
+        let s2 = split(&sample_chunk(8, "T"), false, None, false).unwrap();
         let Split::Split { sections: a, .. } = &s1 else { panic!() };
         let Split::Split { sections: b, .. } = &s2 else { panic!() };
         let ha: Vec<Hash> = a.iter().map(|(h, _)| *h).collect();
@@ -4034,7 +4035,7 @@ mod tests {
         let mut root: Map<String, Value> = Map::new();
         root.insert("DataVersion".to_string(), Value::Int(4189));
         let payload = to_bytes(&Value::Compound(root));
-        let s = split(&payload, false, Some((3, 7))).unwrap();
+        let s = split(&payload, false, Some((3, 7)), false).unwrap();
         assert!(matches!(s, Split::Whole { .. }));
     }
 
@@ -4043,7 +4044,7 @@ mod tests {
         let mut root: Map<String, Value> = Map::new();
         root.insert("sections".to_string(), Value::List(Vec::new()));
         let payload = to_bytes(&Value::Compound(root));
-        let s = split(&payload, false, Some((3, 7))).unwrap();
+        let s = split(&payload, false, Some((3, 7)), false).unwrap();
         let Split::Split { sections, .. } = s else { panic!("empty list must still split") };
         assert!(sections.is_empty());
     }
@@ -4433,12 +4434,12 @@ mod codec_tests {
         root.insert("Position".to_string(), Value::List(vec![Value::Int(5), Value::Int(0), Value::Int(-7)]));
         root.insert("Entities".to_string(), Value::List(Vec::new()));
         let payload = to_bytes(&Value::Compound(root));
-        let s = split(&payload, true, Some((5, -7))).unwrap();
+        let s = split(&payload, true, Some((5, -7)), false).unwrap();
         let Split::Fields { parts, pos_from_key } = &s else { panic!("must field-split") };
         assert!(*pos_from_key, "matching Position must be stripped");
         assert!(!parts.iter().any(|p| p.key == "Position"));
         // wrong key -> Position stays
-        let s2 = split(&payload, true, Some((6, -7))).unwrap();
+        let s2 = split(&payload, true, Some((6, -7)), false).unwrap();
         let Split::Fields { parts: p2, pos_from_key: pf2 } = &s2 else { panic!() };
         assert!(!*pf2);
         assert!(p2.iter().any(|p| p.key == "Position"));
@@ -4519,7 +4520,7 @@ mod codec_tests {
     fn shift_ref_split_and_resolve() {
         for (k, extra) in [(4usize, false), (1, false), (15, false), (4, true), (1, true)] {
             let payload = shift_structured_chunk(k, extra);
-            let split = split(&payload, false, Some((3, 4))).unwrap();
+            let split = split(&payload, false, Some((3, 4)), false).unwrap();
             let (sections, tail) = match &split {
                 Split::Split { sections, tail } => (sections, tail),
                 _ => panic!("expected split"),
@@ -4560,11 +4561,11 @@ mod codec_tests {
         // two chunks with identical ref members but different targets must
         // resolve to different content and different cache keys
         let payload = shift_structured_chunk(4, false);
-        let s1 = split(&payload, false, Some((0, 0))).unwrap();
+        let s1 = split(&payload, false, Some((0, 0)), false).unwrap();
         // fresh thread: the encode cache is thread-local and would mark the
         // sections as cross-chunk-shared, skipping the shift conversion
         let p2 = payload.clone();
-        let s2 = std::thread::spawn(move || split(&p2, false, Some((5, 5))).unwrap())
+        let s2 = std::thread::spawn(move || split(&p2, false, Some((5, 5)), false).unwrap())
             .join()
             .unwrap();
         let (a, b) = match (&s1, &s2) {
@@ -4588,7 +4589,7 @@ mod codec_tests {
     #[test]
     fn shift_ref_corruption_fails_loudly() {
         let payload = shift_structured_chunk(4, false);
-        let split = split(&payload, false, Some((0, 0))).unwrap();
+        let split = split(&payload, false, Some((0, 0)), false).unwrap();
         let sections = match &split {
             Split::Split { sections, .. } => sections.clone(),
             _ => panic!(),
