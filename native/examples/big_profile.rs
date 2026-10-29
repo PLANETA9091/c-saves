@@ -365,25 +365,21 @@ fn main() {
         }
         healed_rounds += 1;
         println!("integrity: heal round {healed_rounds} — re-writing {} chunks", missing.len());
-        // re-read the payloads from the anvil source by key
-        let by_key: std::collections::HashMap<u64, Vec<u8>> = region_files
-            .iter()
-            .enumerate()
-            .flat_map(|(fidx, f)| {
-                if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
-                    return Vec::new();
-                }
-                load_mca(f)
-                    .into_iter()
-                    .map(move |(slot, payload)| (((fidx as u64) << 10) | slot as u64, payload))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        // stream the re-import per region file (the missing set is tiny but
+        // the corpus is 2+ GB decompressed — never hold it all in RAM)
+        let missing_set: std::collections::HashSet<u64> = missing.iter().copied().collect();
         let mut rew = 0usize;
-        for &k in &missing {
-            if let Some(p) = by_key.get(&k) {
-                if rs.write_chunk(k, p, false).is_ok() {
+        'files: for (fidx, f) in region_files.iter().enumerate() {
+            if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
+                continue;
+            }
+            for (slot, payload) in load_mca(f) {
+                let k = ((fidx as u64) << 10) | slot as u64;
+                if missing_set.contains(&k) && rs.write_chunk(k, &payload, false).is_ok() {
                     rew += 1;
+                    if rew == missing.len() {
+                        break 'files;
+                    }
                 }
             }
         }
