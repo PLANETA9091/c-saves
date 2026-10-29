@@ -247,6 +247,7 @@ fn main() {
     let mut n_ent_chunks = 0u64;
     let mut raw_ent = 0u64;
     let t0 = std::time::Instant::now();
+    let mut pack_waves = 0u64;
     for (fidx, f) in region_files.iter().enumerate() {
         if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
             continue;
@@ -258,6 +259,25 @@ fn main() {
             let k = ((fidx as u64) << 10) | slot as u64;
             if rs.write_chunk(k, &payload, false).is_err() {
                 eprintln!("write failed chunk file={fidx} slot={slot}");
+            }
+            // intermittent pack waves: draining the hot tier in 64k-chunk
+            // installments keeps slab frames + segment rolls bounded — one
+            // giant end-of-import pack on a 2 GB hot tier lost members
+            // (verify MISSING) and left per-section z3 blobs on disk
+            if n_region_chunks % 65536 == 0 {
+                rs.request_pack();
+                loop {
+                    if !rs.compact_step() {
+                        break;
+                    }
+                }
+                pack_waves += 1;
+                eprintln!(
+                    "pack wave {} after {} chunks: region store now {} MiB",
+                    pack_waves,
+                    n_region_chunks,
+                    rs.disk_bytes() / 1048576
+                );
             }
         }
     }
