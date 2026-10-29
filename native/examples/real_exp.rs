@@ -230,8 +230,21 @@ fn main() {
                 let Value::Compound(sm) = s else { continue };
                 sec.sections += 1;
                 if let Some(Value::Compound(bs)) = sm.get("block_states") {
+                    // fastnbt to_bytes needs a compound root: bare palette
+                    // Lists fail and measured 0 — wrap, then strip the
+                    // 5-byte wrapper (type+namelen+name+end).
                     let pb = match bs.get("palette") {
-                        Some(p) => fastnbt::to_bytes(p).unwrap_or_default(),
+                        Some(Value::Compound(_)) => {
+                            fastnbt::to_bytes(bs.get("palette").unwrap()).unwrap_or_default()
+                        }
+                        Some(p) => {
+                            let mut w = std::collections::HashMap::new();
+                            w.insert("p".to_string(), p.clone());
+                            match fastnbt::to_bytes(&Value::Compound(w)) {
+                                Ok(b) => b[5..].to_vec(),
+                                Err(_) => Vec::new(),
+                            }
+                        }
                         None => Vec::new(),
                     };
                     add("palette", &pb, &mut streams);
