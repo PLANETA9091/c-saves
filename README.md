@@ -6,6 +6,28 @@ over Paper 26.x chunk IO. Worlds stay 100% byte-semantically compatible
 is radically smaller, and reads/writes stay off the server thread's critical
 path (background pack passes, bounded slab cache).
 
+## v0.8.0 direction (attribution-driven): the entropy floor map
+
+`survival_exp` (CI job `survival-exp`) compressed every component class of a
+realistic survival corpus separately at zstd-19 and predicted every codec
+lever BEFORE touching production code:
+
+| class | raw | z19 weight | verdict |
+|---|---|---|---|
+| dense block_states data | 40.8 MB | 861 KB (53.8%) | **0.084 bits/voxel — zstd already exploits cross-section LZ matches; custom light/plane/shift codecs all LOSE** |
+| block entities (chests) | 4.2 MB | 352 KB (22.0%) | z19 concat floor; item-level dedup measured WORSE (429 vs 302 KB) |
+| skylight | 7.6 MB | 203 KB (12.7%) | plane-const codec 823 KB, column-staircase 582 KB — both LOSE to plain z19 (203 KB) |
+| heightmaps | 1.5 MB | 140 KB | model overestimates; production stores delta-varint |
+| palettes | 2.3 MB | 45 KB | minor |
+| shift-ref admission | 4/19941 sections | — | survival terrain sections are content-unique (ore noise) |
+| plane-level dedup | 63.9% planes duplicate | — | unique planes are individually incompressible; net LOSS vs slab z19 |
+
+Conclusion: on noise-heavy synthetic terrain every remaining category sits at
+its practical entropy floor, and the ONLY honest way forward is attribution
+on a REAL survival world (`bigworld-survival` workflow: 512x512 vanilla
+chunks + 2000 NBT loot chests + 20k entities, Paper 26.3). `real_exp` breaks
+that corpus down by class, chunk-dedup rate, entity kind and BE family.
+
 ## v0.6.0 (WIP, profiling-driven): section RLE forms
 
 Profiling the real JJThunder corpus showed the remaining region bytes live in
