@@ -2557,61 +2557,86 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
     let root: Value = fastnbt::from_bytes(payload).map_err(|e| format!("nbt parse: {e}"))?;
     SPLT_PARSE.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_PARSE.1.fetch_add(1, Ordering::Relaxed);
-    let Value::Compound(map) = &root else {
-        return Ok(Split::Whole { hash: hash_of(payload) });
+    split_parsed(payload, pos_hint, root)
+}
+
+/// Sectioned split over an ALREADY-parsed chunk (root is consumed for the
+/// tail — no tree clone).
+fn split_parsed(
+    payload: &[u8],
+    pos_hint: Option<(i32, i32)>,
+    root: Value,
+) -> Result<Split, String> {
+    let has_sections = match &root {
+        Value::Compound(map) => matches!(map.get("sections"), Some(Value::List(_))),
+        _ => false,
     };
-    let Some(Value::List(list)) = map.get("sections") else {
+    if !has_sections {
         return whole_split(payload, pos_hint);
-    };
+    }
 
     let t_ss = std::time::Instant::now();
-    let mut sections = Vec::with_capacity(list.len());
-    let mut cache_hit = vec![false; list.len()];
-    for s in list {
-        // encode-cache: re-saving a chunk re-encodes every section; the
-        // structural hash is order-free, so unchanged sections hit the cache
-        // and skip canonicalization + bit-packing entirely.
-        let sh = structural_hash(s);
-        if let Some((h, shared)) = enc_cache_get(sh) {
-            cache_hit[sections.len()] = true;
-            sections.push((h, SecBytes::Shared(shared)));
-            continue;
-        }
-        // custom form when possible (marker-detectable), NBT bytes otherwise.
-        // v3 output is canonical, so identical content yields identical bytes
-        // regardless of the original palette order -> hash the bytes.
-        match section_encode(s) {
-            Some(c) => {
-                if c.first() == Some(&CSEC3_MAGIC) {
-                    let h = hash_of(&c);
-                    let arc = Arc::new(c);
-                    enc_cache_put(sh, h, arc.clone());
-                    sections.push((h, SecBytes::Shared(arc)));
-                } else {
-                    sections.push((structural_hash(s), SecBytes::Owned(c)));
-                }
+    let mut sections;
+    {
+        let Value::Compound(map) = &root else { unreachable!("checked above") };
+        let Some(Value::List(list)) = map.get("sections") else {
+            unreachable!("checked above")
+        };
+        sections = Vec::with_capacity(list.len());
+        let mut cache_hit = vec![false; list.len()];
+        for s in list {
+            // encode-cache: re-saving a chunk re-encodes every section; the
+            // structural hash is order-free, so unchanged sections hit the
+            // cache and skip canonicalization + bit-packing entirely.
+            let sh = structural_hash(s);
+            if let Some((h, shared)) = enc_cache_get(sh) {
+                cache_hit[sections.len()] = true;
+                sections.push((h, SecBytes::Shared(shared)));
+                continue;
             }
-            None => sections.push((structural_hash(s), SecBytes::Owned(to_bytes(s)))),
+            // custom form when possible (marker-detectable), NBT bytes otherwise.
+            // v3 output is canonical, so identical content yields identical bytes
+            // regardless of the original palette order -> hash the bytes.
+            match section_encode(s) {
+                Some(c) => {
+                    if c.first() == Some(&CSEC3_MAGIC) {
+                        let h = hash_of(&c);
+                        let arc = Arc::new(c);
+                        enc_cache_put(sh, h, arc.clone());
+                        sections.push((h, SecBytes::Shared(arc)));
+                    } else {
+                        sections.push((structural_hash(s), SecBytes::Owned(c)));
+                    }
+                }
+                None => sections.push((structural_hash(s), SecBytes::Owned(to_bytes(s)))),
+            }
         }
-    }
-    // shift-ref pass (v0.7): collapse sections that are vertical shifts of a
-    // lower section of this chunk (mountain strata / ocean floors / cave
-    // ceilings) into ~15-30 byte refs; the top k planes stay explicit.
-    // Sections whose content was seen in an earlier chunk (enc-cache hit)
-    // are skipped: their full members dedup across chunks for free, which
-    // always beats a chunk-local ref. CSAVES_NO_SHIFT=1 disables the pass.
-    if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
-        shift_ref_pass(&mut sections, list, &cache_hit);
+        // shift-ref pass (v0.7): collapse sections that are vertical shifts
+        // of a lower section of this chunk (mountain strata / ocean floors /
+        // cave ceilings) into ~15-30 byte refs; the top k planes stay
+        // explicit. Sections whose content was seen in an earlier chunk
+        // (enc-cache hit) are skipped: their full members dedup across
+        // chunks for free, which always beats a chunk-local ref.
+        if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
+            shift_ref_pass(&mut sections, list, &cache_hit);
+        }
     }
     SPLT_SECS.0.fetch_add(t_ss.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_SECS.1.fetch_add(1, Ordering::Relaxed);
 
     let t_sh = std::time::Instant::now();
-    let mut tail_map = map.clone();
-    tail_map.remove("sections");
-    let mut tail_val = Value::Compound(tail_map);
-    tail_encode(&mut tail_val);
-    let tail = to_bytes(&tail_val);
+    // tail = parsed root minus sections, CONSUMED (the old map.clone() of
+    // the whole tree cost ~100 us/chunk of import wall time)
+    let mut root = root;
+    let tail = match &mut root {
+        Value::Compound(m) => {
+            m.remove("sections");
+            let mut tv = Value::Compound(std::mem::take(m));
+            tail_encode(&mut tv);
+            to_bytes(&tv)
+        }
+        _ => unreachable!("checked above"),
+    };
     SPLT_TAIL.0.fetch_add(t_sh.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_TAIL.1.fetch_add(1, Ordering::Relaxed);
 
