@@ -140,16 +140,25 @@ jobs:
 
       - name: build + run the comparison + class attribution
         run: |
+          set -x
           cd native
           cargo build --release --example big_profile
           cargo build --release --example real_exp
+          set +e
           CSAVES_VERIFY_SAMPLE=10 ./target/release/examples/big_profile \
-            ../jjserver/jjworld/dimensions/minecraft/overworld 2>jj_err.txt | tee surv_big.txt
+            ../jjserver/jjworld/dimensions/minecraft/overworld >surv_big.txt 2>jj_err.txt
+          echo "big_profile exit: $?"
+          tail -5 jj_err.txt || true
+          wc -l surv_big.txt
+          cat surv_big.txt
           grep -E "^TOTAL|verify:" surv_big.txt
           BAD=$(grep "verify:" surv_big.txt | grep -o "bad=[0-9]*" | cut -d= -f2)
           [ "$BAD" = "0" ] || { echo "FAIL: semantic verification bad=$BAD"; exit 1; }
           ./target/release/examples/real_exp \
-            ../jjserver/jjworld/dimensions/minecraft/overworld 2>real_exp_err.txt | tee real_exp.txt
+            ../jjserver/jjworld/dimensions/minecraft/overworld >real_exp.txt 2>real_exp_err.txt
+          echo "real_exp exit: $?"
+          cat real_exp.txt
+          tail -5 real_exp_err.txt || true
 
       - name: verdict
         run: |
