@@ -131,6 +131,25 @@ jobs:
           name: survival-exp-results
           path: native/survival_exp.txt
 
+  real-exp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build real_exp
+        working-directory: native
+        run: cargo build --release --example real_exp
+      - name: real-corpus attribution (committed JJThunder subset)
+        working-directory: native
+        run: |
+          ./target/release/examples/real_exp ../bench-corpus/dim 2>&1 | tee real_exp.txt
+          cat real_exp.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: real-exp-results
+          path: native/real_exp.txt
+
   speed-bench:
     runs-on: ubuntu-latest
     timeout-minutes: 20
