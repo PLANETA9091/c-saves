@@ -415,23 +415,20 @@ fn light_columns_cost(sections: &[&SecMeta]) -> (u64, u64) {
                     col_stream.push(v);
                 }
             }
-            // RLE over column records (record = 1 + 2*steps bytes)
+            // RLE over column records (record = 1 + 2*steps bytes):
+            // identical consecutive columns collapse to one record + run len
             let mut i = 0usize;
             while i < col_stream.len() {
-                let rec_len = (1 + 2 * col_stream[i] as usize) as u64;
-                codec_total += 2; // u16 record length prefix (model)
-                codec_total += rec_len;
-                // count consecutive identical records
-                let rec = &col_stream[i..i + rec_len as usize];
-                let mut run = 1usize;
-                let mut j = i + rec_len as usize;
-                while j + rec_len as usize <= col_stream.len()
-                    && &col_stream[j..j + rec_len as usize] == rec
+                let rec_len = 1 + 2 * col_stream[i] as usize;
+                let rec = &col_stream[i..i + rec_len];
+                let mut j = i + rec_len;
+                while j + rec_len <= col_stream.len()
+                    && col_stream[j] == col_stream[i]
+                    && &col_stream[j..j + rec_len] == rec
                 {
-                    run += 1;
-                    j += rec_len as usize;
+                    j += rec_len;
                 }
-                codec_total += 2; // u16 run length
+                codec_total += (rec_len + 4) as u64; // record once + u32 run len
                 i = j;
             }
         }
@@ -466,7 +463,8 @@ fn shift_ref_potential(sections: &[&SecMeta]) -> (usize, u64, u64) {
         if bits == 0 {
             continue;
         }
-        let cost_full = (4096 * bits as u64).div_ceil(8);
+        let bits64 = bits as u64;
+        let cost_full = (4096u64 * bits64).div_ceil(8);
         full_bytes += cost_full;
         let mut best: Option<(usize, u64)> = None;
         for k in 1..=15usize {
@@ -474,7 +472,7 @@ fn shift_ref_potential(sections: &[&SecMeta]) -> (usize, u64, u64) {
                 let limit = 4096 - k * 256;
                 let ok = (0..limit).all(|i| s.voxels[i] == below.voxels[i + k * 256]);
                 if ok {
-                    let cost_ref = (k * 256 * bits as u64).div_ceil(8) + 8;
+                    let cost_ref = ((k * 256) as u64 * bits64).div_ceil(8) + 8;
                     if best.map(|(_, c)| cost_ref < c).unwrap_or(true) {
                         best = Some((k, cost_ref));
                     }
@@ -540,7 +538,6 @@ fn item_dedup_potential(chunks: &[ChunkData]) -> (u64, u64, usize, usize) {
             uniq.push(b.clone());
         }
     }
-    let raw: u64 = blobs.iter().map(|b| b.len() as u64).sum();
     let concat: Vec<u8> = blobs.concat();
     let uniq_concat: Vec<u8> = uniq.concat();
     let refs_cost = refs as u64 * 3; // varint id model
@@ -565,9 +562,8 @@ fn main() {
     let n_chunks = chunks.len();
 
     // ---- class weights (raw) ----
-    let mut class_raw: Map<&str, u64> = Map::new();
     let mut class_stream: Map<&str, Vec<u8>> = Map::new();
-    let mut add = |k: &'static str, bytes: &[u8], cls: &mut Map<&'static str, Vec<u8>>| {
+    let add = |k: &'static str, bytes: &[u8], cls: &mut Map<&'static str, Vec<u8>>| {
         cls.entry(k).or_default().extend_from_slice(bytes);
     };
     let mut sections_all: Vec<&SecMeta> = Vec::new();
