@@ -918,6 +918,14 @@ pub struct Store {
     /// full inflate+deflate for each, we return O(1) when the payload hash
     /// matches. Bounded by unique keys ever written (~24 B/chunk).
     last_written: Mutex<HashMap<u64, Hash>>,
+    /// Parsed blob-hash sets per batched recipe location, for the
+    /// chunk_intact probe: decompressing a 192 KiB batch record per skip
+    /// check thrashes the 32 MiB slab cache on large worlds (each miss is a
+    /// full z6 decompress); the parsed hash set turns the probe into map
+    /// lookups. Cap-cleared (entries are content-derived: blob ids are
+    /// monotonic and segments append-only, so a parsed set never goes stale
+    /// short of data loss — which the membership check itself detects).
+    probe_cache: Mutex<HashMap<(u32, u64, u32, u32), Arc<Vec<Hash>>>>,
 }
 
 impl Store {
@@ -960,6 +968,7 @@ impl Store {
             pack_requested: AtomicBool::new(false),
             pack_watermark: AtomicU64::new(0),
             last_written: Mutex::new(HashMap::new()),
+            probe_cache: Mutex::new(HashMap::new()),
         });
         *st.slab_cache.lock() = SlabCache::new(st.cfg.slab_cache);
         st.load_dicts()?;
@@ -2157,20 +2166,43 @@ impl Store {
             Pending(Vec<u8>),
         }
         // pending batch first (read-your-writes — see read_chunk)
-        let loc = match self.recipe_batch.lock().get(key).cloned() {
-            Some(p) => Loc::Pending(p),
-            None => match self.chunks.read().get(&key).copied() {
-                Some((s, o, l)) => Loc::Seg(s, o, l),
-                None => return false,
-            },
-        };
-        let rec = match &loc {
-            Loc::Pending(body) => self.parse_recipe_body(body),
-            Loc::Seg(seg, off, len) => self.recipe_at(key, *seg, *off, *len),
-        };
-        let Some(rec) = rec else { return false };
+        let hashes: Option<Arc<Vec<Hash>>> =
+            match self.recipe_batch.lock().get(key).cloned() {
+                Some(p) => self.parse_recipe_body(&p).map(|r| Arc::new(r.blob_hashes())),
+                None => match self.chunks.read().get(&key).copied() {
+                    Some((seg, off, len)) => {
+                        if len != BATCHED {
+                            self.load_recipe(seg, off, len)
+                                .map(|r| Arc::new(r.blob_hashes()))
+                        } else {
+                            let (boff, soff, rl) =
+                                match self.batch_idx.lock().get(&key).copied() {
+                                    Some(x) => x,
+                                    None => return false,
+                                };
+                            let pk = (seg, boff, soff, rl);
+                            if let Some(set) = self.probe_cache.lock().get(&pk) {
+                                Some(Arc::clone(set))
+                            } else {
+                                let parsed = self.recipe_at(key, seg, off, len)
+                                    .map(|r| Arc::new(r.blob_hashes()));
+                                if let Some(set) = &parsed {
+                                    let mut pc = self.probe_cache.lock();
+                                    if pc.len() >= 4096 {
+                                        pc.clear();
+                                    }
+                                    pc.insert(pk, Arc::clone(set));
+                                }
+                                parsed
+                            }
+                        }
+                    }
+                    None => return false,
+                },
+            };
+        let Some(hashes) = hashes else { return false };
         let blobs = self.blobs.read();
-        rec.blob_hashes().iter().all(|h| blobs.contains_key(h))
+        hashes.iter().all(|h| blobs.contains_key(h))
     }
 
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
