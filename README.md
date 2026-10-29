@@ -28,6 +28,33 @@ on a REAL survival world (`bigworld-survival` workflow: 512x512 vanilla
 chunks + 2000 NBT loot chests + 20k entities, Paper 26.3). `real_exp` breaks
 that corpus down by class, chunk-dedup rate, entity kind and BE family.
 
+## v0.9.1: correctness round — scan refcount fix + self-healing autosave skip
+
+The unchanged-write fast path (Paper autosaves re-serialize unchanged chunks
+every cycle; hash match returns O(1) where Anvil pays inflate+deflate)
+exposed TWO latent production bugs:
+
+1. **scan() rebuilt refcounts as 0 for every BATCHED recipe** — the reopen
+   pass resolved recipes with `load_recipe`, which cannot follow the kind-9
+   batch index (BATCHED is a sentinel, not a length). Reopen → refs=0 → the
+   first full-rewrite cycle superseded recipes down to refs=0 and evicted
+   live blobs that other, still-unrewritten recipes referenced (dangling
+   ids, unreadable chunks). Masked for months because subsequent full
+   rewrites re-created the blobs; any chunk NOT rewritten afterwards would
+   break. Now resolved through the batch index.
+2. **read-your-writes**: a rewrite of a BATCHED chunk removes its batch_idx
+   entry at supersede time, so the stale committed pointer was unreadable
+   until the next flush — reads now take the pending recipe batch FIRST.
+
+The fast path is SELF-HEALING: on a hash match it probes chunk_intact()
+(recipe resolves + every referenced blob is live — a few map lookups, no
+decompress) and falls through to the full write on any damage, repairing
+from the payload the server just handed us.
+
+Speed (corpus bench, vs the Anvil zlib-6 baseline): steady-state autosave
+p50 **9.3 us vs Anvil ~150 us**, aggregate 124 MB/s vs 62.6; a 10%-dirty
+autosave cycle (real mutations) runs at 284 MB/s aggregate, p50 8 us.
+
 ## v0.9.0: light-uniform codec + bigworld pack-drain fix
 
 The 512x512-chunk real JJThunder world (261,542 chunks) measured **31.8% of
