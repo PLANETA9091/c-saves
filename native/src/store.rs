@@ -806,6 +806,8 @@ impl RecipeBatch {
 /// atomic adds per stage are noise next to the IO work itself, and this is
 /// the CI "stall point" recorder (dump via read_stage_json).
 pub static ST_RECIPE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// Unchanged-chunk autosave skips (hash match against the last write).
+pub static ST_WRITE_SKIP: AtomicU64 = AtomicU64::new(0);
 pub static ST_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_SECTLOAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_FUSED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -911,6 +913,11 @@ pub struct Store {
     pack_requested: AtomicBool,
     /// disk_bytes() watermark at the last completed pack pass.
     pack_watermark: AtomicU64,
+    /// Content hash of the last successful write_chunk per key: Paper
+    /// autosaves re-serialize UNCHANGED chunks every cycle; Anvil pays a
+    /// full inflate+deflate for each, we return O(1) when the payload hash
+    /// matches. Bounded by unique keys ever written (~24 B/chunk).
+    last_written: Mutex<HashMap<u64, Hash>>,
 }
 
 impl Store {
@@ -952,6 +959,7 @@ impl Store {
             whole_mode: AtomicBool::new(false),
             pack_requested: AtomicBool::new(false),
             pack_watermark: AtomicU64::new(0),
+            last_written: Mutex::new(HashMap::new()),
         });
         *st.slab_cache.lock() = SlabCache::new(st.cfg.slab_cache);
         st.load_dicts()?;
@@ -1987,6 +1995,16 @@ impl Store {
         // Field split only pays off for tiny payloads (POI stores dedup their
         // small structures across chunks).
         let hash = chunknbt::hash_of(payload);
+        {
+            // unchanged-payload fast path: Paper's autosave re-serializes
+            // every loaded chunk each cycle even when nothing changed; the
+            // existing recipe is already correct, so return without parse,
+            // encode, or IO (Anvil inflates+deflates the same bytes).
+            if self.last_written.lock().get(&key) == Some(&hash) {
+                ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
         let t0w = std::time::Instant::now();
         let recipe = if whole_mode && payload.len() > 1024 {
             self.ensure_blob(hash, payload, false)?;
@@ -2100,6 +2118,7 @@ impl Store {
             }
         }
         WST_RECIPE.0.fetch_add(t2w.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.last_written.lock().insert(key, hash);
         Ok(())
     }
 
@@ -2466,6 +2485,7 @@ impl Store {
 
     pub fn delete_chunk(&self, key: u64) -> Result<(), String> {
         self.flush_recipe_batch();
+        self.last_written.lock().remove(&key);
         let old = self.chunks.write().remove(&key);
         if let Some((seg, off, len)) = old {
             if let Some(rec) = self.recipe_at(key, seg, off, len) {
@@ -2615,6 +2635,7 @@ impl Store {
             r#""slabs":{{"records_frame":{slab_frame},"comp":{slab_comp},"members":{slab_n},"member_share":{slab_share}}},"#
         ));
         s.push_str(&format!(r#""dicts":{dict_bytes},"#));
+        s.push_str(&format!(r#""write_skip":{},"#, ST_WRITE_SKIP.load(Ordering::Relaxed)));
         s.push_str(&format!(r#""unattributed":{unattr}"#));
         s.push_str("}");
         s
@@ -3373,6 +3394,34 @@ pub mod tests {
         let va: Value = fastnbt::from_bytes(a).unwrap();
         let vb: Value = fastnbt::from_bytes(b).unwrap();
         va == vb
+    }
+
+    #[test]
+    fn unchanged_write_skip_and_invalidation() {
+        let dir = temp_dir("skip-test");
+        let s = Store::open_cfg(&dir, false, Cfg::default()).unwrap();
+        let p = chunk_payload(7, 42, 1);
+        s.write_chunk(1, &p, false).unwrap();
+        let before = ST_WRITE_SKIP.load(Ordering::Relaxed);
+        // identical re-save (autosave of an unchanged chunk): skipped
+        s.write_chunk(1, &p, false).unwrap();
+        assert_eq!(
+            ST_WRITE_SKIP.load(Ordering::Relaxed),
+            before + 1,
+            "identical re-write must hit the skip path"
+        );
+        assert!(semantic(&s.read_chunk(1).unwrap(), &p));
+        // changed content: full path again
+        let p2 = chunk_payload(7, 43, 2);
+        s.write_chunk(1, &p2, false).unwrap();
+        assert_eq!(ST_WRITE_SKIP.load(Ordering::Relaxed), before + 1);
+        assert!(semantic(&s.read_chunk(1).unwrap(), &p2));
+        // delete invalidates the cache: same content re-writes fully
+        s.delete_chunk(1).unwrap();
+        assert!(s.read_chunk(1).is_none());
+        s.write_chunk(1, &p, false).unwrap();
+        assert_eq!(ST_WRITE_SKIP.load(Ordering::Relaxed), before + 1);
+        assert!(semantic(&s.read_chunk(1).unwrap(), &p));
     }
 
     #[test]
