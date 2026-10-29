@@ -56,6 +56,12 @@ pub struct Cfg {
     pub hot_level: i32,
     /// zstd level for background recompression (cold tier).
     pub cold_level: i32,
+    /// zstd level for recipe-batch flushes (write-path critical section;
+    /// measured on the JJ corpus: z19 compression of the 64-192 KiB batch
+    /// stream ate ~49% of fresh-import wall time in sync flush pauses,
+    /// while z6 costs only a few % more container bytes — the pack pass
+    /// re-tiers the underlying section/BE bytes anyway).
+    pub recipe_level: i32,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
     /// Slab member cap for whole-mode stores (entity/POI payloads).
@@ -99,6 +105,7 @@ impl Default for Cfg {
             // anyway, so the hot level only bounds transient disk usage.
             hot_level: 3,
             cold_level: 19,
+            recipe_level: 6,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
             auto_pack_bytes: 4 * 1024 * 1024,
@@ -171,6 +178,7 @@ impl Cfg {
         Cfg {
             hot_level: env_parse("CSAVES_HOT_LEVEL", 3),
             cold_level: env_parse("CSAVES_COLD_LEVEL", 19),
+            recipe_level: env_parse("CSAVES_RECIPE_LEVEL", 6),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 64 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),
             auto_pack_bytes: env_parse("CSAVES_AUTO_PACK_BYTES", 4 * 1024 * 1024),
@@ -1594,7 +1602,7 @@ impl Store {
     /// Each entry is indexed in `chunks` with len=BATCHED; the true
     /// (rec_off, stream_off, len) sits in `batch_idx`.
     fn flush_recipe_batch(&self) {
-        const BATCH_BYTES: usize = 64 * 1024;
+        const BATCH_BYTES: usize = 192 * 1024;
         let entries: Vec<(u64, Vec<u8>)> = {
             let mut b = self.recipe_batch.lock();
             if b.entries.is_empty() {
@@ -1638,7 +1646,12 @@ impl Store {
                 so += bare.len() as u32;
             }
             let raw_total = stream.len() as u32;
-            let (dict_id, comp) = self.compress_tier_plain(&stream, true);
+            // z6: the recipe flush runs in the WRITE thread's critical path;
+            // z19 there ate ~49% of fresh-import wall time in sync pauses
+            // (measured via SPEED stages-import on the JJ corpus). Container
+            // cost of z6 vs z19 on these streams is a few %; section/BE
+            // payload bytes are re-tiered at the cold level by the pack pass.
+            let (dict_id, comp) = self.compress_tier_level(&stream, self.cfg.recipe_level);
             debug_assert_eq!(dict_id, 0);
             let mut body = Vec::with_capacity(13 + comp.len());
             body.push(9u8);
@@ -1744,6 +1757,15 @@ impl Store {
     /// header cost and dilutes match search.
     fn compress_tier_plain(&self, data: &[u8], cold: bool) -> (u8, Vec<u8>) {
         let level = if cold { self.cfg.cold_level } else { self.cfg.hot_level };
+        match zstd::bulk::compress(data, level) {
+            Ok(out) => (0, out),
+            Err(_) => (0, data.to_vec()),
+        }
+    }
+
+    /// Explicit-level variant (recipe-batch flush): same no-dictionary path,
+    /// caller picks the zstd level.
+    fn compress_tier_level(&self, data: &[u8], level: i32) -> (u8, Vec<u8>) {
         match zstd::bulk::compress(data, level) {
             Ok(out) => (0, out),
             Err(_) => (0, data.to_vec()),
@@ -2069,7 +2091,7 @@ impl Store {
             batch.push(key, bare);
             let total = batch.bytes;
             drop(batch);
-            if total >= 64 * 1024 {
+            if total >= 192 * 1024 {
                 self.flush_recipe_batch();
             }
         }
@@ -2929,7 +2951,7 @@ impl Store {
             }
             rewritten += 1;
             let total = self.recipe_batch.lock().bytes;
-            if total >= 64 * 1024 {
+            if total >= 192 * 1024 {
                 self.flush_recipe_batch();
             }
         }
@@ -3231,7 +3253,7 @@ impl Store {
                 batch.push(key, bare);
                 let total = batch.bytes;
                 drop(batch);
-                if total >= 64 * 1024 {
+                if total >= 192 * 1024 {
                     self.flush_recipe_batch();
                 }
             }
