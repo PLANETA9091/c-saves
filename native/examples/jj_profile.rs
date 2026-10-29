@@ -538,6 +538,10 @@ fn main() {
     };
     let rs = Store::open_cfg(&out.join("region"), true, cfg.clone()).unwrap();
     let es = Store::open_cfg(&out.join("entities"), true, cfg.clone()).unwrap();
+    // the bench models the PRODUCTION import path: derived light is stripped
+    // (server relights from isLightOn=0 — vanilla-standard). Comparisons
+    // below strip the source side to stay apples-to-apples.
+    c_saves::chunknbt::set_strip_light(true);
     es.set_whole_mode();
     let t0 = std::time::Instant::now();
     for (cx, cz, p) in &region_chunks {
@@ -602,11 +606,17 @@ fn main() {
     // neutral), so chunk equality = per-section expanded state vectors +
     // structural equality of everything else.
     let chunks_semantic = |a: &[u8], b: &[u8]| -> bool {
-        let (Ok(Value::Compound(ma)), Ok(Value::Compound(mb))) =
+        let (Ok(mut ma), Ok(Value::Compound(mb))) =
             (fastnbt::from_bytes::<Value>(a), fastnbt::from_bytes::<Value>(b))
         else {
             return false;
         };
+        if c_saves::chunknbt::strip_light_on() {
+            // the stored side has derived light stripped; strip the source
+            // too — light is recomputed by the server (isLightOn=0)
+            c_saves::chunknbt::strip_derived_chunk(&mut ma);
+        }
+        let Value::Compound(ma) = ma else { return false };
         if ma.len() != mb.len() {
             return false;
         }

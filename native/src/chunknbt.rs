@@ -27,7 +27,7 @@
 use fastnbt::Value;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use xxhash_rust::xxh3::{xxh3_128, Xxh3};
 
@@ -267,6 +267,50 @@ fn is_csec4(b: Option<&u8>) -> bool {
     matches!(b, Some(&CSEC3_MAGIC) | Some(&CSEC4_MAGIC))
 }
 const HMAP_MAGIC: u8 = 0xC6; // repacked heightmap ByteArray marker
+
+// -------------------------------------------------- derived-data strip ----
+// Light is DERIVED data: starlight recomputes SkyLight/BlockLight from block
+// data whenever isLightOn is 0 — this is exactly how vanilla represents every
+// freshly-generated chunk, so storing chunks without light arrays and with
+// isLightOn=0 is 100% vanilla-compatible (the server relights on first load,
+// off-thread, then Paper hands the lit chunk back for the next save).
+// The IMPORT path strips by default (the 261k-chunk world measured 31.8% of
+// raw NBT bytes in light arrays); the RUNTIME write path keeps whatever the
+// server hands us so relit light is stored and never recomputed again.
+static STRIP_LIGHT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_strip_light(on: bool) {
+    STRIP_LIGHT.store(on, Ordering::Relaxed);
+}
+
+pub fn strip_light_on() -> bool {
+    !matches!(std::env::var("CSAVES_KEEP_LIGHT").as_deref(), Ok("1"))
+        && STRIP_LIGHT.load(Ordering::Relaxed)
+}
+
+/// Remove derived light fields from one section compound.
+pub fn strip_derived_section(sec: &mut Value) {
+    if let Value::Compound(m) = sec {
+        m.remove("SkyLight");
+        m.remove("BlockLight");
+        m.remove("starlight.skylight_state");
+        m.remove("starlight.blocklight_state");
+    }
+}
+
+/// Strip derived data from a whole chunk (sections + isLightOn) — used on
+/// the import path and, with the same shape, by semantic comparators on the
+/// SOURCE side so verification stays apples-to-apples.
+pub fn strip_derived_chunk(root: &mut Value) {
+    if let Value::Compound(m) = root {
+        if let Some(Value::List(list)) = m.get_mut("sections") {
+            for s in list.iter_mut() {
+                strip_derived_section(s);
+            }
+        }
+        m.insert("isLightOn".to_string(), Value::Byte(0));
+    }
+}
 
 fn bits_for(n: usize) -> u32 {
     let mut b = 1u32;
@@ -2638,7 +2682,7 @@ pub fn split(payload: &[u8], whole_mode: bool, pos_hint: Option<(i32, i32)>) -> 
 fn split_parsed(
     payload: &[u8],
     pos_hint: Option<(i32, i32)>,
-    root: Value,
+    mut root: Value,
 ) -> Result<Split, String> {
     let has_sections = match &root {
         Value::Compound(map) => matches!(map.get("sections"), Some(Value::List(_))),
@@ -2650,14 +2694,23 @@ fn split_parsed(
 
     let t_ss = std::time::Instant::now();
     let mut sections;
+    let strip = strip_light_on();
     {
-        let Value::Compound(map) = &root else { unreachable!("checked above") };
-        let Some(Value::List(list)) = map.get("sections") else {
+        let Value::Compound(map) = &mut root else { unreachable!("checked above") };
+        let Some(Value::List(list)) = map.get_mut("sections") else {
             unreachable!("checked above")
         };
+        if strip {
+            // strip BEFORE hashing/encoding so dedup hashes key on the
+            // stripped content: chunks differing only in derived light
+            // collapse to the same blobs.
+            for s in list.iter_mut() {
+                strip_derived_section(s);
+            }
+        }
         sections = Vec::with_capacity(list.len());
         let mut cache_hit = vec![false; list.len()];
-        for s in list {
+        for s in list.iter() {
             // encode-cache: re-saving a chunk re-encodes every section; the
             // structural hash is order-free, so unchanged sections hit the
             // cache and skip canonicalization + bit-packing entirely.
@@ -2704,6 +2757,12 @@ fn split_parsed(
     let tail = match &mut root {
         Value::Compound(m) => {
             m.remove("sections");
+            if strip {
+                // relight trigger: isLightOn=0 makes the server recompute
+                // light for this chunk on load (vanilla standard for fresh
+                // chunks)
+                m.insert("isLightOn".to_string(), Value::Byte(0));
+            }
             let mut tv = Value::Compound(std::mem::take(m));
             tail_encode(&mut tv);
             to_bytes(&tv)

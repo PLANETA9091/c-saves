@@ -281,6 +281,9 @@ fn main() {
     let _ = std::fs::remove_dir_all(&store_dir_e);
     let es = Store::open_cfg(&store_dir_e, true, bench_cfg()).unwrap();
     es.set_whole_mode();
+    // models the production IMPORT path: derived light stripped (relight on
+    // load, vanilla-standard); the verify comparator strips the source side.
+    c_saves::chunknbt::set_strip_light(true);
 
     let mut comps = Comps::default();
     let mut n_region_chunks = 0u64;
@@ -539,8 +542,11 @@ fn dir_bytes(dir: &Path) -> u64 {
 }
 
 fn chunk_semantic(a: &[u8], b: &[u8]) -> bool {
-    let va: Value = fastnbt::from_bytes(a).unwrap();
-    let vb: Value = fastnbt::from_bytes(b).unwrap();
+    let Ok(mut va) = fastnbt::from_bytes::<Value>(a) else { return false };
+    let Ok(vb) = fastnbt::from_bytes::<Value>(b) else { return false };
+    if c_saves::chunknbt::strip_light_on() {
+        c_saves::chunknbt::strip_derived_chunk(&mut va);
+    }
     let Value::Compound(ma) = &va else { return va == vb };
     let Value::Compound(mb) = &vb else { return false };
     for (k, v) in ma {

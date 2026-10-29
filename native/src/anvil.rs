@@ -44,6 +44,10 @@ fn decompress(comp_type: u8, data: &[u8]) -> Option<Vec<u8>> {
 /// Chunks already present in the container are skipped (never overwritten:
 /// live server data wins over possibly stale .mca contents).
 pub fn import_dir(regions_dir: &Path, store: &Arc<Store>) -> std::io::Result<ImportReport> {
+    // Bulk conversion of cold legacy data: strip derived light (the server
+    // relights with isLightOn=0 — vanilla-standard). Runtime saves are NOT
+    // affected: the runtime write path keeps whatever Paper hands us.
+    crate::chunknbt::set_strip_light(true);
     let mut rep = ImportReport { files: 0, chunks: 0, skipped_present: 0, failed: 0 };
     let mut files: Vec<_> = fs::read_dir(regions_dir)?
         .filter_map(|e| e.ok())
