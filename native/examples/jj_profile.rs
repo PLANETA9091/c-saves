@@ -118,15 +118,13 @@ fn val_bytes(v: &Value) -> u64 {
 }
 
 fn pal_data_stats(bs: &Value) -> (u64, u64) {
-    // (palette name bytes, data bytes)
+    // (palette wire bytes, data bytes) — full serialized palette (compound
+    // {Name, Properties} entries included; the old name-only count measured
+    // modern Paper palettes as 0).
     let Value::Compound(bm) = bs else { return (0, 0) };
     let mut pal = 0u64;
-    if let Some(Value::List(l)) = bm.get("palette") {
-        for p in l {
-            if let Value::String(s) = p {
-                pal += s.len() as u64;
-            }
-        }
+    if let Some(p) = bm.get("palette") {
+        pal = val_bytes(p);
     }
     let mut data = 0u64;
     if let Some(Value::LongArray(la)) = bm.get("data") {

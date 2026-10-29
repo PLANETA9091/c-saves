@@ -139,16 +139,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: build real_exp
         working-directory: native
-        run: cargo build --release --example real_exp
+        run: |
+          cargo build --release --example real_exp
+          cargo build --release --example jj_exp4
       - name: real-corpus attribution (committed JJThunder subset)
         working-directory: native
         run: |
           ./target/release/examples/real_exp ../bench-corpus/dim 2>&1 | tee real_exp.txt
           cat real_exp.txt
+          echo "--- cross-chunk dense-delta potential (jj_exp4) ---"
+          ./target/release/examples/jj_exp4 ../bench-corpus/dim 2>&1 | tee jj_exp4.txt
+          cat jj_exp4.txt
       - uses: actions/upload-artifact@v4
         with:
           name: real-exp-results
-          path: native/real_exp.txt
+          path: |
+            native/real_exp.txt
+            native/jj_exp4.txt
 
   speed-bench:
     runs-on: ubuntu-latest
