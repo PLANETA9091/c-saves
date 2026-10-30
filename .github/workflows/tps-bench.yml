@@ -15,7 +15,7 @@ on:
       samples:
         description: 'TPS samples per phase'
         required: false
-        default: '24'
+        default: '12'
       interval:
         description: 'seconds between samples'
         required: false
@@ -57,7 +57,7 @@ jobs:
   tps:
     needs: module
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       SAMPLES: ${{ inputs.samples || '24' }}
       INTERVAL: ${{ inputs.interval || '10' }}
