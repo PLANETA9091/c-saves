@@ -93,6 +93,10 @@ pub struct Cfg {
     pub slab_max_raw_whole: usize,
     /// Decompressed-slab read cache budget (bytes).
     pub slab_cache: u64,
+    /// Writer segment roll threshold. 64 MiB in production; tests shrink it
+    /// to force rolls while the append buffer is guaranteed non-empty (the
+    /// exact window of the roll-hole corruption this once caused).
+    pub seg_roll: u64,
 }
 
 impl Default for Cfg {
@@ -117,6 +121,7 @@ impl Default for Cfg {
             slab_max_raw: 8 * 1024 * 1024,
             slab_max_raw_whole: 4 * 1024 * 1024,
             slab_cache: 32 * 1024 * 1024,
+            seg_roll: 64 * 1024 * 1024,
         }
     }
 }
@@ -190,6 +195,7 @@ impl Cfg {
             slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 8 * 1024 * 1024),
             slab_max_raw_whole: env_parse("CSAVES_SLAB_MAX_RAW_WHOLE", 4 * 1024 * 1024),
             slab_cache: env_parse("CSAVES_SLAB_CACHE", 32 * 1024 * 1024),
+            seg_roll: env_parse("CSAVES_SEG_ROLL", 64 * 1024 * 1024),
         }
     }
 }
@@ -277,6 +283,11 @@ struct Seg {
     mmap: std::sync::OnceLock<Option<Arc<Mmap>>>,
     total: AtomicU64,
     live: AtomicU64,
+    /// Set when a full-rewrite pack had to skip unreadable victims: the
+    /// segment is then NEVER removed (removal would turn those victims into
+    /// permanent dangling references — the 23,380-chunk bigworld loss class).
+    /// Compaction stops considering poisoned segments.
+    pack_broken: AtomicBool,
 }
 
 impl Seg {
@@ -1137,6 +1148,7 @@ impl Store {
                 mmap: std::sync::OnceLock::new(),
                 total: AtomicU64::new(0),
                 live: AtomicU64::new(0),
+                pack_broken: AtomicBool::new(false),
             }),
         );
         Ok(wfile)
@@ -1772,8 +1784,19 @@ impl Store {
             *wg = Some(Writer { file, seg_id: id, written: 0, buf: Vec::with_capacity(BUF_CAP) });
         }
         let w = wg.as_mut().unwrap();
-        if w.written > 0 && w.written + body.len() as u64 > SEG_ROLL {
-            w.file.seek(SeekFrom::Start(w.written))?;
+        if w.written > 0 && w.written + body.len() as u64 > self.cfg.seg_roll {
+            // The append buffer holds records whose bytes were already counted
+            // in `written` but NOT yet on disk; they belong at
+            // written - buf.len() (the file position invariant). Rolling with
+            // a seek to `written` wrote them a buffer-length TOO FAR, leaving
+            // a hole of zeros over the tail records: batch records decoded
+            // rawlen=0 (LEAK slice fail) and blobs decompressed to garbage —
+            // every pack then skipped them and the segment drop turned them
+            // into permanent dangling references (23,380 missing chunks on
+            // the 262k-chunk bigworld run; JJ-corpus benches never roll a
+            // segment with a non-empty buffer, so they stayed clean).
+            w.file
+                .seek(SeekFrom::Start(w.written - w.buf.len() as u64))?;
             if !w.buf.is_empty() {
                 w.file.write_all(&w.buf)?;
                 w.buf.clear();
@@ -3222,6 +3245,9 @@ impl Store {
                 if *id == writer_id {
                     continue;
                 }
+                if s.pack_broken.load(Ordering::Relaxed) {
+                    continue; // poisoned: never considered again
+                }
                 let total = s.total.load(Ordering::Relaxed);
                 let live = s.live.load(Ordering::Relaxed);
                 if total > self.cfg.compact_min {
@@ -3305,6 +3331,17 @@ impl Store {
     /// segment (continuous pack pass).
     fn pack_segment(&self, worst_id: u32, drop_seg: bool) -> bool {
         self.pack_requested.store(false, Ordering::Relaxed);
+        // Poison marker: any unreadable victim on the drop path must PREVENT
+        // the segment removal (removal turns the victim's dangling references
+        // into permanent chunk loss). The segment is kept, poisoned, and
+        // never considered again — correctness over reclaim.
+        let mark_broken = || {
+            if drop_seg {
+                if let Some(s) = self.segs.read().get(&worst_id) {
+                    s.pack_broken.store(true, Ordering::Relaxed);
+                }
+            }
+        };
         // Locality-ordered victims: take the segment's blobs DIRECTLY from
         // the blobs map and sort by blob id — blob ids are allocated in
         // section order as chunks are written, so id order approximates
@@ -3333,7 +3370,13 @@ impl Store {
             if !drop_seg && (loc.slab || loc.cold) {
                 continue; // already packed: leave in place
             }
-            let Some(data) = self.read_blob(loc, Some(worst_id)) else { continue };
+            let Some(data) = self.read_blob(loc, Some(worst_id)) else {
+                eprintln!(
+                    "[c-saves] PACK LOSS RISK: blob {h:016x} unreadable in seg-{worst_id:05} — segment will be KEPT"
+                );
+                mark_broken();
+                continue;
+            };
             did = true;
             let member_cap = if self.whole_mode.load(Ordering::Relaxed) {
                 self.cfg.slab_max_member_whole
@@ -3425,6 +3468,7 @@ impl Store {
                 // bare bytes out of the decompressed stream
                 let Some((boff, soff, rl)) = self.batch_idx.lock().get(&key).copied() else {
                     eprintln!("[c-saves] LEAK: batch_idx miss key={key:016x} during seg-{worst_id} rewrite");
+                    mark_broken();
                     continue;
                 };
                 if _s != worst_id {
@@ -3438,34 +3482,42 @@ impl Store {
                 let Some(seg) = segs.get(&worst_id) else { continue };
                 let Some(hdr) = seg.read_at(boff, 13, !is_writer) else {
                     eprintln!("[c-saves] LEAK: hdr read fail key={key:016x} boff={boff}");
+                    mark_broken();
                     continue;
                 };
                 let cl = u32::from_le_bytes(hdr[5..9].try_into().unwrap()) as usize;
                 let raw_total = u32::from_le_bytes(hdr[9..13].try_into().unwrap());
                 let Some(data) = seg.read_at(boff + 13, cl, !is_writer) else {
                     eprintln!("[c-saves] LEAK: body read fail key={key:016x} cl={cl}");
+                    mark_broken();
                     continue;
                 };
                 drop(segs);
                 let Some(raw) = self.decompress(0, &data, raw_total) else {
                     eprintln!("[c-saves] LEAK: batch decompress fail key={key:016x}");
+                    mark_broken();
                     continue;
                 };
                 let Some(e) = raw.get(soff as usize..(soff + rl) as usize) else {
                     eprintln!("[c-saves] LEAK: slice fail key={key:016x} soff={soff} rl={rl} rawlen={}", raw.len());
+                    mark_broken();
                     continue;
                 };
                 e.to_vec()
             } else {
                 let segs = self.segs.read();
                 let Some(seg) = segs.get(&worst_id) else { continue };
-                let Some(body) = seg.read_at(off, len as usize, false) else { continue };
+                let Some(body) = seg.read_at(off, len as usize, false) else {
+                    mark_broken();
+                    continue;
+                };
                 drop(segs);
                 if body.first() == Some(&0xFF) {
                     body
                 } else if body.first() == Some(&2) && body.len() >= 13 {
                     let rl = u32::from_le_bytes(body[9..13].try_into().unwrap()) as usize;
                     if body.len() < 13 + rl {
+                        mark_broken();
                         continue;
                     }
                     let mut b = Vec::with_capacity(1 + rl);
@@ -3473,6 +3525,7 @@ impl Store {
                     b.extend_from_slice(&body[13..13 + rl]);
                     b
                 } else {
+                    mark_broken();
                     continue;
                 }
             };
@@ -3507,6 +3560,22 @@ impl Store {
         // preserve interned keys recorded in this segment (kind-6 records
         // are not referenced by recipes but the key table must survive)
         self.preserve_keys(worst_id);
+        let broken = self
+            .segs
+            .read()
+            .get(&worst_id)
+            .map(|s| s.pack_broken.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        if broken {
+            // Never remove a segment whose victims could not all be moved:
+            // the recipes still pointing into it would dangle forever. The
+            // segment stays on disk (dead bytes included) and is never
+            // considered by compaction again.
+            eprintln!(
+                "[c-saves] packed seg-{worst_id:05} PARTIAL — segment KEPT (poisoned) to preserve dangling references"
+            );
+            return true;
+        }
         // drop the segment
         let old = self.segs.write().remove(&worst_id);
         drop(old);
@@ -3690,6 +3759,44 @@ pub mod tests {
         }
         root.insert("sections".to_string(), Value::List(sec_list));
         fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn seg_roll_with_pending_buffer_keeps_every_record() {
+        // Regression for the 23,380-chunk bigworld-survival loss: the writer
+        // roll seeked to `written` instead of `written - buf.len()`, writing
+        // the pending append buffer a buffer-length TOO FAR and zeroing the
+        // segment tail records. Batch records in the hole decoded rawlen=0
+        // ("LEAK: slice fail") and blobs decompressed to garbage; the next
+        // full-rewrite pack skipped them and the segment drop made the loss
+        // permanent ("blob ... segment N removed from segs" forensics).
+        // JJ-corpus benches never rolled a segment with a non-empty buffer
+        // (whole store < 64 MiB), so only the 262k-chunk world ever hit it.
+        // seg_roll (192 KiB) < BUF_CAP (1 MiB) guarantees the append buffer
+        // is non-empty at EVERY roll in this test.
+        let dir = temp_dir("seg-roll-buffer");
+        let cfg = Cfg {
+            seg_roll: 192 * 1024,
+            compact_min: u64::MAX, // keep every segment: only the roll path is under test
+            auto_pack_bytes: 0,
+            ..bench_cfg()
+        };
+        let st = Store::open_cfg(&dir, true, cfg).unwrap();
+        // ~1+ MiB of appends -> several rolls; all-unique sections so a hole
+        // cannot hide behind dedup
+        let n = 120u64;
+        let payloads: Vec<Vec<u8>> = (0..n).map(|i| unique_payload(i as i32, 700 + i)).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            st.write_chunk(i as u64, p, false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable after segment rolls (roll-hole regression)"));
+            assert!(semantic(&got, p), "chunk {i} corrupted after segment rolls");
+        }
     }
 
     #[test]

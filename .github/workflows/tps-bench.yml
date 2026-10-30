@@ -39,12 +39,13 @@ jobs:
         working-directory: native
         run: |
           cargo build --release
-          nm -D target/release/libc-saves.so | grep -q cplugin_init || {
+          # crate "c-saves" -> cdylib "libc_saves.so" (hyphens become underscores)
+          nm -D target/release/libc_saves.so | grep -q cplugin_init || {
             echo "::error::cplugin_init export missing"; exit 1; }
       - name: package module dir
         run: |
           mkdir -p pkg/c-saves
-          cp native/target/release/libc-saves.so pkg/c-saves/
+          cp native/target/release/libc_saves.so pkg/c-saves/
           cp module.json pkg/c-saves/
           ls -la pkg/c-saves
       - uses: actions/upload-artifact@v4
