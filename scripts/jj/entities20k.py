@@ -4,23 +4,29 @@ import sys, math, random
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from rcon import rcon
 
+import os
 random.seed(9091)
 CX, CZ = 0, 0          # chunk center area (all generated: chunks -16..15)
-R_BLOCKS = 380         # spread radius
+R_BLOCKS = int(os.environ.get("R_BLOCKS", "380"))   # spread radius
+TOTAL = int(os.environ.get("ENTITY_COUNT", "20000"))  # target corpus size
+SCALE = TOTAL / 20000.0
 
 def pos(i):
     # deterministic spiral-ish spread with jitter
     a = i * 2.399963  # golden angle
-    r = R_BLOCKS * math.sqrt((i + 0.5) / 20000.0)
+    r = R_BLOCKS * math.sqrt((i + 0.5) / float(TOTAL))
     x = CX * 16 + 8 + r * math.cos(a) + random.uniform(-1.5, 1.5)
     z = CZ * 16 + 8 + r * math.sin(a) + random.uniform(-1.5, 1.5)
     return x, z
 
+def _n(base):
+    return max(1, round(base * SCALE))
+
 kinds = (
-    [("minecraft:villager", 4000, '{"Tags":["jjb"],"PersistenceRequired":1b}')] +
-    [("minecraft:sheep", 8000, '{"Tags":["jjb"],"PersistenceRequired":1b}')] +
-    [("minecraft:zombie", 4000, '{"Tags":["jjb"],"PersistenceRequired":1b}')] +
-    [("minecraft:armor_stand", 4000, '{"Tags":["jjb"],"PersistenceRequired":1b,"ShowArms":1b}')]
+    [("minecraft:villager", _n(4000), '{"Tags":["jjb"],"PersistenceRequired":1b}')] +
+    [("minecraft:sheep", _n(8000), '{"Tags":["jjb"],"PersistenceRequired":1b}')] +
+    [("minecraft:zombie", _n(4000), '{"Tags":["jjb"],"PersistenceRequired":1b}')] +
+    [("minecraft:armor_stand", _n(4000), '{"Tags":["jjb"],"PersistenceRequired":1b,"ShowArms":1b}')]
 )
 cmds = []
 idx = 0

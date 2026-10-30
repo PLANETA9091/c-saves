@@ -1,0 +1,200 @@
+name: tps-bench
+
+# LIVE E2E: Paper 26.3 with the c-saves module INJECTED via the CRUSSTY
+# runtime, vs the identical server on vanilla Anvil. One prepared world
+# (1024 chunks + a persisted entity corpus), two phases, identical heaps:
+#   phase A — baseline: java -jar paper.jar (Anvil)
+#   phase B — csaves:   launcher (CRUSSTY runtime) + modules/c-saves
+# Metrics per phase: `tps` + `mspt` samples, forceload-window rotation
+# (disk read churn), timed `save-all flush` (full save cycle), lag-spike
+# log lines. Everything runs on the CI runner — never locally.
+
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: 'TPS samples per phase'
+        required: false
+        default: '24'
+      interval:
+        description: 'seconds between samples'
+        required: false
+        default: '10'
+      entities:
+        description: 'persisted entity corpus size'
+        required: false
+        default: '10000'
+
+jobs:
+  module:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: build the module .so
+        working-directory: native
+        run: |
+          cargo build --release
+          nm -D target/release/libc-saves.so | grep -q cplugin_init || {
+            echo "::error::cplugin_init export missing"; exit 1; }
+      - name: package module dir
+        run: |
+          mkdir -p pkg/c-saves
+          cp native/target/release/libc-saves.so pkg/c-saves/
+          cp module.json pkg/c-saves/
+          ls -la pkg/c-saves
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c-saves-module
+          path: pkg/c-saves
+          retention-days: 7
+
+  tps:
+    needs: module
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SAMPLES: ${{ inputs.samples || '24' }}
+      INTERVAL: ${{ inputs.interval || '10' }}
+      ENTITIES: ${{ inputs.entities || '10000' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: download the module artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download $GITHUB_RUN_ID -n c-saves-module -D modules-dir
+          mkdir -p modules/c-saves
+          cp modules-dir/c-saves/* modules/c-saves/
+          ls -la modules/c-saves
+
+      - name: assemble server dirs (CRUSSTY + Paper 26.3)
+        run: |
+          set -e
+          V=2.9.0
+          curl -sL -o launcher.jar "https://github.com/PLANETA9091/CRUSSTY/releases/download/v$V/launcher.jar"
+          curl -sL -o libcrussty_runtime.so "https://github.com/PLANETA9091/CRUSSTY/releases/download/v$V/libcrussty_runtime.so"
+          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15/paper-26.3-227.jar"
+          echo "416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15  paper.jar" | sha256sum -c -
+          mkdir -p baseline/config
+          cp paper.jar baseline/paper.jar
+          mkdir -p crussty-srv/launcher crussty-srv/versions crussty-srv/modules/c-saves crussty-srv/config
+          cp launcher.jar crussty-srv/launcher/
+          cp libcrussty_runtime.so crussty-srv/
+          cp paper.jar crussty-srv/versions/paper-26.3-227.jar
+          cp -r modules/c-saves crussty-srv/modules/
+          printf '[server]\nkernel = "paper-26.3-227.jar"\nmemory = "6G"\n\n[catalog]\nrepo = "PLANETA9091/crussty-catalog"\n' > crussty-srv/crussty.toml
+          for D in baseline crussty-srv; do
+            printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=true\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > "$D/server.properties"
+            printf 'eula=true\n' > "$D/eula.txt"
+            printf '_version: 29\nwatchdog:\n  enable: false\n' > "$D/config/paper-global.yml"
+          done
+          ls baseline crussty-srv crussty-srv/modules/c-saves
+
+      - name: prep — generate the world once on plain Paper (throwaway dir)
+        run: |
+          set -e
+          mkdir -p prep/config
+          cp paper.jar prep/paper.jar
+          printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=true\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > prep/server.properties
+          printf 'eula=true\n' > prep/eula.txt
+          printf '_version: 29\nwatchdog:\n  enable: false\n' > prep/config/paper-global.yml
+          cd prep
+          java -Xms2G -Xmx6G -jar paper.jar nogui > console.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 180); do
+            grep -q "Done (" logs/latest.log 2>/dev/null && break
+            kill -0 $SRV 2>/dev/null || { echo "::error::prep server died"; tail -30 console.log; exit 1; }
+            sleep 2
+          done
+          grep -q "Done (" logs/latest.log || { echo "::error::prep boot timeout"; tail -30 console.log; kill $SRV; exit 1; }
+          echo "prep server up"
+          python3 ../scripts/jj/prep_world.py
+          rcon_stopped=$?
+          wait $SRV || true
+          [ "$rcon_stopped" = "0" ] || { echo "::error::prep phase failed"; tail -30 console.log; exit 1; }
+          cd ..
+          cp -r prep/jjworld baseline/jjworld
+          cp -r prep/jjworld crussty-srv/jjworld
+          du -sh baseline/jjworld crussty-srv/jjworld
+
+      - name: phase A — baseline Anvil (samples + flush timing + spikes)
+        run: |
+          set -e
+          cd baseline
+          java -Xms2G -Xmx6G -jar paper.jar nogui > console.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 150); do
+            grep -q "Done (" logs/latest.log 2>/dev/null && break
+            kill -0 $SRV 2>/dev/null || { echo "::error::baseline died"; tail -30 console.log; exit 1; }
+            sleep 2
+          done
+          grep -q "Done (" logs/latest.log || { echo "::error::baseline boot timeout"; tail -30 console.log; kill $SRV; exit 1; }
+          echo "baseline up; warming 30s"
+          sleep 30
+          python3 ../scripts/jj/tps_sample.py tps_baseline.txt A "$SAMPLES" "$INTERVAL" || echo "::warning::sampler error"
+          grep -E "Running [0-9]+ms behind|Can't keep up|lag spike|Watchdog" logs/latest.log > spikes_A.txt || true
+          echo "--- spikes A: $(wc -l < spikes_A.txt)"
+          python3 ../scripts/jj/stop_srv.py
+          wait $SRV || true
+          cd ..
+
+      - name: phase B — c-saves injected via CRUSSTY (import + samples + spikes)
+        run: |
+          set -e
+          cd crussty-srv
+          java -Xms2G -Xmx6G -jar launcher/launcher.jar nogui > console.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 240); do
+            grep -q "Done (" logs/latest.log 2>/dev/null && break
+            kill -0 $SRV 2>/dev/null || { echo "::error::crussty server died"; tail -40 console.log; exit 1; }
+            sleep 2
+          done
+          grep -q "Done (" logs/latest.log || { echo "::error::crussty boot timeout"; tail -40 console.log; kill $SRV; exit 1; }
+          echo "crussty server up"
+          grep -E "pipeline ready|inject|module" console.log logs/latest.log 2>/dev/null | head -12 || echo "NO module lines found"
+          for i in $(seq 1 300); do
+            grep -q "\[c-saves\] import region:" console.log logs/latest.log 2>/dev/null && break
+            kill -0 $SRV 2>/dev/null || { echo "::error::crussty server died during import"; tail -40 console.log; exit 1; }
+            sleep 2
+          done
+          grep -h "\[c-saves\]" console.log logs/latest.log 2>/dev/null | tail -40 > csaves_lines.txt || true
+          cat csaves_lines.txt || true
+          echo "warming 30s"
+          sleep 30
+          python3 ../scripts/jj/tps_sample.py tps_csaves.txt B "$SAMPLES" "$INTERVAL" || echo "::warning::sampler error"
+          grep -E "Running [0-9]+ms behind|Can't keep up|lag spike|Watchdog" logs/latest.log > spikes_B.txt || true
+          echo "--- spikes B: $(wc -l < spikes_B.txt)"
+          python3 ../scripts/jj/stop_srv.py
+          wait $SRV || true
+          du -sh crus jjworld 2>/dev/null || true
+          cd ..
+
+      - name: verdict + report
+        run: |
+          python3 scripts/jj/tps_verdict.py baseline/tps_baseline.txt crussty-srv/tps_csaves.txt \
+            baseline/spikes_A.txt crussty-srv/spikes_B.txt crussty-srv/csaves_lines.txt > tps_report.md || true
+          cat tps_report.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tps-bench-results
+          path: |
+            tps_report.md
+            baseline/tps_baseline.txt
+            baseline/spikes_A.txt
+            baseline/console.log
+            crussty-srv/tps_csaves.txt
+            crussty-srv/spikes_B.txt
+            crussty-srv/csaves_lines.txt
+            crussty-srv/console.log
+          retention-days: 30
