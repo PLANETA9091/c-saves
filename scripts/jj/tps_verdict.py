@@ -20,21 +20,17 @@ def fnum(xs):
 
 
 def parse(path):
-    tps, mspt_avg, p95, p99, flushes, rotates = [], [], [], [], [], []
+    tps, mspt_avg, mspt_max, flushes, rotates = [], [], [], [], []
     for line in open(path, encoding="utf-8", errors="replace"):
-        m = re.search(r"TPS[^:\d]*1m[^:\d]*5m[^:\d]*15m[^:\d]*:\s*([\d.]+)", line)
-        if not m:
-            m = re.search(r"TPS[^:]*:\s*([\d.]+)", line)
+        # clean response: "TPS from last 1m, 5m, 15m: 19.6, 19.6, 19.6 |"
+        # "Server tick times (avg/min/max) from last 5s, 10s, 1m: ◴ 10.5/7.9/13.5, ..."
+        m = re.search(r"TPS from last 1m, 5m, 15m:\s*([\d.]+)", line)
         if m:
             tps.append(float(m.group(1)))
-        for pat, sink in (
-            (r"(?:avg|mean)\s*[:=]\s*([\d.]+)", mspt_avg),
-            (r"p95\s*[:=]\s*([\d.]+)", p95),
-            (r"p99\s*[:=]\s*([\d.]+)", p99),
-        ):
-            m = re.search(pat, line, re.IGNORECASE)
-            if m:
-                sink.append(float(m.group(1)))
+        m = re.search(r"◴\s*([\d.]+)/([\d.]+)/([\d.]+)", line)
+        if m:
+            mspt_avg.append(float(m.group(1)))
+            mspt_max.append(float(m.group(3)))
         m = re.search(r"flush\s+([\d.]+)s", line)
         if m:
             flushes.append(float(m.group(1)))
@@ -42,7 +38,7 @@ def parse(path):
         if m:
             rotates.append(float(m.group(1)))
     return {
-        "tps": fnum(tps), "mspt": fnum(mspt_avg), "p95": fnum(p95), "p99": fnum(p99),
+        "tps": fnum(tps), "mspt": fnum(mspt_avg), "mspt_max": fnum(mspt_max),
         "flush": fnum(flushes), "rotate": fnum(rotates),
         "n_tps": len(tps), "n_flush": len(flushes), "n_rotate": len(rotates),
     }
@@ -83,9 +79,8 @@ def main():
         print(f"| {name} | {fa} | {fb} | {cmp} |")
 
     row("TPS (avg of samples)", "tps")
-    row("MSPT avg (ms)", "mspt", lower_is_better=True)
-    row("MSPT p95 (ms)", "p95", lower_is_better=True)
-    row("MSPT p99 (ms)", "p99", lower_is_better=True)
+    row("MSPT avg 5s (ms)", "mspt", lower_is_better=True)
+    row("MSPT max 5s (ms)", "mspt_max", lower_is_better=True)
     row("save-all flush (s)", "flush", "{:.2f}", lower_is_better=True)
     row("forceload rotate (s)", "rotate", "{:.2f}", lower_is_better=True)
     print(f"| samples (tps/flush/rotate) | {A['n_tps']}/{A['n_flush']}/{A['n_rotate']} | "
@@ -107,8 +102,8 @@ def main():
     warns = []
     if A["tps"] == A["tps"] and B["tps"] == B["tps"] and B["tps"] < A["tps"] * 0.995:
         warns.append(f"TPS B {B['tps']:.2f} < A {A['tps']:.2f}")
-    if A["p95"] == A["p95"] and B["p95"] == B["p95"] and B["p95"] > A["p95"] * 1.05:
-        warns.append(f"MSPT p95 B {B['p95']:.2f} > A {A['p95']:.2f}")
+    if A["mspt_max"] == A["mspt_max"] and B["mspt_max"] == B["mspt_max"] and B["mspt_max"] > A["mspt_max"] * 1.05:
+        warns.append(f"MSPT max B {B['mspt_max']:.2f} > A {A['mspt_max']:.2f}")
 
     for w in warns:
         print(f"::warning::{w}")

@@ -3472,6 +3472,16 @@ impl Store {
                 .collect()
         };
         for (key, _s, off, len) in recs {
+            // Re-check the CURRENT chunks-map pointer: a supersede after the
+            // snapshot moved this key (pending batch entry or a newer batch)
+            // and the snapshot's pointer is now DEAD bytes. Moving it anyway
+            // would (a) trip the batch_idx-miss poison (the supersede removed
+            // the entry) or (b) re-queue the OLD bare recipe over the newer
+            // pending one — RecipeBatch is last-write-wins, so the chunk
+            // would silently ROLL BACK. The pending/newer state is the truth.
+            if self.chunks.read().get(&key).copied() != Some((_s, off, len)) {
+                continue;
+            }
             // normalize to a bare batched recipe
             let bare: Vec<u8> = if len == BATCHED {
                 // entry lives inside a compressed kind-9 batch: pull the
@@ -3806,6 +3816,72 @@ pub mod tests {
                 .read_chunk(i as u64)
                 .unwrap_or_else(|| panic!("chunk {i} unreadable after segment rolls (roll-hole regression)"));
             assert!(semantic(&got, p), "chunk {i} corrupted after segment rolls");
+        }
+    }
+
+    #[test]
+    fn concurrent_supersede_during_pack_keeps_newest_state() {
+        // Production firing (tps-bench phase B): the runtime's compaction
+        // thread packed seg-11 while Paper's save thread superseded chunk
+        // recipes — the pack's recs snapshot held DEAD pointers whose
+        // batch_idx entries were already removed by the supersede. Moving
+        // them anyway would (a) trip the batch_idx-miss poison or (b)
+        // re-queue the OLD bare recipe over the newer pending one and
+        // silently ROLL the chunk back (RecipeBatch is last-write-wins).
+        // The loop must re-check the current chunks-map pointer.
+        let dir = temp_dir("supersede-during-pack");
+        let cfg = Cfg {
+            compact_min: 16 * 1024,
+            compact_ratio: 0.10,
+            dict_train: 16,
+            ..bench_cfg()
+        };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        // seed: 80 chunks committed in sealed segments
+        for i in 0..80u64 {
+            s.write_chunk(i, &unique_payload(i as i32, 900), false).unwrap();
+        }
+        s.sync();
+        s.seal();
+        // writer: supersede a slice of keys continuously
+        let sw = Arc::clone(&s);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            // bounded: 12 rounds x 20 keys, small pauses so the packer can
+            // interleave (the race window is snapshot-vs-supersede)
+            for r in 0..12u64 {
+                for i in 0..20u64 {
+                    let _ = sw.write_chunk(i, &unique_payload(i as i32, 910 + r), false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(3));
+            }
+            stop2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        // packer: dead-ratio compaction waves on the main thread
+        for _ in 0..60 {
+            s.request_pack();
+            for _ in 0..4 {
+                s.compact_step();
+            }
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        s.sync();
+        s.seal();
+        // nothing may be lost, and every survivor must be valid NBT
+        for i in 0..80u64 {
+            let got = s
+                .read_chunk(i)
+                .unwrap_or_else(|| panic!("chunk {i} lost after concurrent supersede+pack"));
+            assert!(
+                fastnbt::from_bytes::<Value>(&got).is_ok(),
+                "chunk {i} unreadable after concurrent supersede+pack"
+            );
         }
     }
 
