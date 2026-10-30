@@ -24,7 +24,7 @@ import time
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from rcon import rcon
 
-ROTATE_EVERY = 3
+ROTATE_EVERY = 4
 # four 16x16-CHUNK (256-chunk, the forceload cap) windows around spawn,
 # in CHUNK coordinates; all pregenerated during the prep phase
 WINDOWS = [
@@ -71,7 +71,7 @@ for i in range(n):
             )
         except Exception as e:
             row.append(f"rotate ERR {type(e).__name__}")
-    if i % 5 == 4:
+    if i % 8 == 7:
         t0 = time.time()
         try:
             rcon("save-all flush", timeout=900)
