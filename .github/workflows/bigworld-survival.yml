@@ -93,6 +93,66 @@ jobs:
           path: jjserver/artifact
           retention-days: 3
 
+  attrib:
+    needs: tile
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: download 16 tile artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tx in 0 1 2 3; do
+            for tz in 0 1 2 3; do
+              gh run download $GITHUB_RUN_ID -n "tile-$tx-$tz" -D "art/tile-$tx-$tz"
+            done
+          done
+
+      - name: merge into one world
+        run: |
+          R=jjserver/jjworld/dimensions/minecraft/overworld/region
+          mkdir -p "$R"
+          for d in art/tile-*; do
+            if ls "$d"/region/*.mca >/dev/null 2>&1; then
+              cp "$d"/region/*.mca "$R"/
+            fi
+          done
+
+      - name: enrich merged world (same params as bench)
+        run: |
+          cd native
+          cargo build --release --example enrich
+          ./target/release/examples/enrich \
+            ../jjserver/jjworld/dimensions/minecraft/overworld 2000 20000 250
+
+      - name: class attribution (real_exp)
+        if: ${{ !cancelled() }}
+        run: |
+          cd native
+          cargo build --release --example real_exp
+          set +e
+          ./target/release/examples/real_exp \
+            ../jjserver/jjworld/dimensions/minecraft/overworld >real_exp.txt 2>real_exp_err.txt
+          echo "real_exp exit: $?"
+          cat real_exp.txt || true
+          tail -20 real_exp_err.txt || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bigworld-attrib-results
+          path: |
+            native/real_exp.txt
+            native/real_exp_err.txt
+          retention-days: 30
+
   bench:
     needs: tile
     if: ${{ !cancelled() }}
@@ -100,11 +160,10 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '25'
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
 
       - name: download 16 tile artifacts
         env:
@@ -138,12 +197,11 @@ jobs:
             ../jjserver/jjworld/dimensions/minecraft/overworld 2000 20000 250
           du -sh ../jjserver/jjworld/dimensions/minecraft/overworld/* || true
 
-      - name: build + run the comparison + class attribution
+      - name: build + run the comparison
         run: |
           set -x
           cd native
           cargo build --release --example big_profile
-          cargo build --release --example real_exp
           set +e
           CSAVES_VERIFY_SAMPLE=10 ./target/release/examples/big_profile \
             ../jjserver/jjworld/dimensions/minecraft/overworld >surv_big.txt 2>jj_err.txt
@@ -154,11 +212,6 @@ jobs:
           grep -E "^TOTAL|verify:|integrity|drained|profile:" surv_big.txt || true
           BAD=$(grep "verify:" surv_big.txt | grep -o "bad=[0-9]*" | cut -d= -f2)
           [ "$BAD" = "0" ] || { echo "FAIL: semantic verification bad=$BAD"; exit 1; }
-          ./target/release/examples/real_exp \
-            ../jjserver/jjworld/dimensions/minecraft/overworld >real_exp.txt 2>real_exp_err.txt
-          echo "real_exp exit: $?"
-          cat real_exp.txt
-          tail -5 real_exp_err.txt || true
 
       - name: verdict
         run: |
@@ -172,6 +225,5 @@ jobs:
           name: bigworld-survival-results
           path: |
             native/surv_big.txt
-            native/real_exp.txt
             native/jj_err.txt
           retention-days: 30

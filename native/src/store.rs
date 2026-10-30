@@ -1080,7 +1080,13 @@ impl Store {
     }
 
     fn gc_dicts(&self) {
-        // drop dictionary versions no blob references anymore
+        // RAM-cache trim ONLY: dict FILES are never deleted. Compressed data
+        // outside the blobs map also references dict versions — kind-2 recipe
+        // inline tails (Tail::Inline{dict,..}) — which blob-only accounting
+        // cannot see. Deleting the file made every such chunk permanently
+        // unreadable (the 11,819-missing bigworld-survival loss). decompress()
+        // lazy-loads the file back on a cache miss, so the RAM map is a pure
+        // cache and the disk copies (<= ~112 KiB per version) are the truth.
         let used: std::collections::HashSet<u8> =
             self.blobs.read().values().map(|l| l.dict_id).collect();
         let cur = self.cur_dict.load(Ordering::Relaxed);
@@ -1092,8 +1098,26 @@ impl Store {
             .collect();
         for v in dead {
             dicts.remove(&v);
-            let _ = fs::remove_file(self.dict_dir().join(format!("dict-{v}.bin")));
         }
+    }
+
+    /// Lazy (re)load a dictionary version from its on-disk file into the RAM
+    /// cache. Called from decompress() on a cache miss so reads survive any
+    /// trim/GC of the RAM map (files are never deleted — see gc_dicts). Also
+    /// covers stores reopened after a crash where the open-time loader
+    /// skipped a small/short file: the file is the source of truth.
+    fn load_dict_from_disk(&self, v: u8) -> Option<Arc<Vec<u8>>> {
+        if v == 0 {
+            return None;
+        }
+        let d = fs::read(self.dict_dir().join(format!("dict-{v}.bin"))).ok()?;
+        if d.len() < 512 {
+            return None;
+        }
+        let a = Arc::new(d);
+        let mut dicts = self.dicts.write();
+        dicts.entry(v).or_insert_with(|| Arc::clone(&a));
+        Some(a)
     }
 
     // ---- segments ----
@@ -1844,7 +1868,15 @@ impl Store {
                 let dec = if dict_id == 0 {
                     build_dec(None)
                 } else {
-                    let dict = self.dicts.read().get(&dict_id)?.clone();
+                    // scope the read guard BEFORE load_dict_from_disk: the
+                    // match temporary would otherwise hold dicts.read()
+                    // across the dicts.write() inside the lazy reload ->
+                    // same-thread read->write self-deadlock
+                    let cached = self.dicts.read().get(&dict_id).map(Arc::clone);
+                    let dict = match cached {
+                        Some(d) => d,
+                        None => self.load_dict_from_disk(dict_id)?, // lazy reload
+                    };
                     build_dec(Some(&dict))
                 }
                 .ok()?;
@@ -2549,6 +2581,83 @@ impl Store {
             }
         }
         out
+    }
+
+    /// Names of dictionary files still on disk (forensics for integrity
+    /// reports: which dict versions survived GC).
+    pub fn dict_files_on_disk(&self) -> Vec<String> {
+        std::fs::read_dir(self.dict_dir())
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.starts_with("dict-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Forensics for a chunk that failed to read: walk the read path and name
+    /// the FIRST blocking stage (no recipe / recipe unreadable / blob gone
+    /// from the map / segment file gone / blob range beyond the segment /
+    /// dictionary version absent in RAM AND on disk / inline-tail dict gone).
+    /// Integrity-scan tooling, never on the hot path.
+    pub fn read_fail_reason(&self, key: u64) -> String {
+        let ptr = self.chunks.read().get(&key).copied();
+        let Some((seg, off, len)) = ptr else {
+            return if self.recipe_batch.lock().get(key).is_some() {
+                "pending batch recipe unparseable".to_string()
+            } else {
+                "no recipe in chunks map".to_string()
+            };
+        };
+        let Some(rec) = self.recipe_at(key, seg, off, len) else {
+            return format!("recipe unreadable at seg={seg} off={off} len={len}");
+        };
+        let hashes = rec.blob_hashes();
+        for h in &hashes {
+            let l = match self.blobs.read().get(h) {
+                Some(l) => *l,
+                None => return format!("blob {h:016x} missing from blobs map"),
+            };
+            let segs = self.segs.read();
+            let seg_total = segs.get(&l.seg).map(|s| s.total.load(Ordering::Relaxed));
+            drop(segs);
+            let Some(seg_total) = seg_total else {
+                return format!("blob {h:016x} segment {} removed from segs", l.seg);
+            };
+            let end = if l.slab {
+                l.slab_off as u64 + l.raw_len as u64
+            } else {
+                l.off + l.header_len() as u64 + l.comp_len as u64
+            };
+            if end > seg_total {
+                return format!(
+                    "blob {h:016x} range end {end} > seg {} size {seg_total}",
+                    l.seg
+                );
+            }
+            if l.dict_id != 0
+                && !self.dicts.read().contains_key(&l.dict_id)
+                && !self.dict_dir().join(format!("dict-{}.bin", l.dict_id)).exists()
+            {
+                return format!(
+                    "blob {h:016x} dict v{} absent in RAM and on disk",
+                    l.dict_id
+                );
+            }
+        }
+        if let Tail::Inline { dict, .. } = &rec.tail {
+            if *dict != 0
+                && !self.dicts.read().contains_key(dict)
+                && !self.dict_dir().join(format!("dict-{dict}.bin")).exists()
+            {
+                return format!("inline tail dict v{dict} absent in RAM and on disk");
+            }
+        }
+        format!(
+            "map-level checks pass (recipe seg={seg}, {} blob refs) — failure is in decompress/join",
+            hashes.len()
+        )
     }
 
     fn load_recipe_for_debug(&self, key: u64) -> Option<Recipe> {
@@ -3510,11 +3619,17 @@ pub mod tests {
         s.sync();
         s.seal();
         s.request_pack();
-        loop {
+        // bounded drain: compact_step must converge, otherwise the test would
+        // spin forever (a non-converging maintenance loop is itself a bug)
+        for _ in 0..200 {
             if !s.compact_step() {
                 break;
             }
         }
+        assert!(
+            !s.compact_step(),
+            "drain did not converge: compact_step still finds work"
+        );
         s.sync();
         // reopen (fresh caches, recipes + refs rebuilt from disk)
         drop(s);
@@ -3531,6 +3646,109 @@ pub mod tests {
         s.sync();
         for (i, p) in payloads.iter().enumerate() {
             assert!(semantic(&s.read_chunk(i as u64).unwrap(), p), "post-rewrite chunk {i}");
+        }
+    }
+
+    /// All-unique-sections payload: every section's data depends on
+    /// (cx, cz, y, salt) so a rewrite strands ~24 dead section blobs per
+    /// chunk (chunk_payload shares 18 of 24 sections per variant, which
+    /// keeps them alive across rewrites). Tail stays < tail_blob_min so it
+    /// is stored INLINE in the kind-2 recipe (the loss vector under test).
+    fn unique_payload(cx: i32, salt: u64) -> Vec<u8> {
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        root.insert(
+            "Position".to_string(),
+            Value::List(vec![Value::Int(cx), Value::Int(0), Value::Int(cx * 7)]),
+        );
+        let mut hm: Map<String, Value> = Map::new();
+        let la: Vec<i64> = (0..37).map(|i| (i as i64) * 7 + salt as i64).collect();
+        hm.insert("MOTION_BLOCKING".to_string(), Value::LongArray(fastnbt::LongArray::new(la)));
+        root.insert("Heightmaps".to_string(), Value::Compound(hm));
+        let mut sec_list = Vec::new();
+        for y in 0..24i32 {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = Vec::new();
+            pal.push(Value::String("minecraft:stone".to_string()));
+            pal.push(Value::String("minecraft:deepslate".to_string()));
+            pal.push(Value::String("minecraft:air".to_string()));
+            bs.insert("palette".to_string(), Value::List(pal));
+            let data: Vec<i64> = (0..64)
+                .map(|i| {
+                    (i as i64)
+                        .wrapping_mul(0x1234_9abc_def0_5678)
+                        ^ (cx as i64).wrapping_mul(0x9e37_79b9)
+                        ^ ((salt as i64) << 8)
+                        ^ (y as i64)
+                })
+                .collect();
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn dict_gc_keeps_files_inline_tails_readable() {
+        // Regression for the bigworld-survival 11,819-missing loss: gc_dicts
+        // used to DELETE dictionary files. Kind-2 recipe inline tails (raw
+        // tail < tail_blob_min) are compressed on the hot tier WITH the
+        // then-current dictionary version, and that reference lives in the
+        // RECIPE — invisible to the blobs-map-only GC accounting. Deleting
+        // dict-vN.bin made every such chunk permanently unreadable.
+        // Scenario: train v1 -> write 60 all-unique-section chunks + rewrite
+        // 40 (current tails carry dict v1; rewrites strand dead blobs so the
+        // dead-ratio compaction fires) -> train v2 -> drain (drop_seg re-tiers
+        // v1 blobs to plain slabs / v2 colds; gc sees no live blob on v1).
+        // The FILE must survive; reads must succeed via lazy disk reload.
+        let dir = temp_dir("dict-gc-tails");
+        let cfg = Cfg { dict_train: 16, compact_min: 128 * 1024, ..bench_cfg() };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        let mk = |i: u64, salt: u64| unique_payload(i as i32, salt);
+        // warm-up: populate dict samples, train v1
+        for i in 0..4u64 {
+            s.write_chunk(9000 + i, &mk(9000 + i, 50), false).unwrap();
+        }
+        assert!(s.train_dict_if_needed(), "dict v1 must train");
+        // batch: written while cur_dict = v1 -> inline tails carry dict v1
+        for i in 0..60u64 {
+            s.write_chunk(i, &mk(i, 0), false).unwrap();
+        }
+        // rewrite 40 with different content (still cur_dict = v1): old
+        // section blobs die -> dead-ratio compaction candidate
+        for i in 0..40u64 {
+            s.write_chunk(i, &mk(i, 1), false).unwrap();
+        }
+        // more samples -> train v2 (cur_dict = v2 from here on)
+        for i in 0..4u64 {
+            s.write_chunk(9100 + i, &mk(9100 + i, 51), false).unwrap();
+        }
+        assert!(s.train_dict_if_needed(), "dict v2 must train");
+        // drain: dead-ratio drop_seg compaction re-tiers the v1 blobs;
+        // pack_segment's gc_dicts then sees no live blob on v1
+        s.sync();
+        s.seal();
+        s.request_pack();
+        loop {
+            if !s.compact_step() {
+                break;
+            }
+        }
+        // the dict FILE survives (old code deleted it)
+        let d1 = dir.join("dicts").join("dict-1.bin");
+        assert!(d1.exists(), "dict-1.bin must never be deleted");
+        // every chunk readable, incl. current inline tails carrying dict v1
+        // (lazy disk reload)
+        for i in 0..60u64 {
+            let want = if i < 40 { mk(i, 1) } else { mk(i, 0) };
+            let got = s
+                .read_chunk(i)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable after dict gc"));
+            assert!(semantic(&got, &want), "chunk {i} drifted");
         }
     }
 

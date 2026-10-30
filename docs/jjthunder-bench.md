@@ -341,3 +341,50 @@ id (ids allocate in section write order ≈ chunk locality — same-chunk
 sections still land in one slab frame) instead of a per-segment full
 chunks-map sort + per-key `recipe_at`. The 262k-chunk world's pack pass was
 O(segments × chunks) batch decompresses (~40+ min); now O(blobs log blobs).
+
+## v0.9.2 — root cause of the 11,819-missing integrity loss (dict file GC)
+
+The bigworld-survival run on 4eec7a4 drained the 261,573-chunk world to
+956 MiB but the integrity scan found **11,819 region keys unreadable
+(4.5%)** and died in heal round 1 against the job timeout. The loss class:
+
+**`gc_dicts` deleted dictionary FILES.** Shared zstd dictionaries are
+versioned (`dicts/dict-vN.bin`); the GC kept a version alive only when some
+blob in the blobs map still carried its id. But compressed data OUTSIDE the
+blobs map also references dict versions: **kind-2 recipe inline tails**
+(`Tail::Inline { dict, .. }` — tails smaller than `tail_blob_min`, compressed
+on the hot tier WITH the then-current dictionary). That reference lives in
+the recipe and is invisible to blob-only accounting. Sequence on the big
+world: dict v1 trained early (dict_train=40) → chunks written under v1 →
+later versions trained → pack waves re-tiered every v1 blob to plain slabs
+or v2/v3 colds → `gc_dicts` saw no blob on v1 → `fs::remove_file(dict-1.bin)`
+→ every recipe whose inline tail was compressed under v1 failed
+`decompress(v1, ..)` → `read_chunk` → None. 4.5% of chunks = the share
+written between dict version switches with sub-512-byte tails.
+
+Fix (three layers):
+1. **Dict files are immutable.** `gc_dicts` only trims the in-RAM map; the
+   disk copies (≤ ~112 KiB per version, ≤ 255 versions) are the source of
+   truth. Worst-case disk cost ~28 MB, in practice a handful of versions.
+2. **`decompress` lazy-loads from disk** on a RAM cache miss — reads survive
+   any trim. This also closed a same-thread **read→write self-deadlock**: a
+   `match` on `dicts.read().get(..)` holds the read guard across the arms,
+   and the lazy-reload arm takes `dicts.write()` — the guard is now scoped
+   out before the reload.
+3. **Forensics**: `Store::read_fail_reason(key)` walks the read path and
+   names the first blocking stage (recipe / blobs map / segment file /
+   blob range / dict version absent in RAM AND on disk); the bigworld
+   integrity scan prints it for a sample of every missing set, plus the
+   surviving dict file list. `big_profile` reports the integrity phase wall
+   time. A bounded-drain guard fails fast if the maintenance loop stops
+   converging instead of eating the CI job.
+
+Regression test `dict_gc_keeps_files_inline_tails_readable` reproduces the
+exact loss: all-unique-section chunks (a rewrite must strand dead blobs so
+the dead-ratio drop_seg compaction fires) + two dict versions + drain; on
+the pre-fix code it fails with "dict-1.bin must never be deleted".
+
+Workflow: `real_exp` (class attribution) moved to a parallel `attrib` job
+(it re-imports the whole world a second time — the sequential layout made
+the bench job exceed its 350-minute budget), and both CI jobs now build
+with a Rust cache (~10 min saved per run).

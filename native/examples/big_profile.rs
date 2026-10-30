@@ -344,6 +344,7 @@ fn main() {
     // pack-vs-write loss: heal rounds that stick mean a pack bug; losses that
     // reappear right after a clean re-write mean a write-path bug.
     let mut healed_rounds = 0u64;
+    let t_integrity = std::time::Instant::now();
     loop {
         let mut missing: Vec<u64> = Vec::new();
         for &k in &region_keys {
@@ -357,6 +358,18 @@ fn main() {
             region_keys.len(),
             missing.len()
         );
+        // FORENSICS: name the first blocking read stage for a sample of the
+        // missing set (recipe / blobs map / segment file / dict version) —
+        // turns silent pack losses into actionable CI evidence.
+        for (i, &k) in missing.iter().take(12).enumerate() {
+            eprintln!(
+                "integrity: forensics[{i}] key={k:016x}: {}",
+                rs.read_fail_reason(k)
+            );
+        }
+        if !missing.is_empty() {
+            eprintln!("integrity: dict files on disk: {:?}", rs.dict_files_on_disk());
+        }
         if missing.is_empty() || healed_rounds >= 2 {
             if !missing.is_empty() {
                 println!("integrity: GIVING UP with {} missing", missing.len());
@@ -392,6 +405,10 @@ fn main() {
     let rd = rs.disk_bytes();
     let ed = es.disk_bytes();
     let secs = t0.elapsed().as_secs_f64();
+    println!(
+        "integrity: scan+heal took {:.1}s (heal_rounds {healed_rounds})",
+        t_integrity.elapsed().as_secs_f64()
+    );
 
     println!(
         "chunks: region={} entities={} | anvil on disk: region {:.2} MiB, entities {:.2} MiB",
