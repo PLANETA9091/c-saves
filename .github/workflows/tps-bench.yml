@@ -72,9 +72,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # single-artifact `gh run download -n` puts the FILES directly
+          # into -D (no artifact-name subdirectory)
           gh run download $GITHUB_RUN_ID -n c-saves-module -D modules-dir
           mkdir -p modules/c-saves
-          cp modules-dir/c-saves/* modules/c-saves/
+          cp modules-dir/libc_saves.so modules-dir/module.json modules/c-saves/
           ls -la modules/c-saves
 
       - name: assemble server dirs (CRUSSTY + Paper 26.3)
