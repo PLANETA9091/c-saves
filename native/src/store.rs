@@ -2259,8 +2259,18 @@ impl Store {
                                     None => return false,
                                 };
                             let pk = (seg, boff, soff, rl);
-                            if let Some(set) = self.probe_cache.lock().get(&pk) {
-                                Some(Arc::clone(set))
+                            // The cache lookup MUST be a standalone statement:
+                            // in edition 2021 an `if let` scrutinee temporary
+                            // (the MutexGuard here) lives until the end of the
+                            // whole if/else, so re-locking probe_cache inside
+                            // the else branch was a SAME-THREAD self-deadlock
+                            // (spin+park loop) on every probe miss — the
+                            // speed-bench G2 phase hung forever and the job
+                            // timed out; a Paper autosave of unchanged chunks
+                            // would have frozen the server the same way.
+                            let cached = self.probe_cache.lock().get(&pk).cloned();
+                            if let Some(set) = cached {
+                                Some(set)
                             } else {
                                 let parsed = self.recipe_at(key, seg, off, len)
                                     .map(|r| Arc::new(r.blob_hashes()));
