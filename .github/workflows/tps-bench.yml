@@ -96,7 +96,7 @@ jobs:
           cp -r modules/c-saves crussty-srv/modules/
           printf '[server]\nkernel = "paper-26.3-227.jar"\nmemory = "6G"\n\n[catalog]\nrepo = "PLANETA9091/crussty-catalog"\n' > crussty-srv/crussty.toml
           for D in baseline crussty-srv; do
-            printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=true\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > "$D/server.properties"
+            printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=false\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > "$D/server.properties"
             printf 'eula=true\n' > "$D/eula.txt"
             printf '_version: 29\nwatchdog:\n  enable: false\n' > "$D/config/paper-global.yml"
           done
@@ -107,7 +107,7 @@ jobs:
           set -e
           mkdir -p prep/config
           cp paper.jar prep/paper.jar
-          printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=true\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > prep/server.properties
+          printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=false\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > prep/server.properties
           printf 'eula=true\n' > prep/eula.txt
           printf '_version: 29\nwatchdog:\n  enable: false\n' > prep/config/paper-global.yml
           cd prep

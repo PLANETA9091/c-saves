@@ -74,7 +74,7 @@ for i in range(n):
     if i % 8 == 7:
         t0 = time.time()
         try:
-            rcon("save-all flush", timeout=900)
+            rcon("save-all flush", timeout=1800)
             row.append(f"flush {time.time()-t0:.2f}s")
         except Exception as e:
             row.append(f"flush ERR {type(e).__name__}")
