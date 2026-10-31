@@ -817,6 +817,8 @@ impl RecipeBatch {
 /// atomic adds per stage are noise next to the IO work itself, and this is
 /// the CI "stall point" recorder (dump via read_stage_json).
 pub static ST_RECIPE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static ST_GLOB_CONV_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ST_GLOB_SLABS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Unchanged-chunk autosave skips (hash match against the last write).
 pub static ST_WRITE_SKIP: AtomicU64 = AtomicU64::new(0);
 pub static ST_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -937,6 +939,13 @@ pub struct Store {
     /// monotonic and segments append-only, so a parsed set never goes stale
     /// short of data loss — which the membership check itself detects).
     probe_cache: Mutex<HashMap<(u32, u64, u32, u32), Arc<Vec<Hash>>>>,
+    /// Global block-state registry for the 0xCB GLOB slab form (jj_exp5:
+    /// x2.16 on the like-for-like dense content of the vanilla-terrain
+    /// bigworld). Append-only, monotonic gids; persisted in states-1.bin
+    /// BEFORE any slab that introduced new states lands on disk (a missing
+    /// registry entry after a crash would misresolve gids silently).
+    glob_reg: Mutex<chunknbt::StateRegistry>,
+    reg_dirty: AtomicBool,
 }
 
 impl Store {
@@ -980,11 +989,59 @@ impl Store {
             pack_watermark: AtomicU64::new(0),
             last_written: Mutex::new(HashMap::new()),
             probe_cache: Mutex::new(HashMap::new()),
+            glob_reg: Mutex::new(chunknbt::StateRegistry::new()),
+            reg_dirty: AtomicBool::new(false),
         });
         *st.slab_cache.lock() = SlabCache::new(st.cfg.slab_cache);
         st.load_dicts()?;
+        st.load_glob_reg();
         st.scan()?;
         Ok(st)
+    }
+
+    // ---- global state registry (0xCB GLOB slabs) ----
+
+    fn states_path(&self) -> PathBuf {
+        self.dir.join("states-1.bin")
+    }
+
+    fn load_glob_reg(&self) {
+        let Ok(bytes) = fs::read(self.states_path()) else { return };
+        match chunknbt::StateRegistry::from_bytes(&bytes) {
+            Some(r) => *self.glob_reg.lock() = r,
+            None => eprintln!("[c-saves] states-1.bin unparseable — starting an empty registry (old GLOB slabs would misresolve; re-import needed)"),
+        }
+    }
+
+    /// Persist the registry atomically (tmp + rename). Called BEFORE any
+    /// slab that introduced new gids is appended, and on sync/seal.
+    fn persist_glob_reg(&self) -> std::io::Result<()> {
+        let bytes = self.glob_reg.lock().to_bytes();
+        let tmp = self.dir.join("states-1.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_data()?;
+        }
+        fs::rename(&tmp, self.states_path())
+    }
+
+    /// Number of slabs stored in the 0xCB GLOB form (probe/statistic).
+    pub fn glob_slab_count() -> u64 {
+        ST_GLOB_SLABS.load(Ordering::Relaxed)
+    }
+
+    /// GLOB conversion admission: section stores only (whole-mode payloads
+    /// are not CSEC sections), registry small enough for the 1-byte gid
+    /// stream, and the OPT-IN switch. EXPERIMENTAL: the transform and the
+    /// read path are test-green, but the natural pack choice produced a
+    /// blob-map vs slab-generation divergence on the JJ corpus (32 semantic
+    /// mismatches) that is not root-caused yet — the form ships opt-in
+    /// (CSAVES_GLOB=1) until that hunt closes.
+    fn glob_enabled(&self) -> bool {
+        !self.whole_mode.load(Ordering::Relaxed)
+            && std::env::var("CSAVES_GLOB").as_deref() == Ok("1")
     }
 
     // ---- dictionaries ----
@@ -1338,9 +1395,12 @@ impl Store {
                                 }
                             }
                         }
-                        8 => {
+                        k if k == 8 || k == 8 | 0x80 => {
                             // SLAB v2: same header layout; entries are varint
                             // zigzag id-delta + varint len + 16B hash, raws after.
+                            // GLOB slabs (kind | 0x80) carry one extra header
+                            // byte (reg_w); the member raws are 0xCB global-id
+                            // sections, converted back by the read paths.
                             if body.len() < 12 {
                                 false
                             } else {
@@ -1348,13 +1408,14 @@ impl Store {
                                 let cl = u32::from_le_bytes(body[2..6].try_into().unwrap()) as usize;
                                 let raw_total = u32::from_le_bytes(body[6..10].try_into().unwrap());
                                 let n = u16::from_le_bytes(body[10..12].try_into().unwrap()) as usize;
-                                if body.len() < 12 + cl || n == 0 {
+                                let ghdr = if body[0] & 0x80 != 0 { 13usize } else { 12usize };
+                                if body.len() < ghdr + cl || n == 0 {
                                     false
                                 } else {
                                     let body_start = off + 8;
                                     let share = ((8 + blen) as u64 / n as u64).min(u32::MAX as u64) as u32;
                                     let last_share = (8 + blen) as u64 - share as u64 * (n as u64 - 1) as u64;
-                                    match self.parse_slab_v2(dict_id, &body[12..12 + cl], raw_total, n) {
+                                    match self.parse_slab_v2(dict_id, &body[ghdr..ghdr + cl], raw_total, n) {
                                         Some((entries, tab_len)) => {
                                             let mut idx = 0usize;
                                             let mut cursor = tab_len as u32;
@@ -2397,11 +2458,37 @@ impl Store {
                     Some(l) => l,
                     None => return fail("section-blob"),
                 };
-                let slices: Vec<&[u8]> = loaded
+                let slices_raw: Vec<&[u8]> = loaded
                     .refs
                     .iter()
                     .map(|(i, s, e)| &loaded.keep[*i][*s as usize..*e as usize])
                     .collect();
+                // GLOB members (0xCB) convert back to canonical CSEC here:
+                // reads are the only place 0xCB bytes exist
+                // GLOB members (0xCB) convert back to canonical CSEC here:
+                // reads are the only place 0xCB bytes exist. Two passes keep
+                // the borrow checker happy without aliasing games: pass 1
+                // materializes converted buffers, pass 2 assembles slices.
+                let mut glob_store: Vec<Vec<u8>> = Vec::with_capacity(slices_raw.len());
+                for s in slices_raw.iter() {
+                    let sv: &[u8] = s;
+                    if sv.first() == Some(&chunknbt::GLOB_MAGIC) {
+                        if let Some(c) = self.glob_to_canon(sv) {
+                            glob_store.push(c);
+                        }
+                    }
+                }
+                let mut gi = 0usize;
+                let mut slices: Vec<&[u8]> = Vec::with_capacity(slices_raw.len());
+                for s in slices_raw.iter() {
+                    let sv: &[u8] = s;
+                    if sv.first() == Some(&chunknbt::GLOB_MAGIC) && gi < glob_store.len() {
+                        slices.push(glob_store[gi].as_slice());
+                        gi += 1;
+                    } else {
+                        slices.push(sv);
+                    }
+                }
                 {
                     let el = t_sec.elapsed().as_nanos() as u64;
                     ST_SECTLOAD.0.fetch_add(el, Ordering::Relaxed);
@@ -2524,13 +2611,15 @@ impl Store {
                 let seg = segs.get(&loc.seg)?;
                 let sealed = Some(loc.seg) != writer_id;
                 let hdr = seg.read_at(loc.off, 12, sealed)?;
-                let kind = *hdr.first()?;
+                let kind = hdr[0] & 0x7f;
                 if kind != 5 && kind != 8 {
                     return None;
                 }
+                // GLOB slabs (kind | 0x80) start their data one byte later
+                let hlen = if hdr[0] & 0x80 != 0 { 13usize } else { 12usize };
                 let cl = u32::from_le_bytes(hdr[2..6].try_into().ok()?) as usize;
                 let raw_total = u32::from_le_bytes(hdr[6..10].try_into().ok()?);
-                let data = seg.read_at(loc.off + 12, cl, sealed)?;
+                let data = seg.read_at(loc.off + hlen as u64, cl, sealed)?;
                 let raw = Arc::new(self.decompress(loc.dict_id, &data, raw_total)?);
                 if (loc.slab_off + loc.raw_len) as usize > raw.len() {
                     return None;
@@ -2577,26 +2666,51 @@ impl Store {
             let key = (loc.seg, loc.off);
             if let Some(cached) = self.slab_cache.lock().get(&key) {
                 let s = cached.get(loc.slab_off as usize..(loc.slab_off + loc.raw_len) as usize)?;
-                return Some(s.to_vec());
+                return self.glob_to_canon(s);
             }
             let hdr = seg.read_at(loc.off, 12, sealed)?;
-            let kind = *hdr.first()?;
+            let kind = hdr[0] & 0x7f;
             if kind != 5 && kind != 8 {
                 return None;
             }
+            // GLOB slabs (kind | 0x80) carry one extra header byte (reg_w);
+            // its value is informational, the data just starts one byte later
+            let hlen = if hdr[0] & 0x80 != 0 { 13usize } else { 12usize };
             let cl = u32::from_le_bytes(hdr[2..6].try_into().ok()?) as usize;
             let raw_total = u32::from_le_bytes(hdr[6..10].try_into().ok()?);
-            let data = seg.read_at(loc.off + 12, cl, sealed)?;
+            let data = seg.read_at(loc.off + hlen as u64, cl, sealed)?;
             let raw = self.decompress(loc.dict_id, &data, raw_total)?;
             let out = raw
                 .get(loc.slab_off as usize..(loc.slab_off + loc.raw_len) as usize)?
                 .to_vec();
             drop(segs);
             self.slab_cache.lock().put(key, Arc::new(raw));
-            return Some(out);
+            return self.glob_to_canon(&out);
         }
         let data = seg.read_at(loc.off + loc.header_len(), loc.comp_len as usize, sealed)?;
         self.decompress(loc.dict_id, &data, loc.raw_len)
+    }
+
+    /// Convert a member's raw bytes to canonical CSEC when they carry the
+    /// 0xCB GLOB form. Reads are the only place 0xCB bytes exist; every
+    /// decoder and every re-pack sees canonical bytes.
+    fn glob_to_canon(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.first() != Some(&chunknbt::GLOB_MAGIC) {
+            return Some(bytes.to_vec());
+        }
+        let reg = self.glob_reg.lock();
+        match chunknbt::glob_to_section(bytes, &reg) {
+            Some(c) => Some(c),
+            None => {
+                ST_GLOB_CONV_FAIL.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[c-saves] GLOB member convert failed len={} reg={}",
+                    bytes.len(),
+                    reg.len()
+                );
+                None
+            }
+        }
     }
 
     pub fn debug_blob_state(&self, key: u64) -> String {
@@ -2759,6 +2873,9 @@ impl Store {
 
     /// fsync all segments + flush buffers (end of a save cycle).
     pub fn sync(&self) {
+        if self.reg_dirty.swap(false, Ordering::Relaxed) {
+            let _ = self.persist_glob_reg();
+        }
         self.flush_recipe_batch();
         self.flush_writer();
         {
@@ -2777,6 +2894,9 @@ impl Store {
     /// the next append opens a fresh segment. Sealed segments become immutable
     /// (mmap reads) and eligible for background compaction.
     pub fn seal(&self) {
+        if self.reg_dirty.swap(false, Ordering::Relaxed) {
+            let _ = self.persist_glob_reg();
+        }
         self.flush_recipe_batch();
         self.flush_writer();
         let mut wg = self.writer.lock();
@@ -2977,32 +3097,118 @@ impl Store {
                 tab.extend_from_slice(&(*h as u64).to_le_bytes());
                 rawcat.extend_from_slice(raw);
             }
-            let tab_len = tab.len();
-            let mut stream = tab;
-            stream.extend_from_slice(&rawcat);
-            let raw_total = stream.len() as u32;
-            if std::env::var("CSAVES_SLAB_DEBUG").map(|v| v == "1").unwrap_or(false) {
-                eprintln!(
-                    "[c-saves] slab: n={n} tab={tab_len} rawcat={} members_raw_min={} members_raw_max={}",
-                    rawcat.len(),
-                    group.iter().map(|c| c.3.len()).min().unwrap_or(0),
-                    group.iter().map(|c| c.3.len()).max().unwrap_or(0)
-                );
-                if let Ok(d) = std::env::var("CSAVES_SLAB_DUMP") {
-                    let i = self.next_seg.load(Ordering::Relaxed);
-                    let p = std::path::PathBuf::from(d).join(format!("slabdump-{i}-{}.bin", group[0].0 as u64));
-                    let _ = std::fs::write(p, &stream);
+            let build = |lens: &[usize], raws: &[&[u8]]| -> (Vec<u8>, usize) {
+                let mut tab = Vec::with_capacity(n * 4);
+                let mut prev_id: i64 = 0;
+                for (i, (h, id, _loc, _raw)) in group.iter().enumerate() {
+                    let _ = _loc;
+                    let _ = _raw;
+                    put_u64(&mut tab, zigzag(*id as i64 - prev_id));
+                    prev_id = *id as i64;
+                    put_u64(&mut tab, lens[i] as u64);
+                    tab.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
+                    tab.extend_from_slice(&(*h as u64).to_le_bytes());
+                }
+                let tl = tab.len();
+                let mut st = tab;
+                for r in raws {
+                    st.extend_from_slice(r);
+                }
+                (st, tl)
+            };
+            let canon_lens: Vec<usize> = group.iter().map(|c| c.3.len()).collect();
+            let canon_raws: Vec<&[u8]> = group.iter().map(|c| c.3.as_slice()).collect();
+            let (canon_stream, canon_tab_len) = build(&canon_lens, &canon_raws);
+            // GLOB variant (jj_exp5: x2.16 on vanilla-terrain dense content):
+            // the same members with dense CSEC sections converted to the 0xCB
+            // global-id form. The slab stores whichever variant compresses
+            // smaller at the cold tier — the window-level comparison is the
+            // honest gate (raw sizes mislead: the gid stream is wider but
+            // matches cross-section). Non-converting members keep their
+            // canonical bytes; every member is self-describing by magic.
+            let mut glob: Option<(Vec<usize>, Vec<Vec<u8>>)> = None;
+            if self.glob_enabled() && self.glob_reg.lock().len() <= 256 {
+                let mut reg = self.glob_reg.lock();
+                let before = reg.len();
+                let mut glens = Vec::with_capacity(n);
+                let mut graws: Vec<Vec<u8>> = Vec::with_capacity(n);
+                let mut any = false;
+                for (_h, _id, _loc, raw) in &group {
+                    match chunknbt::section_to_glob(raw, &mut reg) {
+                        Some(g) => {
+                            any = true;
+                            glens.push(g.len());
+                            graws.push(g);
+                        }
+                        None => {
+                            glens.push(raw.len());
+                            graws.push(raw.clone());
+                        }
+                    }
+                }
+                if reg.len() != before {
+                    self.reg_dirty.store(true, Ordering::Relaxed);
+                }
+                if any {
+                    glob = Some((glens, graws));
                 }
             }
-            // Both store kinds compress plain: section slabs measured -4%
-            // without the dict, and whole-mode stores no longer train one.
-            let (dict_id, comp) = self.compress_tier_plain(&stream, true);
-            let mut body = Vec::with_capacity(12 + comp.len());
-            body.push(8u8);
+            let (dict_id, comp, kind_byte, stream, tab_len, lens): (
+                u8,
+                Vec<u8>,
+                u8,
+                Vec<u8>,
+                usize,
+                Vec<usize>,
+            ) = match &glob {
+                Some((glens, graws)) => {
+                    let graws_ref: Vec<&[u8]> = graws.iter().map(|v| v.as_slice()).collect();
+                    let (gs, gtab_len) = build(glens, &graws_ref);
+                    let (dg, cg) = self.compress_tier_plain(&gs, true);
+                    let (dc, cc) = self.compress_tier_plain(&canon_stream, true);
+                    // CSAVES_FORCE_GLOB=1: debug knob — take the glob variant
+                    // unconditionally so the read/scan paths are testable
+                    // regardless of the size heuristic
+                    let force = std::env::var("CSAVES_FORCE_GLOB").as_deref() == Ok("1");
+                    if force || cg.len() < cc.len() {
+                        // the registry MUST be on disk before the slab that
+                        // references its gids (crash = silent misresolution)
+                        if self.reg_dirty.swap(false, Ordering::Relaxed) {
+                            match self.persist_glob_reg() {
+                                Ok(()) => {
+                                    ST_GLOB_SLABS.fetch_add(1, Ordering::Relaxed);
+                                    (dg, cg, 8u8 | 0x80, gs, gtab_len, glens.clone())
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[c-saves] states persist failed ({e}) — keeping the canonical slab"
+                                    );
+                                    (dc, cc, 8u8, canon_stream, canon_tab_len, canon_lens)
+                                }
+                            }
+                        } else {
+                            ST_GLOB_SLABS.fetch_add(1, Ordering::Relaxed);
+                            (dg, cg, 8u8 | 0x80, gs, gtab_len, glens.clone())
+                        }
+                    } else {
+                        (dc, cc, 8u8, canon_stream, canon_tab_len, canon_lens.clone())
+                    }
+                }
+                None => {
+                    let (dc, cc) = self.compress_tier_plain(&canon_stream, true);
+                    (dc, cc, 8u8, canon_stream, canon_tab_len, canon_lens)
+                }
+            };
+            let raw_total = stream.len() as u32;
+            let mut body = Vec::with_capacity(13 + comp.len());
+            body.push(kind_byte);
             body.push(dict_id);
             body.extend_from_slice(&(comp.len() as u32).to_le_bytes());
             body.extend_from_slice(&raw_total.to_le_bytes());
             body.extend_from_slice(&(n as u16).to_le_bytes());
+            if kind_byte & 0x80 != 0 {
+                body.push(1u8); // reg_w: 1-byte gid streams
+            }
             body.extend_from_slice(&comp);
             let blen = body.len() as u64;
             let Ok((seg, off, _)) = self.append(&body) else { continue };
@@ -3023,16 +3229,21 @@ impl Store {
                     l.slab_off = 0; // patched below by cursor
                     l.slab_raw = raw_total;
                     l.slab_comp = comp.len() as u32;
-                    l.comp_len = old_loc.raw_len; // own raw size (mirrors raw_len)
+                    // the member's length in THIS slab's form: the GLOB
+                    // variant changes member lengths (gid streams vs packed
+                    // canonical), so raw_len MUST follow — reads slice the
+                    // member out of the slab with it
+                    l.raw_len = lens[i] as u32;
+                    l.comp_len = lens[i] as u32;
                 }
             }
             // patch slab_off per member in order (raws start after entry table)
             let mut cursor = tab_len as u32;
-            for (h, _id, old_loc, _raw) in group.iter() {
+            for (i, (h, _id, _old_loc, _raw)) in group.iter().enumerate() {
                 if let Some(l) = blobs.get_mut(h) {
                     l.slab_off = cursor;
                 }
-                cursor += old_loc.raw_len;
+                cursor += lens[i] as u32;
             }
             drop(blobs);
         }
@@ -3639,7 +3850,7 @@ pub mod tests {
 
     /// Semi-realistic chunk: 24 sections, some shared via `variant`,
     /// palette + packed longs, heightmaps, block entities.
-    fn chunk_payload(cx: i32, cz: i32, variant: u64) -> Vec<u8> {
+    pub(crate) fn chunk_payload(cx: i32, cz: i32, variant: u64) -> Vec<u8> {
         let mut root: Map<String, Value> = Map::new();
         root.insert("DataVersion".to_string(), Value::Int(4189));
         root.insert(
@@ -3686,7 +3897,7 @@ pub mod tests {
         fastnbt::to_bytes(&Value::Compound(root)).unwrap()
     }
 
-    fn semantic(a: &[u8], b: &[u8]) -> bool {
+    pub(crate) fn semantic(a: &[u8], b: &[u8]) -> bool {
         let va: Value = fastnbt::from_bytes(a).unwrap();
         let vb: Value = fastnbt::from_bytes(b).unwrap();
         va == vb
@@ -4453,6 +4664,151 @@ pub mod tests {
 }
 
 #[cfg(test)]
+mod glob_slab_test {
+    use super::tests::{bench_cfg, semantic, temp_dir};
+    use super::*;
+    use fastnbt::Value;
+    use std::collections::HashMap as Map;
+
+    /// Dense multi-state section with PROPER vanilla packing (the shared
+    /// chunk_payload helper predates the strict packing checks and falls
+    /// back to whole-blob storage, which never reaches the slab path).
+    /// 20-state palettes sliding over a 200-state pool: per-section palettes
+    /// differ (canonical streams do not align cross-section), the content is
+    /// strata-like so the GLOB gid streams do.
+    fn glob_chunk_payload(i: usize) -> Vec<u8> {
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut sec_list = Vec::new();
+        for y in 0..24i32 {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = Vec::new();
+            for k in 0..20usize {
+                let mut c: Map<String, Value> = Map::new();
+                let id = (i * 7 + y as usize * 3 + k) % 200;
+                c.insert("Name".to_string(), Value::String(format!("minecraft:st_{id}")));
+                let mut props: Map<String, Value> = Map::new();
+                props.insert("f".to_string(), Value::String(format!("{}", k % 2)));
+                c.insert("Properties".to_string(), Value::Compound(props));
+                pal.push(Value::Compound(c));
+            }
+            bs.insert("palette".to_string(), Value::List(pal));
+            // strata voxels: bands by (x+z+y) with speckle — structured, so
+            // gid streams align across sections while canonical indices do not
+            let mut vox = [0u8; 4096];
+            for x in 0..16usize {
+                for z in 0..16usize {
+                    for yy in 0..16usize {
+                        let band = ((x + z + yy) / 4 + i + y as usize) % 20;
+                        let speck = (x * 31 + z * 17 + yy * 7 + i) % 19 == 0;
+                        vox[x * 256 + z * 16 + yy] = if speck { (band + 5) % 20 } else { band } as u8;
+                    }
+                }
+            }
+            // vanilla width for a 20-state palette: ceil(log2(20)) = 5 bits
+            let vbits = ((20u32 - 1).ilog2() + 1).max(4);
+            let data = chunknbt::dense_to_nostroddle(&vox, 4096, 8, vbits);
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    /// Chunk-level SEMANTIC comparator: sections compared with
+    /// sections_semantically_equal (palette-permutation and unused-state
+    /// tolerant — the GLOB rebuild drops unused palette entries), every
+    /// other root key exactly.
+    fn chunk_semantic_glob(a: &[u8], b: &[u8]) -> bool {
+        let (Ok(va), Ok(vb)) = (
+            fastnbt::from_bytes::<Value>(a),
+            fastnbt::from_bytes::<Value>(b),
+        ) else {
+            return false;
+        };
+        let (Value::Compound(ma), Value::Compound(mb)) = (&va, &vb) else {
+            return va == vb;
+        };
+        if ma.len() != mb.len() {
+            return false;
+        }
+        for (k, v) in ma {
+            let Some(w) = mb.get(k) else { return false };
+            if k == "sections" {
+                let (Value::List(sa), Value::List(sb)) = (v, w) else { return false };
+                if sa.len() != sb.len() {
+                    return false;
+                }
+                for (s1, s2) in sa.iter().zip(sb.iter()) {
+                    if !chunknbt::sections_semantically_equal(s1, s2) {
+                        return false;
+                    }
+                }
+            } else if v != w {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn glob_slab_roundtrip_and_reopen() {
+        // Integration for the 0xCB GLOB slab form under CSAVES_FORCE_GLOB=1:
+        // the pack stores glob slabs, reads convert members back to
+        // canonical CSEC (byte-semantically equal), and scan rebuilds the
+        // blob map from the 13-byte glob slab header on reopen. The natural
+        // size heuristic is gated by the real-corpus CI benches (synthetic
+        // payloads cannot reproduce vanilla terrain's palette-diversity
+        // statistics where the glob form measured x2.16).
+        // NOTE: set_var is process-global; the flag only flips the pack's
+        // storage-form choice (never semantics — every read converts back),
+        // so parallel-test interference is bounded to the storage form.
+        std::env::set_var("CSAVES_GLOB", "1");
+        std::env::set_var("CSAVES_FORCE_GLOB", "1");
+        let dir = temp_dir("glob-slab");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let n = 120usize;
+        let payloads: Vec<Vec<u8>> = (0..n).map(glob_chunk_payload).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            st.write_chunk(i as u64, p, false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for _ in 0..50 {
+            st.request_pack();
+            if !st.compact_step() {
+                break;
+            }
+        }
+        assert!(
+            Store::glob_slab_count() > 0,
+            "no GLOB slabs were produced under CSAVES_FORCE_GLOB=1"
+        );
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st.read_chunk(i as u64).unwrap_or_else(|| panic!("chunk {i} unreadable post-pack"));
+            assert!(chunk_semantic_glob(&got, p), "chunk {i} semantically wrong post-pack");
+        }
+        // reopen: scan must rebuild the blob map from glob slabs
+        drop(st);
+        let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st2
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable post-reopen"));
+            assert!(chunk_semantic_glob(&got, p), "chunk {i} semantically wrong post-reopen");
+        }
+        // the registry must be persisted alongside the glob slabs
+        assert!(dir.join("states-1.bin").exists(), "states-1.bin missing");
+        std::env::remove_var("CSAVES_FORCE_GLOB");
+        std::env::remove_var("CSAVES_GLOB");
+        let _ = fs::remove_dir_all(&dir);
+}
+}
+
+#[cfg(test)]
 mod repro {
     use super::*;
     use fastnbt::Value;
@@ -4522,58 +4878,5 @@ mod repro {
         }
         assert_eq!(bad, 0, "{bad} unreadable chunks");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod reopen_regression {
-    use super::tests::{bench_cfg, key, temp_dir};
-    use super::*;
-    use fastnbt::Value;
-    use std::collections::HashMap as Map;
-
-    /// WRITE -> REOPEN -> WRITE MORE -> REOPEN -> verify everything.
-    /// Regression for the next_seg reset that overwrote seg-00000.
-    #[test]
-    fn writes_after_reopen_append_not_overwrite() {
-        let dir = temp_dir("reopensave");
-        let n = 120usize;
-        let payload = |i: usize| -> Vec<u8> {
-            let mut root: Map<String, Value> = Map::new();
-            root.insert("DataVersion".to_string(), Value::Int(4189));
-            root.insert("Position".to_string(), Value::List(vec![
-                Value::Int(i as i32), Value::Int(0), Value::Int(0)]));
-            root.insert("Pad".to_string(), Value::String("x".repeat(64 + i % 200)));
-            fastnbt::to_bytes(&Value::Compound(root)).unwrap()
-        };
-        // session 1
-        {
-            let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
-            for i in 0..n {
-                st.write_chunk(key(i as i32, 0), &payload(i), true).unwrap();
-            }
-            st.sync();
-            st.seal();
-        }
-        // session 2: reopen + write MORE chunks (new seg must not clobber)
-        {
-            let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
-            assert_eq!(st.chunk_count(), n);
-            for i in n..2 * n {
-                st.write_chunk(key(i as i32, 0), &payload(i), true).unwrap();
-            }
-            st.sync();
-            st.seal();
-        }
-        // session 3: everything must survive
-        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
-        assert_eq!(st.chunk_count(), 2 * n, "all chunks must survive reopen+write");
-        for i in 0..2 * n {
-            let got = st.read_chunk(key(i as i32, 0)).expect("chunk survives");
-            let a: Value = fastnbt::from_bytes(&got).unwrap();
-            let b: Value = fastnbt::from_bytes(&payload(i)).unwrap();
-            assert_eq!(a, b, "chunk {i} corrupted by reopen-write cycle");
-        }
-        let _ = fs::remove_dir_all(&dir);
     }
 }

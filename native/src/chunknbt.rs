@@ -770,7 +770,7 @@ pub fn pack_nostroddle(entries: &[u8], bits: u32) -> Vec<i64> {
 /// dense stream IS the no-straddle layout bit-for-bit: pure byte copy. This
 /// covers the overwhelmingly common vanilla-clamped 4-bit terrain data.
 /// Everything else goes through a rolling-u64 window at ~4ns/voxel.
-fn dense_to_nostroddle(dense: &[u8], n: usize, in_bits: u32, out_bits: u32) -> Vec<i64> {
+pub fn dense_to_nostroddle(dense: &[u8], n: usize, in_bits: u32, out_bits: u32) -> Vec<i64> {
     if in_bits == out_bits && matches!(in_bits, 1 | 2 | 4 | 8 | 16 | 32) {
         let per = (64 / in_bits) as usize;
         let nlongs = (n + per - 1) / per;
@@ -3968,6 +3968,9 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     }
     let magic = *csec.first()?;
     if magic != CSEC3_MAGIC && magic != CSEC4_MAGIC {
+        if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+            eprintln!("glob: magic {magic:#04x} len={} not CSEC", csec.len());
+        }
         return None;
     }
     let f1 = *csec.get(1)?;
@@ -3982,6 +3985,9 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     p += 1;
     // block_states present AND has data; dense form only (f2 order bits 4/5)
     if f1 & 3 != 3 || f2 & 48 != 0 {
+        if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+            eprintln!("glob: skip f1={f1:02x} f2={f2:02x} (f1&3={}, f2&48={})", f1 & 3, f2 & 48);
+        }
         return None;
     }
     let n = u16::from_le_bytes(csec.get(p..p + 2)?.try_into().ok()?) as usize;
@@ -4010,13 +4016,22 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
         return None;
     };
     if vox.iter().any(|&x| (x as usize) >= n) {
+        if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+            eprintln!("glob: voxel out of range n={n} out_bits={out_bits}");
+        }
         return None;
     }
-    // gid stream: 1 byte per voxel (registry <= 256 guarded above)
+    // gid stream: 1 byte per voxel. The registry may cross the 256-state
+    // line MID-CONVERSION (earlier sections in the same pack wave insert
+    // new states): a gid above 255 cannot be represented in the u8 stream —
+    // refuse the conversion instead of silently truncating.
     let mut stream = Vec::with_capacity(4096);
     for v in &vox {
         let st = &states[*v as usize];
         let g = reg.get_or_insert(st.clone());
+        if g > 255 {
+            return None;
+        }
         stream.push(g as u8);
     }
     let mut out = Vec::with_capacity(p + stream_len + stream.len());
@@ -4030,6 +4045,9 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     out.extend_from_slice(&stream);
     out.extend_from_slice(&csec[p + stream_len..]);
     ST_GLOB_ENC.fetch_add(1, Ordering::Relaxed);
+    if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+        eprintln!("glob: converted ok n={n} canon={} glob={}", csec.len(), out.len());
+    }
     Some(out)
 }
 
@@ -4151,7 +4169,7 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     Some(out)
 }
 
-const GLOB_MAGIC: u8 = 0xCB;
+pub const GLOB_MAGIC: u8 = 0xCB;
 
 static ST_GLOB_ENC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ST_GLOB_DEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
