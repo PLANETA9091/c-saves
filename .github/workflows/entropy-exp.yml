@@ -1,0 +1,52 @@
+name: entropy-exp
+
+# jj_exp5 on REAL bigworld-survival tiles: is the dense block-state stream
+# the size floor, or does a better MODEL (vertical conditioning / bitmap
+# predictor form / global state registry) beat it? Dispatch-only; seeds
+# tile region files from a completed bigworld-survival run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed_run_id:
+        description: 'bigworld-survival run id whose tile artifacts to use'
+        required: true
+        default: '41067689403'
+
+jobs:
+  exp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: download tile artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for T in 1-1 2-2; do
+            gh run download ${{ inputs.seed_run_id }} -n "tile-$T" -D "art/tile-$T" || echo "no tile-$T"
+          done
+          mkdir -p dim/region
+          for D in art/tile-*/; do
+            [ -d "$D/region" ] && cp "$D"/region/*.mca dim/region/ || true
+          done
+          ls dim/region | head -5
+          du -sh dim/region
+
+      - name: build + run jj_exp5
+        working-directory: native
+        run: |
+          cargo build --release --example jj_exp5
+          ./target/release/examples/jj_exp5 ../dim 2>&1 | tee exp5.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: entropy-exp-results
+          path: native/exp5.txt
+          retention-days: 30
