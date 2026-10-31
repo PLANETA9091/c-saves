@@ -3772,6 +3772,390 @@ pub fn join_fields(parts: &[FieldBytes], pos: Option<(i32, i32)>) -> Result<Vec<
     Ok(to_bytes(&map))
 }
 
+// ------------------------------------------------------ global registry ----
+//
+// The 0xCB GLOB form. Measured on the real 262k-chunk vanilla-terrain
+// bigworld (jj_exp5, 32,768 chunks): the canonical dense streams sit BELOW
+// the order-0 arithmetic floor (z19 already exploits cross-section repeats),
+// yet replacing per-section palette STRINGS with a GLOBAL state registry
+// wins another x2.16 on the like-for-like dense content: every section's
+// palette bytes (18.8% of the raw canonical weight) disappear, and the
+// global-id streams line the same geological micro-patterns up byte-for-byte
+// across the whole slab window, where per-section palette indices never
+// matched. Vertical-conditioning and bitmap-predictor models measured
+// x1.20 / x0.50 — the registry is the lever.
+//
+// The transform is STORE-LEVEL and transparent to the codec: canonical CSEC
+// bytes and their dedup hashes never change; the pack pass converts eligible
+// dense sections to 0xCB members inside a slab (slab-level form choice by
+// compressed size), and read_blob converts members back to canonical bytes
+// before any decoder sees them. Registry assignment is per store dir,
+// append-only (monotonic gids), persisted in states-1.bin.
+
+/// One registry state: canonical (plain flag, name, sorted props).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct GlobState {
+    pub plain: bool,
+    pub name: String,
+    pub props: Vec<(String, String)>,
+}
+
+/// Global block-state registry: state -> gid, append-only. Gid 0 is the
+/// FIRST inserted state (a valid dense index must never be confused with
+/// "absent" — the registry never stores Option gids, so 0 is fine).
+#[derive(Default, Debug)]
+pub struct StateRegistry {
+    states: Vec<GlobState>,
+    index: HashMap<GlobState, u32>,
+}
+
+impl StateRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    pub fn get(&self, gid: u32) -> Option<&GlobState> {
+        self.states.get(gid as usize)
+    }
+
+    pub fn get_or_insert(&mut self, st: GlobState) -> u32 {
+        if let Some(&g) = self.index.get(&st) {
+            return g;
+        }
+        let g = self.states.len() as u32;
+        self.states.push(st.clone());
+        self.index.insert(st, g);
+        g
+    }
+
+    /// Serialize: [b'G'][b'S'][b'V'][b'1'][u32 n]{[u8 kind][u16 nlen][name]
+    /// [u8 np]{[u16 kl][k][u16 vl][v]}} — the put_entry wire format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.states.len() * 24);
+        out.extend_from_slice(b"GSV1");
+        out.extend_from_slice(&(self.states.len() as u32).to_le_bytes());
+        for s in &self.states {
+            let nb = s.name.as_bytes();
+            out.push(if s.plain { 0u8 } else if s.props.is_empty() { 1u8 } else { 2u8 });
+            out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            out.extend_from_slice(nb);
+            if !s.plain {
+                out.push(s.props.len().min(255) as u8);
+                for (k, v) in s.props.iter().take(255) {
+                    out.extend_from_slice(&(k.len() as u16).to_le_bytes());
+                    out.extend_from_slice(k.as_bytes());
+                    out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+                    out.extend_from_slice(v.as_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < 8 || &b[0..4] != b"GSV1" {
+            return None;
+        }
+        let n = u32::from_le_bytes(b[4..8].try_into().ok()?) as usize;
+        let mut reg = StateRegistry::new();
+        reg.states.reserve(n);
+        let mut p = 8usize;
+        for _ in 0..n {
+            let kind = *b.get(p)?;
+            p += 1;
+            let nl = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2;
+            let name = String::from_utf8(b.get(p..p + nl)?.to_vec()).ok()?;
+            p += nl;
+            let mut props = Vec::new();
+            let plain = kind == 0;
+            if !plain {
+                let np = *b.get(p)? as usize;
+                p += 1;
+                for _ in 0..np {
+                    let kl = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+                    p += 2;
+                    let k = String::from_utf8(b.get(p..p + kl)?.to_vec()).ok()?;
+                    p += kl;
+                    let vl = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+                    p += 2;
+                    let v = String::from_utf8(b.get(p..p + vl)?.to_vec()).ok()?;
+                    p += vl;
+                    props.push((k, v));
+                }
+            }
+            let st = GlobState { plain, name, props };
+            reg.get_or_insert(st);
+        }
+        Some(reg)
+    }
+}
+
+/// Serialize one palette entry in the canonical put_entry wire format.
+fn glob_put_entry(out: &mut Vec<u8>, s: &GlobState) {
+    let nb = s.name.as_bytes();
+    if s.plain {
+        out.push(0u8);
+    } else if s.props.is_empty() {
+        out.push(1u8);
+    } else {
+        out.push(2u8);
+    }
+    out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+    out.extend_from_slice(nb);
+    if !s.plain && !s.props.is_empty() {
+        out.push(s.props.len() as u8);
+        for (k, v) in &s.props {
+            out.extend_from_slice(&(k.len() as u16).to_le_bytes());
+            out.extend_from_slice(k.as_bytes());
+            out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            out.extend_from_slice(v.as_bytes());
+        }
+    }
+}
+
+/// Parse one put_entry palette entry starting at p. Returns (state, kind).
+fn glob_parse_entry(b: &[u8], p: &mut usize) -> Option<(GlobState, u8)> {
+    let kind = *b.get(*p)?;
+    *p += 1;
+    let nl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+    *p += 2;
+    let name = String::from_utf8(b.get(*p..*p + nl)?.to_vec()).ok()?;
+    *p += nl;
+    let mut props = Vec::new();
+    let plain = kind == 0;
+    // canonical put_entry format: ONLY kind 2 (compound with Properties)
+    // carries the np byte; kind 1 (compound, no props) ends after the name
+    if kind == 2 {
+        let np = *b.get(*p)? as usize;
+        *p += 1;
+        for _ in 0..np {
+            let kl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p += 2;
+            let k = String::from_utf8(b.get(*p..*p + kl)?.to_vec()).ok()?;
+            *p += kl;
+            let vl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p += 2;
+            let v = String::from_utf8(b.get(*p..*p + vl)?.to_vec()).ok()?;
+            *p += vl;
+            props.push((k, v));
+        }
+    }
+    Some((GlobState { plain, name, props }, kind))
+}
+
+/// Convert one canonical CSEC section (0xC7/0xC8) to the GLOB form (0xCB).
+/// Applies ONLY to dense block_states sections with data (RLE and
+/// single-state sections already beat the wide stream or carry no stream);
+/// everything after the block_states stream (biomes, light, starlight) is
+/// copied verbatim. Returns None when the section is not eligible — the
+/// caller then stores the canonical bytes (always safe).
+///
+/// Layout: [0xCB][f1][f2'][f3'?][Y][4096 gid bytes][verbatim tail]
+/// — f2' is f2 with the block_states narrow/RLE bits cleared; the gid width
+/// is always 1 byte (the caller guarantees registry <= 256 states).
+pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> {
+    if reg.len() > 256 {
+        return None;
+    }
+    let magic = *csec.first()?;
+    if magic != CSEC3_MAGIC && magic != CSEC4_MAGIC {
+        return None;
+    }
+    let f1 = *csec.get(1)?;
+    let f2 = *csec.get(2)?;
+    let mut p = 3usize;
+    let mut f3 = 0u8;
+    if magic == CSEC4_MAGIC {
+        f3 = *csec.get(p)?;
+        p += 1;
+    }
+    let y = *csec.get(p)?;
+    p += 1;
+    // block_states present AND has data; dense form only (f2 order bits 4/5)
+    if f1 & 3 != 3 || f2 & 48 != 0 {
+        return None;
+    }
+    let n = u16::from_le_bytes(csec.get(p..p + 2)?.try_into().ok()?) as usize;
+    p += 2;
+    if n == 0 || n > 65535 {
+        return None;
+    }
+    let mut states = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some((st, _kind)) = glob_parse_entry(csec, &mut p) else {
+            if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+                eprintln!("glob: entry parse failed i={i}/{n} p={p} len={}", csec.len());
+            }
+            return None;
+        };
+        states.push(st);
+    }
+    // dense stream width: narrow (f2 bit2) packs at bits_for(n), else the
+    // vanilla max(4, bits_for(n)) clamp
+    let out_bits = if f2 & 4 != 0 { bits_for(n) } else { bits_for(n).max(4) };
+    let stream_len = (4096usize * out_bits as usize).div_ceil(8);
+    let Some(vox) = dense_unpack(csec.get(p..p + stream_len)?, 4096, out_bits) else {
+        if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+            eprintln!("glob: dense_unpack failed n={n} out_bits={out_bits} stream_len={stream_len} p={p} len={}", csec.len());
+        }
+        return None;
+    };
+    if vox.iter().any(|&x| (x as usize) >= n) {
+        return None;
+    }
+    // gid stream: 1 byte per voxel (registry <= 256 guarded above)
+    let mut stream = Vec::with_capacity(4096);
+    for v in &vox {
+        let st = &states[*v as usize];
+        let g = reg.get_or_insert(st.clone());
+        stream.push(g as u8);
+    }
+    let mut out = Vec::with_capacity(p + stream_len + stream.len());
+    out.push(GLOB_MAGIC);
+    out.push(f1);
+    out.push(f2 & !4 & !16 & !32);
+    // 0xCB ALWAYS carries the f3 byte (all f1/f2 bits are taken; the
+    // explicit shape removes any v3/v4 header ambiguity)
+    out.push(f3);
+    out.push(y);
+    out.extend_from_slice(&stream);
+    out.extend_from_slice(&csec[p + stream_len..]);
+    ST_GLOB_ENC.fetch_add(1, Ordering::Relaxed);
+    Some(out)
+}
+
+/// Rebuild canonical CSEC bytes from a GLOB section (0xCB). The rebuilt
+/// palette holds exactly the USED states in the frequency-canonical order
+/// (dominant first, ties by (plain, name, props) — the enc_pal_data_canon
+/// rule), so identical content reproduces identical bytes; the dense/RLE
+/// form is re-chosen by the same admission rule as section_encode. The
+/// rebuilt palette drops states the source palette carried unused —
+/// semantically irrelevant (a palette is a pure lookup), verified by the
+/// semantic comparators.
+pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+    if glob.first() != Some(&GLOB_MAGIC) {
+        return None;
+    }
+    let f1 = *glob.get(1)?;
+    let f2 = *glob.get(2)?;
+    let f3 = *glob.get(3)?; // 0xCB always carries the f3 byte
+    let y = *glob.get(4)?;
+    let mut p = 5usize;
+    let magic = if f3 != 0 { CSEC4_MAGIC } else { CSEC3_MAGIC };
+    if f1 & 3 != 3 {
+        return None; // never globbed without a data stream
+    }
+    let stream = glob.get(p..p + 4096)?;
+    p += 4096;
+    let tail = &glob[p..];
+    // counts per gid over the section's voxels
+    let mut counts = [0u32; 256];
+    for &g in stream {
+        counts[g as usize] += 1;
+    }
+    // distinct used gids in the frequency-canonical order (dominant first,
+    // ties by (plain, name, props) — enc_pal_data_canon's exact rule)
+    let mut used: Vec<(u32, u32)> = (0..reg.len().min(256) as u32)
+        .filter(|&g| counts[g as usize] > 0)
+        .map(|g| (counts[g as usize], g))
+        .collect();
+    let _reg_state_unused = |g: u32| -> Option<&GlobState> { reg.get(g) };
+    let reg_snap: Vec<(u32, bool, String, Vec<(String, String)>)> = used
+        .iter()
+        .map(|&(c, g)| {
+            let s = reg.get(g);
+            (
+                c,
+                s.map(|s| s.plain).unwrap_or(false),
+                s.map(|s| s.name.clone()).unwrap_or_default(),
+                s.map(|s| s.props.clone()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..used.len()).collect();
+    order.sort_by(|&i, &j| {
+        let (ci, gi) = used[i];
+        let (cj, gj) = used[j];
+        let (_, pi, ni, propsi) = &reg_snap[i];
+        let (_, pj, nj, propsj) = &reg_snap[j];
+        ci.cmp(&cj)
+            .then_with(|| (pi, ni, propsi).cmp(&(pj, nj, propsj)))
+            .then_with(|| gi.cmp(&gj))
+    });
+    let ordered: Vec<(u32, u32)> = order.into_iter().map(|i| used[i]).collect();
+    let used = ordered;
+    let n = used.len();
+    if n == 0 || n > 65535 {
+        return None;
+    }
+    let mut gid2canon = [0u8; 256];
+    for (i, (_, g)) in used.iter().enumerate() {
+        gid2canon[*g as usize] = i as u8;
+    }
+    let vox: Vec<u8> = stream.iter().map(|&g| gid2canon[g as usize]).collect();
+    // same form choice as the canonical encoder
+    let narrow = bits_for(n) < 4;
+    let out_bits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+    let dense = dense_pack(&vox, out_bits);
+    let mut best_len = dense.len();
+    let mut best: Option<(u8, Vec<u8>)> = None;
+    let ra = rle_encode_stream(&vox);
+    if ra.len() * 4 <= dense.len() && ra.len() + 32 <= dense.len() {
+        best_len = ra.len();
+        best = Some((1, ra));
+    }
+    let rb = rle_encode_stream(&transpose_fast_y(&vox, 16));
+    if rb.len() * 4 <= dense.len() && rb.len() + 32 <= dense.len() && rb.len() < best_len {
+        best = Some((2, rb));
+    }
+    let mut out = Vec::with_capacity(16 + n * 32 + dense.len() + tail.len());
+    out.push(magic);
+    out.push(f1);
+    let mut f2n = f2 & !4 & !16 & !32;
+    if narrow {
+        f2n |= 4;
+    }
+    out.push(f2n);
+    if magic == CSEC4_MAGIC {
+        out.push(f3);
+    }
+    out.push(y);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    for (_, g) in &used {
+        let st = reg.get(*g)?;
+        glob_put_entry(&mut out, st);
+    }
+    match best {
+        None => {
+            out.extend_from_slice(&dense);
+            let _ = best_len;
+        }
+        Some((ord, bytes)) => {
+            out.extend_from_slice(&bytes);
+            f2n |= ord << 4;
+        }
+    }
+    // f2n was computed BEFORE the palette/stream were pushed; patch byte 2
+    out[2] = f2n;
+    out.extend_from_slice(tail);
+    ST_GLOB_DEC.fetch_add(1, Ordering::Relaxed);
+    Some(out)
+}
+
+const GLOB_MAGIC: u8 = 0xCB;
+
+static ST_GLOB_ENC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ST_GLOB_DEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(test)]
 mod fused_tests {
     use super::*;
@@ -4606,5 +4990,159 @@ mod codec_tests {
         refs2[1][3] = 16;
         let slices2: Vec<&[u8]> = refs2.iter().map(|b| b.as_slice()).collect();
         assert!(resolve_shifts(&slices2, &hashes).is_none(), "k=16 must fail");
+    }
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::*;
+    use std::collections::HashMap as Map;
+
+    fn glob_section(y: i32, seed: u64, distinct: usize) -> Value {
+        // dense multi-state section: deterministic pseudo-random voxels over
+        // `distinct` states, plus a biome palette so the verbatim-tail path
+        // is exercised
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(y as i8));
+        let mut bs: Map<String, Value> = Map::new();
+        let mut pal = Vec::new();
+        for i in 0..distinct {
+            // compound entries only: an NBT palette list cannot mix string
+            // and compound elements (vanilla never does)
+            let mut c: Map<String, Value> = Map::new();
+            c.insert("Name".to_string(), Value::String(format!("minecraft:block_{i}")));
+            if i % 2 == 0 {
+                let mut props: Map<String, Value> = Map::new();
+                props.insert("axis".to_string(), Value::String(format!("{}_{}", i % 2, i % 7)));
+                props.insert("lit".to_string(), Value::String("true".to_string()));
+                c.insert("Properties".to_string(), Value::Compound(props));
+            }
+            pal.push(Value::Compound(c));
+        }
+        bs.insert("palette".to_string(), Value::List(pal));
+        let mut st = seed | 1;
+        let vox: Vec<u8> = (0..4096)
+            .map(|_| {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                (st % distinct as u64) as u8
+            })
+            .collect();
+        // vanilla no-straddle packing at the clamped width
+        let vbits = (((distinct as u32 - 1).ilog2() + 1).max(4)) as u32;
+        let data = dense_to_nostroddle(&vox, 4096, 8, vbits);
+        bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let mut bio: Map<String, Value> = Map::new();
+        bio.insert(
+            "palette".to_string(),
+            Value::List(vec![Value::String("minecraft:plains".to_string())]),
+        );
+        sec.insert("biomes".to_string(), Value::Compound(bio));
+        sec.insert("SkyLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![15i8; 2048])));
+        Value::Compound(sec)
+    }
+
+    #[test]
+    fn glob_roundtrip_semantic_and_registry_persist() {
+        for distinct in [2usize, 5, 16, 17, 300] {
+            let src = glob_section(-4 + distinct as i32, 0xDEADBEEF, distinct);
+            let mut reg = StateRegistry::new();
+            let canon = match section_encode(&src) {
+                Some(c) => c,
+                None => panic!("canonical encode failed at distinct={distinct}"),
+            };
+            let glob = section_to_glob(&canon, &mut reg);
+            if distinct > 256 {
+                // the u8 gid stream only admits registries <= 256: the
+                // 300-state section itself is fine but pushing >256 states
+                // mid-run disables further conversions
+                if let Some(g) = glob {
+                    let back = glob_to_section(&g, &reg).expect("decode");
+                    let a = section_decode(&canon).expect("decode canon");
+                    let b = section_decode(&back).expect("decode back");
+                    assert!(sections_semantically_equal(&a, &b), "semantic {distinct}");
+                }
+                continue;
+            }
+            let glob = glob.expect("glob conversion");
+            assert_eq!(glob[0], GLOB_MAGIC);
+            let back = glob_to_section(&glob, &reg).expect("decode");
+            // semantic equality through the SECTION DECODER (CSEC -> Value):
+            // the rebuilt palette holds only USED states, so the wire bytes
+            // differ while the section content is identical
+            let a = section_decode(&canon).expect("decode canon");
+            let b = section_decode(&back).expect("decode back");
+            assert!(
+                sections_semantically_equal(&a, &b),
+                "semantic roundtrip failed at distinct={distinct}"
+            );
+            // registry persistence
+            let bytes = reg.to_bytes();
+            let mut reg2 = StateRegistry::from_bytes(&bytes).expect("registry parse");
+            assert_eq!(reg2.len(), reg.len(), "registry size");
+            for g in 0..reg.len() as u32 {
+                assert_eq!(reg.get(g), reg2.get(g), "state {g}");
+            }
+            // a SECOND conversion of the rebuilt canonical bytes must yield
+            // the same gid stream content (determinism)
+            let glob2 = section_to_glob(&back, &mut reg2).expect("re-glob");
+            let a2 = section_decode(&back).expect("re-decode canon");
+            // production contract: 0xCB members are converted back by
+            // read_blob BEFORE any decoder; mirror that here
+            let back2 = glob_to_section(&glob2, &reg2).expect("decode glob2");
+            let b2 = section_decode(&back2).expect("re-decode glob");
+            assert!(sections_semantically_equal(&a2, &b2), "re-glob semantic {distinct}");
+        }
+    }
+
+    #[test]
+    fn glob_rejects_rle_and_single_state_sections() {
+        let mut reg = StateRegistry::new();
+        // single-state section (no data)
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(3));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert(
+            "palette".to_string(),
+            Value::List(vec![Value::String("minecraft:stone".to_string())]),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let canon = section_encode(&Value::Compound(sec)).expect("encode");
+        assert!(section_to_glob(&canon, &mut reg).is_none(), "single-state must not glob");
+        // RLE-friendly section: one horizontal stratum plane -> rle_van wins
+        let mut sec2: Map<String, Value> = Map::new();
+        sec2.insert("Y".to_string(), Value::Byte(1));
+        let mut bs2: Map<String, Value> = Map::new();
+        bs2.insert(
+            "palette".to_string(),
+            Value::List(vec![
+                Value::String("minecraft:air".to_string()),
+                Value::String("minecraft:stone".to_string()),
+            ]),
+        );
+        let mut vox = [0u8; 4096];
+        for x in 0..16 {
+            for z in 0..16 {
+                vox[x * 256 + z] = 1;
+            }
+        }
+        bs2.insert(
+            "data".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(
+                dense_to_nostroddle(&vox, 4096, 8, 1)
+                    .iter()
+                    .map(|l| *l as i64)
+                    .collect::<Vec<i64>>(),
+            )),
+        );
+        sec2.insert("block_states".to_string(), Value::Compound(bs2));
+        let canon2 = section_encode(&Value::Compound(sec2)).expect("encode2");
+        // the encoder chose an RLE form (f2 order bits set) -> not globbable
+        assert!(canon2.len() > 4);
+        if canon2[2] & 48 != 0 {
+            assert!(section_to_glob(&canon2, &mut reg).is_none(), "rle must not glob");
+        }
     }
 }
