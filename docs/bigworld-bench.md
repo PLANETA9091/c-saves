@@ -55,3 +55,41 @@ collapse to 0.65 MiB (x11.4).
   data is part of both sides of the comparison), then verifies a 1-in-10
   chunk sample semantically (full verification of 34M sections would triple
   the job time; the corpus job verifies 100%).
+
+## bigworld-survival (0.9.5): the vanilla-terrain plateau, measured
+
+The `bigworld-survival` workflow (Paper 26.3 pure vanilla worldgen, seed
+77007, 512x512 chunks = 261,572 terrain chunks + 19,992 persisted entities
++ 2,000 loot chests, imported through the production pipeline with the
+derived-light strip) measured on 6b05aaa (GLOB2 div=8 default):
+
+| side | region | entities | TOTAL |
+|---|---|---|---|
+| Anvil (.mca) | 2135.99 MiB | 7.27 MiB | 2143.26 MiB |
+| c-saves | 970.08 MiB | 0.86 MiB | 970.94 MiB |
+| ratio | x2.20 | **x8.47** | **x2.21** |
+
+Integrity **261,572/261,572** keys readable (missing 0, heal_rounds 0);
+semantic verify **ok=26,342 bad=0** (1-in-10 sample). Enc-mode census:
+2.29M dense vs 0.25M RLE sections — survival terrain is noise-dense.
+
+**Why GLOB did not move this world.** The raw gid stream is 4096 bytes;
+a 4-bit canonical dense stream is 2048. For the glob slab to win, zstd
+must recover the 2x width from cross-section alignment alone. JJThunder
+mountain tiles deliver that (the registry won x2.16 there and pushed the
+corpus x2.99 -> x3.08); vanilla survival sections are ore-noise-unique,
+alignment doesn't materialize, and the per-slab natural choice correctly
+keeps canonical. GID-RLE (div=8) has nothing to bite on: the runny
+sections never reach the glob pass (canonical RLE beats the packed width
+outright). x2.21 is the same number the pre-GLOB architecture measured —
+the plateau is the terrain's entropy, not a codec gap.
+
+Class attribution (raw NBT): block_states data 46.0%, light 32.5%
+(stripped on import — the server relights from isLightOn=0), palettes
+9.5% (dropped by the registry), biomes 2.8%, heightmaps 3.0%.
+
+Where the 50x-class ratios DO come from: repeated structure (the earlier
+JJThunder 262k-chunk container measured x19.88), identical entity NBT
+(x8.47-x11.4 here and in the JJ world), and player-built duplication —
+content-addressed dedup converts all of it into single blobs. Pure fresh
+worldgen has no such redundancy to claim.
