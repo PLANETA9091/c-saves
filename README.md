@@ -103,6 +103,31 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.4 — GLOB (global state registry) ON by default
+
+jj_exp5 measured the section-size frontier on real bigworld tiles: the
+winning architecture is a GLOBAL STATE REGISTRY — dense sections convert
+to 1-byte global-id streams (175 distinct states in vanilla terrain →
+x2.16 on the dense streams), cross-section repeats match through the
+registry instead of per-section palettes. v0.9.3 shipped it opt-in
+because the natural per-slab choice corrupted 32 of 946 JJ chunks.
+
+**Root cause (0.9.4):** `glob_to_section` rebuilt target palettes in
+count-ASCENDING order while the canonical encoder is count-DESCENDING.
+0xC9 shift-ref members store their top planes as TARGET-CANONICAL
+indices; every shift whose target was glob-rebuilt decoded through a
+rotated palette (andesite at index 0). The rebuild now reproduces the
+exact `enc_pal_data_canon` rule — glob roundtrips are byte-identical for
+encoder-produced sections, shift permutations stay valid, dedup hashes
+stay content-pure. Regression test `glob_rebuild_keeps_shiftref_target_order`
+fails on pre-fix code; `Store::slab_invariant_scan` + the probe_glob /
+probe_bad2 examples document the hunt (the map-vs-disk invariant was
+CLEAN at every step — the bug lived in the codec layer, not the store).
+
+Corpus with the natural choice (CI-gated): TOTAL **x3.08**
+(region x3.07, entities x3.11), `verify ok=946 bad=0`; FORCE_GLOB
+x3.08 bad=0; `CSAVES_GLOB=0` opt-out x2.99. Bigworld rerun queued.
+
 Synthetic Tectonic-style wgen bench (4096 chunks): compact container =
 **x0.08 of Anvil** (x173 vs logical).
 

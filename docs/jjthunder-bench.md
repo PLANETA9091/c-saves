@@ -461,3 +461,77 @@ not gated). Result (8 samples/phase): TPS 19.96 vs 19.95, MSPT avg 5.78
 vs 5.96 ms, MSPT max 12.11 vs 10.41 ms (c-saves better), rotate 491.6 s
 vs 493.2 s, module attached, import 897+193 chunks 0 failed, zero
 integrity events.
+
+## 0.9.4 — GLOB natural-choice root cause: shift-ref permutations vs the rebuilt palette order
+
+### The hunt
+
+The GLOB form (0xCB global state registry) shipped opt-in in 0.9.3 because
+the NATURAL per-slab size choice corrupted 32 of 946 JJ-corpus chunks
+(x3.08 but verify bad=32), while the forced path was test-green. Three
+instruments closed the gap:
+
+* `Store::slab_invariant_scan` — cross-checks every slab entry in the blob
+  map against the ON-DISK slab it points at (hash in the entry table,
+  slab_off/raw_len equal to the table's cursor walk). Result: the map and
+  the disk tables were CONSISTENT at every drain step and after sync —
+  the store layers were innocent.
+* `probe_glob` — the exact jj_profile pipeline with per-step invariant
+  scans. First version read all chunks between steps and stayed clean at
+  bad=0: the reads populate the slab/emit caches and MASK the bug.
+  Read-free scans + one final verify reproduce bad=32 exactly
+  (first bad chunks (3,-20), (0,-19)).
+* `probe_bad2` — surgical diff of the first bad chunks: the palette came
+  back SHIFTED (src [stone, diorite, coal_ore] → got [andesite, stone,
+  diorite, coal_ore]) and the members were **0xC9 shift-refs**, not 0xCB.
+
+### Root cause
+
+A 0xC9 shift-ref stores its top planes as **target-canonical palette
+indices** (computed at write time against the target's canonical order).
+`resolve_one` expands them against the target's palette AS DECODED FROM
+ITS CURRENT BYTES. `glob_to_section` — the 0xCB → canonical rebuild —
+sorted the rebuilt palette by count ASCENDING, while the canonical
+encoder (`enc_pal_data_canon`) sorts count DESCENDING (dominant first).
+Every shift whose target was glob-rebuilt therefore decoded through a
+ROTATED palette: index 0 resolved to the RAREST state instead of the
+dominant one. 32 chunks on the corpus had a glob-rebuilt shift target;
+the other 914 did not (targets canonical, or RLE — `section_to_glob`
+refuses non-dense members, which is also why the synthetic GLOB test
+never caught it: strata-free random sections have no shifts AND its
+targets stayed dense-canonical under FORCE... the real trigger needs a
+shift member plus a glob-rebuilt dense target in one chunk, exactly the
+JJ terrain shape).
+
+### Fix + verification
+
+`glob_to_section` now reproduces the exact canonical rule (count DESC,
+ties (plain, name, props) ASC — the gid tiebreak never fires because
+(plain, name, props) ties imply identical states). With that, a glob
+roundtrip is byte-identical for encoder-produced sections, so:
+
+* shift permutations stay valid regardless of which slabs globbed;
+* dedup hashes of glob-roundtripped sections match fresh encodes again
+  (the rebuild is a pure function of content).
+
+Results on the committed corpus (728 region + 218 entity chunks):
+
+| mode | container | verify |
+| --- | --- | --- |
+| natural GLOB (now default) | x3.08 | 946/946 |
+| FORCE_GLOB=1 (all-dense globbed) | x3.08 | 946/946 |
+| CSAVES_GLOB=0 (opt-out) | x2.99 | 946/946 |
+
+47/47 unit tests (new: `glob_rebuild_keeps_shiftref_target_order`,
+which FAILS on pre-fix code — 3-state target with strictly descending
+counts, k=1 shift member whose top plane sits at canonical index 0,
+semantic verify post-pack and post-reopen). Speed bench with GLOB on:
+warm region read 1318 MB/s p50 16.9 us, import 46.5 MB/s, steady region
+write 88 MB/s, entity write 4.9 GB/s — all CI gates pass.
+
+### GLOB default ON
+
+`glob_enabled()` is now on unless `CSAVES_GLOB=0`. The known limit stays:
+sections convert while the registry holds ≤ 256 states (1-byte gid
+streams); a bigger world just stops converting NEW sections — existing
+glob slabs keep reading through the persisted registry.

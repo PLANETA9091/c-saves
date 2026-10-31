@@ -4080,13 +4080,19 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     for &g in stream {
         counts[g as usize] += 1;
     }
-    // distinct used gids in the frequency-canonical order (dominant first,
-    // ties by (plain, name, props) — enc_pal_data_canon's exact rule)
+    // distinct used gids in the frequency-canonical order — EXACTLY the
+    // enc_pal_data_canon rule: count DESC (dominant first), ties by
+    // (plain, name, props) ASC. The rebuild MUST reproduce the canonical
+    // encoder's palette order byte-for-byte: 0xC9 shift-ref members store
+    // permutations against the TARGET's palette positions, computed at
+    // write time against the canonical order. Any divergence (e.g. the
+    // ascending sort this code once had) silently invalidates every shift
+    // whose target was glob-rebuilt — palettes came back rotated by the
+    // re-sorted indices (32 corrupt chunks on the JJ corpus).
     let mut used: Vec<(u32, u32)> = (0..reg.len().min(256) as u32)
         .filter(|&g| counts[g as usize] > 0)
         .map(|g| (counts[g as usize], g))
         .collect();
-    let _reg_state_unused = |g: u32| -> Option<&GlobState> { reg.get(g) };
     let reg_snap: Vec<(u32, bool, String, Vec<(String, String)>)> = used
         .iter()
         .map(|&(c, g)| {
@@ -4101,13 +4107,12 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         .collect();
     let mut order: Vec<usize> = (0..used.len()).collect();
     order.sort_by(|&i, &j| {
-        let (ci, gi) = used[i];
-        let (cj, gj) = used[j];
+        let (ci, _) = used[i];
+        let (cj, _) = used[j];
         let (_, pi, ni, propsi) = &reg_snap[i];
         let (_, pj, nj, propsj) = &reg_snap[j];
-        ci.cmp(&cj)
-            .then_with(|| (pi, ni, propsi).cmp(&(pj, nj, propsj)))
-            .then_with(|| gi.cmp(&gj))
+        // count DESC, then (plain, name, props) ASC — enc_pal_data_canon
+        cj.cmp(&ci).then_with(|| (pi, ni, propsi).cmp(&(pj, nj, propsj)))
     });
     let ordered: Vec<(u32, u32)> = order.into_iter().map(|i| used[i]).collect();
     let used = ordered;

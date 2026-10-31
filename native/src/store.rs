@@ -1033,15 +1033,18 @@ impl Store {
     }
 
     /// GLOB conversion admission: section stores only (whole-mode payloads
-    /// are not CSEC sections), registry small enough for the 1-byte gid
-    /// stream, and the OPT-IN switch. EXPERIMENTAL: the transform and the
-    /// read path are test-green, but the natural pack choice produced a
-    /// blob-map vs slab-generation divergence on the JJ corpus (32 semantic
-    /// mismatches) that is not root-caused yet — the form ships opt-in
-    /// (CSAVES_GLOB=1) until that hunt closes.
+    /// are not CSEC sections) and a registry small enough for the 1-byte
+    /// gid stream. ON by default: the jj_exp5 entropy measurements put the
+    /// global-id form at x2.16 on vanilla-terrain dense streams, and the
+    /// natural per-slab size choice measured x2.99 -> x3.08 on the real JJ
+    /// corpus. The former natural-choice corruption was the glob_to_section
+    /// palette-order divergence (shift-ref permutations against rebuilt
+    /// targets) — fixed and CI-regressed by
+    /// glob_rebuild_keeps_shiftref_target_order. CSAVES_GLOB=0 opts out
+    /// (emergency switch / A-B benches).
     fn glob_enabled(&self) -> bool {
         !self.whole_mode.load(Ordering::Relaxed)
-            && std::env::var("CSAVES_GLOB").as_deref() == Ok("1")
+            && std::env::var("CSAVES_GLOB").as_deref() != Ok("0")
     }
 
     // ---- dictionaries ----
@@ -2092,6 +2095,88 @@ impl Store {
         Some((out, p))
     }
 
+    /// DIAGNOSTIC: cross-check every slab entry in the blobs map against the
+    /// ON-DISK slab it points at. For each (seg, off) group: parse the slab
+    /// header + entry table (the disk ground truth, same code as scan()) and
+    /// require (a) the map hash is IN the table and (b) the table's member
+    /// offset/len equal the map's slab_off/raw_len. Returns violation lines
+    /// (empty = clean). This is the invariant whose violation produced the
+    /// "map points into a slab whose entry table lacks the hash" forensics.
+    pub fn slab_invariant_scan(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // group slab map entries by slab location
+        let mut groups: HashMap<(u32, u64), Vec<(Hash, BlobLoc)>> = HashMap::new();
+        {
+            let blobs = self.blobs.read();
+            for (h, l) in blobs.iter() {
+                if l.slab {
+                    groups.entry((l.seg, l.off)).or_default().push((*h, *l));
+                }
+            }
+        }
+        let segs = self.segs.read();
+        for ((seg_id, off), members) in groups {
+            let Some(seg) = segs.get(&seg_id) else {
+                out.push(format!(
+                    "slab @({seg_id},{off}): SEGMENT MISSING, {n} map refs",
+                    n = members.len()
+                ));
+                continue;
+            };
+            let Some(hdr) = seg.read_at(off, 12, false) else {
+                out.push(format!("slab @({seg_id},{off}): header unreadable"));
+                continue;
+            };
+            let kind = hdr[0] & 0x7f;
+            if kind != 5 && kind != 8 {
+                out.push(format!("slab @({seg_id},{off}): kind {kind} not a slab"));
+                continue;
+            }
+            let dict_id = hdr[1];
+            let hlen = if hdr[0] & 0x80 != 0 { 13usize } else { 12usize };
+            let cl = u32::from_le_bytes(hdr[2..6].try_into().unwrap()) as usize;
+            let raw_total = u32::from_le_bytes(hdr[6..10].try_into().unwrap());
+            let n = u16::from_le_bytes(hdr[10..12].try_into().unwrap()) as usize;
+            let Some(data) = seg.read_at(off + hlen as u64, cl, false) else {
+                out.push(format!("slab @({seg_id},{off}): body unreadable cl={cl}"));
+                continue;
+            };
+            let parsed = if kind == 5 {
+                self.parse_slab(dict_id, &data, raw_total, n)
+                    .map(|e| (e, n * 24))
+            } else {
+                self.parse_slab_v2(dict_id, &data, raw_total, n)
+            };
+            let Some((entries, tab_len)) = parsed else {
+                out.push(format!("slab @({seg_id},{off}): ENTRY TABLE UNPARSEABLE n={n}"));
+                continue;
+            };
+            // disk ground truth: hash -> (offset in raw, len)
+            let mut disk: HashMap<Hash, (u32, u32)> = HashMap::new();
+            let mut cursor = tab_len as u32;
+            for (_bid, rl, h) in &entries {
+                disk.insert(*h, (cursor, *rl));
+                cursor += *rl;
+            }
+            for (h, l) in &members {
+                match disk.get(h) {
+                    None => out.push(format!(
+                        "slab @({seg_id},{off}): map hash {h:016x} NOT IN entry table (n={n})"
+                    )),
+                    Some(&(doff, dlen)) => {
+                        if l.slab_off != doff || l.raw_len != dlen {
+                            out.push(format!(
+                                "slab @({seg_id},{off}): hash {h:016x} map (soff={}, raw={}) != disk (soff={doff}, raw={dlen})",
+                                l.slab_off, l.raw_len
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Intern a recipe key name; persists it as a kind-6 record so scans
     /// rebuild the table in log order.
     fn intern_key(&self, key: &str) -> Result<u16, String> {
@@ -2293,6 +2378,19 @@ impl Store {
         WST_RECIPE.0.fetch_add(t2w.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.last_written.lock().insert(key, hash);
         Ok(())
+    }
+
+    /// DIAGNOSTIC: fetch one blob's canonical bytes by hash (read_blob with
+    /// glob_to_canon applied). For probes/forensics only.
+    pub fn read_blob_by_hash(&self, h: Hash) -> Option<Vec<u8>> {
+        let loc = *self.blobs.read().get(&h)?;
+        self.read_blob(loc, None)
+    }
+
+    /// DIAGNOSTIC: the section hashes of a chunk's recipe, in order.
+    pub fn debug_section_hashes(&self, key: u64) -> Option<Vec<Hash>> {
+        let rec = self.load_recipe_for_debug(key)?;
+        Some(rec.sections)
     }
 
     /// Cheap integrity probe: does the chunk's recipe resolve AND do all
@@ -4669,6 +4767,12 @@ mod glob_slab_test {
     use super::*;
     use fastnbt::Value;
     use std::collections::HashMap as Map;
+    use std::sync::Mutex as StdMutex;
+
+    /// set_var/remove_var are process-global: the two GLOB tests must not
+    /// run concurrently or one's cleanup pulls the flags from under the
+    /// other (observed: glob_slab_count() == 0 flake).
+    static GLOB_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     /// Dense multi-state section with PROPER vanilla packing (the shared
     /// chunk_payload helper predates the strict packing checks and falls
@@ -4756,6 +4860,7 @@ mod glob_slab_test {
 
     #[test]
     fn glob_slab_roundtrip_and_reopen() {
+        let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Integration for the 0xCB GLOB slab form under CSAVES_FORCE_GLOB=1:
         // the pack stores glob slabs, reads convert members back to
         // canonical CSEC (byte-semantically equal), and scan rebuilds the
@@ -4805,7 +4910,138 @@ mod glob_slab_test {
         std::env::remove_var("CSAVES_FORCE_GLOB");
         std::env::remove_var("CSAVES_GLOB");
         let _ = fs::remove_dir_all(&dir);
-}
+    }
+
+    /// Chunk with a k=1 vertical shift-ref member (0xC9) whose target is a
+    /// dense 3-state section with strictly descending counts. Under GLOB
+    /// packing the target is rebuilt from the gid stream — the rebuild MUST
+    /// reproduce the canonical (count-DESC) palette order, because the
+    /// shift-ref stores its top plane as TARGET-CANONICAL indices.
+    ///
+    /// REGRESSION: glob_to_section once sorted counts ASCENDING; the rebuilt
+    /// target's palette positions rotated and every shift whose target was
+    /// glob-rebuilt decoded with permuted states (JJ corpus: 32 chunks where
+    /// andesite appeared at palette index 0). The top plane below uses the
+    /// state at canonical index 0, which the ascending sort moved to the
+    /// END — pre-fix code reads it back as a different block.
+    #[test]
+    fn glob_rebuild_keeps_shiftref_target_order() {
+        let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CSAVES_GLOB", "1");
+        std::env::set_var("CSAVES_FORCE_GLOB", "1");
+        let dir = temp_dir("glob-shift");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+
+        // Biased pseudo-random strata-free content: r = (x*31+z*17+yy*7)%10,
+        // S0 for r<6, S1 for r<9, else S2 — counts ~62/31/6% (strictly
+        // descending canonical order [S0, S1, S2]) with no runs longer than
+        // a few blocks, so neither RLE form is admitted and the sections
+        // stay DENSE (section_to_glob refuses RLE members). The member
+        // section is the target rotated down one plane (k=1 shift) with the
+        // top plane repeating the target's plane 0 (S0-dominant: canonical
+        // index 0, which the once-ascending rebuild sort moved to the END).
+        // Vanilla palette order is deliberately non-canonical ([S2, S0, S1])
+        // so canonicalization really reorders.
+        let payload = |parity: usize| -> Vec<u8> {
+            let sfx = format!("_p{parity}");
+            let states = [
+                format!("minecraft:gl_a{sfx}"),
+                format!("minecraft:gl_b{sfx}"),
+                format!("minecraft:gl_c{sfx}"),
+            ];
+            let vox_at = |lin: usize| -> usize {
+                let x = lin / 256;
+                let z = (lin / 16) % 16;
+                let yy = lin % 16;
+                let r = (x * 31 + z * 17 + yy * 7 + parity) % 10;
+                if r < 6 {
+                    0
+                } else if r < 9 {
+                    1
+                } else {
+                    2
+                }
+            };
+            let mut root: Map<String, Value> = Map::new();
+            root.insert("DataVersion".to_string(), Value::Int(4189));
+            let mut sec_list = Vec::new();
+            for y in 0..2i32 {
+                let mut vox = [0u8; 4096];
+                for lin in 0..4096usize {
+                    // voxel values index the vanilla palette [S2, S0, S1]
+                    let v = if y == 0 {
+                        vox_at(lin)
+                    } else {
+                        vox_at((lin + 256) % 4096) // k=1 plane shift
+                    };
+                    vox[lin] = match v {
+                        0 => 1u8, // S0 at vanilla index 1
+                        1 => 2u8, // S1 at vanilla index 2
+                        _ => 0u8, // S2 at vanilla index 0
+                    };
+                }
+                let mut sec: Map<String, Value> = Map::new();
+                sec.insert("Y".to_string(), Value::Byte(y as i8));
+                let mut bs: Map<String, Value> = Map::new();
+                // vanilla order deliberately non-canonical: [S2, S0, S1]
+                bs.insert(
+                    "palette".to_string(),
+                    Value::List(vec![
+                        Value::String(states[2].clone()),
+                        Value::String(states[0].clone()),
+                        Value::String(states[1].clone()),
+                    ]),
+                );
+                let data = chunknbt::dense_to_nostroddle(&vox, 4096, 8, 4);
+                bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+                sec.insert("block_states".to_string(), Value::Compound(bs));
+                sec_list.push(Value::Compound(sec));
+            }
+            root.insert("sections".to_string(), Value::List(sec_list));
+            fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+        };
+
+        for i in 0..40u64 {
+            st.write_chunk(i as u64, &payload(i as usize % 2), false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for _ in 0..50 {
+            st.request_pack();
+            if !st.compact_step() {
+                break;
+            }
+        }
+        assert!(
+            Store::glob_slab_count() > 0,
+            "no GLOB slabs were produced — target was never glob-rebuilt"
+        );
+        for i in 0..40u64 {
+            let want = payload(i as usize % 2);
+            let got = st
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable post-pack"));
+            assert!(
+                chunk_semantic_glob(&got, &want),
+                "chunk {i} semantically wrong post-pack (shift-ref target order broken)"
+            );
+        }
+        drop(st);
+        let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for i in 0..40u64 {
+            let want = payload(i as usize % 2);
+            let got = st2
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable post-reopen"));
+            assert!(
+                chunk_semantic_glob(&got, &want),
+                "chunk {i} semantically wrong post-reopen"
+            );
+        }
+        std::env::remove_var("CSAVES_FORCE_GLOB");
+        std::env::remove_var("CSAVES_GLOB");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
