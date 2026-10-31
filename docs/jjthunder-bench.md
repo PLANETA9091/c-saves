@@ -535,3 +535,36 @@ write 88 MB/s, entity write 4.9 GB/s — all CI gates pass.
 sections convert while the registry holds ≤ 256 states (1-byte gid
 streams); a bigger world just stops converting NEW sections — existing
 glob slabs keep reading through the persisted registry.
+
+### v0.9.5 — GLOB2 (0xCC) gid-stream forms
+
+Follow-up levers on the GLOB architecture (u16 registries + RLE'd gid
+streams), plus two bugs the work flushed out:
+
+* **wide-palette unpack** — the u8 unpack wrapped 9..16-bit voxel indices
+  (`as u8`), silently corrupting the canonical encoder's frequency counts,
+  the canonical remap and the section identity for palettes > 256 states
+  with indices >= 256. Vanilla terrain never triggers it; modded worlds
+  could. All unpack paths are width-correct now.
+* **transpose decode** — the first 0xCC build decoded gform 2/5 payloads
+  without un-transposing. `verify ok=944 bad=2` on this corpus (chunks
+  (0,9)/(1,9)): identical per-state histograms, permuted positions — the
+  0xC9 shift-ref signature (expansion against a rebuilt target palette).
+  The transpose permutation is an involution; the rebuild applies it
+  again. Regression test pins the gform-2-strictly-wins shape.
+
+GID-RLE admission divisor on this corpus (default via `CSAVES_GID_RLE_DIV`):
+
+| div | container | verify |
+| --- | --- | --- |
+| 4 (canonical-style 4x) | x2.99 | 946/946 |
+| 8 (default) | x3.07 | 946/946 |
+| 16 | x3.08 | 946/946 |
+| 0 (gid RLE off = legacy 0xCB only) | x3.08 | 946/946 |
+
+The JJ corpus is strata-dominated: its runny sections never reach the glob
+pass (canonical RLE beats the packed stream outright), and its dense
+sections are noise — so gid RLE has nothing to bite on HERE. The lever's
+real target is moderate-strata vanilla terrain (survival bigworld), where
+sections fail the canonical 4x-vs-packed-width test but clear the wider
+4096-byte gid window. The bigworld-survival CI bench measures it.

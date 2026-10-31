@@ -548,6 +548,39 @@ fn transpose_fast_y(v: &[u8], side: usize) -> Vec<u8> {
     out
 }
 
+/// u32-input twin of rle_encode_stream (GLOB gid streams wider than 8
+/// bits): [gid u16 LE][varint run] pairs in stream order.
+fn rle_encode_stream_u16(v: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() / 4 * 3 + 16);
+    let mut i = 0usize;
+    while i < v.len() {
+        let idx = v[i] as u16;
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == v[i] {
+            run += 1;
+        }
+        out.extend_from_slice(&idx.to_le_bytes());
+        push_uvarint(&mut out, run as u64);
+        i += run;
+    }
+    out
+}
+
+/// u32-input twin of transpose_fast_y (column-major reorder for wide gid
+/// streams).
+fn transpose_fast_y_u16(v: &[u32], side: usize) -> Vec<u32> {
+    let s2 = side * side;
+    let mut out = vec![0u32; v.len()];
+    for y in 0..side {
+        for z in 0..side {
+            for x in 0..side {
+                out[x * s2 + z * side + y] = v[y * s2 + z * side + x];
+            }
+        }
+    }
+    out
+}
+
 /// Decode a v3 (0xC7) section.
 fn section_decode3(b: &[u8]) -> Option<Value> {
     let f1 = *b.get(1)?;
@@ -746,6 +779,19 @@ fn dense_unpack(b: &[u8], n: usize, bits: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Width-safe voxel unpack: 9..16-bit streams (palettes > 256 states) must
+/// NOT go through dense_unpack — `as u8` would silently wrap indices >= 256
+/// and corrupt the section. Dispatches to the wide reader.
+fn dense_unpack_vox(b: &[u8], n: usize, bits: u32) -> Option<Vec<u32>> {
+    if bits <= 8 {
+        let v = dense_unpack(b, n, bits)?;
+        Some(v.iter().map(|&x| x as u32).collect())
+    } else {
+        let v = dense_unpack_wide(b, n, bits)?;
+        Some(v.iter().map(|&x| x as u32).collect())
+    }
+}
+
 /// 1.16+ no-straddle packing (vanilla layout).
 /// Pack a byte stream into vanilla no-straddle longs (entries per long =
 /// 64/bits, zero padding at the top). Public so sibling modules' tests can
@@ -914,6 +960,38 @@ pub fn unpack_nostroddle(longs: &[i64], n: usize, bits: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Wide twin of unpack_nostroddle for 9..16-bit streams (palettes > 256
+/// states): the u8 variant silently WRAPS indices >= 256, which corrupted
+/// the frequency counts, the canonical remap and the section identity for
+/// wide-palette sections. Palette sizes are <= 65535, so u16 suffices.
+pub fn unpack_nostroddle_wide(longs: &[i64], n: usize, bits: u32) -> Vec<u16> {
+    let per = (64 / bits) as usize;
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mut out = Vec::with_capacity(n);
+    for l in longs {
+        let lu = *l as u64;
+        for i in 0..per {
+            if out.len() == n {
+                return out;
+            }
+            out.push(((lu >> (i * bits as usize)) & mask) as u16);
+        }
+    }
+    out
+}
+
+/// Width-correct voxel unpack for block_states data (bits up to 16).
+fn unpack_nostroddle_vox(longs: &[i64], n: usize, bits: u32) -> Vec<u32> {
+    if bits <= 8 {
+        unpack_nostroddle(longs, n, bits).into_iter().map(|x| x as u32).collect()
+    } else {
+        unpack_nostroddle_wide(longs, n, bits)
+            .into_iter()
+            .map(|x| x as u32)
+            .collect()
+    }
 }
 
 /// Encode one section compound into the custom form (v3). Returns None when
@@ -1108,7 +1186,7 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             let bits = section_data_bits(n, entries, la.as_ref().len());
             let per = (64 / bits) as usize;
             if la.as_ref().len() == (entries + per - 1) / per {
-                for v in unpack_nostroddle(la.as_ref(), entries, bits) {
+                for v in unpack_nostroddle_vox(la.as_ref(), entries, bits) {
                     if (v as usize) < n {
                         counts[v as usize] += 1;
                     }
@@ -1154,7 +1232,7 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             && in_bits == out_bits
             && matches!(in_bits, 1 | 2 | 4 | 8 | 16 | 32)
             && ents.iter().enumerate().all(|(i, (_, old))| *old == i);
-        let v = unpack_nostroddle(data, entries, in_bits);
+        let v = unpack_nostroddle_vox(data, entries, in_bits);
         // sanity: every voxel index must be inside the palette. Valid vanilla
         // data always is; a mismatch means malformed/mutated source bytes
         // (garbage in unused codes). Fall back to raw NBT storage instead of
@@ -1553,7 +1631,10 @@ fn shift_sec_of(s: &Value, tab: &mut HashMap<Vec<u8>, u32>) -> Option<ShiftSec> 
             if la.as_ref().len() != (4096 + per - 1) / per {
                 return None;
             }
-            for (i, v) in unpack_nostroddle(la.as_ref(), 4096, bits).into_iter().enumerate() {
+            for (i, v) in unpack_nostroddle_vox(la.as_ref(), 4096, bits)
+                .into_iter()
+                .enumerate()
+            {
                 let o = v as usize;
                 if o >= n {
                     return None;
@@ -1570,14 +1651,14 @@ fn shift_sec_of(s: &Value, tab: &mut HashMap<Vec<u8>, u32>) -> Option<ShiftSec> 
         }
     }
     // canonical order of the original palette, mirroring enc_pal_data_canon:
-    // counts from the vanilla data (truncated u8 unpack, same as enc), sort
+    // counts from the vanilla data (width-correct unpack, same as enc), sort
     // by (count desc, (plain, name, props) asc).
     let mut counts = vec![0u32; n];
     if let Some(Value::LongArray(la)) = bm.get("data") {
         let bits = section_data_bits(n, 4096, la.as_ref().len());
         let per = (64 / bits) as usize;
         if la.as_ref().len() == (4096 + per - 1) / per {
-            for v in unpack_nostroddle(la.as_ref(), 4096, bits) {
+            for v in unpack_nostroddle_vox(la.as_ref(), 4096, bits) {
                 if (v as usize) < n {
                     counts[v as usize] += 1;
                 }
@@ -2285,9 +2366,10 @@ fn pal_semantic_equal(a: &Value, b: &Value, entries: usize) -> bool {
         match m.get("data") {
             Some(Value::LongArray(la)) => {
                 // derive the packing width from the array itself (floor:
-                // no-straddle padding lives in the last long)
+                // no-straddle padding lives in the last long); width-correct
+                // unpack — modded biome palettes can exceed 256 entries
                 let bits = ((la.as_ref().len() as u32) * 64 / entries as u32).max(1);
-                let idx = unpack_nostroddle(la.as_ref(), entries, bits);
+                let idx = unpack_nostroddle_vox(la.as_ref(), entries, bits);
                 Some(idx.into_iter().map(|i| names.get(i as usize).cloned().unwrap_or_default()).collect())
             }
             Some(_) => None,
@@ -3952,18 +4034,25 @@ fn glob_parse_entry(b: &[u8], p: &mut usize) -> Option<(GlobState, u8)> {
     Some((GlobState { plain, name, props }, kind))
 }
 
-/// Convert one canonical CSEC section (0xC7/0xC8) to the GLOB form (0xCB).
-/// Applies ONLY to dense block_states sections with data (RLE and
+/// Convert one canonical CSEC section (0xC7/0xC8) to the GLOB form (0xCB /
+/// 0xCC). Applies ONLY to dense block_states sections with data (RLE and
 /// single-state sections already beat the wide stream or carry no stream);
 /// everything after the block_states stream (biomes, light, starlight) is
 /// copied verbatim. Returns None when the section is not eligible — the
 /// caller then stores the canonical bytes (always safe).
 ///
-/// Layout: [0xCB][f1][f2'][f3'?][Y][4096 gid bytes][verbatim tail]
-/// — f2' is f2 with the block_states narrow/RLE bits cleared; the gid width
-/// is always 1 byte (the caller guarantees registry <= 256 states).
+/// Layouts:
+///   [0xCB][f1][f2'][f3'?][Y][4096 gid bytes][verbatim tail]
+///   [0xCC][f1][f2'][f3'?][Y][gform][payload][verbatim tail]
+/// — f2' is f2 with the block_states narrow/RLE bits cleared. gform encodes
+/// the gid-stream representation: bit0 RLE-coded, bit1 u16 width, bit2
+/// y-fast transposed order before RLE (values: 0 raw u8 — identical bytes
+/// to 0xCB, 1 rle u8, 2 rle-t u8, 3 raw u16, 4 rle u16, 5 rle-t u16). The
+/// raw-u8 case keeps the legacy 0xCB layout byte-for-byte; wider/RLE forms
+/// take 0xCC. The gid width follows the section's MAX gid: registries up
+/// to 65536 states are representable (u16 streams).
 pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> {
-    if reg.len() > 256 {
+    if reg.len() > 65536 {
         return None;
     }
     let magic = *csec.first()?;
@@ -4009,7 +4098,7 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     // vanilla max(4, bits_for(n)) clamp
     let out_bits = if f2 & 4 != 0 { bits_for(n) } else { bits_for(n).max(4) };
     let stream_len = (4096usize * out_bits as usize).div_ceil(8);
-    let Some(vox) = dense_unpack(csec.get(p..p + stream_len)?, 4096, out_bits) else {
+    let Some(vox) = dense_unpack_vox(csec.get(p..p + stream_len)?, 4096, out_bits) else {
         if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
             eprintln!("glob: dense_unpack failed n={n} out_bits={out_bits} stream_len={stream_len} p={p} len={}", csec.len());
         }
@@ -4021,32 +4110,125 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
         }
         return None;
     }
-    // gid stream: 1 byte per voxel. The registry may cross the 256-state
+    // gid stream: one gid per voxel. The registry may cross the 256-state
     // line MID-CONVERSION (earlier sections in the same pack wave insert
-    // new states): a gid above 255 cannot be represented in the u8 stream —
-    // refuse the conversion instead of silently truncating.
-    let mut stream = Vec::with_capacity(4096);
+    // new states): gids above 255 switch this section's stream to the u16
+    // width instead of refusing the conversion (registries up to 65536
+    // states stay representable).
+    let mut gids: Vec<u32> = Vec::with_capacity(4096);
+    let mut max_gid: u32 = 0;
     for v in &vox {
         let st = &states[*v as usize];
         let g = reg.get_or_insert(st.clone());
-        if g > 255 {
+        if g > 65535 {
             return None;
         }
-        stream.push(g as u8);
+        if g > max_gid {
+            max_gid = g;
+        }
+        gids.push(g);
     }
-    let mut out = Vec::with_capacity(p + stream_len + stream.len());
-    out.push(GLOB_MAGIC);
-    out.push(f1);
-    out.push(f2 & !4 & !16 & !32);
-    // 0xCB ALWAYS carries the f3 byte (all f1/f2 bits are taken; the
-    // explicit shape removes any v3/v4 header ambiguity)
-    out.push(f3);
-    out.push(y);
-    out.extend_from_slice(&stream);
+    let wide = max_gid > 255;
+    // GID-RLE admission divisor: the raw gid stream wins slabs through
+    // CROSS-SECTION byte alignment (identical geology -> identical streams);
+    // RLE destroys that alignment (run boundaries differ). The uncompressed
+    // 4x rule admits streams whose RLE is small but whose slab compresses
+    // WORSE (corpus: x2.99 vs x3.08 at div=4). The divisor is tunable —
+    // CSAVES_GID_RLE_DIV, 0 disables gid RLE entirely.
+    let div: u64 = std::env::var("CSAVES_GID_RLE_DIV")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+        eprintln!("glob: n={n} vox_max={:?} reg_len={} max_gid={max_gid} wide={wide}", vox.iter().max(), reg.len());
+    }
+    // The run structure of the gid stream equals the canonical index stream
+    // (palette mapping is a bijection), but the RLE admission WINDOW differs:
+    // the raw gid stream is always 4096/8192 bytes while the canonical dense
+    // stream packs at out_bits. Moderate-run sections that LOSE the
+    // canonical RLE admission (ra*4 > dense bytes) still clear the wider gid
+    // window — and the RLE'd [gid][run] pairs of similar strata line up
+    // byte-for-byte across the whole slab window (the same lever that made
+    // the raw gid form win x2.16).
+    let (gform, payload): (u8, Vec<u8>) = if wide {
+        let mut raw = Vec::with_capacity(8192);
+        for g in &gids {
+            raw.extend_from_slice(&(*g as u16).to_le_bytes());
+        }
+        let rv = rle_encode_stream_u16(&gids);
+        let rt = rle_encode_stream_u16(&transpose_fast_y_u16(&gids, 16));
+        let raw_ok = |r: &Vec<u8>| {
+            div > 0
+                && r.len() as u64 * div <= raw.len() as u64
+                && r.len() + 32 <= raw.len()
+        };
+        let rv_ok = raw_ok(&rv);
+        let rt_ok = raw_ok(&rt);
+        if rv_ok {
+            if rt_ok && rt.len() < rv.len() {
+                (5, rt)
+            } else {
+                (4, rv)
+            }
+        } else if rt_ok {
+            (5, rt)
+        } else {
+            (3, raw)
+        }
+    } else {
+        let mut raw = Vec::with_capacity(4096);
+        for g in &gids {
+            raw.push(*g as u8);
+        }
+        let admit = |r: &Vec<u8>| {
+            div > 0
+                && r.len() as u64 * div <= raw.len() as u64
+                && r.len() + 32 <= raw.len()
+        };
+        let ra = rle_encode_stream(&raw);
+        let ra_ok = admit(&ra);
+        let rt = rle_encode_stream(&transpose_fast_y(&raw, 16));
+        let rt_ok = admit(&rt);
+        if ra_ok {
+            if rt_ok && rt.len() < ra.len() {
+                (2, rt)
+            } else {
+                (1, ra)
+            }
+        } else if rt_ok {
+            (2, rt)
+        } else {
+            (0, raw)
+        }
+    };
+    let mut out = Vec::with_capacity(p + stream_len + payload.len() + 8);
+    if gform == 0 {
+        // legacy 0xCB: byte-identical to the pre-0xCC wire (raw u8 stream)
+        out.push(GLOB_MAGIC);
+        out.push(f1);
+        out.push(f2 & !4 & !16 & !32);
+        // 0xCB ALWAYS carries the f3 byte (all f1/f2 bits are taken; the
+        // explicit shape removes any v3/v4 header ambiguity)
+        out.push(f3);
+        out.push(y);
+        out.extend_from_slice(&payload);
+    } else {
+        out.push(GLOB2_MAGIC);
+        out.push(f1);
+        out.push(f2 & !4 & !16 & !32);
+        out.push(f3);
+        out.push(y);
+        out.push(gform);
+        out.extend_from_slice(&payload);
+    }
     out.extend_from_slice(&csec[p + stream_len..]);
     ST_GLOB_ENC.fetch_add(1, Ordering::Relaxed);
     if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
-        eprintln!("glob: converted ok n={n} canon={} glob={}", csec.len(), out.len());
+        eprintln!(
+            "glob: converted ok n={n} canon={} glob={} gform={gform}",
+            csec.len(),
+            out.len()
+        );
     }
     Some(out)
 }
@@ -4175,6 +4357,234 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
 }
 
 pub const GLOB_MAGIC: u8 = 0xCB;
+
+/// 0xCC GLOB2 (v0.9.5): RLE-coded / u16-width gid streams. Layout
+/// [0xCC][f1][f2'][f3][Y][gform][payload][verbatim tail] — gform values in
+/// section_to_glob's doc (0 raw u8, 1 rle u8, 2 rle-t u8, 3 raw u16,
+/// 4 rle u16, 5 rle-t u16). Raw-u8 members stay on the legacy 0xCB wire.
+pub const GLOB2_MAGIC: u8 = 0xCC;
+
+/// A slab member carries a GLOB form (either wire version).
+pub fn is_glob_member(b: &[u8]) -> bool {
+    matches!(b.first(), Some(&GLOB_MAGIC) | Some(&GLOB2_MAGIC))
+}
+
+/// True when the member's gid stream is u16-wide (slab reg_w bookkeeping).
+pub fn glob_member_wide(b: &[u8]) -> bool {
+    b.first() == Some(&GLOB2_MAGIC) && matches!(b.get(5), Some(3 | 4 | 5))
+}
+
+/// Dispatch any GLOB member (0xCB legacy raw-u8 or 0xCC) back to canonical
+/// CSEC bytes. This is the single read-side entry point.
+pub fn glob_any_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+    match glob.first() {
+        Some(&GLOB_MAGIC) => glob_to_section(glob, reg),
+        Some(&GLOB2_MAGIC) => glob2_to_section(glob, reg),
+        _ => None,
+    }
+}
+
+/// Rebuild canonical CSEC bytes from a 0xCC GLOB2 member. Mirrors
+/// glob_to_section's rebuild exactly — frequency-canonical palette order
+/// (count DESC, ties (plain, name, props) ASC), same dense/RLE/RLE-t form
+/// re-choice for n <= 256, dense-only wide packing for n > 256 — with a
+/// payload-decode step (gform) in front.
+pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+    if glob.first() != Some(&GLOB2_MAGIC) {
+        return None;
+    }
+    let f1 = *glob.get(1)?;
+    let f2 = *glob.get(2)?;
+    let f3 = *glob.get(3)?; // 0xCC always carries the f3 byte
+    let y = *glob.get(4)?;
+    let gform = *glob.get(5)?;
+    let mut p = 6usize;
+    if f1 & 3 != 3 {
+        return None; // never globbed without a data stream
+    }
+    // decode the gid payload: one u32 gid per voxel
+    let mut gids: Vec<u32> = Vec::with_capacity(4096);
+    match gform {
+        0 => {
+            let s = glob.get(p..p + 4096)?;
+            p += 4096;
+            gids.extend(s.iter().map(|&g| g as u32));
+        }
+        1 | 2 => {
+            // [gid u8][varint run] pairs. gform 2 stored the RLE over the
+            // y-fast TRANSPOSED order — the transpose permutation is an
+            // involution, so applying it again restores vanilla order.
+            let mut raw: Vec<u8> = Vec::with_capacity(4096);
+            let mut total = 0usize;
+            while total < 4096 {
+                let g = *glob.get(p)?;
+                p += 1;
+                let run = read_uvarint(glob, &mut p)? as usize;
+                total += run;
+                if total > 4096 {
+                    return None;
+                }
+                raw.extend(std::iter::repeat(g).take(run));
+            }
+            if gform == 2 {
+                for g in transpose_fast_y(&raw, 16) {
+                    gids.push(g as u32);
+                }
+            } else {
+                gids.extend(raw.iter().map(|&g| g as u32));
+            }
+        }
+        3 => {
+            let s = glob.get(p..p + 8192)?;
+            p += 8192;
+            for c in s.chunks_exact(2) {
+                gids.push(u16::from_le_bytes(c.try_into().ok()?) as u32);
+            }
+        }
+        4 | 5 => {
+            // [gid u16 LE][varint run] pairs; gform 5 un-transposes like
+            // gform 2 above
+            let mut raw: Vec<u32> = Vec::with_capacity(4096);
+            let mut total = 0usize;
+            while total < 4096 {
+                let c = glob.get(p..p + 2)?;
+                p += 2;
+                let g = u16::from_le_bytes(c.try_into().ok()?) as u32;
+                let run = read_uvarint(glob, &mut p)? as usize;
+                total += run;
+                if total > 4096 {
+                    return None;
+                }
+                raw.extend(std::iter::repeat(g).take(run));
+            }
+            if gform == 5 {
+                gids.extend(transpose_fast_y_u16(&raw, 16));
+            } else {
+                gids.extend(raw);
+            }
+        }
+        _ => return None,
+    }
+    if gids.len() != 4096 {
+        return None;
+    }
+    let tail = &glob[p..];
+    let max_gid = *gids.iter().max()? as usize;
+    // counts per gid over the section's voxels — sized to the gid range the
+    // section actually touches (the u8 hot path never allocates beyond 256)
+    let mut counts = vec![0u32; max_gid + 1];
+    for &g in &gids {
+        counts[g as usize] += 1;
+    }
+    // distinct used gids in the frequency-canonical order — EXACTLY the
+    // enc_pal_data_canon rule (count DESC, ties (plain, name, props) ASC);
+    // see glob_to_section for why byte-identity matters (shift-ref perms)
+    let mut used: Vec<(u32, u32)> = (0..counts.len() as u32)
+        .filter(|&g| counts[g as usize] > 0)
+        .map(|g| (counts[g as usize], g))
+        .collect();
+    let reg_snap: Vec<(u32, bool, String, Vec<(String, String)>)> = used
+        .iter()
+        .map(|&(c, g)| {
+            let s = reg.get(g);
+            (
+                c,
+                s.map(|s| s.plain).unwrap_or(false),
+                s.map(|s| s.name.clone()).unwrap_or_default(),
+                s.map(|s| s.props.clone()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..used.len()).collect();
+    order.sort_by(|&i, &j| {
+        let (ci, _) = used[i];
+        let (cj, _) = used[j];
+        let (_, pi, ni, propsi) = &reg_snap[i];
+        let (_, pj, nj, propsj) = &reg_snap[j];
+        cj.cmp(&ci).then_with(|| (pi, ni, propsi).cmp(&(pj, nj, propsj)))
+    });
+    let ordered: Vec<(u32, u32)> = order.into_iter().map(|i| used[i]).collect();
+    let used = ordered;
+    let n = used.len();
+    if n == 0 || n > 65535 {
+        return None;
+    }
+    let magic = if f3 != 0 { CSEC4_MAGIC } else { CSEC3_MAGIC };
+    let mut gid2canon = vec![0u16; max_gid + 1];
+    for (i, (_, g)) in used.iter().enumerate() {
+        gid2canon[*g as usize] = i as u16;
+    }
+    let mut out = Vec::with_capacity(16 + n * 32 + 8192 + tail.len());
+    if n > 256 {
+        // wide palette rebuild: dense-only, exactly the canonical n>256 path
+        let out_bits = bits_for(n);
+        let f2n = f2 & !4 & !16 & !32;
+        out.push(magic);
+        out.push(f1);
+        out.push(f2n);
+        if magic == CSEC4_MAGIC {
+            out.push(f3);
+        }
+        out.push(y);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        for (_, g) in &used {
+            let st = reg.get(*g)?;
+            glob_put_entry(&mut out, st);
+        }
+        let mut w = BitW::new();
+        for g in &gids {
+            w.put(gid2canon[*g as usize] as u64, out_bits);
+        }
+        out.extend_from_slice(&w.finish());
+        out.extend_from_slice(tail);
+        ST_GLOB_DEC.fetch_add(1, Ordering::Relaxed);
+        return Some(out);
+    }
+    // narrow rebuild: same form re-choice as the canonical encoder
+    let narrow = bits_for(n) < 4;
+    let out_bits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+    let vox: Vec<u8> = gids.iter().map(|&g| gid2canon[g as usize] as u8).collect();
+    let dense = dense_pack(&vox, out_bits);
+    let mut best_len = dense.len();
+    let mut best: Option<(u8, Vec<u8>)> = None;
+    let ra = rle_encode_stream(&vox);
+    if ra.len() * 4 <= dense.len() && ra.len() + 32 <= dense.len() {
+        best_len = ra.len();
+        best = Some((1, ra));
+    }
+    let rb = rle_encode_stream(&transpose_fast_y(&vox, 16));
+    if rb.len() * 4 <= dense.len() && rb.len() + 32 <= dense.len() && rb.len() < best_len {
+        best = Some((2, rb));
+    }
+    let mut f2n = f2 & !4 & !16 & !32;
+    if narrow {
+        f2n |= 4;
+    }
+    out.push(magic);
+    out.push(f1);
+    out.push(f2n);
+    if magic == CSEC4_MAGIC {
+        out.push(f3);
+    }
+    out.push(y);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    for (_, g) in &used {
+        let st = reg.get(*g)?;
+        glob_put_entry(&mut out, st);
+    }
+    match best {
+        None => {
+            out.extend_from_slice(&dense);
+        }
+        Some((ord, bytes)) => {
+            out.extend_from_slice(&bytes);
+            out[2] |= ord << 4;
+        }
+    }
+    out.extend_from_slice(tail);
+    ST_GLOB_DEC.fetch_add(1, Ordering::Relaxed);
+    Some(out)
+}
 
 static ST_GLOB_ENC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ST_GLOB_DEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5067,40 +5477,97 @@ mod glob_tests {
         Value::Compound(sec)
     }
 
+    /// True wide-voxel section: u16 values spanning all `distinct` states
+    /// (the u8 helper above wraps values >= 256 — useless for the >256-state
+    /// paths). Data is packed no-straddle at the vanilla clamp width.
+    fn glob_section_wide(y: i32, seed: u64, distinct: usize) -> Value {
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(y as i8));
+        let mut bs: Map<String, Value> = Map::new();
+        let mut pal = Vec::new();
+        for i in 0..distinct {
+            let mut c: Map<String, Value> = Map::new();
+            c.insert("Name".to_string(), Value::String(format!("minecraft:block_{i}")));
+            if i % 2 == 0 {
+                let mut props: Map<String, Value> = Map::new();
+                props.insert("axis".to_string(), Value::String(format!("{}_{}", i % 2, i % 7)));
+                props.insert("lit".to_string(), Value::String("true".to_string()));
+                c.insert("Properties".to_string(), Value::Compound(props));
+            }
+            pal.push(Value::Compound(c));
+        }
+        bs.insert("palette".to_string(), Value::List(pal));
+        let mut st = seed | 1;
+        let vox: Vec<u16> = (0..4096)
+            .map(|_| {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                (st % distinct as u64) as u16
+            })
+            .collect();
+        let vbits = (((distinct as u32 - 1).ilog2() + 1).max(4)) as u32;
+        // vanilla no-straddle longs: per = 64/bits entries per long, entry k
+        // at bit offset k*bits (matches dense_to_nostroddle's layout)
+        let per = (64 / vbits) as usize;
+        let mut longs = vec![0i64; (4096 + per - 1) / per];
+        for (i, &v) in vox.iter().enumerate() {
+            longs[i / per] |= (v as i64) << ((i % per) * vbits as usize);
+        }
+        bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(longs)));
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let mut bio: Map<String, Value> = Map::new();
+        bio.insert(
+            "palette".to_string(),
+            Value::List(vec![Value::String("minecraft:plains".to_string())]),
+        );
+        sec.insert("biomes".to_string(), Value::Compound(bio));
+        sec.insert("SkyLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![15i8; 2048])));
+        Value::Compound(sec)
+    }
+
     #[test]
     fn glob_roundtrip_semantic_and_registry_persist() {
         for distinct in [2usize, 5, 16, 17, 300] {
-            let src = glob_section(-4 + distinct as i32, 0xDEADBEEF, distinct);
+            // the >256 case must use TRUE wide voxels: the u8 helper wraps
+            // values >= 256, so a 300-palette section built from it only
+            // ever references 256 states
+            let src = if distinct > 256 {
+                glob_section_wide(-4 + distinct as i32, 0xDEADBEEF, distinct)
+            } else {
+                glob_section(-4 + distinct as i32, 0xDEADBEEF, distinct)
+            };
             let mut reg = StateRegistry::new();
             let canon = match section_encode(&src) {
                 Some(c) => c,
                 None => panic!("canonical encode failed at distinct={distinct}"),
             };
             let glob = section_to_glob(&canon, &mut reg);
+            let back;
             if distinct > 256 {
-                // the u8 gid stream only admits registries <= 256: the
-                // 300-state section itself is fine but pushing >256 states
-                // mid-run disables further conversions
-                if let Some(g) = glob {
-                    let back = glob_to_section(&g, &reg).expect("decode");
-                    let a = section_decode(&canon).expect("decode canon");
-                    let b = section_decode(&back).expect("decode back");
-                    assert!(sections_semantically_equal(&a, &b), "semantic {distinct}");
-                }
-                continue;
+                // v0.9.5: registries above 256 states take the u16 gid
+                // stream (0xCC gform 3 for noisy content) instead of
+                // refusing the conversion
+                let glob = glob.expect("u16 glob conversion");
+                assert_eq!(glob[0], GLOB2_MAGIC, "wide registry must take 0xCC");
+                back = glob_any_to_section(&glob, &reg).expect("decode");
+                let a = section_decode(&canon).expect("decode canon");
+                let b = section_decode(&back).expect("decode back");
+                assert!(sections_semantically_equal(&a, &b), "semantic {distinct}");
+            } else {
+                let glob = glob.expect("glob conversion");
+                assert_eq!(glob[0], GLOB_MAGIC);
+                back = glob_to_section(&glob, &reg).expect("decode");
+                // semantic equality through the SECTION DECODER (CSEC -> Value):
+                // the rebuilt palette holds only USED states, so the wire bytes
+                // differ while the section content is identical
+                let a = section_decode(&canon).expect("decode canon");
+                let b = section_decode(&back).expect("decode back");
+                assert!(
+                    sections_semantically_equal(&a, &b),
+                    "semantic roundtrip failed at distinct={distinct}"
+                );
             }
-            let glob = glob.expect("glob conversion");
-            assert_eq!(glob[0], GLOB_MAGIC);
-            let back = glob_to_section(&glob, &reg).expect("decode");
-            // semantic equality through the SECTION DECODER (CSEC -> Value):
-            // the rebuilt palette holds only USED states, so the wire bytes
-            // differ while the section content is identical
-            let a = section_decode(&canon).expect("decode canon");
-            let b = section_decode(&back).expect("decode back");
-            assert!(
-                sections_semantically_equal(&a, &b),
-                "semantic roundtrip failed at distinct={distinct}"
-            );
             // registry persistence
             let bytes = reg.to_bytes();
             let mut reg2 = StateRegistry::from_bytes(&bytes).expect("registry parse");
@@ -5112,9 +5579,9 @@ mod glob_tests {
             // the same gid stream content (determinism)
             let glob2 = section_to_glob(&back, &mut reg2).expect("re-glob");
             let a2 = section_decode(&back).expect("re-decode canon");
-            // production contract: 0xCB members are converted back by
+            // production contract: GLOB members are converted back by
             // read_blob BEFORE any decoder; mirror that here
-            let back2 = glob_to_section(&glob2, &reg2).expect("decode glob2");
+            let back2 = glob_any_to_section(&glob2, &reg2).expect("decode glob2");
             let b2 = section_decode(&back2).expect("re-decode glob");
             assert!(sections_semantically_equal(&a2, &b2), "re-glob semantic {distinct}");
         }
@@ -5167,5 +5634,137 @@ mod glob_tests {
         if canon2[2] & 48 != 0 {
             assert!(section_to_glob(&canon2, &mut reg).is_none(), "rle must not glob");
         }
+    }
+
+    /// Two-state section with moderate horizontal runs: the canonical dense
+    /// stream packs at 1 bit (512 B) so the RLE admission (ra*4 <= dense)
+    /// fails, but the 4096-byte raw gid stream clears the wider window —
+    /// the member must take the 0xCC RLE form and roundtrip byte-identically.
+    fn strata_section(y: i32, a: &str, b: &str, period: usize) -> Value {
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(y as i8));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert(
+            "palette".to_string(),
+            Value::List(vec![
+                Value::String(a.to_string()),
+                Value::String(b.to_string()),
+            ]),
+        );
+        let vox: Vec<u8> = (0..4096).map(|i| ((i / period) % 2) as u8).collect();
+        bs.insert(
+            "data".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(dense_to_nostroddle(&vox, 4096, 8, 4))),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        Value::Compound(sec)
+    }
+
+    #[test]
+    fn glob_transposed_gid_form_roundtrip_byte_identical() {
+        // vertical-wall content: state varies with x, constant along y —
+        // vanilla-order RLE has runs of 1 (never admitted), the y-fast
+        // transposed order has runs of 16 (admitted) -> gform must be 2,
+        // and the rebuild must un-transpose back to byte-identical canon
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(9));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert(
+            "palette".to_string(),
+            Value::List(vec![
+                Value::String("minecraft:brick_a".to_string()),
+                Value::String("minecraft:brick_b".to_string()),
+            ]),
+        );
+        // checkerboard columns: state = (x+z)%2 — vanilla order (x fastest)
+        // alternates every voxel (runs of 1), the y-fast transposed order has
+        // runs of 16 (whole columns) -> canonical dense, gid RLE gform 2
+        let vox: Vec<u8> = (0..4096)
+            .map(|i| ((i % 16 + (i / 16) % 16) % 2) as u8)
+            .collect();
+        bs.insert(
+            "data".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(dense_to_nostroddle(&vox, 4096, 8, 4))),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        let canon = section_encode(&Value::Compound(sec)).expect("encode");
+        assert_eq!(canon[2] & 48, 0, "source must be canonical-dense");
+        let mut reg = StateRegistry::new();
+        let glob = section_to_glob(&canon, &mut reg).expect("glob conversion");
+        assert_eq!(glob[0], GLOB2_MAGIC);
+        assert_eq!(glob[5], 2, "transposed rle form must win for wall content");
+        let back = glob_any_to_section(&glob, &reg).expect("decode");
+        assert_eq!(back, canon, "gform 2 roundtrip must be byte-identical");
+    }
+
+    #[test]
+    fn glob_rle_gid_form_roundtrip_byte_identical() {
+        // pin the admission divisor: this test needs the 4x rule so the
+        // ~850-byte strata RLE is admitted (the default 8x would refuse it)
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        std::env::set_var("CSAVES_GID_RLE_DIV", "4");
+        let src = strata_section(5, "minecraft:block_a", "minecraft:block_b", 10);
+        let canon = section_encode(&src).expect("encode");
+        // the canonical stream stays DENSE (runs too short for the packed
+        // width) — otherwise the section would never reach the glob pass
+        assert_eq!(canon[2] & 48, 0, "source must be canonical-dense");
+        let mut reg = StateRegistry::new();
+        let glob = section_to_glob(&canon, &mut reg).expect("glob conversion");
+        assert_eq!(glob[0], GLOB2_MAGIC, "rle gid streams take 0xCC");
+        let gform = glob[5];
+        assert!(
+            gform == 1 || gform == 2,
+            "expected rle u8 form, got gform={gform}"
+        );
+        // the payload must actually be smaller than the raw gid stream
+        assert!(glob.len() < canon.len() + 4096, "rle payload shrank the member");
+        let back = glob_any_to_section(&glob, &reg).expect("decode");
+        assert_eq!(back, canon, "0xCC rle roundtrip must be byte-identical");
+        // noisy content keeps the legacy raw-u8 wire
+        let noisy = glob_section(6, 0xFEED, 16);
+        let canon_n = section_encode(&noisy).expect("encode noisy");
+        let glob_n = section_to_glob(&canon_n, &mut reg).expect("glob noisy");
+        assert_eq!(glob_n[0], GLOB_MAGIC, "noisy gid stream stays 0xCB");
+        assert_eq!(glob_any_to_section(&glob_n, &reg).unwrap(), canon_n);
+        std::env::remove_var("CSAVES_GID_RLE_DIV");
+    }
+
+    #[test]
+    fn glob_u16_wide_registry_rle_roundtrip() {
+        // push the registry past 256 states, then convert a strata section
+        // whose states land at gids > 255: the u16 RLE form (gform 4/5)
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        std::env::set_var("CSAVES_GID_RLE_DIV", "4");
+        let pre = glob_section_wide(-2, 0xAAAA, 300);
+        let mut reg = StateRegistry::new();
+        let pre_canon = section_encode(&pre).expect("encode pre");
+        let pre_glob = section_to_glob(&pre_canon, &mut reg).expect("pre glob");
+        assert_eq!(pre_glob[0], GLOB2_MAGIC, "noisy wide section takes 0xCC gform 3");
+        assert_eq!(pre_glob[5], 3, "raw u16 gform for noisy content");
+        let pre_back = glob_any_to_section(&pre_glob, &reg).expect("pre decode");
+        let a = section_decode(&pre_canon).expect("decode");
+        let b = section_decode(&pre_back).expect("decode");
+        assert!(sections_semantically_equal(&a, &b), "wide semantic");
+        // strata states AFTER the 256 line: gids 300/301
+        let src = strata_section(7, "minecraft:block_300", "minecraft:block_301", 12);
+        let canon = section_encode(&src).expect("encode strata");
+        assert_eq!(canon[2] & 48, 0, "strata source must be canonical-dense");
+        let glob = section_to_glob(&canon, &mut reg).expect("wide strata glob");
+        assert_eq!(glob[0], GLOB2_MAGIC);
+        let gform = glob[5];
+        assert!(
+            gform == 4 || gform == 5,
+            "expected rle u16 form, got gform={gform}"
+        );
+        assert!(glob.len() < canon.len() + 8192, "u16 rle payload shrank the member");
+        let back = glob_any_to_section(&glob, &reg).expect("wide strata decode");
+        assert_eq!(back, canon, "u16 rle roundtrip must be byte-identical");
+        // registry persistence across the >256 line: reload from bytes,
+        // decode again
+        let reg2 = StateRegistry::from_bytes(&reg.to_bytes()).expect("registry parse");
+        assert_eq!(reg2.len(), reg.len());
+        let back2 = glob_any_to_section(&glob, &reg2).expect("decode with reloaded registry");
+        assert_eq!(back2, canon);
+        std::env::remove_var("CSAVES_GID_RLE_DIV");
     }
 }

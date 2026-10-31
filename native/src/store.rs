@@ -2570,7 +2570,7 @@ impl Store {
                 let mut glob_store: Vec<Vec<u8>> = Vec::with_capacity(slices_raw.len());
                 for s in slices_raw.iter() {
                     let sv: &[u8] = s;
-                    if sv.first() == Some(&chunknbt::GLOB_MAGIC) {
+                    if chunknbt::is_glob_member(sv) {
                         if let Some(c) = self.glob_to_canon(sv) {
                             glob_store.push(c);
                         }
@@ -2580,7 +2580,7 @@ impl Store {
                 let mut slices: Vec<&[u8]> = Vec::with_capacity(slices_raw.len());
                 for s in slices_raw.iter() {
                     let sv: &[u8] = s;
-                    if sv.first() == Some(&chunknbt::GLOB_MAGIC) && gi < glob_store.len() {
+                    if chunknbt::is_glob_member(sv) && gi < glob_store.len() {
                         slices.push(glob_store[gi].as_slice());
                         gi += 1;
                     } else {
@@ -2789,15 +2789,16 @@ impl Store {
         self.decompress(loc.dict_id, &data, loc.raw_len)
     }
 
-    /// Convert a member's raw bytes to canonical CSEC when they carry the
-    /// 0xCB GLOB form. Reads are the only place 0xCB bytes exist; every
-    /// decoder and every re-pack sees canonical bytes.
+    /// Convert a member's raw bytes to canonical CSEC when they carry a
+    /// GLOB form (0xCB raw-u8 legacy or 0xCC rle/u16). Reads are the only
+    /// place GLOB bytes exist; every decoder and every re-pack sees
+    /// canonical bytes.
     fn glob_to_canon(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        if bytes.first() != Some(&chunknbt::GLOB_MAGIC) {
+        if !chunknbt::is_glob_member(bytes) {
             return Some(bytes.to_vec());
         }
         let reg = self.glob_reg.lock();
-        match chunknbt::glob_to_section(bytes, &reg) {
+        match chunknbt::glob_any_to_section(bytes, &reg) {
             Some(c) => Some(c),
             None => {
                 ST_GLOB_CONV_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -3225,7 +3226,7 @@ impl Store {
             // matches cross-section). Non-converting members keep their
             // canonical bytes; every member is self-describing by magic.
             let mut glob: Option<(Vec<usize>, Vec<Vec<u8>>)> = None;
-            if self.glob_enabled() && self.glob_reg.lock().len() <= 256 {
+            if self.glob_enabled() && self.glob_reg.lock().len() <= 65536 {
                 let mut reg = self.glob_reg.lock();
                 let before = reg.len();
                 let mut glens = Vec::with_capacity(n);
@@ -3298,6 +3299,18 @@ impl Store {
                 }
             };
             let raw_total = stream.len() as u32;
+            // reg_w: the widest gid stream among this slab's GLOB members
+            // (informational on read — members are self-describing by magic)
+            let reg_w = match &glob {
+                Some((_, graws)) => {
+                    if graws.iter().any(|g| chunknbt::glob_member_wide(g)) {
+                        2u8
+                    } else {
+                        1u8
+                    }
+                }
+                None => 1u8,
+            };
             let mut body = Vec::with_capacity(13 + comp.len());
             body.push(kind_byte);
             body.push(dict_id);
@@ -3305,7 +3318,7 @@ impl Store {
             body.extend_from_slice(&raw_total.to_le_bytes());
             body.extend_from_slice(&(n as u16).to_le_bytes());
             if kind_byte & 0x80 != 0 {
-                body.push(1u8); // reg_w: 1-byte gid streams
+                body.push(reg_w); // 1 = u8 gid streams, 2 = u16 present
             }
             body.extend_from_slice(&comp);
             let blen = body.len() as u64;
@@ -4762,17 +4775,23 @@ pub mod tests {
 }
 
 #[cfg(test)]
-mod glob_slab_test {
+pub(crate) mod glob_slab_test {
     use super::tests::{bench_cfg, semantic, temp_dir};
     use super::*;
     use fastnbt::Value;
     use std::collections::HashMap as Map;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
     /// set_var/remove_var are process-global: the two GLOB tests must not
     /// run concurrently or one's cleanup pulls the flags from under the
     /// other (observed: glob_slab_count() == 0 flake).
     static GLOB_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Shared with chunknbt's GLOB env-var tests (CSAVES_GID_RLE_DIV) —
+    /// section_to_glob reads it on the pack path these tests exercise.
+    pub(crate) fn tests_glob_lock() -> StdMutexGuard<'static, ()> {
+        GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// Dense multi-state section with PROPER vanilla packing (the shared
     /// chunk_payload helper predates the strict packing checks and falls

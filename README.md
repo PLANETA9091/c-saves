@@ -103,6 +103,48 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.5 — GLOB2 (0xCC): RLE'd gid streams + u16 registries + a latent wide-palette fix
+
+Three increments on the GLOB architecture, plus one bug the work flushed out:
+
+1. **0xCC GLOB2 forms.** The raw 4096-byte gid stream is no longer the only
+   wire: `[gid][varint run]` RLE pairs in vanilla order (gform 1), in the
+   y-fast transposed order (gform 2), and their u16 twins (gform 3/4/5) for
+   registries past 256 states. Raw-u8 members keep emitting the legacy 0xCB
+   bytes unchanged — 0xCC appears only when a wider form wins. The old
+   `registry > 256 states → refuse conversion` rule is gone: a section whose
+   gids exceed 255 switches to the u16 stream instead (the registry may
+   cross the line MID-conversion; registries up to 65536 states stay
+   representable — modded worlds keep the x2.16 lever).
+2. **Latent wide-palette corruption fix.** The u8 unpack wrapped voxel
+   indices >= 256 (`as u8` on a 9..16-bit stream): the canonical encoder's
+   frequency counts, its canonical remap, the section identity AND the biome
+   identity all silently mis-mapped for palettes > 256 states whose data
+   references the upper half. Vanilla terrain never gets there (its palettes
+   are small); modded worlds could. All unpack paths are width-correct now
+   (`unpack_nostroddle_wide` / `dense_unpack_vox`).
+3. **The transpose decode fix — caught by the corpus gate.** The first
+   build forgot to un-transpose gform 2/5 payloads (the transpose
+   permutation is an involution — applying it again restores vanilla
+   order). jj_profile: `verify ok=944 bad=2`, the two bad chunks showed the
+   shift-ref signature exactly: identical per-state histograms, permuted
+   positions (0xC9 members expanded against a rebuilt target palette).
+   Regression test `glob_transposed_gid_form_roundtrip_byte_identical`
+   pins the checkerboard-column case where gform 2 strictly wins.
+4. **GID-RLE admission is NOT the canonical rule.** Uncompressed-size
+   admission (the canonical 4x rule) lets mid-run sections into 0xCC whose
+   slabs then compress WORSE — the raw gid stream's value is cross-section
+   byte alignment in the zstd window, which RLE destroys (run boundaries
+   differ per section). Measured on the JJ corpus: div=4 → x2.99
+   (regression), div=8 → x3.07, div=16/off → x3.08. Default 8, tunable via
+   `CSAVES_GID_RLE_DIV` (0 = off). The lever targets moderate-strata
+   vanilla terrain (the survival bigworld), where sections fail the
+   canonical 4x-vs-packed-width test but clear the 4 KiB gid window.
+
+Corpus (CI-gated): TOTAL **x3.08** (region x3.07, entities x3.11),
+`verify ok=946 bad=0`; 50/50 unit tests (new: transposed-gid roundtrip,
+u8-RLE roundtrip with the divisor pinned, u16 wide-registry roundtrip).
+
 ## v0.9.4 — GLOB (global state registry) ON by default
 
 jj_exp5 measured the section-size frontier on real bigworld tiles: the
