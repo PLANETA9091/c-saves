@@ -388,3 +388,76 @@ Workflow: `real_exp` (class attribution) moved to a parallel `attrib` job
 (it re-imports the whole world a second time — the sequential layout made
 the bench job exceed its 350-minute budget), and both CI jobs now build
 with a Rust cache (~10 min saved per run).
+
+## v0.9.3 — roll hole, probe-cache deadlock, live Paper 26.3 tps-bench
+
+### The 23,380-missing loss class: writer-segment roll hole
+
+Forensics (`read_fail_reason`) on run 41020241542 named it: every sampled
+missing chunk = "blob ... segment 1 removed from segs", plus a storm of
+"LEAK: slice fail ... rawlen=0" while packing segs 25-30 — batch records
+decompressing to ZERO bytes. Root cause in `append()`: the writer roll
+seeked to `written` while the append buffer held unflushed records that
+belong at `written - buf.len()` (the file-position invariant). The roll
+wrote them a buffer-length too far: a hole of zeros over the segment tail
+(up to BUF_CAP = 1 MiB per roll) with the buffer duplicated after it.
+Batch records in the hole decode rawlen=0; blobs in the hole decompress to
+garbage; the pack skips them (continue) and the drop_seg removal turns
+them into permanent dangling references. The JJ corpus (< 64 MiB) never
+rolls a segment with a non-empty buffer — only the 262k world rolled 60+
+times per run, losing a timing-dependent 11,819-23,380 chunks.
+
+Fixes: roll seeks `written - buf.len()`; `Cfg.seg_roll`
+(CSAVES_SEG_ROLL, default 64 MiB) so tests force rolls; the pack drop
+path is poison-guarded — any unreadable victim (blob read fail,
+batch_idx miss, hdr/body/decompress/slice fail, unknown recipe body)
+keeps the segment (`pack_broken`, never considered by compaction again,
+loud logs). Regression test `seg_roll_with_pending_buffer_keeps_every_record`
+(seg_roll 192 KiB < BUF_CAP forces non-empty buffers at every roll;
+fails on pre-fix code). Bigworld after the fix: **261,573/261,573
+integrity, heal_rounds 0, verify bad=0, TOTAL x2.21** (region x2.20,
+entities x8.48; vs stripped raw ~x7.7; vanilla terrain = dense sections
+at the z19 floor, dense:rle = 2.29M:250k).
+
+### Probe-cache self-deadlock (the 20-minute speed-bench "cancellations")
+
+`chunk_intact`'s probe-cache lookup was an `if let` scrutinee; edition
+2021 keeps the scrutinee temporary (the MutexGuard) alive through the
+else branch, so the miss path re-locked probe_cache against itself:
+parking_lot spin (~9 s) + park (~5 s), forever. Requires a committed
+BATCHED key whose payload hash matches last_written — exactly the speed
+bench's G2 phase and Paper's unchanged-chunk autosave; import/G phases
+never hit it, so it shipped in v0.9.1 unnoticed (every speed-bench since
+died at the 20-min job timeout). Fixed by binding the lookup to a
+standalone statement; verified with a standalone repro + marker bisect.
+
+### Concurrent supersede during pack (production firing in phase B)
+
+The module runs compaction concurrently with Paper's save thread: the
+pack's recs snapshot held dead pointers (supersede removes the batch_idx
+entry, the chunks map flips at flush). Moving them tripped the poison
+("batch_idx miss xN ... seg-00011 PARTIAL — segment KEPT") or worse,
+re-queued the OLD recipe over the newer pending one (RecipeBatch is
+last-write-wins → silent chunk-state rollback). The loop re-checks the
+live chunks pointer and skips superseded keys. Regression test
+`concurrent_supersede_during_pack_keeps_newest_state` (writer thread +
+compaction waves); after the fix the live phase-B console is clean
+(zero LEAK/PARTIAL lines).
+
+### Live Paper 26.3 tps-bench (the TPS milestone)
+
+module job builds `libc_saves.so` (cdylib name: hyphens → underscores;
+module.json `main` must match — CRUSSTY silently skips a plugin whose
+entry does not resolve), packages it with module.json; the tps job runs
+phase A (plain Paper) and phase B (CRUSSTY launcher + the module:
+SavesShim natives, Moonrise RFS bridges, auto-import) on one prepared
+1024-chunk world + 10k persisted entities. Measurement notes that cost
+us a few runs: `forceload add` takes BLOCK coords (chunk coords marked
+2x2 chunks instead of 256); chat §-codes must be stripped before
+parsing; Paper's `mspt` answers "◴ avg/min/max" for 5s/10s/1m (no
+p95/p99); with 10k ticking entities `save-all flush` never converges on
+a 2-core runner (both engines censored at any RCON timeout — reported,
+not gated). Result (8 samples/phase): TPS 19.96 vs 19.95, MSPT avg 5.78
+vs 5.96 ms, MSPT max 12.11 vs 10.41 ms (c-saves better), rotate 491.6 s
+vs 493.2 s, module attached, import 897+193 chunks 0 failed, zero
+integrity events.

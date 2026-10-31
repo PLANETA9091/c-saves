@@ -106,6 +106,63 @@ farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 Synthetic Tectonic-style wgen bench (4096 chunks): compact container =
 **x0.08 of Anvil** (x173 vs logical).
 
+## v0.9.3 correctness round + LIVE Paper 26.3 (tps-bench)
+
+Three latent bugs root-caused and CI-regressed in one round:
+
+1. **Writer-segment roll hole (silent data loss).** `append()` rolled the
+   writer with `seek(written)` while the append buffer still held unflushed
+   records belonging at `written - buf.len()`: a hole of zeros over the
+   segment tail records. Batch records decoded rawlen=0, blobs decompressed
+   to garbage, the full-rewrite pack skipped them and the segment drop made
+   the loss permanent — 23,380 of 261,572 chunks unreadable on the 262k-chunk
+   bigworld (11,819 the run before; the corpus benches never roll a segment
+   with a non-empty buffer, so they stayed clean). Roll now seeks correctly;
+   `Cfg.seg_roll` (CSAVES_SEG_ROLL) lets tests force rolls; the pack drop
+   path is poison-guarded (any unreadable victim keeps the segment, loudly).
+2. **Probe-cache self-deadlock (server freeze).** `chunk_intact`'s cache
+   lookup was an `if let` scrutinee; in edition 2021 the scrutinee guard
+   lives through the else branch, so the miss path re-locked the same mutex
+   against itself — every unchanged-chunk autosave (Paper's steady state)
+   would freeze the server. Shipped in v0.9.1's probe_cache; every
+   speed-bench since died at the job timeout unnoticed. Fixed by binding
+   the lookup to a standalone statement.
+3. **Concurrent supersede during pack (rollback/poison).** The pack's
+   recs loop used a snapshot; a supersede in flight left dead pointers
+   whose batch_idx entries were already removed — moving them tripped the
+   poison or re-queued the OLD recipe over the newer pending one (silent
+   chunk-state rollback). The loop re-checks the live chunks pointer.
+
+**262,573-chunk real survival world (512x512, vanilla terrain, 10k
+entities, bigworld-survival CI): integrity 261,573/261,573 (missing 0),
+heal_rounds 0, verify ok=26,342 bad=0:**
+
+| store | Anvil | c-saves | ratio |
+|---|---|---|---|
+| region | 2135.99 MiB | 970.43 MiB | x2.20 |
+| entities | 7.27 MiB | 0.86 MiB | x8.48 |
+| **TOTAL** | **2143.25 MiB** | **971.29 MiB** | **x2.21** |
+
+(vs the light-stripped raw the container is ~x7.7; vanilla terrain is
+noisy — dense sections at the z19 entropy floor — datapack worlds with
+extreme terrain compress x3.0+.)
+
+**Live Paper 26.3, c-saves injected via the CRUSSTY runtime (tps-bench
+CI, 2-core runner, 1024-chunk world + 10k persisted entities, 8 samples
+per phase, 256-chunk forceload-window rotation, timed save-all):**
+
+| metric | A (Anvil) | B (c-saves) | B vs A |
+|---|---|---|---|
+| TPS (avg) | 19.96 | 19.95 | 1.00x |
+| MSPT avg 5s | 5.78 ms | 5.96 ms | 1.03x |
+| MSPT max 5s | 12.11 ms | 10.41 ms | **0.86x (better)** |
+| forceload rotate (unload+save+load 256 chunks) | 491.6 s | 493.2 s | 1.00x |
+| module attached / import | n/a | 897+193 chunks, 0 failed | YES |
+
+(save-all flush never converges on the 2-core runner with 10k ticking
+entities — both engines censored at the RCON timeout; engine save speed
+is hard-gated by the speed-bench jobs instead.)
+
 ## I/O speed (real JJThunder corpus, 2-core CI sandbox, single-threaded unless noted)
 
 | operation | Anvil (zlib-6) | c-saves | vs Anvil |
