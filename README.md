@@ -103,6 +103,27 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.6 — hot-slab write batching: one frame per chunk on the import path
+
+The import path used to run one bulk-zstd call per SECTION (~130 calls of
+0.25-4 KiB per chunk; the ensure stage measured 16.5% of import wall time on
+the real corpus). v0.9.6 batches a chunk's sections into ONE hot-tier slab
+frame at write time:
+
+* wire = SLAB V2 with a new **0x40 hot-tier kind bit**; no GLOB variant on
+  the write path (the cold re-pack re-decides the form with a 4-8 MiB
+  window), so the drained container is byte-equivalent to the old pipeline —
+  corpus stays **x3.07, verify 946/946**.
+* `scan()` rebuilds 0x40 slabs with `cold=false`, so the pack pass can still
+  re-group them into 4-8 MiB cold frames after a reopen; pack-produced slabs
+  now stamp `cold=true` explicitly (previously the slab flag alone gated
+  re-packing).
+* import throughput **+6-8%** single-thread (30.7 -> 33.1 MB/s) and **+4-7%**
+  multi-thread (45.2 -> 47-49 MB/s) on the real corpus; ensure stage -36%.
+* regression tests: batch roundtrip across reopen + drain + invariant scan,
+  and the below-threshold per-blob fallback. 52/52 tests, all size gates
+  unchanged (bench_size x0.08 vs anvil, gate <= 0.15).
+
 ## v0.9.5 — GLOB2 (0xCC): RLE'd gid streams + u16 registries + a latent wide-palette fix
 
 Three increments on the GLOB architecture, plus one bug the work flushed out:

@@ -44,6 +44,20 @@ const SEG_ROLL: u64 = 64 * 1024 * 1024;
 const BUF_CAP: usize = 1 << 20;
 const MAX_SECTIONS: usize = 255;
 const NO_ID: u32 = u32::MAX;
+/// Import-path hot-slab batching: a write carrying at least this many
+/// sections AND this much raw section bytes goes into ONE hot-tier slab
+/// frame instead of one zstd frame per section (~130 calls of 0.25-4 KiB
+/// measured 16.5% of import wall time; the frame also gives zstd the
+/// whole-chunk window). Below the thresholds the entry-table + record
+/// overhead would beat the saved calls — the per-blob path stays.
+const HOT_SLAB_MIN_SECS: usize = 8;
+const HOT_SLAB_MIN_RAW: usize = 8 * 1024;
+/// SLAB V2 kind-bit marking a HOT-tier slab (write-path batch frame).
+/// scan() reconstructs these members with cold=false so the pack pass can
+/// still re-group them into 4-8 MiB cold frames; pack-produced slabs (no
+/// bit) rebuild as cold=true and stay in place. Legacy containers written
+/// before the bit never carry it — they rebuild exactly as before.
+const SLAB_KIND_HOT: u8 = 0x40;
 /// chunks-map len marker: recipe lives inside a compressed kind-9 batch;
 /// the real (rec_off, stream_off, len) is in `batch_idx`.
 const BATCHED: u32 = u32::MAX;
@@ -1381,7 +1395,7 @@ impl Store {
                                                     refs: 0,
                                                     id: bid,
                                                     slab: true,
-                                                    cold: true,
+                                                    cold: body[0] & SLAB_KIND_HOT == 0,
                                                     share: sh,
                                                     slab_off: cursor,
                                                     slab_raw: raw_total,
@@ -1398,7 +1412,7 @@ impl Store {
                                 }
                             }
                         }
-                        k if k == 8 || k == 8 | 0x80 => {
+                        k if k & 0x3f == 8 => {
                             // SLAB v2: same header layout; entries are varint
                             // zigzag id-delta + varint len + 16B hash, raws after.
                             // GLOB slabs (kind | 0x80) carry one extra header
@@ -1435,7 +1449,7 @@ impl Store {
                                                     refs: 0,
                                                     id: bid,
                                                     slab: true,
-                                                    cold: true,
+                                                    cold: body[0] & SLAB_KIND_HOT == 0,
                                                     share: sh,
                                                     slab_off: cursor,
                                                     slab_raw: raw_total,
@@ -2004,6 +2018,142 @@ impl Store {
         Ok((false, id))
     }
 
+    /// Import-path batching: ONE hot-tier slab frame instead of one zstd
+    /// frame per section. The per-section bulk zstd call dominated the
+    /// ensure stage (~130 small calls per chunk); a single frame per chunk
+    /// removes the per-call overhead AND hands zstd the whole-chunk window
+    /// (cross-section matches inside one chunk compress immediately, before
+    /// the pack pass ever sees the bytes).
+    ///
+    /// Wire format = SLAB V2 (kind 8) + the 0x40 hot-tier bit. No GLOB
+    /// variant here: the write path stays lean, the cold re-pack re-decides
+    /// the form with a 4-8 MiB window (the same end state the individual
+    /// pipeline produced). Dedup stays content-pure: map hits and in-batch
+    /// duplicates never enter the frame.
+    fn ensure_blobs_batch<'a>(&self, items: &[(Hash, &'a [u8])]) -> Result<(), String> {
+        let mut misses: Vec<(Hash, u32, &'a [u8])> = Vec::with_capacity(items.len());
+        {
+            let blobs = self.blobs.read();
+            for (h, raw) in items {
+                if blobs.contains_key(h) {
+                    self.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if misses.iter().any(|m| m.0 == *h) {
+                    continue; // in-batch duplicate of an earlier miss
+                }
+                misses.push((*h, 0, raw));
+            }
+        }
+        let raw_total: usize = misses.iter().map(|m| m.2.len()).sum();
+        if misses.len() < HOT_SLAB_MIN_SECS || raw_total < HOT_SLAB_MIN_RAW {
+            // below the frame threshold the per-blob path is cheaper
+            for (h, _, raw) in &misses {
+                self.ensure_blob(*h, raw, false)?;
+            }
+            return Ok(());
+        }
+        for m in &mut misses {
+            m.1 = self.next_blob_id.fetch_add(1, Ordering::Relaxed) as u32;
+        }
+        for (_, _, raw) in &misses {
+            self.dict_sample(raw);
+        }
+        // split into slab-sized groups (same cap rule as the pack path)
+        let slab_cap = if self.whole_mode.load(Ordering::Relaxed) {
+            self.cfg.slab_max_raw_whole
+        } else {
+            self.cfg.slab_max_raw
+        };
+        let mut group: Vec<(Hash, u32, &[u8])> = Vec::new();
+        let mut group_raw = 24usize; // entry-table floor (pack-path rule)
+        for m in misses {
+            let need = 24 + m.2.len();
+            if !group.is_empty() && group_raw + need > slab_cap {
+                self.flush_hot_slab_group(std::mem::take(&mut group))?;
+                group_raw = 24;
+            }
+            group_raw += need;
+            group.push(m);
+        }
+        if !group.is_empty() {
+            self.flush_hot_slab_group(group)?;
+        }
+        Ok(())
+    }
+
+    /// Write one hot-tier slab frame: SLAB V2 stream (varint zigzag
+    /// id-delta + varint len + 16B hash per member, raws concatenated),
+    /// compressed at the hot level WITHOUT the shared dictionary (slab
+    /// streams measure ~4% smaller without it — same rule as the pack
+    /// path) and WITHOUT the GLOB variant. Fresh members: no old-location
+    /// live accounting (their bytes were never on disk before this record).
+    fn flush_hot_slab_group(&self, group: Vec<(Hash, u32, &[u8])>) -> Result<(), String> {
+        let n = group.len();
+        let mut tab: Vec<u8> = Vec::with_capacity(n * 20);
+        let mut prev_id: i64 = 0;
+        for (h, id, raw) in &group {
+            put_u64(&mut tab, zigzag(*id as i64 - prev_id));
+            prev_id = *id as i64;
+            put_u64(&mut tab, raw.len() as u64);
+            tab.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
+            tab.extend_from_slice(&(*h as u64).to_le_bytes());
+        }
+        let tab_len = tab.len() as u32;
+        let mut stream = tab;
+        stream.reserve(group.iter().map(|g| g.2.len()).sum::<usize>());
+        for (_, _, raw) in &group {
+            stream.extend_from_slice(raw);
+        }
+        let (dict_id, comp) = self.compress_tier_plain(&stream, false);
+        let raw_total = stream.len() as u32;
+        let mut body = Vec::with_capacity(13 + comp.len());
+        body.push(8u8 | SLAB_KIND_HOT);
+        body.push(dict_id);
+        body.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+        body.extend_from_slice(&raw_total.to_le_bytes());
+        body.extend_from_slice(&(n as u16).to_le_bytes());
+        body.extend_from_slice(&comp);
+        let blen = body.len() as u64;
+        let (seg, off, _) = self.append(&body).map_err(|e| e.to_string())?;
+        let share = ((8 + blen) / n as u64).min(u32::MAX as u64) as u32;
+        let last_share = (8 + blen) - share as u64 * (n as u64 - 1) as u64;
+        let cnt = group.len();
+        {
+            let mut blobs = self.blobs.write();
+            for (i, (h, id, raw)) in group.iter().enumerate() {
+                blobs.entry(*h).or_insert(BlobLoc {
+                    seg,
+                    off,
+                    comp_len: raw.len() as u32,
+                    raw_len: raw.len() as u32,
+                    dict_id,
+                    refs: 0,
+                    id: *id,
+                    slab: true,
+                    cold: false, // hot tier: the pack pass may re-group these
+                    share: if i + 1 == cnt {
+                        last_share.min(u32::MAX as u64) as u32
+                    } else {
+                        share
+                    },
+                    slab_off: 0, // patched below in member order
+                    slab_raw: raw_total,
+                    slab_comp: comp.len() as u32,
+                });
+                self.ids.write().insert(*id, *h);
+            }
+            let mut cursor = tab_len;
+            for (h, _, raw) in &group {
+                if let Some(l) = blobs.get_mut(h) {
+                    l.slab_off = cursor;
+                }
+                cursor += raw.len() as u32;
+            }
+        }
+        Ok(())
+    }
+
     fn bump_recipe_refs(&self, rec: &Recipe) {
         let mut blobs = self.blobs.write();
         for h in rec.blob_hashes() {
@@ -2127,7 +2277,7 @@ impl Store {
                 out.push(format!("slab @({seg_id},{off}): header unreadable"));
                 continue;
             };
-            let kind = hdr[0] & 0x7f;
+            let kind = hdr[0] & 0x3f; // 0x80 = GLOB, 0x40 = hot tier
             if kind != 5 && kind != 8 {
                 out.push(format!("slab @({seg_id},{off}): kind {kind} not a slab"));
                 continue;
@@ -2296,8 +2446,17 @@ impl Store {
                     Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
                 } else {
                     let mut hashes = Vec::with_capacity(sections.len());
-                    for (h, bytes) in &sections {
-                        self.ensure_blob(*h, bytes.as_slice(), false)?;
+                    if sections.len() >= HOT_SLAB_MIN_SECS {
+                        // hot-slab batch: one frame for the chunk's sections
+                        let slices: Vec<(Hash, &[u8])> =
+                            sections.iter().map(|(h, b)| (*h, b.as_slice())).collect();
+                        self.ensure_blobs_batch(&slices)?;
+                    } else {
+                        for (h, bytes) in &sections {
+                            self.ensure_blob(*h, bytes.as_slice(), false)?;
+                        }
+                    }
+                    for (h, _) in &sections {
                         hashes.push(*h);
                     }
                     // tail: dedup large tails as blobs, inline tiny ones
@@ -2709,7 +2868,7 @@ impl Store {
                 let seg = segs.get(&loc.seg)?;
                 let sealed = Some(loc.seg) != writer_id;
                 let hdr = seg.read_at(loc.off, 12, sealed)?;
-                let kind = hdr[0] & 0x7f;
+                let kind = hdr[0] & 0x3f; // 0x80 = GLOB, 0x40 = hot tier
                 if kind != 5 && kind != 8 {
                     return None;
                 }
@@ -2767,7 +2926,7 @@ impl Store {
                 return self.glob_to_canon(s);
             }
             let hdr = seg.read_at(loc.off, 12, sealed)?;
-            let kind = hdr[0] & 0x7f;
+            let kind = hdr[0] & 0x3f; // 0x80 = GLOB, 0x40 = hot tier
             if kind != 5 && kind != 8 {
                 return None;
             }
@@ -3336,6 +3495,9 @@ impl Store {
                     l.off = off;
                     l.dict_id = dict_id;
                     l.slab = true;
+                    // pack-produced slabs are the cold tier: excluded from
+                    // re-pack (the 0x40 bit makes hot batch frames distinct)
+                    l.cold = true;
                     l.share = if i + 1 == cnt { last_share.min(u32::MAX as u64) as u32 } else { share };
                     l.slab_off = 0; // patched below by cursor
                     l.slab_raw = raw_total;
@@ -3639,7 +3801,11 @@ impl Store {
         {
             let blobs = self.blobs.read();
             for l in blobs.values() {
-                if l.slab || l.cold || l.seg == writer_id {
+                // hot material = anything not on the cold tier: fresh
+                // individual blobs AND hot-tier slab frames (write-path
+                // batches, cold=false by the 0x40 bit). Pack-produced slabs
+                // are cold=true and stay in place.
+                if l.cold || l.seg == writer_id {
                     continue;
                 }
                 *hot.entry(l.seg).or_default() += l.body_len();
@@ -3687,9 +3853,7 @@ impl Store {
             let blobs = self.blobs.read();
             let mut v: Vec<(Hash, BlobLoc)> = blobs
                 .iter()
-                .filter(|(_, l)| {
-                    l.seg == worst_id && (drop_seg || !(l.slab || l.cold))
-                })
+                .filter(|(_, l)| l.seg == worst_id && (drop_seg || !l.cold))
                 .map(|(h, l)| (*h, *l))
                 .collect();
             v.sort_by_key(|(_, l)| (l.id, l.off));
@@ -3699,8 +3863,8 @@ impl Store {
         let mut cand_bytes = 0usize;
         let mut did = false;
         for (h, loc) in victims {
-            if !drop_seg && (loc.slab || loc.cold) {
-                continue; // already packed: leave in place
+            if !drop_seg && loc.cold {
+                continue; // cold-tier material: leave in place
             }
             let Some(data) = self.read_blob(loc, Some(worst_id)) else {
                 eprintln!(
@@ -5066,6 +5230,7 @@ pub(crate) mod glob_slab_test {
 #[cfg(test)]
 mod repro {
     use super::*;
+    use super::tests::{chunk_payload, semantic, temp_dir};
     use fastnbt::Value;
     use std::collections::HashMap as Map;
 
@@ -5132,6 +5297,114 @@ mod repro {
             }
         }
         assert_eq!(bad, 0, "{bad} unreadable chunks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hot_slab_batch_roundtrip_reopen_repack() {
+        // Hot-slab write batching (0x40 tier bit): a chunk's sections go to
+        // disk as ONE hot-tier slab frame. The frame must (a) read back
+        // byte-correctly in the SAME session, (b) survive REOPEN with
+        // scan() rebuilding its members as cold=false (the bit), (c) be
+        // re-groupable by the pack pass into cold frames, (d) stay readable
+        // and invariant-clean through every stage.
+        let dir = temp_dir("hot-slab-batch");
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        let n = 30usize;
+        let payloads: Vec<Vec<u8>> = (0..n)
+            .map(|i| chunk_payload((i % 6) as i32, (i / 6) as i32, (i % 4) as u64))
+            .collect();
+        for (i, p) in payloads.iter().enumerate() {
+            s.write_chunk(i as u64, p, false).unwrap();
+        }
+        // in-session read: every chunk readable, semantically identical
+        for (i, p) in payloads.iter().enumerate() {
+            let got = s.read_chunk(i as u64).expect("in-session read");
+            assert!(semantic(&got, p), "in-session mismatch chunk {i}");
+        }
+        // the batch path actually formed hot slabs (members in slabs, not
+        // regular kind-4 blobs)
+        let prof = s.profile_json();
+        assert!(
+            prof.contains("\"members\":") && !prof.contains("\"members\":0"),
+            "expected hot slab members, profile={prof}"
+        );
+        s.sync();
+        drop(s);
+        // REOPEN: scan() must rebuild the hot slab members with cold=false
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            let got = s.read_chunk(i as u64).expect("post-reopen read");
+            assert!(semantic(&got, p), "post-reopen mismatch chunk {i}");
+        }
+        // drain: hot frames must be re-groupable (converging, not spinning)
+        s.request_pack();
+        let mut steps = 0;
+        while s.compact_step() {
+            steps += 1;
+            assert!(steps < 500, "drain did not converge ({steps} steps)");
+        }
+        for (i, p) in payloads.iter().enumerate() {
+            let got = s.read_chunk(i as u64).expect("post-drain read");
+            assert!(semantic(&got, p), "post-drain mismatch chunk {i}");
+        }
+        assert!(
+            s.slab_invariant_scan().is_empty(),
+            "slab invariant violations after drain"
+        );
+        drop(s);
+        // reopen AFTER the drain too: cold slabs rebuild, content intact
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            let got = s.read_chunk(i as u64).expect("final read");
+            assert!(semantic(&got, p), "final mismatch chunk {i}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hot_slab_below_threshold_keeps_per_blob_path() {
+        // chunks below HOT_SLAB_MIN_SECS must stay on the per-blob path
+        // (the entry-table overhead would dominate tiny writes) and remain
+        // fully readable — regression guard for the fallback branch.
+        let dir = temp_dir("hot-slab-small");
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        root.insert("Position".to_string(), Value::List(vec![Value::Int(1), Value::Int(0), Value::Int(1)]));
+        let mut sec_list = Vec::new();
+        for y in 0..4i32 {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = Vec::new();
+            pal.push(Value::String("minecraft:stone".to_string()));
+            pal.push(Value::String("minecraft:deepslate".to_string()));
+            pal.push(Value::String("minecraft:air".to_string()));
+            bs.insert("palette".to_string(), Value::List(pal));
+            let data: Vec<i64> = (0..64)
+                .map(|i| (i as i64).wrapping_mul(0x1234_9abc_def0_5678i64) ^ (y as i64))
+                .collect();
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        let payload = fastnbt::to_bytes(&Value::Compound(root)).unwrap();
+        // runtime write path: write_chunk_import would add isLightOn=0 (the
+        // derived-light strip) and break the byte-level Value comparison
+        s.write_chunk(key(1, 1), &payload, false).unwrap();
+        s.sync();
+        let prof = s.profile_json();
+        // no hot slab frame may exist; the sections are regular blobs
+        assert!(
+            !prof.contains("\"members\":") || prof.contains("\"members\":0"),
+            "tiny write must not batch, profile={prof}"
+        );
+        drop(s);
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        let got = s.read_chunk(key(1, 1)).expect("small-chunk read");
+        assert!(semantic(&got, &payload));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
