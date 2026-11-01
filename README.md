@@ -118,8 +118,11 @@ frame at write time:
   re-group them into 4-8 MiB cold frames after a reopen; pack-produced slabs
   now stamp `cold=true` explicitly (previously the slab flag alone gated
   re-packing).
-* import throughput **+6-8%** single-thread (30.7 -> 33.1 MB/s) and **+4-7%**
-  multi-thread (45.2 -> 47-49 MB/s) on the real corpus; ensure stage -36%.
+* import throughput on CI (same-runner comparison): **33.3 -> 45.7 MB/s
+  (+37%)** single-thread, **65.7 -> 90.4 MB/s (+38%)** multi-thread; ensure
+  stage **-44%** (105.9 -> 59.3 ms), import wall time -27%. Local 2-core
+  sandbox: +6-8% / +4-7% (smaller absolute gain — a larger share of that
+  machine's import time sits in the parse/encode stage).
 * regression tests: batch roundtrip across reopen + drain + invariant scan,
   and the below-threshold per-blob fallback. 52/52 tests, all size gates
   unchanged (bench_size x0.08 vs anvil, gate <= 0.15).
