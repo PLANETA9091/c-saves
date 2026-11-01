@@ -127,16 +127,35 @@ fn main() {
     let dim = PathBuf::from(args.get(1).cloned().unwrap_or_default());
     let region_dir = dim.join("region");
     let entity_dir = dim.join("entities");
+    // File-level sampling (CSAVES_ATTRIB_SAMPLE, default 16: every 16th
+    // .mca = 32x32 chunks). The enriched bigworld holds 261k chunks / ~2 GB
+    // of raw regions; loading ALL of it (plus parsed NBT trees and the
+    // per-class byte streams) needs far more RAM than a hosted runner has
+    // — five attrib attempts died there while every other job of the same
+    // workflow stayed green. Every 16th region file = ~16k chunks, a solid
+    // statistical base for the percentage attribution; files are sorted
+    // and evenly strided, so every world region contributes.
+    let sample: usize = std::env::var("CSAVES_ATTRIB_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(16);
     let mut region_chunks: Vec<(i32, i32, Vec<u8>)> = Vec::new();
     let mut entity_chunks: Vec<(i32, i32, Vec<u8>)> = Vec::new();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&region_dir)
         .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
         .unwrap_or_default();
     files.sort();
-    for f in &files {
-        if f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
-            region_chunks.extend(load_mca(f));
+    let mut taken = 0usize;
+    for (fi, f) in files.iter().enumerate() {
+        if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
+            continue;
         }
+        if sample > 1 && fi % sample != 0 {
+            continue;
+        }
+        taken += 1;
+        region_chunks.extend(load_mca(f));
     }
     let mut efiles: Vec<PathBuf> = std::fs::read_dir(&entity_dir)
         .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
@@ -148,7 +167,7 @@ fn main() {
         }
     }
     println!(
-        "real_exp: {} region chunks, {} entity chunks from {}",
+        "real_exp: {} region chunks (sample 1-in-{sample}: {taken} files), {} entity chunks from {}",
         region_chunks.len(),
         entity_chunks.len(),
         dim.display()
