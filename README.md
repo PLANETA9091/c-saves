@@ -103,6 +103,37 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.7 — import split-path cuts: lazy shift builds, single-unpack encode
+
+Profiling the split path (the stages-split JSON) showed the sections stage
+at 635 µs/chunk: section_encode 346 + shift_ref_pass 198 + structural_hash
+72. Three cuts, byte-exact on the whole corpus (new `enc_fp` example
+fingerprints every member: 12,130 members / 9,971,843 bytes — identical to
+main before and after):
+
+1. **Lazy ShiftSec builds.** The shift pass built a per-section view
+   (unpack + canonical keys + 16 plane fingerprints, ~40 µs each) for EVERY
+   eligible section before matching; the fingerprint pre-filter then rejects
+   99.93% of candidate pairs and enc-cache hits are skipped as match sources
+   entirely — most builds were never consulted. Builds now happen on first
+   USE as match source/target. One real bug caught and fixed en route: the
+   lazy getter must refuse INELIGIBLE targets without building (the eager
+   `None` did), or the candidate budget and the chosen refs change. Shift
+   build 124 -> 88 ms, shift stage 196 -> 152 µs/chunk.
+2. **Single-unpack canonical encode.** `enc_pal_data_canon` re-unpacked the
+   same 4096 voxels twice (once for the frequency counts, once for the
+   remap/dense/RLE stages). Counts now come from the shared stream; failure
+   modes are preserved (length mismatch -> None, garbage voxel ->
+   ST_ENC_FALLBACK + None, no-data -> zero-count lexicographic order).
+   section_encode 251 -> 224 ms.
+3. **Batched structural-hash feeds.** LongArray/ByteArray feed xxh3 as ONE
+   update over the raw two's-complement LE bytes (streaming == one-shot
+   over the same byte sequence; was 256 / 2048 update calls per array).
+
+Import 31.5 -> 34.3 MB/s single-thread, MT 47.9 -> 52.4 MB/s (local 2-core;
+the CI runner splits differently — faster cores, relatively slower encode).
+Corpus verify 946/946, container x3.07 unchanged, bench_size x0.08 vs anvil.
+
 ## v0.9.6 — hot-slab write batching: one frame per chunk on the import path
 
 The import path used to run one bulk-zstd call per SECTION (~130 calls of

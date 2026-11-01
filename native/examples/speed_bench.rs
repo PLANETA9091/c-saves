@@ -374,6 +374,21 @@ fn main() {
         lat.report("csaves-import-region", region_raw, secs);
         println!("SPEED stages-import: {}", c_saves::store::write_stage_json());
         println!("SPEED stages-split: {}", c_saves::chunknbt::split_stage_json());
+        {
+            use c_saves::chunknbt::*;
+            use std::sync::atomic::Ordering::Relaxed;
+            println!(
+                "SPEED stages-shift: build_ms={:.1} secs_ok={} cand={} plane0={} full={} ksum={} dense_nomatch={} dense_match={}",
+                ST_SHIFT_BUILD_NS.load(Relaxed) as f64 / 1e6,
+                ST_SHIFT_SECS_OK.load(Relaxed),
+                ST_SHIFT_CAND.load(Relaxed),
+                ST_SHIFT_PLANE0.load(Relaxed),
+                ST_SHIFT_FULL.load(Relaxed),
+                ST_SHIFT_KSUM.load(Relaxed),
+                ST_SHIFT_DENSE_NOMATCH.load(Relaxed),
+                ST_SHIFT_DENSE_MATCH.load(Relaxed),
+            );
+        }
     }
     {
         let mut lat = Lat::new(entities.len());
