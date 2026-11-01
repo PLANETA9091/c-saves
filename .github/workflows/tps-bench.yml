@@ -8,6 +8,20 @@ name: tps-bench
 # Metrics per phase: `tps` + `mspt` samples, forceload-window rotation
 # (disk read churn), timed `save-all flush` (full save cycle), lag-spike
 # log lines. Everything runs on the CI runner — never locally.
+#
+# SPLIT-JOB LAYOUT (the serial single-job version could not fit: prep ~33
+# min + phase A ~76 min + phase B ~80 min > the 150-min job cap — three
+# runs died at the 150:00 mark with phase B mid-sampling):
+#   module  — build the .so                      (~5 min)
+#   prep    — worldgen on plain Paper, upload jjworld (~35 min)
+#   phase-a — baseline on a fresh runner         (~80 min)  \
+#   phase-b — c-saves on a fresh runner          (~85 min)  / parallel
+#   verdict — download both result artifacts, one report (~2 min)
+# Critical path ≈ prep + phase-b + verdict ≈ 2h; every job stays far
+# below its own 150-min cap. Comparability note: separate jobs land on
+# separate runners either way (the serial job died before it could keep
+# a same-runner advantage), and the parity gates are level checks
+# (TPS 20.0) plus within-phase flush/rotate timers, robust to that.
 
 on:
   workflow_dispatch:
@@ -54,13 +68,10 @@ jobs:
           path: pkg/c-saves
           retention-days: 7
 
-  tps:
-    needs: module
+  prep:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 75
     env:
-      SAMPLES: ${{ inputs.samples || '24' }}
-      INTERVAL: ${{ inputs.interval || '10' }}
       ENTITIES: ${{ inputs.entities || '10000' }}
     steps:
       - uses: actions/checkout@v4
@@ -68,48 +79,20 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
-      - name: download the module artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # single-artifact `gh run download -n` puts the FILES directly
-          # into -D (no artifact-name subdirectory)
-          gh run download $GITHUB_RUN_ID -n c-saves-module -D modules-dir
-          mkdir -p modules/c-saves
-          cp modules-dir/libc_saves.so modules-dir/module.json modules/c-saves/
-          ls -la modules/c-saves
-
-      - name: assemble server dirs (CRUSSTY + Paper 26.3)
+      - name: assemble prep dir (plain Paper 26.3)
         run: |
           set -e
-          V=2.9.0
-          curl -sL -o launcher.jar "https://github.com/PLANETA9091/CRUSSTY/releases/download/v$V/launcher.jar"
-          curl -sL -o libcrussty_runtime.so "https://github.com/PLANETA9091/CRUSSTY/releases/download/v$V/libcrussty_runtime.so"
           curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15/paper-26.3-227.jar"
           echo "416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15  paper.jar" | sha256sum -c -
-          mkdir -p baseline/config
-          cp paper.jar baseline/paper.jar
-          mkdir -p crussty-srv/launcher crussty-srv/versions crussty-srv/modules/c-saves crussty-srv/config
-          cp launcher.jar crussty-srv/launcher/
-          cp libcrussty_runtime.so crussty-srv/
-          cp paper.jar crussty-srv/versions/paper-26.3-227.jar
-          cp -r modules/c-saves crussty-srv/modules/
-          printf '[server]\nkernel = "paper-26.3-227.jar"\nmemory = "6G"\n\n[catalog]\nrepo = "PLANETA9091/crussty-catalog"\n' > crussty-srv/crussty.toml
-          for D in baseline crussty-srv; do
-            printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=false\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > "$D/server.properties"
-            printf 'eula=true\n' > "$D/eula.txt"
-            printf '_version: 29\nwatchdog:\n  enable: false\n' > "$D/config/paper-global.yml"
-          done
-          ls baseline crussty-srv crussty-srv/modules/c-saves
-
-      - name: prep — generate the world once on plain Paper (throwaway dir)
-        run: |
-          set -e
           mkdir -p prep/config
           cp paper.jar prep/paper.jar
           printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=false\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > prep/server.properties
           printf 'eula=true\n' > prep/eula.txt
           printf '_version: 29\nwatchdog:\n  enable: false\n' > prep/config/paper-global.yml
+          ls prep
+      - name: prep — generate the world once on plain Paper
+        run: |
+          set -e
           cd prep
           java -Xms2G -Xmx6G -jar paper.jar nogui > console.log 2>&1 &
           SRV=$!
@@ -125,10 +108,44 @@ jobs:
           wait $SRV || true
           [ "$rcon_stopped" = "0" ] || { echo "::error::prep phase failed"; tail -30 console.log; exit 1; }
           cd ..
-          cp -r prep/jjworld baseline/jjworld
-          cp -r prep/jjworld crussty-srv/jjworld
-          du -sh baseline/jjworld crussty-srv/jjworld
+          du -sh prep/jjworld
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tps-prep-world
+          path: prep/jjworld
+          retention-days: 7
 
+  phase-a:
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      SAMPLES: ${{ inputs.samples || '24' }}
+      INTERVAL: ${{ inputs.interval || '10' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: assemble baseline dir (plain Paper 26.3)
+        run: |
+          set -e
+          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15/paper-26.3-227.jar"
+          echo "416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15  paper.jar" | sha256sum -c -
+          mkdir -p baseline/config
+          cp paper.jar baseline/paper.jar
+          printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=false\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > baseline/server.properties
+          printf 'eula=true\n' > baseline/eula.txt
+          printf '_version: 29\nwatchdog:\n  enable: false\n' > baseline/config/paper-global.yml
+          ls baseline
+      - name: download the prepared world
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download $GITHUB_RUN_ID -n tps-prep-world -D prep-world
+          cp -r prep-world baseline/jjworld
+          du -sh baseline/jjworld
       - name: phase A — baseline Anvil (samples + flush timing + spikes)
         run: |
           set -e
@@ -149,7 +166,64 @@ jobs:
           python3 ../scripts/jj/stop_srv.py
           wait $SRV || true
           cd ..
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tps-phase-a
+          path: |
+            baseline/tps_baseline.txt
+            baseline/spikes_A.txt
+            baseline/console.log
+          retention-days: 30
 
+  phase-b:
+    needs: [module, prep]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      SAMPLES: ${{ inputs.samples || '24' }}
+      INTERVAL: ${{ inputs.interval || '10' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: download the module artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # single-artifact `gh run download -n` puts the FILES directly
+          # into -D (no artifact-name subdirectory)
+          gh run download $GITHUB_RUN_ID -n c-saves-module -D modules-dir
+          mkdir -p modules/c-saves
+          cp modules-dir/libc_saves.so modules-dir/module.json modules/c-saves/
+          ls -la modules/c-saves
+      - name: assemble server dir (CRUSSTY + Paper 26.3)
+        run: |
+          set -e
+          V=2.9.0
+          curl -sL -o launcher.jar "https://github.com/PLANETA9091/CRUSSTY/releases/download/v$V/launcher.jar"
+          curl -sL -o libcrussty_runtime.so "https://github.com/PLANETA9091/CRUSSTY/releases/download/v$V/libcrussty_runtime.so"
+          curl -sL -o paper.jar "https://fill-data.papermc.io/v1/objects/416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15/paper-26.3-227.jar"
+          echo "416b7d105b1d0192df4afa4b29d2800d9dbeda092a82fbc5b511248a54adde15  paper.jar" | sha256sum -c -
+          mkdir -p crussty-srv/launcher crussty-srv/versions crussty-srv/modules/c-saves crussty-srv/config
+          cp launcher.jar crussty-srv/launcher/
+          cp libcrussty_runtime.so crussty-srv/
+          cp paper.jar crussty-srv/versions/paper-26.3-227.jar
+          cp -r modules/c-saves crussty-srv/modules/
+          printf '[server]\nkernel = "paper-26.3-227.jar"\nmemory = "6G"\n\n[catalog]\nrepo = "PLANETA9091/crussty-catalog"\n' > crussty-srv/crussty.toml
+          printf 'level-name=jjworld\nlevel-seed=77007\nonline-mode=false\nspawn-protection=0\nview-distance=8\nsimulation-distance=6\nsync-chunk-writes=false\nrcon.port=25575\nrcon.password=jjbench2026\nenable-rcon=true\n' > crussty-srv/server.properties
+          printf 'eula=true\n' > crussty-srv/eula.txt
+          printf '_version: 29\nwatchdog:\n  enable: false\n' > crussty-srv/config/paper-global.yml
+          ls crussty-srv crussty-srv/modules/c-saves
+      - name: download the prepared world
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download $GITHUB_RUN_ID -n tps-prep-world -D prep-world
+          cp -r prep-world crussty-srv/jjworld
+          du -sh crussty-srv/jjworld
       - name: phase B — c-saves injected via CRUSSTY (import + samples + spikes)
         run: |
           set -e
@@ -180,13 +254,37 @@ jobs:
           wait $SRV || true
           du -sh crus jjworld 2>/dev/null || true
           cd ..
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tps-phase-b
+          path: |
+            crussty-srv/tps_csaves.txt
+            crussty-srv/spikes_B.txt
+            crussty-srv/csaves_lines.txt
+            crussty-srv/console.log
+          retention-days: 30
 
+  verdict:
+    needs: [phase-a, phase-b]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: download both phases' results
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download $GITHUB_RUN_ID -n tps-phase-a -D baseline
+          gh run download $GITHUB_RUN_ID -n tps-phase-b -D crussty-srv
+          ls baseline crussty-srv
       - name: verdict + report
         run: |
           python3 scripts/jj/tps_verdict.py baseline/tps_baseline.txt crussty-srv/tps_csaves.txt \
-            baseline/spikes_A.txt crussty-srv/spikes_B.txt crussty-srv/csaves_lines.txt > tps_report.md || true
+            baseline/spikes_A.txt crussty-srv/spikes_B.txt crussty-srv/csaves_lines.txt > tps_report.md
+          rc=$?
           cat tps_report.md
-
+          exit $rc
       - uses: actions/upload-artifact@v4
         if: always()
         with:
