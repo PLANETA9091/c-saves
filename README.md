@@ -103,6 +103,42 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.8 — warm-read canon cache: GLOB decode once per member, not per read
+
+The CI speed gate's warm-read floor (0.4x same-run Anvil + 100 MB/s absolute
+backstop) had been passing **via the backstop only**: the region corpus
+measured warm read at 260 MB/s vs Anvil 1036 (0.25x), p50 15.9 µs but p90
+549 µs — a collapsed tail, not a slow mean. Per-stage instrumentation (new
+`slab_hit`/`slab_miss`/`decomp`/`glob_conv`/`shift_res` counters in
+`read_stage_json`) pinpointed it: the slab cache was perfect (3860 hits, 0
+misses, 0 decompress ms) while **`glob_conv` burned 39.4 µs × 13,575 = 534
+ms — 92% of sectload**. Every warm read re-decoded every GLOB member
+section: RLE gid decode of 4096 voxels + the frequency-canonical CSEC
+rebuild, from scratch, every time, forever.
+
+Fix: a bounded `CanonCache` (LRU by bytes, `CSAVES_CANON_CACHE`, default
+16 MiB, 0 disables) keyed by the section blob's **content hash**. The stored
+member bytes are immutable (content-addressed) and the state registry is
+append-only, so the conversion is a pure function — each member decodes once
+per process. The old two-pass positional assembly (a `gi` counter pairing
+converted buffers with member slices) is replaced by per-index
+`canon[i] <-> slices_raw[i]`, which also removes a latent desync hazard: one
+failed conversion used to shift every later member of that chunk onto the
+wrong canonical buffer (unreachable on valid stores — conversion failure
+already implies corruption — but the invariant is now structural).
+
+Results (local 2-core, same corpus, same run): warm region read **190.8 ->
+1303.2 MB/s (x6.8)**, wall 0.391 -> 0.055 s, **p90 758 -> 49 µs (x15)**,
+p99 1195 -> 75 µs; 2-thread warm read 4742 -> **36.5k chunks/s**. Warm read
+is now **x1.6 vs same-run Anvil aggregate** (was 0.23x); p50 unchanged
+(17.4 µs — the no-GLOB fast path was never slow). Cold read, import,
+steady-write and size are unchanged (import 35.2 ST / 50.4 MT local,
+container 1.81 MiB = x6.88 vs Anvil sector-padded), `enc_fp` fingerprints
+byte-exact (12,130 members, fp 6d240d7166cdda99), corpus verify 946/946,
+tests 52/52. The speed gate now means what it says: warm-read floor raised
+0.4x -> **0.8x same-run Anvil** (backstop unchanged) — the pre-fix state
+would fail it.
+
 ## v0.9.7 — import split-path cuts: lazy shift builds, single-unpack encode
 
 Profiling the split path (the stages-split JSON) showed the sections stage
@@ -285,17 +321,18 @@ per phase, 256-chunk forceload-window rotation, timed save-all):**
 entities — both engines censored at the RCON timeout; engine save speed
 is hard-gated by the speed-bench jobs instead.)
 
-## I/O speed (real JJThunder corpus, 2-core CI sandbox, single-threaded unless noted)
+## I/O speed (real JJThunder corpus, 2-core sandbox, single-threaded unless noted; v0.9.8 same-run numbers — CI-confirmed per-version numbers live in the version sections)
 
 | operation | Anvil (zlib-6) | c-saves | vs Anvil |
 |---|---|---|---|
-| region read, warm | 723 MB/s, p50 12.7 us | **2237 MB/s, p50 10.8 us** | **x3.1 faster** |
-| region read, 2 IO threads | — | **34.8k chunks/s** | scales with Moonrise workers |
-| region import (fresh write) | 62.6 MB/s | **51.0 MB/s, p99.9 3.9 ms** | near-parity, tails inside tick budget |
-| region import, 2 save threads | — | **96.7 MB/s** | x1.9 scaling (Moonrise-style parallel saves) |
-| region steady rewrite (autosave) | 62.6 MB/s, p90 2.2 ms | **~40 MB/s, p90 2.0 ms** | p90 tails BEAT Anvil |
-| entity write (fresh) | 202 MB/s | **708 MB/s** | **x3.5 faster** |
-| entity steady rewrite | 202 MB/s | **1893 MB/s** | **x9.4 faster** |
+| region read, warm | 812 MB/s, p50 12.2 us | **1253 MB/s, p90 53.5 us** | **x1.5 aggregate, x2.8 p90** |
+| region read, 2 IO threads | — | **30.7k chunks/s** | scales with Moonrise workers |
+| region import (fresh write) | 54.8 MB/s, p50 142 us | 34.9 MB/s ST, **50.4 MB/s MT** | 0.64x ST, 0.92x MT — tails inside tick budget (p99.9 5.5 ms) |
+| region steady rewrite (autosave) | 54.8 MB/s, p90 2.3 ms | **173 MB/s aggregate, p50 8.5 us, p90 0.37 ms** | **x3.2 aggregate, x6 p90** |
+| 10%-dirty autosave cycle | — | **387 MB/s aggregate** | real mutations, p50 7.1 us |
+| entity write (fresh) | 109.5 MB/s | **738 MB/s** | **x6.7 faster** |
+| entity steady rewrite | 109.5 MB/s | **5975 MB/s** | **x55 faster** |
+| container size (sector-padded) | 12.46 MiB | **1.81 MiB** | **x6.88 smaller** |
 
 The v0.8.0 speed work (profiling-driven): the recipe-batch flush ran
 zstd-19 synchronously inside the write thread — measured via the SPEED

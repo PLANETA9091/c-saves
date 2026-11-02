@@ -193,9 +193,11 @@ jobs:
           awk -v r="$CIMP"  'BEGIN { if (r+0 < 25)  { print "FAIL: region import " r " MB/s < 25"; exit 1 } }'
           awk -v r="$CWR"   'BEGIN { if (r+0 < 30)  { print "FAIL: region steady write " r " MB/s < 30"; exit 1 } }'
           # relative floor with an absolute backstop: the warm read must stay
-          # in the anvil-inflate ballpark on the SAME run (same runner state);
-          # 100 MB/s absolute catches a true collapse when anvil is slow too.
-          awk -v c="$CREAD" -v a="$AREAD" 'BEGIN { if (c+0 < a*0.4 && c+0 < 100) { print "FAIL: region warm read " c " MB/s < max(0.4x anvil " a ", 100)"; exit 1 } }'
+          # at 0.8x of anvil-inflate on the SAME run (same runner state) —
+          # v0.9.8's canon cache put it at ~1.5x; before that fix it sat at
+          # 0.25x, hidden by the old 100 MB/s backstop. The backstop only
+          # catches a true collapse when anvil is slow too.
+          awk -v c="$CREAD" -v a="$AREAD" 'BEGIN { if (c+0 < a*0.8 && c+0 < 100) { print "FAIL: region warm read " c " MB/s < max(0.8x anvil " a ", 100)"; exit 1 } }'
           awk -v r="$RP50"  'BEGIN { if (r+0 > 40)  { print "FAIL: read p50 " r "us > 40us"; exit 1 } }'
           awk -v c="$CWR_E" -v a="$AWR_E" 'BEGIN { if (c+0 < a*4) { print "FAIL: entity write " c " MB/s < 4x anvil " a; exit 1 } }'
           echo "speed gates OK"

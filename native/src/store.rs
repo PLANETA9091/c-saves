@@ -107,6 +107,10 @@ pub struct Cfg {
     pub slab_max_raw_whole: usize,
     /// Decompressed-slab read cache budget (bytes).
     pub slab_cache: u64,
+    /// GLOB→canonical section conversion cache budget (bytes). Conversions
+    /// are pure functions of immutable content-addressed member bytes, so
+    /// each member decodes once per process instead of once per read.
+    pub canon_cache: u64,
     /// Writer segment roll threshold. 64 MiB in production; tests shrink it
     /// to force rolls while the append buffer is guaranteed non-empty (the
     /// exact window of the roll-hole corruption this once caused).
@@ -135,6 +139,7 @@ impl Default for Cfg {
             slab_max_raw: 8 * 1024 * 1024,
             slab_max_raw_whole: 4 * 1024 * 1024,
             slab_cache: 32 * 1024 * 1024,
+            canon_cache: 16 * 1024 * 1024,
             seg_roll: 64 * 1024 * 1024,
         }
     }
@@ -209,6 +214,7 @@ impl Cfg {
             slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 8 * 1024 * 1024),
             slab_max_raw_whole: env_parse("CSAVES_SLAB_MAX_RAW_WHOLE", 4 * 1024 * 1024),
             slab_cache: env_parse("CSAVES_SLAB_CACHE", 32 * 1024 * 1024),
+            canon_cache: env_parse("CSAVES_CANON_CACHE", 16 * 1024 * 1024),
             seg_roll: env_parse("CSAVES_SEG_ROLL", 64 * 1024 * 1024),
         }
     }
@@ -778,6 +784,45 @@ impl SlabCache {
     }
 }
 
+/// GLOB→canonical section conversion results, keyed by the member blob's
+/// content hash. Stored member bytes are immutable (content-addressed) and
+/// the state registry is append-only, so a conversion is a pure function:
+/// decode once per member per process, not once per read (39 us x 3.7
+/// members x every chunk read was 92% of warm sectload).
+struct CanonCache {
+    map: HashMap<u128, Arc<Vec<u8>>>,
+    order: VecDeque<(u128, u64)>,
+    total: u64,
+    cap: u64,
+}
+impl CanonCache {
+    fn new(cap: u64) -> Self {
+        CanonCache { map: HashMap::new(), order: VecDeque::new(), total: 0, cap }
+    }
+    fn get(&self, k: &u128) -> Option<Arc<Vec<u8>>> {
+        self.map.get(k).cloned()
+    }
+    fn put(&mut self, k: u128, v: Arc<Vec<u8>>) {
+        let sz = v.len() as u64;
+        if sz > self.cap {
+            return;
+        }
+        if self.map.insert(k, v).is_none() {
+            self.order.push_front((k, sz));
+            self.total += sz;
+            while self.total > self.cap {
+                if let Some((ek, esz)) = self.order.pop_back() {
+                    if self.map.remove(&ek).is_some() {
+                        self.total -= esz;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------- recipe batch -----
 
 /// Pending chunk recipes queued as one kind-9 batch record on flush.
@@ -840,6 +885,13 @@ pub static ST_SECTLOAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::
 pub static ST_JOIN_FUSED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_LEGACY: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_PARSE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// read-path diagnostics: slab cache hit/miss (miss = full frame decompress),
+// decompress ns+bytes, GLOB member conversion ns+count, shift resolve ns
+pub static ST_SLAB_HIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_SLAB_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_DECOMP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static ST_GLOB_CONV: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static ST_SHIFT_RES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 // write path
 pub static WST_SPLIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static WST_ENS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -852,13 +904,18 @@ pub fn read_stage_json() -> String {
         format!("\"{}\":{{ns:{},n:{},per_call:{}}}", name, ns, n, if n > 0 { ns / n } else { 0 })
     };
     format!(
-        "{{{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{}}}",
         fmt("recipe", &ST_RECIPE),
         fmt("tail", &ST_TAIL),
         fmt("sectload", &ST_SECTLOAD),
         fmt("join_fused", &ST_JOIN_FUSED),
         fmt("join_legacy", &ST_JOIN_LEGACY),
         fmt("fastnbt_parse", &ST_PARSE),
+        fmt("slab_hit", &ST_SLAB_HIT),
+        fmt("slab_miss", &ST_SLAB_MISS),
+        fmt("decomp", &ST_DECOMP),
+        fmt("glob_conv", &ST_GLOB_CONV),
+        fmt("shift_res", &ST_SHIFT_RES),
     )
 }
 
@@ -876,7 +933,7 @@ pub fn write_stage_json() -> String {
 }
 
 pub fn read_stage_reset() {
-    for st in [&ST_RECIPE, &ST_TAIL, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE] {
+    for st in [&ST_RECIPE, &ST_TAIL, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_SHIFT_RES] {
         st.0.store(0, Ordering::Relaxed);
         st.1.store(0, Ordering::Relaxed);
     }
@@ -921,6 +978,7 @@ pub struct Store {
     next_blob_id: AtomicU64,
     dicts: RwLock<HashMap<u8, Arc<Vec<u8>>>>,
     slab_cache: Mutex<SlabCache>,
+    canon_cache: Mutex<CanonCache>,
     cur_dict: AtomicU8,
     next_dict_ver: AtomicU8,
     dict_samples: Mutex<Vec<Vec<u8>>>,
@@ -986,6 +1044,7 @@ impl Store {
             batch_idx: Mutex::new(HashMap::new()),
             writer: Mutex::new(None),
             slab_cache: Mutex::new(SlabCache::new(32 * 1024 * 1024)),
+            canon_cache: Mutex::new(CanonCache::new(16 * 1024 * 1024)),
             next_seg: AtomicU64::new(0),
             next_blob_id: AtomicU64::new(1),
             dicts: RwLock::new(HashMap::new()),
@@ -1007,6 +1066,7 @@ impl Store {
             reg_dirty: AtomicBool::new(false),
         });
         *st.slab_cache.lock() = SlabCache::new(st.cfg.slab_cache);
+        *st.canon_cache.lock() = CanonCache::new(st.cfg.canon_cache);
         st.load_dicts()?;
         st.load_glob_reg();
         st.scan()?;
@@ -2720,30 +2780,28 @@ impl Store {
                     .iter()
                     .map(|(i, s, e)| &loaded.keep[*i][*s as usize..*e as usize])
                     .collect();
-                // GLOB members (0xCB) convert back to canonical CSEC here:
-                // reads are the only place 0xCB bytes exist
-                // GLOB members (0xCB) convert back to canonical CSEC here:
-                // reads are the only place 0xCB bytes exist. Two passes keep
-                // the borrow checker happy without aliasing games: pass 1
-                // materializes converted buffers, pass 2 assembles slices.
-                let mut glob_store: Vec<Vec<u8>> = Vec::with_capacity(slices_raw.len());
-                for s in slices_raw.iter() {
-                    let sv: &[u8] = s;
-                    if chunknbt::is_glob_member(sv) {
-                        if let Some(c) = self.glob_to_canon(sv) {
-                            glob_store.push(c);
-                        }
+                // GLOB members (0xCB/0xCC) convert back to canonical CSEC
+                // here — reads are the only place GLOB bytes exist. Results
+                // are cached by the section's content hash (member bytes are
+                // immutable + registry is append-only = pure function), so
+                // each member decodes once per process, not once per read.
+                let mut canon: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(slices_raw.len());
+                let t_glob = std::time::Instant::now();
+                for (i, s) in slices_raw.iter().enumerate() {
+                    let c = self.glob_to_canon_cached(rec.sections[i], s);
+                    if c.is_some() {
+                        ST_GLOB_CONV.1.fetch_add(1, Ordering::Relaxed);
                     }
+                    canon.push(c);
                 }
-                let mut gi = 0usize;
+                {
+                    ST_GLOB_CONV.0.fetch_add(t_glob.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 let mut slices: Vec<&[u8]> = Vec::with_capacity(slices_raw.len());
-                for s in slices_raw.iter() {
-                    let sv: &[u8] = s;
-                    if chunknbt::is_glob_member(sv) && gi < glob_store.len() {
-                        slices.push(glob_store[gi].as_slice());
-                        gi += 1;
-                    } else {
-                        slices.push(sv);
+                for (i, s) in slices_raw.iter().enumerate() {
+                    match &canon[i] {
+                        Some(c) => slices.push(c.as_slice()),
+                        None => slices.push(s),
                     }
                 }
                 {
@@ -2754,10 +2812,15 @@ impl Store {
                 // shift-ref resolution (v0.7): [0xC9] members expand to
                 // canonical CSEC3 against their chunk-local target; keys are
                 // re-mixed so the fused emit cache stays content-keyed.
+                let t_shr = std::time::Instant::now();
                 let resolved = match chunknbt::resolve_shifts(&slices, &rec.sections) {
                     Some(r) => r,
                     None => return fail("shift-resolve"),
                 };
+                {
+                    ST_SHIFT_RES.0.fetch_add(t_shr.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    ST_SHIFT_RES.1.fetch_add(1, Ordering::Relaxed);
+                }
                 let any_shift = !resolved.is_empty();
                 let mut shift_store: Vec<Arc<Vec<u8>>> = Vec::new();
                 let mut keys: Vec<chunknbt::Hash> = Vec::with_capacity(rec.sections.len());
@@ -2848,6 +2911,7 @@ impl Store {
                         let idx = keep.len();
                         keep.push(cached);
                         slab_map.insert(skey, idx);
+                        ST_SLAB_HIT.1.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -2877,7 +2941,14 @@ impl Store {
                 let cl = u32::from_le_bytes(hdr[2..6].try_into().ok()?) as usize;
                 let raw_total = u32::from_le_bytes(hdr[6..10].try_into().ok()?);
                 let data = seg.read_at(loc.off + hlen as u64, cl, sealed)?;
+                let t_dec = std::time::Instant::now();
                 let raw = Arc::new(self.decompress(loc.dict_id, &data, raw_total)?);
+                {
+                    ST_SLAB_MISS.0.fetch_add(raw_total as u64, Ordering::Relaxed);
+                    ST_SLAB_MISS.1.fetch_add(1, Ordering::Relaxed);
+                    ST_DECOMP.0.fetch_add(t_dec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    ST_DECOMP.1.fetch_add(1, Ordering::Relaxed);
+                }
                 if (loc.slab_off + loc.raw_len) as usize > raw.len() {
                     return None;
                 }
@@ -2959,6 +3030,36 @@ impl Store {
         let reg = self.glob_reg.lock();
         match chunknbt::glob_any_to_section(bytes, &reg) {
             Some(c) => Some(c),
+            None => {
+                ST_GLOB_CONV_FAIL.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[c-saves] GLOB member convert failed len={} reg={}",
+                    bytes.len(),
+                    reg.len()
+                );
+                None
+            }
+        }
+    }
+
+    /// Hash-keyed variant for the section read path: the stored member bytes
+    /// are immutable (content-addressed) and the registry is append-only, so
+    /// the canonical form is computed once per member and reused across
+    /// reads. Returns None for non-members (caller keeps the raw slice).
+    fn glob_to_canon_cached(&self, h: chunknbt::Hash, bytes: &[u8]) -> Option<Arc<Vec<u8>>> {
+        if !chunknbt::is_glob_member(bytes) {
+            return None;
+        }
+        if let Some(c) = self.canon_cache.lock().get(&h) {
+            return Some(c);
+        }
+        let reg = self.glob_reg.lock();
+        match chunknbt::glob_any_to_section(bytes, &reg) {
+            Some(c) => {
+                let c = Arc::new(c);
+                self.canon_cache.lock().put(h, c.clone());
+                Some(c)
+            }
             None => {
                 ST_GLOB_CONV_FAIL.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
@@ -5406,5 +5507,38 @@ mod repro {
         let got = s.read_chunk(key(1, 1)).expect("small-chunk read");
         assert!(semantic(&got, &payload));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canon_cache_lru_bounds_and_disable() {
+        // The GLOB→canon result cache must (a) return the stored Arc for a
+        // known hash, (b) evict LRU-style when the byte budget is exceeded,
+        // (c) refuse entries bigger than the cap, (d) store nothing at cap=0
+        // (CSAVES_CANON_CACHE=0 disables the cache entirely).
+        let mut c = CanonCache::new(100);
+        let v1 = Arc::new(vec![1u8; 40]);
+        let v2 = Arc::new(vec![2u8; 40]);
+        let v3 = Arc::new(vec![3u8; 40]);
+        c.put(1, v1.clone());
+        c.put(2, v2.clone());
+        assert!(Arc::ptr_eq(&c.get(&1).unwrap(), &v1));
+        assert!(Arc::ptr_eq(&c.get(&2).unwrap(), &v2));
+        // v1 is now LRU; inserting v3 (total would be 120 > 100) evicts it
+        c.put(3, v3.clone());
+        assert!(c.get(&1).is_none(), "LRU entry must be evicted");
+        assert!(Arc::ptr_eq(&c.get(&2).unwrap(), &v2));
+        assert!(Arc::ptr_eq(&c.get(&3).unwrap(), &v3));
+        // oversize entry: refused, cache state untouched
+        let big = Arc::new(vec![4u8; 200]);
+        c.put(4, big);
+        assert!(c.get(&4).is_none());
+        // re-put of an existing key must not double-count its size
+        c.put(2, v2.clone());
+        c.put(3, v3.clone());
+        assert!(Arc::ptr_eq(&c.get(&2).unwrap(), &v2));
+        // cap=0 disables
+        let mut d = CanonCache::new(0);
+        d.put(9, Arc::new(vec![5u8; 8]));
+        assert!(d.get(&9).is_none());
     }
 }
