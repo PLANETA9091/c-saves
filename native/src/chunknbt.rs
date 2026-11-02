@@ -407,11 +407,26 @@ fn section_data_bits(n: usize, entries: usize, longs: usize) -> u32 {
 }
 
 fn dense_pack_wide(entries: &[u16], bits: u32) -> Vec<u8> {
-    let mut w = BitW::new();
-    for e in entries {
-        w.put(*e as u64, bits);
+    // Word-at-a-time twin of dense_pack for u16 entries (palettes > 256);
+    // bit-identical output to the BitW::put formulation.
+    let b = bits as usize;
+    let mut out = Vec::with_capacity((entries.len() * b + 7) / 8 + 8);
+    let mut acc: u64 = 0;
+    let mut n: usize = 0;
+    for &e in entries {
+        acc |= (e as u64) << n;
+        n += b;
+        if n >= 64 {
+            out.extend_from_slice(&acc.to_le_bytes());
+            n -= 64;
+            acc = (e as u64) >> (b - n);
+        }
     }
-    w.finish()
+    if n > 0 {
+        let bytes = acc.to_le_bytes();
+        out.extend_from_slice(&bytes[..(n + 7) / 8]);
+    }
+    out
 }
 
 fn dense_unpack_wide(b: &[u8], n: usize, bits: u32) -> Option<Vec<u16>> {
@@ -592,6 +607,112 @@ fn transpose_fast_y_u16(v: &[u32], side: usize) -> Vec<u32> {
         }
     }
     out
+}
+
+/// uvarint (LEB128) byte length.
+fn uvarint_len(mut v: u64) -> u64 {
+    let mut l = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        l += 1;
+    }
+    l
+}
+
+/// RLE stream SIZE without materializing it: the same run walk as
+/// rle_encode_stream ([idx u8][varint run] pairs), counting bytes only.
+/// The admission rules only need the length — materializing the full
+/// candidate for a check that rejects ~99% of noise-heavy sections was
+/// pure waste (~20 KB of writes per section across the two candidates).
+fn rle_stream_len(v: &[u8]) -> u64 {
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let idx = v[i];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == idx {
+            run += 1;
+        }
+        total += 1 + uvarint_len(run as u64);
+        i += run;
+    }
+    total
+}
+
+/// RLE size of the y-transposed stream without materializing the
+/// transpose: walks the same (x, z, y) order as transpose_fast_y (x outer,
+/// z middle, y inner stride s2) accumulating the identical run framing.
+fn rle_transposed_len(v: &[u8], side: usize) -> u64 {
+    let s2 = side * side;
+    let mut total = 0u64;
+    let mut run_val = 0u8;
+    let mut run_len = 0usize;
+    for x in 0..side {
+        for z in 0..side {
+            let base = z * side + x;
+            for y in 0..side {
+                let e = v[y * s2 + base];
+                if run_len > 0 && e == run_val {
+                    run_len += 1;
+                } else {
+                    if run_len > 0 {
+                        total += 1 + uvarint_len(run_len as u64);
+                    }
+                    run_val = e;
+                    run_len = 1;
+                }
+            }
+        }
+    }
+    if run_len > 0 {
+        total += 1 + uvarint_len(run_len as u64);
+    }
+    total
+}
+
+/// u32-input twin of rle_stream_len ([gid u16 LE][varint run] framing).
+fn rle_stream_len_u16(v: &[u32]) -> u64 {
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let idx = v[i];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == idx {
+            run += 1;
+        }
+        total += 2 + uvarint_len(run as u64);
+        i += run;
+    }
+    total
+}
+
+/// u32-input twin of rle_transposed_len.
+fn rle_transposed_len_u16(v: &[u32], side: usize) -> u64 {
+    let s2 = side * side;
+    let mut total = 0u64;
+    let mut run_val = 0u32;
+    let mut run_len = 0usize;
+    for x in 0..side {
+        for z in 0..side {
+            let base = z * side + x;
+            for y in 0..side {
+                let e = v[y * s2 + base];
+                if run_len > 0 && e == run_val {
+                    run_len += 1;
+                } else {
+                    if run_len > 0 {
+                        total += 2 + uvarint_len(run_len as u64);
+                    }
+                    run_val = e;
+                    run_len = 1;
+                }
+            }
+        }
+    }
+    if run_len > 0 {
+        total += 2 + uvarint_len(run_len as u64);
+    }
+    total
 }
 
 /// Decode a v3 (0xC7) section.
@@ -776,11 +897,28 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
 }
 
 fn dense_pack(entries: &[u8], bits: u32) -> Vec<u8> {
-    let mut w = BitW::new();
-    for e in entries {
-        w.put(*e as u64, bits);
+    // Word-at-a-time continuous LSB-first packing. Bit-identical output to
+    // the old BitW::put byte loop (2 branches + a byte push per entry), but
+    // one branch per entry and a full LE word flush every 64/bits entries.
+    let b = bits as usize;
+    let mut out = Vec::with_capacity((entries.len() * b + 7) / 8 + 8);
+    let mut acc: u64 = 0;
+    let mut n: usize = 0;
+    for &e in entries {
+        acc |= (e as u64) << n;
+        n += b;
+        if n >= 64 {
+            out.extend_from_slice(&acc.to_le_bytes());
+            n -= 64;
+            // the top (n) bits of this entry continue into the next word
+            acc = (e as u64) >> (b - n);
+        }
     }
-    w.finish()
+    if n > 0 {
+        let bytes = acc.to_le_bytes();
+        out.extend_from_slice(&bytes[..(n + 7) / 8]);
+    }
+    out
 }
 
 fn dense_unpack(b: &[u8], n: usize, bits: u32) -> Option<Vec<u8>> {
@@ -1053,16 +1191,19 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
     let mut f3 = 0u8;
 
     /// One palette entry, normalized from either the string form or the
-    /// modern compound form {Name, Properties}.
-    struct PalEntry {
-        name: String,
-        props: Vec<(String, String)>,
+    /// modern compound form {Name, Properties}. Borrows the strings from the
+    /// parsed NBT tree — the encoder used to clone name + every property
+    /// (hundreds of allocations per section on modded palettes) for bytes
+    /// it only writes straight back out.
+    struct PalEntry<'a> {
+        name: &'a str,
+        props: Vec<(&'a str, &'a str)>,
         plain: bool, // was a bare string
     }
 
-    fn parse_entry(v: &Value) -> Option<PalEntry> {
+    fn parse_entry<'a>(v: &'a Value) -> Option<PalEntry<'a>> {
         match v {
-            Value::String(s) => Some(PalEntry { name: s.clone(), props: Vec::new(), plain: true }),
+            Value::String(s) => Some(PalEntry { name: s.as_str(), props: Vec::new(), plain: true }),
             Value::Compound(cm) => {
                 let Value::String(name) = cm.get("Name")? else { return None };
                 let mut props = Vec::new();
@@ -1070,14 +1211,14 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
                     Some(Value::Compound(pn)) => {
                         for (k, kv) in pn {
                             let Value::String(vv) = kv else { return None };
-                            props.push((k.clone(), vv.clone()));
+                            props.push((k.as_str(), vv.as_str()));
                         }
                     }
                     None => {}
                     _ => return None,
                 }
                 props.sort();
-                Some(PalEntry { name: name.clone(), props, plain: false })
+                Some(PalEntry { name: name.as_str(), props, plain: false })
             }
             _ => None,
         }
@@ -1280,12 +1421,9 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             for (new_i, (_, old_i)) in ents.iter().enumerate() {
                 remap16[*old_i] = new_i as u16;
             }
-            let remapped: Vec<u16> = v.iter().map(|x| remap16[*x as usize]).collect();
-            let mut w = BitW::new();
-            for e in &remapped {
-                w.put(*e as u64, out_bits);
-            }
-            out.extend_from_slice(&w.finish());
+            let mut remapped: Vec<u16> = v.iter().map(|x| remap16[*x as usize]).collect();
+            // word-at-a-time wide pack (bit-identical to the BitW::put loop)
+            out.extend_from_slice(&dense_pack_wide(&remapped, out_bits));
             ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
             return Some((true, 0));
         }
@@ -1326,15 +1464,21 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         let mut best_len = dense.len();
         let mut best: Option<(u8, Vec<u8>)> = None;
         if side != 0 {
-            let ra = rle_encode_stream(&remapped);
-            if ra.len() * 4 <= dense.len() && ra.len() + 32 <= dense.len() {
-                best_len = ra.len();
-                best = Some((1, ra));
-            }
-            let rb = rle_encode_stream(&transpose_fast_y(&remapped, side));
-            if rb.len() * 4 <= dense.len() && rb.len() + 32 <= dense.len() && rb.len() < best_len {
-                best_len = rb.len();
-                best = Some((2, rb));
+            // size-only scans: the admission rule (4x smaller AND 32+ bytes
+            // saved) rejects ~99% of noise-heavy sections — materialize only
+            // the winning candidate. The sizes are exact (same run walk,
+            // same [idx][varint] framing), so decisions and chosen bytes are
+            // identical to materializing both candidates.
+            let la = rle_stream_len(&remapped);
+            let a_ok = la * 4 <= dense.len() as u64 && la + 32 <= dense.len() as u64;
+            let lb = rle_transposed_len(&remapped, side);
+            let b_ok = lb * 4 <= dense.len() as u64 && lb + 32 <= dense.len() as u64;
+            if b_ok && (!a_ok || lb < la) {
+                best_len = lb as usize;
+                best = Some((2, rle_encode_stream(&transpose_fast_y(&remapped, side))));
+            } else if a_ok {
+                best_len = la as usize;
+                best = Some((1, rle_encode_stream(&remapped)));
             }
         }
         SPLT_PACK.0.fetch_add(t_pack.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -4231,23 +4375,20 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
         for g in &gids {
             raw.extend_from_slice(&(*g as u16).to_le_bytes());
         }
-        let rv = rle_encode_stream_u16(&gids);
-        let rt = rle_encode_stream_u16(&transpose_fast_y_u16(&gids, 16));
-        let raw_ok = |r: &Vec<u8>| {
-            div > 0
-                && r.len() as u64 * div <= raw.len() as u64
-                && r.len() + 32 <= raw.len()
-        };
-        let rv_ok = raw_ok(&rv);
-        let rt_ok = raw_ok(&rt);
-        if rv_ok {
-            if rt_ok && rt.len() < rv.len() {
-                (5, rt)
+        // size-only scans (exact [gid u16][varint] lengths) — materialize
+        // only the winning form; identical decisions and bytes
+        let lv = rle_stream_len_u16(&gids);
+        let v_ok = div > 0 && lv * div <= raw.len() as u64 && lv + 32 <= raw.len() as u64;
+        let lt = rle_transposed_len_u16(&gids, 16);
+        let t_ok = div > 0 && lt * div <= raw.len() as u64 && lt + 32 <= raw.len() as u64;
+        if v_ok {
+            if t_ok && lt < lv {
+                (5, rle_encode_stream_u16(&transpose_fast_y_u16(&gids, 16)))
             } else {
-                (4, rv)
+                (4, rle_encode_stream_u16(&gids))
             }
-        } else if rt_ok {
-            (5, rt)
+        } else if t_ok {
+            (5, rle_encode_stream_u16(&transpose_fast_y_u16(&gids, 16)))
         } else {
             (3, raw)
         }
@@ -4256,23 +4397,19 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
         for g in &gids {
             raw.push(*g as u8);
         }
-        let admit = |r: &Vec<u8>| {
-            div > 0
-                && r.len() as u64 * div <= raw.len() as u64
-                && r.len() + 32 <= raw.len()
-        };
-        let ra = rle_encode_stream(&raw);
-        let ra_ok = admit(&ra);
-        let rt = rle_encode_stream(&transpose_fast_y(&raw, 16));
-        let rt_ok = admit(&rt);
-        if ra_ok {
-            if rt_ok && rt.len() < ra.len() {
-                (2, rt)
+        // size-only scans (exact lengths) — materialize only the winner
+        let la = rle_stream_len(&raw);
+        let a_ok = div > 0 && la * div <= raw.len() as u64 && la + 32 <= raw.len() as u64;
+        let lb = rle_transposed_len(&raw, 16);
+        let b_ok = div > 0 && lb * div <= raw.len() as u64 && lb + 32 <= raw.len() as u64;
+        if a_ok {
+            if b_ok && lb < la {
+                (2, rle_encode_stream(&transpose_fast_y(&raw, 16)))
             } else {
-                (1, ra)
+                (1, rle_encode_stream(&raw))
             }
-        } else if rt_ok {
-            (2, rt)
+        } else if b_ok {
+            (2, rle_encode_stream(&transpose_fast_y(&raw, 16)))
         } else {
             (0, raw)
         }
@@ -4389,14 +4526,23 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     let dense = dense_pack(&vox, out_bits);
     let mut best_len = dense.len();
     let mut best: Option<(u8, Vec<u8>)> = None;
-    let ra = rle_encode_stream(&vox);
-    if ra.len() * 4 <= dense.len() && ra.len() + 32 <= dense.len() {
-        best_len = ra.len();
-        best = Some((1, ra));
-    }
-    let rb = rle_encode_stream(&transpose_fast_y(&vox, 16));
-    if rb.len() * 4 <= dense.len() && rb.len() + 32 <= dense.len() && rb.len() < best_len {
-        best = Some((2, rb));
+    // size-only scans (exact lengths, same run walk) — materialize only the
+    // winning candidate; identical decisions and bytes to full materialize
+    let la = rle_stream_len(&vox);
+    let a_ok = la * 4 <= dense.len() as u64 && la + 32 <= dense.len() as u64;
+    let lb = rle_transposed_len(&vox, 16);
+    let b_ok = lb * 4 <= dense.len() as u64 && lb + 32 <= dense.len() as u64;
+    if a_ok {
+        if b_ok && lb < la {
+            best_len = lb as usize;
+            best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
+        } else {
+            best_len = la as usize;
+            best = Some((1, rle_encode_stream(&vox)));
+        }
+    } else if b_ok {
+        best_len = lb as usize;
+        best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
     }
     let mut out = Vec::with_capacity(16 + n * 32 + dense.len() + tail.len());
     out.push(magic);
@@ -4623,14 +4769,23 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     let dense = dense_pack(&vox, out_bits);
     let mut best_len = dense.len();
     let mut best: Option<(u8, Vec<u8>)> = None;
-    let ra = rle_encode_stream(&vox);
-    if ra.len() * 4 <= dense.len() && ra.len() + 32 <= dense.len() {
-        best_len = ra.len();
-        best = Some((1, ra));
-    }
-    let rb = rle_encode_stream(&transpose_fast_y(&vox, 16));
-    if rb.len() * 4 <= dense.len() && rb.len() + 32 <= dense.len() && rb.len() < best_len {
-        best = Some((2, rb));
+    // size-only scans (exact lengths, same run walk) — materialize only the
+    // winning candidate; identical decisions and bytes to full materialize
+    let la = rle_stream_len(&vox);
+    let a_ok = la * 4 <= dense.len() as u64 && la + 32 <= dense.len() as u64;
+    let lb = rle_transposed_len(&vox, 16);
+    let b_ok = lb * 4 <= dense.len() as u64 && lb + 32 <= dense.len() as u64;
+    if a_ok {
+        if b_ok && lb < la {
+            best_len = lb as usize;
+            best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
+        } else {
+            best_len = la as usize;
+            best = Some((1, rle_encode_stream(&vox)));
+        }
+    } else if b_ok {
+        best_len = lb as usize;
+        best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
     }
     let mut f2n = f2 & !4 & !16 & !32;
     if narrow {
