@@ -2519,13 +2519,17 @@ impl Store {
                     for (h, _) in &sections {
                         hashes.push(*h);
                     }
-                    // tail: dedup large tails as blobs, inline tiny ones
-                    let (tdict, tcomp) = self.compress_tier(&tail, false);
+                    // tail: dedup large tails as blobs, inline tiny ones.
+                    // compress_tier used to run BEFORE the size branch and
+                    // its z6 output was thrown away for every tail >= the
+                    // blob threshold (the blob path recompresses inside
+                    // ensure_blob) — pure wasted CPU on most chunk tails.
                     let tail_ref = if tail.len() >= self.cfg.tail_blob_min {
                         let th = chunknbt::hash_of(&tail);
                         self.ensure_blob(th, &tail, false)?;
                         Tail::Blob(th)
                     } else {
+                        let (tdict, tcomp) = self.compress_tier(&tail, false);
                         Tail::Inline { dict: tdict, comp: tcomp, raw: tail.len() as u32 }
                     };
                     Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false }
