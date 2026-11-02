@@ -103,6 +103,17 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.9 — skip discarded tail compression on blob-path tails
+
+`write_chunk_mode` compressed every chunk tail at z6 BEFORE the size branch;
+for tails >= tail_blob_min (512 B — most chunk tails: block entities,
+entities, heightmaps) the compressed output was thrown away and ensure_blob
+recompressed the same bytes at the hot tier. compress_tier has no side
+effects (dict sampling happens elsewhere), so the call moves inside the
+inline branch. Stored bytes identical (blob tails unchanged, inline tails
+same path), enc_fp byte-exact (fp 6d240d7166cdda99), jj verify 946/946,
+tests 53/53. Local import p50 262.9 -> 252.9 µs (-4%), ST 34.9 -> 36.0 MB/s.
+
 ## v0.9.8 — warm-read canon cache: GLOB decode once per member, not per read
 
 The CI speed gate's warm-read floor (0.4x same-run Anvil + 100 MB/s absolute
@@ -321,17 +332,17 @@ per phase, 256-chunk forceload-window rotation, timed save-all):**
 entities — both engines censored at the RCON timeout; engine save speed
 is hard-gated by the speed-bench jobs instead.)
 
-## I/O speed (real JJThunder corpus, 2-core sandbox, single-threaded unless noted; v0.9.8 same-run numbers — CI-confirmed per-version numbers live in the version sections)
+## I/O speed (real JJThunder corpus, 2-core hosted CI runner, single-threaded unless noted; v0.9.9 same-run numbers, CI-confirmed)
 
 | operation | Anvil (zlib-6) | c-saves | vs Anvil |
 |---|---|---|---|
-| region read, warm | 812 MB/s, p50 12.2 us | **1253 MB/s, p90 53.5 us** | **x1.5 aggregate, x2.8 p90** |
-| region read, 2 IO threads | — | **30.7k chunks/s** | scales with Moonrise workers |
-| region import (fresh write) | 54.8 MB/s, p50 142 us | 34.9 MB/s ST, **50.4 MB/s MT** | 0.64x ST, 0.92x MT — tails inside tick budget (p99.9 5.5 ms) |
-| region steady rewrite (autosave) | 54.8 MB/s, p90 2.3 ms | **173 MB/s aggregate, p50 8.5 us, p90 0.37 ms** | **x3.2 aggregate, x6 p90** |
-| 10%-dirty autosave cycle | — | **387 MB/s aggregate** | real mutations, p50 7.1 us |
-| entity write (fresh) | 109.5 MB/s | **738 MB/s** | **x6.7 faster** |
-| entity steady rewrite | 109.5 MB/s | **5975 MB/s** | **x55 faster** |
+| region read, warm | 802 MB/s, p50 11.4 us | **1055 MB/s, p90 67.4 us** | **x1.3 aggregate, x2.3 p90** |
+| region read, 2 IO threads | — | **31.7k chunks/s** | scales with Moonrise workers |
+| region import (fresh write) | 55.5 MB/s, p50 104 us | 37.3 MB/s ST, **75.1 MB/s MT** | 0.67x ST, **x1.35 MT** — tails inside tick budget (p99.9 7.6 ms) |
+| region steady rewrite (autosave) | 55.5 MB/s, p90 2.4 ms | **205 MB/s aggregate, p50 9.5 us, p90 0.33 ms** | **x3.7 aggregate, x7.3 p90** |
+| 10%-dirty autosave cycle | — | **515 MB/s aggregate** | real mutations, p50 7.1 us |
+| entity write (fresh) | 173.4 MB/s | **873.4 MB/s** | **x5.0 faster** |
+| entity steady rewrite | 173.4 MB/s | **8212 MB/s** | **x47 faster** |
 | container size (sector-padded) | 12.46 MiB | **1.81 MiB** | **x6.88 smaller** |
 
 The v0.8.0 speed work (profiling-driven): the recipe-batch flush ran
