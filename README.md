@@ -103,6 +103,43 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.11 — zero-copy scan split: no full-tree parse, no tail re-serialization
+
+The import split path parsed the WHOLE chunk payload into a fastnbt Value
+tree (an allocation per NBT node) and then re-serialized the tail
+(everything except sections) through a HashMap in arbitrary iteration
+order. Both are pure overhead: import only needs (a) the sections list as
+Values and (b) the tail bytes — which the source payload already contains
+verbatim in vanilla key order (strictly more deterministic than HashMap
+order, and it compresses better: cross-chunk tail prefixes stay aligned).
+
+`scan_split` walks the root compound by header arithmetic (zero
+allocation), removes the `sections` range, repacks each Heightmaps
+LongArray through hmap_encode (the same transform tail_encode applies) and
+patches isLightOn when stripping. Any structural doubt -> the full-parse
+fallback runs unchanged. The raw tail is valid NBT; join parses it exactly
+like the old tail.
+
+The walk's own diagnostics (SCAN_FAIL reason + SKIP_LAST_POS beacon in
+`split_stage_json`) caught a cursor-drift bug in the new `skip_value`:
+TAG_Long_Array/Int_Array advanced by `l + 4 + l*8` instead of `4 + l*8` —
+the element count was added as bytes, so every sections walk crossing a
+block_states.data array overshot and fell back. Scan coverage on this
+corpus: 522/728 -> **728/728** (the full-parse path never runs).
+
+Encoder cuts in the same round: the palette remap fuses into the pack and
+RLE loops (`dense_pack_mapped` / `dense_pack_wide_mapped` /
+`rle_*_len_mapped` / `rle_encode_stream_mapped`) — byte-identical by
+construction, since an injective remap preserves run structure and framing
+— and the shift-pass identity serialization is allocation-free
+(`pal_entry_identity_into` + borrowed sort keys).
+
+Results (local, same corpus/run pair): import ST **36.9 -> 41.5-42.3 MB/s
+(+13%)**, import p90 3496 -> 2873 µs; warm read parity (1200-1261 MB/s,
+p50 17.1-17.3 µs); container unchanged (2.96 MiB = x0.08 vs Anvil in
+bench_size). `enc_fp` byte-exact (fp 6d240d7166cdda99, 12 130 members),
+corpus verify 946/946 bad=0, tests 53/53.
+
 ## v0.9.9 — skip discarded tail compression on blob-path tails
 
 `write_chunk_mode` compressed every chunk tail at z6 BEFORE the size branch;

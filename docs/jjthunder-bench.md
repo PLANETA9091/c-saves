@@ -568,3 +568,34 @@ sections are noise — so gid RLE has nothing to bite on HERE. The lever's
 real target is moderate-strata vanilla terrain (survival bigworld), where
 sections fail the canonical 4x-vs-packed-width test but clear the wider
 4096-byte gid window. The bigworld-survival CI bench measures it.
+
+### v0.9.8-v0.9.11 verdict — warm-read regression found and fixed; scan split
+
+CI artifact archaeology (`scripts/ci_art.py`) surfaced a hidden regression
+the 0.4x speed gate had been waving through via its 100 MB/s absolute
+backstop: warm region read measured **0.25x same-run Anvil** (260 vs
+1035 MB/s, p90 549 µs — a collapsed tail, not a slow mean). Per-stage
+counters attributed 92% of sectload to per-read GLOB canonical rebuilds;
+the v0.9.8 content-hash `CanonCache` turned the conversion into a
+once-per-member pure function (hosted-runner warm read x1.3 aggregate vs
+Anvil, p90 x2.3, gate raised to 0.8x).
+
+v0.9.11 then replaced the import split's full-tree parse + HashMap tail
+re-serialization with a zero-copy header-arithmetic walk (`scan_split`).
+The walk's own diagnostics caught a cursor-drift bug in array skipping
+(element count added as bytes), which had silently degraded scan coverage
+to 72% of chunks; after the fix the corpus splits **100%** through the
+scan path (full-parse fallback never runs).
+
+Same-corpus, same-machine numbers (v0.9.10 -> v0.9.11):
+
+| metric | v0.9.10 | v0.9.11 |
+| --- | --- | --- |
+| import ST | 36.9 MB/s | 41.5-42.3 MB/s |
+| import p90 | 3496 µs | 2873 µs |
+| scan coverage | — (full parse) | 728/728 |
+| warm region read | 1217 MB/s | 1200-1261 MB/s |
+| container (bench_size) | 2.96 MiB (x0.08) | 2.96 MiB (x0.08) |
+
+Equivalence pins: `enc_fp` fp=6d240d7166cdda99 (12 130 members, byte-exact),
+`verify ok=946 bad=0`, tests 53/53.

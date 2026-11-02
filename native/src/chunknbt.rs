@@ -429,6 +429,56 @@ fn dense_pack_wide(entries: &[u16], bits: u32) -> Vec<u8> {
     out
 }
 
+/// dense_pack with the palette remap applied on the fly: emits exactly the
+/// bytes of dense_pack(&entries.iter().map(|x| remap[*x]).collect(), bits)
+/// without materializing the mapped stream (remap is injective on 0..n and
+/// every entry is < n, so per-entry mapping and packing fuse losslessly).
+fn dense_pack_mapped(entries: &[u32], remap: &[u8], bits: u32) -> Vec<u8> {
+    let b = bits as usize;
+    let mut out = Vec::with_capacity((entries.len() * b + 7) / 8 + 8);
+    let mut acc: u64 = 0;
+    let mut n: usize = 0;
+    for &e in entries {
+        let e = remap[e as usize];
+        acc |= (e as u64) << n;
+        n += b;
+        if n >= 64 {
+            out.extend_from_slice(&acc.to_le_bytes());
+            n -= 64;
+            acc = (e as u64) >> (b - n);
+        }
+    }
+    if n > 0 {
+        let bytes = acc.to_le_bytes();
+        out.extend_from_slice(&bytes[..(n + 7) / 8]);
+    }
+    out
+}
+
+/// Wide (palette > 256) twin of dense_pack_mapped: emits exactly the bytes
+/// of dense_pack_wide over the materialized remapped u16 stream.
+fn dense_pack_wide_mapped(entries: &[u32], remap: &[u16], bits: u32) -> Vec<u8> {
+    let b = bits as usize;
+    let mut out = Vec::with_capacity((entries.len() * b + 7) / 8 + 8);
+    let mut acc: u64 = 0;
+    let mut n: usize = 0;
+    for &e in entries {
+        let e = remap[e as usize];
+        acc |= (e as u64) << n;
+        n += b;
+        if n >= 64 {
+            out.extend_from_slice(&acc.to_le_bytes());
+            n -= 64;
+            acc = (e as u64) >> (b - n);
+        }
+    }
+    if n > 0 {
+        let bytes = acc.to_le_bytes();
+        out.extend_from_slice(&bytes[..(n + 7) / 8]);
+    }
+    out
+}
+
 fn dense_unpack_wide(b: &[u8], n: usize, bits: u32) -> Option<Vec<u16>> {
     let mut r = BitR { in_: b, pos: 0 };
     let mut out = Vec::with_capacity(n);
@@ -481,6 +531,12 @@ static SPLT_ENC: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0))
 static SPLT_PAL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static SPLT_UNP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static SPLT_PACK: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// scan-split attempts (fast path; falls back to the full parse on doubt)
+static SPLT_SCAN: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static SPLT_SCAN_OK: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// Last scan_root failure reason: 1=root hdr, 2=sections skip, 3=hmap walk,
+/// 4=light patch, 5=generic key skip, 6=no sections key, 7=root key name.
+static SCAN_FAIL: AtomicU64 = AtomicU64::new(0);
 
 /// One-line JSON summary of the split-path stage timers (nanos, calls).
 pub fn split_stage_json() -> String {
@@ -496,7 +552,7 @@ pub fn split_stage_json() -> String {
         )
     }
     format!(
-        "{{{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{}}}",
         f("parse", &SPLT_PARSE),
         f("sections", &SPLT_SECS),
         f("sh", &SPLT_SH),
@@ -505,7 +561,13 @@ pub fn split_stage_json() -> String {
         f("unp", &SPLT_UNP),
         f("pack", &SPLT_PACK),
         f("shift", &SPLT_SHIFT),
-        f("tail", &SPLT_TAIL)
+        f("tail", &SPLT_TAIL),
+        f("scan", &SPLT_SCAN),
+        f("scan_ok", &SPLT_SCAN_OK),
+        format!(
+            r#""scan_fail":{{why:{}}}"#,
+            SCAN_FAIL.load(Ordering::Relaxed)
+        )
     )
 }
 
@@ -607,6 +669,75 @@ fn transpose_fast_y_u16(v: &[u32], side: usize) -> Vec<u32> {
         }
     }
     out
+}
+
+/// rle_encode_stream over a mapped u32 stream ([idx u8][varint run] framing):
+/// identical bytes to rle_encode_stream over the materialized mapped stream.
+fn rle_encode_stream_mapped(v: &[u32], remap: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() / 4 + 16);
+    let mut i = 0usize;
+    while i < v.len() {
+        let idx = remap[v[i] as usize];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == v[i] {
+            run += 1;
+        }
+        out.push(idx);
+        push_uvarint(&mut out, run as u64);
+        i += run;
+    }
+    out
+}
+
+/// RLE SIZE of a mapped u32 stream ([idx u8][varint run] framing) without
+/// materializing it: run boundaries match the materialized form exactly
+/// (injective remap preserves equality), and the framing length is
+/// independent of the idx byte value.
+fn rle_stream_len_mapped(v: &[u32], remap: &[u8]) -> u64 {
+    let _ = remap; // equality-preserving: run structure of v == mapped v
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == v[i] {
+            run += 1;
+        }
+        total += 1 + uvarint_len(run as u64);
+        i += run;
+    }
+    total
+}
+
+/// RLE SIZE of the y-transposed mapped u32 stream without materializing
+/// either the map or the transpose: same (x, z, y) walk as
+/// rle_transposed_len over the mapped stream.
+fn rle_transposed_len_mapped(v: &[u32], remap: &[u8], side: usize) -> u64 {
+    let _ = remap;
+    let s2 = side * side;
+    let mut total = 0u64;
+    let mut run_val = 0u32;
+    let mut run_len = 0usize;
+    for x in 0..side {
+        for z in 0..side {
+            let base = z * side + x;
+            for y in 0..side {
+                let e = v[y * s2 + base];
+                if run_len > 0 && e == run_val {
+                    run_len += 1;
+                } else {
+                    if run_len > 0 {
+                        total += 1 + uvarint_len(run_len as u64);
+                    }
+                    run_val = e;
+                    run_len = 1;
+                }
+            }
+        }
+    }
+    if run_len > 0 {
+        total += 1 + uvarint_len(run_len as u64);
+    }
+    total
 }
 
 /// uvarint (LEB128) byte length.
@@ -1416,22 +1547,22 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         }
         if n > 256 {
             // wide palettes: remap table must be u16; RLE (byte indices)
-            // does not apply — dense only.
+            // does not apply — dense only. The remap fuses into the pack
+            // loop (identical bytes to packing the materialized stream).
             let mut remap16 = vec![0u16; n];
             for (new_i, (_, old_i)) in ents.iter().enumerate() {
                 remap16[*old_i] = new_i as u16;
             }
-            let mut remapped: Vec<u16> = v.iter().map(|x| remap16[*x as usize]).collect();
-            // word-at-a-time wide pack (bit-identical to the BitW::put loop)
-            out.extend_from_slice(&dense_pack_wide(&remapped, out_bits));
+            out.extend_from_slice(&dense_pack_wide_mapped(&v, &remap16, out_bits));
             ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
             return Some((true, 0));
         }
-        // remap re-opens the unp bucket (disjoint from the unpack window above)
-        let t_unp = std::time::Instant::now();
-        let remapped: Vec<u8> = v.iter().map(|x| remap[*x as usize]).collect();
-        SPLT_UNP.0.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        SPLT_UNP.1.fetch_add(1, Ordering::Relaxed);
+        // v0.9.11: the mapped stream is never materialized. remap is
+        // injective on 0..n and every voxel is < n (checked above), so run
+        // structure is preserved exactly: the RLE size scans walk the RAW
+        // stream with identical framing, and the remap fuses into packing
+        // and winner materialization. Outputs are byte-identical to the
+        // materialized formulation (pinned by enc_fp).
         // Dense candidate (identity => the raw vanilla longs, memcpy'd —
         // byte-identical to what dense_pack would produce).
         let t_pack = std::time::Instant::now();
@@ -1442,7 +1573,7 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             }
             d
         } else {
-            dense_pack(&remapped, out_bits)
+            dense_pack_mapped(&v, &remap, out_bits)
         };
         // RLE candidates (v0.6): vanilla order collapses horizontal strata
         // planes into single runs; the y-fast transposed stream collapses
@@ -1469,16 +1600,19 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             // the winning candidate. The sizes are exact (same run walk,
             // same [idx][varint] framing), so decisions and chosen bytes are
             // identical to materializing both candidates.
-            let la = rle_stream_len(&remapped);
+            let la = rle_stream_len_mapped(&v, &remap);
             let a_ok = la * 4 <= dense.len() as u64 && la + 32 <= dense.len() as u64;
-            let lb = rle_transposed_len(&remapped, side);
+            let lb = rle_transposed_len_mapped(&v, &remap, side);
             let b_ok = lb * 4 <= dense.len() as u64 && lb + 32 <= dense.len() as u64;
             if b_ok && (!a_ok || lb < la) {
                 best_len = lb as usize;
-                best = Some((2, rle_encode_stream(&transpose_fast_y(&remapped, side))));
+                best = Some((
+                    2,
+                    rle_encode_stream_mapped(&transpose_fast_y_u16(&v, side), &remap),
+                ));
             } else if a_ok {
                 best_len = la as usize;
-                best = Some((1, rle_encode_stream(&remapped)));
+                best = Some((1, rle_encode_stream_mapped(&v, &remap)));
             }
         }
         SPLT_PACK.0.fetch_add(t_pack.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1601,8 +1735,10 @@ pub static ST_SHIFT_DENSE_MATCH: AtomicU64 = AtomicU64::new(0);
 /// Identity key bytes for one palette entry (order-free, canonical):
 /// [plain][name][0x00][k1=v1 0x1f k2=v2 ...]. Two entries are the same block
 /// state iff these bytes are equal.
-fn pal_entry_identity(v: &Value) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(32);
+/// pal_entry_identity into a caller-owned scratch buffer (cleared first):
+/// identical bytes to pal_entry_identity, zero per-entry allocation.
+fn pal_entry_identity_into(v: &Value, out: &mut Vec<u8>) -> Option<()> {
+    out.clear();
     match v {
         Value::String(s) => {
             out.push(1u8);
@@ -1613,12 +1749,12 @@ fn pal_entry_identity(v: &Value) -> Option<Vec<u8>> {
             out.push(0u8);
             out.extend_from_slice(name.as_bytes());
             out.push(0x00);
-            let mut props: Vec<(String, String)> = Vec::new();
+            let mut props: Vec<(&str, &str)> = Vec::new();
             match cm.get("Properties") {
                 Some(Value::Compound(pn)) => {
                     for (k, kv) in pn {
                         let Value::String(vv) = kv else { return None };
-                        props.push((k.clone(), vv.clone()));
+                        props.push((k.as_str(), vv.as_str()));
                     }
                 }
                 None => {}
@@ -1636,7 +1772,7 @@ fn pal_entry_identity(v: &Value) -> Option<Vec<u8>> {
         }
         _ => return None,
     }
-    Some(out)
+    Some(())
 }
 
 /// put_entry-form bytes for one palette entry (the CSEC wire encoding,
@@ -1781,7 +1917,14 @@ struct ShiftSec {
     n: usize,
 }
 /// Build the ShiftSec for one section Value (None = not usable).
-fn shift_sec_of(s: &Value, tab: &mut HashMap<Vec<u8>, u32>) -> Option<ShiftSec> {
+/// `tab` interns palette-entry identity bytes chunk-globally (owned copies
+/// only for NEW identities; lookups hash the scratch slice); `idbuf` is a
+/// reusable identity-serialization buffer.
+fn shift_sec_of(
+    s: &Value,
+    tab: &mut HashMap<Box<[u8]>, u32>,
+    idbuf: &mut Vec<u8>,
+) -> Option<ShiftSec> {
     let Value::Compound(m) = s else { return None };
     let bs = m.get("block_states")?;
     let Value::Compound(bm) = bs else { return None };
@@ -1790,16 +1933,19 @@ fn shift_sec_of(s: &Value, tab: &mut HashMap<Vec<u8>, u32>) -> Option<ShiftSec> 
     if n == 0 || n > 65535 {
         return None;
     }
-    let mut entry_id: Vec<u32> = Vec::with_capacity(n);
     let mut id_of_orig = vec![0u32; n];
     for (i, p) in pal.iter().enumerate() {
-        let key = pal_entry_identity(p)?;
+        pal_entry_identity_into(p, idbuf)?;
         let nid = tab.len() as u32;
-        let id = *tab.entry(key).or_insert(nid);
+        let id = match tab.get(idbuf.as_slice()) {
+            Some(&x) => x,
+            None => {
+                tab.insert(idbuf.as_slice().into(), nid);
+                nid
+            }
+        };
         id_of_orig[i] = id;
-        entry_id.push(id);
     }
-    let _ = entry_id;
     let mut ident = vec![0u32; 4096];
     // one unpack feeds ident AND the frequency counts (the canonical order
     // mirrors enc_pal_data_canon: counts desc, then (plain, name, props)) —
@@ -1836,20 +1982,23 @@ fn shift_sec_of(s: &Value, tab: &mut HashMap<Vec<u8>, u32>) -> Option<ShiftSec> 
             ident.iter_mut().for_each(|x| *x = id_of_orig[0]);
         }
     }
-    // precompute sort keys to avoid borrows crossing the sort
-    let keys: Vec<(bool, String, Vec<(String, String)>)> = (0..n)
+    // precompute sort keys to avoid borrows crossing the sort — borrowed
+    // from the parsed tree (the cloned-String version spent hundreds of
+    // allocations per build on wide palettes; the comparison order, hence
+    // the canonical order, is identical)
+    let keys: Vec<(bool, &str, Vec<(&str, &str)>)> = (0..n)
         .map(|i| match &pal[i] {
-            Value::String(s) => (true, s.clone(), Vec::new()),
+            Value::String(s) => (true, s.as_str(), Vec::new()),
             Value::Compound(cm) => {
                 let name = match cm.get("Name") {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => String::new(),
+                    Some(Value::String(s)) => s.as_str(),
+                    _ => "",
                 };
-                let mut ps: Vec<(String, String)> = match cm.get("Properties") {
+                let mut ps: Vec<(&str, &str)> = match cm.get("Properties") {
                     Some(Value::Compound(pn)) => pn
                         .iter()
                         .filter_map(|(k, kv)| match kv {
-                            Value::String(vv) => Some((k.clone(), vv.clone())),
+                            Value::String(vv) => Some((k.as_str(), vv.as_str())),
                             _ => None,
                         })
                         .collect(),
@@ -1858,7 +2007,7 @@ fn shift_sec_of(s: &Value, tab: &mut HashMap<Vec<u8>, u32>) -> Option<ShiftSec> 
                 ps.sort();
                 (false, name, ps)
             }
-            _ => (false, String::new(), Vec::new()),
+            _ => (false, "", Vec::new()),
         })
         .collect();
     let mut order: Vec<usize> = (0..n).collect();
@@ -1900,7 +2049,8 @@ fn shift_ref_pass(sections: &mut [(Hash, SecBytes)], vals: &[Value], cache_hit: 
     if n_sec < 2 {
         return;
     }
-    let mut tab: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut tab: HashMap<Box<[u8]>, u32> = HashMap::new();
+    let mut idbuf: Vec<u8> = Vec::with_capacity(64);
     // Sections with tiny members (uniform / RLE-collapsed) are excluded
     // entirely: their matches can never clear the admission rule (the ref
     // carries at least the header + tail the member already has), and they
@@ -1947,7 +2097,8 @@ fn shift_ref_pass(sections: &mut [(Hash, SecBytes)], vals: &[Value], cache_hit: 
                             Some(a) => Some(a.clone()),
                             None => {
                                 let t_b = std::time::Instant::now();
-                                let r = shift_sec_of(&vals[$ix], &mut tab).map(Arc::new);
+                                let r =
+                                    shift_sec_of(&vals[$ix], &mut tab, &mut idbuf).map(Arc::new);
                                 ST_SHIFT_BUILD_NS.fetch_add(
                                     t_b.elapsed().as_nanos() as u64,
                                     Ordering::Relaxed,
@@ -2959,11 +3110,355 @@ pub fn split(
     if whole_mode {
         return whole_split(payload, pos_hint);
     }
+    let strip = strip && !matches!(std::env::var("CSAVES_KEEP_LIGHT").as_deref(), Ok("1"));
+    if std::env::var("CSAVES_NO_SCAN").as_deref() != Ok("1") {
+        let t_scan = std::time::Instant::now();
+        let r = scan_split(payload, strip);
+        SPLT_SCAN.0.fetch_add(t_scan.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLT_SCAN.1.fetch_add(1, Ordering::Relaxed);
+        if let Some(sp) = r {
+            SPLT_SCAN_OK.0.fetch_add(t_scan.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            SPLT_SCAN_OK.1.fetch_add(1, Ordering::Relaxed);
+            return Ok(sp);
+        }
+    }
     let t_sp = std::time::Instant::now();
     let root: Value = fastnbt::from_bytes(payload).map_err(|e| format!("nbt parse: {e}"))?;
     SPLT_PARSE.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_PARSE.1.fetch_add(1, Ordering::Relaxed);
     split_parsed(payload, pos_hint, root, strip)
+}
+
+/// Section encode + dedup-cache lookup, shared by the scan-split fast path
+/// and the full-parse fallback (identical decisions on identical inputs).
+fn encode_section_list(list: &[Value]) -> (Vec<(Hash, SecBytes)>, Vec<bool>) {
+    let mut sections = Vec::with_capacity(list.len());
+    let mut cache_hit = vec![false; list.len()];
+    for s in list.iter() {
+        // encode-cache: re-saving a chunk re-encodes every section; the
+        // structural hash is order-free, so unchanged sections hit the
+        // cache and skip canonicalization + bit-packing entirely.
+        let t_sh = std::time::Instant::now();
+        let sh = structural_hash(s);
+        SPLT_SH.0.fetch_add(t_sh.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLT_SH.1.fetch_add(1, Ordering::Relaxed);
+        if let Some((h, shared)) = enc_cache_get(sh) {
+            cache_hit[sections.len()] = true;
+            sections.push((h, SecBytes::Shared(shared)));
+            continue;
+        }
+        // custom form when possible (marker-detectable), NBT bytes otherwise.
+        // v3 output is canonical, so identical content yields identical bytes
+        // regardless of the original palette order -> hash the bytes.
+        let t_enc = std::time::Instant::now();
+        match section_encode(s) {
+            Some(c) => {
+                SPLT_ENC.0.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_ENC.1.fetch_add(1, Ordering::Relaxed);
+                if is_csec4(c.first()) {
+                    let h = hash_of(&c);
+                    let arc = Arc::new(c);
+                    enc_cache_put(sh, h, arc.clone());
+                    sections.push((h, SecBytes::Shared(arc)));
+                } else {
+                    sections.push((structural_hash(s), SecBytes::Owned(c)));
+                }
+            }
+            None => {
+                SPLT_ENC.0.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_ENC.1.fetch_add(1, Ordering::Relaxed);
+                sections.push((structural_hash(s), SecBytes::Owned(to_bytes(s))))
+            }
+        }
+    }
+    (sections, cache_hit)
+}
+
+/// The shift-ref stage shared by both split paths: collapse sections that
+/// are vertical shifts of a lower section of this chunk (mountain strata /
+/// ocean floors / cave ceilings) into ~15-30 byte refs; the top k planes
+/// stay explicit. Sections whose content was seen in an earlier chunk
+/// (enc-cache hit) are skipped: their full members dedup across chunks for
+/// free, which always beats a chunk-local ref.
+fn shift_stage(sections: &mut Vec<(Hash, SecBytes)>, vals: &[Value], cache_hit: &[bool]) {
+    if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
+        let t_sp = std::time::Instant::now();
+        shift_ref_pass(sections, vals, cache_hit);
+        SPLT_SHIFT.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLT_SHIFT.1.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ------------------------------------------- zero-copy split scan (v0.9.11) --
+//
+// The fallback path parses the WHOLE payload into a fastnbt Value tree
+// (an allocation per NBT node) and re-serializes the tail (everything except
+// sections) in HashMap iteration order. Both are pure overhead: the import
+// only needs (a) the sections LIST as Values and (b) the tail bytes — which
+// the source payload already contains verbatim in vanilla key order
+// (strictly more deterministic than a HashMap-ordered re-serialization, and
+// it compresses better: vanilla writers emit optional fields last so
+// cross-chunk prefixes stay aligned).
+//
+// scan_split walks the root compound by header arithmetic (no allocation),
+// removes the `sections` range, repacks each Heightmaps LongArray through
+// hmap_encode (the same transform tail_encode applies) and patches
+// isLightOn when stripping. Any doubt -> None -> the full-parse fallback
+// runs unchanged. The raw tail is a VALID NBT compound, so join()/join_fused
+// parse it exactly like the old tail (tail_decode already keys the heightmap
+// transform off the HMAP_MAGIC ByteArray marker).
+
+/// Deepest byte position reached by the most recent skip_value walk
+/// (set at every entry; read by the scan_split failure diagnostics).
+static SKIP_LAST_POS: AtomicU64 = AtomicU64::new(0);
+
+/// Bounds-checked NBT value skip by header arithmetic. Returns None on any
+/// overrun/malformed input (caller falls back to the full parse).
+fn skip_value(b: &[u8], p: &mut usize, ty: u8, depth: u32) -> Option<()> {
+    SKIP_LAST_POS.store(*p as u64, Ordering::Relaxed);
+    if depth == 0 {
+        return None;
+    }
+    match ty {
+        1 => *p += 1,
+        2 => *p += 2,
+        3 | 5 => *p += 4,
+        4 | 6 => *p += 8,
+        7 => {
+            let l = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?) as usize;
+            *p = p.checked_add(l)?.checked_add(4)?;
+        }
+        12 => {
+            let l = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?) as usize;
+            *p = p.checked_add(4)?.checked_add(l.checked_mul(8)?)?;
+        }
+        11 => {
+            let l = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?) as usize;
+            *p = p.checked_add(4)?.checked_add(l.checked_mul(4)?)?;
+        }
+        8 => {
+            let l = u16::from_be_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p = p.checked_add(l)?.checked_add(2)?;
+        }
+        9 => {
+            let et = *b.get(*p)?;
+            let l = i32::from_be_bytes(b.get(*p + 1..*p + 5)?.try_into().ok()?) as usize;
+            *p += 5;
+            if l == 0 {
+                return Some(()); // empty list: element type may be 0
+            }
+            if et == 0 {
+                return None;
+            }
+            for _ in 0..l {
+                skip_value(b, p, et, depth - 1)?;
+            }
+        }
+        10 => {
+            loop {
+                let t = *b.get(*p)?;
+                *p += 1;
+                if t == 0 {
+                    break;
+                }
+                let l = u16::from_be_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+                *p = p.checked_add(2)?.checked_add(l)?; // name length + NAME BYTES
+                skip_value(b, p, t, depth - 1)?;
+            }
+        }
+        _ => return None, // 0 or >12 at value position: malformed
+    }
+    if *p <= b.len() {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// (pos, len, replacement) — disjoint, ascending. Empty replacement = remove.
+type TailEdit = (usize, usize, Vec<u8>);
+
+struct ScanOut {
+    edits: Vec<TailEdit>,
+    /// append TAG_Byte isLightOn=0 before the root END (strip mode only)
+    insert_light: bool,
+    /// payload range of the sections LIST VALUE (after [tag][name])
+    sections_payload: (usize, usize),
+    /// position of the root compound END byte
+    end_pos: usize,
+}
+
+/// Walk the root compound of a chunk payload. Recognizes `sections`
+/// (TAG_List — the removal range), `Heightmaps` (TAG_Compound of LongArrays
+/// — hmap_encode replacements) and `isLightOn` (strip patch). Everything
+/// else is skipped by header arithmetic. None = anything unexpected.
+fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
+    macro_rules! sr {
+        ($e:expr, $why:expr) => {
+            match $e {
+                Some(v) => v,
+                None => {
+                    SCAN_FAIL.store($why, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        };
+    }
+    let mut p = 0usize;
+    if *sr!(payload.first(), 1) != 0x0A {
+        SCAN_FAIL.store(1, Ordering::Relaxed);
+        return None;
+    }
+    p += 1;
+    let nl = u16::from_be_bytes(sr!(sr!(payload.get(p..p + 2), 1).try_into().ok(), 1)) as usize;
+    p += 2 + nl; // root name (usually empty)
+    let mut edits: Vec<TailEdit> = Vec::new();
+    let mut sections_payload: Option<(usize, usize)> = None;
+    let mut insert_light = false;
+    let mut saw_light = false;
+    loop {
+        let tag_pos = p;
+        let ty = *payload.get(p)?;
+        p += 1;
+        if ty == 0 {
+            // the old Value path does m.insert("isLightOn", Byte(0)) — an
+            // UPSERT: the relight trigger must appear even when the source
+            // payload has no isLightOn key (Paper omits it in region files)
+            if strip && !saw_light {
+                insert_light = true;
+            }
+            return Some(ScanOut {
+                edits,
+                insert_light,
+                sections_payload: sr!(sections_payload, 6),
+                end_pos: tag_pos,
+            });
+        }
+        let nl = u16::from_be_bytes(sr!(sr!(payload.get(p..p + 2), 7).try_into().ok(), 7)) as usize;
+        let name = sr!(payload.get(p + 2..p + 2 + nl), 7);
+        p += 2 + nl;
+        match (ty, name) {
+            (9, b"sections") => {
+                let vp = p;
+                sr!(skip_value(payload, &mut p, 9, 24), 2);
+                sections_payload = Some((vp, p));
+                edits.push((tag_pos, p - tag_pos, Vec::new()));
+            }
+            (10, b"Heightmaps") => {
+                // walk the inner compound manually: each TAG_Long_Array value
+                // that hmap_encode accepts is replaced by the dense
+                // TAG_Byte_Array form tail_encode would produce. The edit
+                // range covers the WHOLE entry (type byte + name + payload);
+                // the replacement re-emits type + name.
+                loop {
+                    let it_pos = p;
+                    let it = *sr!(payload.get(p), 3);
+                    p += 1;
+                    if it == 0 {
+                        break;
+                    }
+                    let inl = u16::from_be_bytes(sr!(sr!(payload.get(p..p + 2), 3).try_into().ok(), 3)) as usize;
+                    let iname = sr!(payload.get(p + 2..p + 2 + inl), 3);
+                    p += 2 + inl;
+                    let vs = p;
+                    sr!(skip_value(payload, &mut p, it, 8), 3);
+                    if it != 12 {
+                        continue;
+                    }
+                    let l = i32::from_be_bytes(sr!(sr!(payload.get(vs..vs + 4), 3).try_into().ok(), 3)) as usize;
+                    if l != 37 {
+                        continue; // hmap_encode rejects; keep raw (same decision)
+                    }
+                    let raw = sr!(payload.get(vs + 4..vs + 4 + l * 8), 3);
+                    let la: Vec<i64> = raw
+                        .chunks_exact(8)
+                        .map(|c| i64::from_be_bytes(c.try_into().unwrap()))
+                        .collect();
+                    let Some(dense) = hmap_encode(&la) else { continue };
+                    let mut rep = Vec::with_capacity(7 + iname.len() + dense.len());
+                    rep.push(7u8); // TAG_Byte_Array
+                    rep.extend_from_slice(&(iname.len() as u16).to_be_bytes());
+                    rep.extend_from_slice(iname);
+                    // TAG_Byte_Array payload length is an i32 (standard NBT
+                    // — fastnbt serializes ByteArray the same way, and the
+                    // join-side Heightmaps walk reads 4 bytes here)
+                    rep.extend_from_slice(&(dense.len() as i32).to_be_bytes());
+                    rep.extend_from_slice(&dense);
+                    edits.push((it_pos, p - it_pos, rep));
+                }
+            }
+            (_, b"isLightOn") if strip => {
+                saw_light = true;
+                sr!(skip_value(payload, &mut p, ty, 8), 4);
+                if ty == 1 {
+                    if payload[p - 1] != 0 {
+                        edits.push((p - 1, 1, vec![0u8]));
+                    }
+                } else {
+                    // foreign type: remove; the Byte(0) form is appended
+                    // before END (a map insert would replace it too)
+                    edits.push((tag_pos, p - tag_pos, Vec::new()));
+                    insert_light = true;
+                }
+            }
+            _ => {
+                sr!(skip_value(payload, &mut p, ty, 32), 5);
+            }
+        }
+    }
+}
+
+/// Fast-path split: raw tail + sections-only parse. None = fall back to the
+/// full parse (any structural doubt, non-compound root, missing sections...).
+fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
+    let Some(out) = scan_root(payload, strip) else {
+        if std::env::var("CSAVES_SCAN_DEBUG").as_deref() == Ok("1") {
+            let lp = SKIP_LAST_POS.load(Ordering::Relaxed) as usize;
+            let lo = lp.saturating_sub(12).min(payload.len());
+            let hi = (lp + 8).min(payload.len());
+            let hex: String = payload[lo..hi].iter().map(|x| format!("{x:02x}")).collect();
+            eprintln!(
+                "scan_root fail why={} last_skip_pos={lp} len={} bytes[{lo}..{hi}]={hex}",
+                SCAN_FAIL.load(Ordering::Relaxed),
+                payload.len()
+            );
+        }
+        return None;
+    };
+    let (sp0, sp1) = out.sections_payload;
+    // parse ONLY the sections list: wrap the payload as a named compound
+    // {"": <list>} — fastnbt requires a compound root.
+    let mut buf = Vec::with_capacity(6 + (sp1 - sp0));
+    buf.extend_from_slice(&[0x0A, 0x00, 0x00, 0x09, 0x00, 0x00]);
+    buf.extend_from_slice(&payload[sp0..sp1]);
+    buf.push(0x00);
+    let root: Value = fastnbt::from_bytes(&buf).ok()?;
+    let Value::Compound(mut m) = root else { return None };
+    let Some(Value::List(mut list)) = m.remove("") else { return None };
+    if strip {
+        for s in list.iter_mut() {
+            strip_derived_section(s);
+        }
+    }
+    let (mut sections, cache_hit) = encode_section_list(&list);
+    shift_stage(&mut sections, &list, &cache_hit);
+    // tail = payload minus the sections range, with the heightmap/isLightOn
+    // edits applied; the root END byte is re-emitted after any light insert
+    let mut tail = Vec::with_capacity(payload.len());
+    let mut pos = 0usize;
+    for (ep, el, bytes) in &out.edits {
+        tail.extend_from_slice(payload.get(pos..*ep)?);
+        tail.extend_from_slice(bytes);
+        pos = ep + el;
+    }
+    tail.extend_from_slice(payload.get(pos..out.end_pos)?);
+    if out.insert_light {
+        tail.extend_from_slice(&[
+            1u8, 0x00, 0x09, b'i', b's', b'L', b'i', b'g', b'h', b't', b'O', b'n', 0x00,
+        ]);
+    }
+    tail.push(0x00);
+    Some(Split::Split { sections, tail })
 }
 
 /// Sectioned split over an ALREADY-parsed chunk (root is consumed for the
@@ -2998,57 +3493,9 @@ fn split_parsed(
                 strip_derived_section(s);
             }
         }
-        sections = Vec::with_capacity(list.len());
-        let mut cache_hit = vec![false; list.len()];
-        for s in list.iter() {
-            // encode-cache: re-saving a chunk re-encodes every section; the
-            // structural hash is order-free, so unchanged sections hit the
-            // cache and skip canonicalization + bit-packing entirely.
-            let t_sh = std::time::Instant::now();
-            let sh = structural_hash(s);
-            SPLT_SH.0.fetch_add(t_sh.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            SPLT_SH.1.fetch_add(1, Ordering::Relaxed);
-            if let Some((h, shared)) = enc_cache_get(sh) {
-                cache_hit[sections.len()] = true;
-                sections.push((h, SecBytes::Shared(shared)));
-                continue;
-            }
-            // custom form when possible (marker-detectable), NBT bytes otherwise.
-            // v3 output is canonical, so identical content yields identical bytes
-            // regardless of the original palette order -> hash the bytes.
-            let t_enc = std::time::Instant::now();
-            match section_encode(s) {
-                Some(c) => {
-                    SPLT_ENC.0.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    SPLT_ENC.1.fetch_add(1, Ordering::Relaxed);
-                    if is_csec4(c.first()) {
-                        let h = hash_of(&c);
-                        let arc = Arc::new(c);
-                        enc_cache_put(sh, h, arc.clone());
-                        sections.push((h, SecBytes::Shared(arc)));
-                    } else {
-                        sections.push((structural_hash(s), SecBytes::Owned(c)));
-                    }
-                }
-                None => {
-                    SPLT_ENC.0.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    SPLT_ENC.1.fetch_add(1, Ordering::Relaxed);
-                    sections.push((structural_hash(s), SecBytes::Owned(to_bytes(s))))
-                }
-            }
-        }
-        // shift-ref pass (v0.7): collapse sections that are vertical shifts
-        // of a lower section of this chunk (mountain strata / ocean floors /
-        // cave ceilings) into ~15-30 byte refs; the top k planes stay
-        // explicit. Sections whose content was seen in an earlier chunk
-        // (enc-cache hit) are skipped: their full members dedup across
-        // chunks for free, which always beats a chunk-local ref.
-        if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
-            let t_sp = std::time::Instant::now();
-            shift_ref_pass(&mut sections, list, &cache_hit);
-            SPLT_SHIFT.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            SPLT_SHIFT.1.fetch_add(1, Ordering::Relaxed);
-        }
+        let (mut secs, cache_hit) = encode_section_list(list);
+        shift_stage(&mut secs, list, &cache_hit);
+        sections = secs;
     }
     SPLT_SECS.0.fetch_add(t_ss.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_SECS.1.fetch_add(1, Ordering::Relaxed);
@@ -3782,13 +4229,13 @@ fn emit_tail_direct(tail: &[u8], sections: &[SecSrc], out: &mut Vec<u8>) -> Opti
                     // could not be densified): copy the whole entry verbatim
                     let e0 = p - 3 - inl; // tag(1) + namelen(2) + name(inl)
                     nbt_skip(tail, &mut p, itag, 1)?;
-                    out.extend_from_slice(&tail[e0..p]);
+                    out.extend_from_slice(tail.get(e0..p)?);
                 }
             }
             out.push(0x00); // end Heightmaps compound
         } else {
             nbt_skip(tail, &mut p, tag, 0)?;
-            out.extend_from_slice(&tail[start..p]);
+            out.extend_from_slice(tail.get(start..p)?);
         }
     }
     if !sections_done {
