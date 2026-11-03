@@ -537,6 +537,9 @@ static SPLT_SCAN_OK: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new
 /// Last scan_root failure reason: 1=root hdr, 2=sections skip, 3=hmap walk,
 /// 4=light patch, 5=generic key skip, 6=no sections key, 7=root key name.
 static SCAN_FAIL: AtomicU64 = AtomicU64::new(0);
+/// Byte position of the failure (diagnostics only; stored at the failing
+/// sr! site — exact, unlike a deepest-walk beacon, and zero cost on success).
+static SCAN_FAIL_POS: AtomicU64 = AtomicU64::new(0);
 
 /// One-line JSON summary of the split-path stage timers (nanos, calls).
 pub fn split_stage_json() -> String {
@@ -544,7 +547,7 @@ pub fn split_stage_json() -> String {
         let ns = t.0.load(Ordering::Relaxed);
         let n = t.1.load(Ordering::Relaxed);
         format!(
-            r#"{}":{{ns:{},n:{},per_call:{}}}"#,
+            r#""{}":{{ns:{},n:{},per_call:{}}}"#,
             name,
             ns,
             n,
@@ -552,7 +555,7 @@ pub fn split_stage_json() -> String {
         )
     }
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{}}}",
         f("parse", &SPLT_PARSE),
         f("sections", &SPLT_SECS),
         f("sh", &SPLT_SH),
@@ -563,11 +566,12 @@ pub fn split_stage_json() -> String {
         f("shift", &SPLT_SHIFT),
         f("tail", &SPLT_TAIL),
         f("scan", &SPLT_SCAN),
-        f("scan_ok", &SPLT_SCAN_OK),
-        format!(
-            r#""scan_fail":{{why:{}}}"#,
-            SCAN_FAIL.load(Ordering::Relaxed)
-        )
+        f("scan_ok", &SPLT_SCAN_OK)
+    )
+    + &format!(
+        r#","scan_fail":{{"why":{},"pos":{}}}"#,
+        SCAN_FAIL.load(Ordering::Relaxed),
+        SCAN_FAIL_POS.load(Ordering::Relaxed)
     )
 }
 
@@ -3208,14 +3212,9 @@ fn shift_stage(sections: &mut Vec<(Hash, SecBytes)>, vals: &[Value], cache_hit: 
 // parse it exactly like the old tail (tail_decode already keys the heightmap
 // transform off the HMAP_MAGIC ByteArray marker).
 
-/// Deepest byte position reached by the most recent skip_value walk
-/// (set at every entry; read by the scan_split failure diagnostics).
-static SKIP_LAST_POS: AtomicU64 = AtomicU64::new(0);
-
 /// Bounds-checked NBT value skip by header arithmetic. Returns None on any
 /// overrun/malformed input (caller falls back to the full parse).
 fn skip_value(b: &[u8], p: &mut usize, ty: u8, depth: u32) -> Option<()> {
-    SKIP_LAST_POS.store(*p as u64, Ordering::Relaxed);
     if depth == 0 {
         return None;
     }
@@ -3293,18 +3292,22 @@ struct ScanOut {
 /// — hmap_encode replacements) and `isLightOn` (strip patch). Everything
 /// else is skipped by header arithmetic. None = anything unexpected.
 fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
+    // NOTE: `p` must be declared BEFORE the macro — macro_rules hygiene
+    // resolves the body's `p` at the definition site, and a later local
+    // binding is invisible to it (E0425).
+    let mut p = 0usize;
     macro_rules! sr {
         ($e:expr, $why:expr) => {
             match $e {
                 Some(v) => v,
                 None => {
                     SCAN_FAIL.store($why, Ordering::Relaxed);
+                    SCAN_FAIL_POS.store(p as u64, Ordering::Relaxed);
                     return None;
                 }
             }
         };
     }
-    let mut p = 0usize;
     if *sr!(payload.first(), 1) != 0x0A {
         SCAN_FAIL.store(1, Ordering::Relaxed);
         return None;
@@ -3413,13 +3416,10 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
 fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
     let Some(out) = scan_root(payload, strip) else {
         if std::env::var("CSAVES_SCAN_DEBUG").as_deref() == Ok("1") {
-            let lp = SKIP_LAST_POS.load(Ordering::Relaxed) as usize;
-            let lo = lp.saturating_sub(12).min(payload.len());
-            let hi = (lp + 8).min(payload.len());
-            let hex: String = payload[lo..hi].iter().map(|x| format!("{x:02x}")).collect();
             eprintln!(
-                "scan_root fail why={} last_skip_pos={lp} len={} bytes[{lo}..{hi}]={hex}",
+                "scan_root fail why={} pos={} len={}",
                 SCAN_FAIL.load(Ordering::Relaxed),
+                SCAN_FAIL_POS.load(Ordering::Relaxed),
                 payload.len()
             );
         }
@@ -3459,6 +3459,20 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
     }
     tail.push(0x00);
     Some(Split::Split { sections, tail })
+}
+
+/// Diagnostic hook for probes: run scan_root on one payload and report
+/// (why, pos, ok) without touching the counters' meaning (why=0 = success).
+#[doc(hidden)]
+pub fn scan_probe(payload: &[u8], strip: bool) -> (u64, u64, bool) {
+    match scan_root(payload, strip) {
+        Some(_) => (0, 0, true),
+        None => (
+            SCAN_FAIL.load(Ordering::Relaxed),
+            SCAN_FAIL_POS.load(Ordering::Relaxed),
+            false,
+        ),
+    }
 }
 
 /// Sectioned split over an ALREADY-parsed chunk (root is consumed for the

@@ -1,6 +1,8 @@
 //! Probe: fastnbt's authoritative view of every corpus chunk root — key
-//! names/types, sections list count/elem type — to explain scan_split
-//! fallbacks. Usage: probe_keys <dim-dir>
+//! names/types, sections list count/elem type — cross-checked against the
+//! scan-split walk (scan_probe). Any chunk fastnbt parses but scan_root
+//! rejects shows up as SCANFAIL with its reason code. Usage:
+//! probe_keys <dim-dir>
 use c_saves::chunknbt;
 use std::io::Read;
 use std::path::PathBuf;
@@ -32,6 +34,14 @@ fn main() {
                     continue;
                 }
                 n_all += 1;
+                // scan-walk cross-check: report failures with chunk identity
+                let (why, pos, ok) = chunknbt::scan_probe(&payload, false);
+                if !ok {
+                    eprintln!(
+                        "SCANFAIL file=r.0.{}.mca c={} len={} why={} pos={}",
+                        r * 32 + z, c, payload.len(), why, pos
+                    );
+                }
                 let Ok(root) = fastnbt::from_bytes::<fastnbt::Value>(&payload) else {
                     *shapes.entry("PARSE_FAIL".into()).or_default() += 1;
                     continue;
