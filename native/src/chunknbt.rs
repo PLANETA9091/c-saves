@@ -4593,14 +4593,17 @@ fn dir_str<'a>(b: &'a [u8], p: &mut usize) -> Option<&'a str> {
 }
 
 /// TAG_Byte_Array payload as a borrowed slice (SkyLight / BlockLight).
+/// Consumes 4 header + len bytes — the header add was MISSING pre-0.9.17,
+/// which drifted every light-bearing section 4 bytes left and cascade-failed
+/// ~9% of chunks into the fastnbt fallback (the "fb=66" mystery).
 #[inline]
 fn dir_bytes<'a>(b: &'a [u8], p: &mut usize) -> Option<&'a [u8]> {
     let l = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?);
     if l < 0 {
         return None;
     }
-    let end = p.checked_add(l as usize)?;
-    let s = b.get(*p..end)?;
+    let end = p.checked_add(4)?.checked_add(l as usize)?;
+    let s = b.get(*p + 4..end)?;
     *p = end;
     Some(s)
 }
