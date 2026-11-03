@@ -154,6 +154,28 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.12 — encoder-to-shift facts reuse: build once, use twice
+
+Fine-grained build timers attributed 74% of the shift build (60 of
+81 ms per 728-chunk import) to the voxel unpack + ident/counts fill —
+work the encoder had already done: `section_encode` unpacks the same 4096
+voxels and sorts the palette by the SAME comparator (frequency desc, then
+plain/name/props-sorted — both derive counts from the same stream). The
+encoder now captures `SectionFacts { v, order }` at the pack/RLE decision
+point where both values were dead anyway (the voxel stream is moved out —
+zero copy), threads them through the section list into the shift pass,
+and `shift_sec_from_facts` builds each ShiftSec from id interning + ident
+fill + plane fingerprints only: no unpack, no counts pass, no key sort.
+2973/2977 builds take the fast path (the rest fall back to the unchanged
+full build for enc-cache-hit or non-CSEC sections).
+
+Results (same corpus, 3-repeat confirmed): shift build 81.3 -> 24.3 ms
+(unp 60.0 -> 5.7 ms, key 2.8 -> 0.3 ms), shift stage 141 -> 62.6 µs/chunk,
+scan total 641 -> 561 µs/chunk, import ST 43.2-44.3 -> **47.1-48.1 MB/s**
+(+27% over 0.9.10, now 86% of same-run Anvil write). Match decisions
+byte-identical (dense_match=198, full=327, ksum=3041); `enc_fp` fp
+6d240d7166cdda99 unchanged, 53/53 tests.
+
 ## v0.9.9 — skip discarded tail compression on blob-path tails
 
 `write_chunk_mode` compressed every chunk tail at z6 BEFORE the size branch;

@@ -612,3 +612,14 @@ sector-padded. The remaining `scan_root fail` lines in speed_bench logs
 originate in the G2 dirty phase, which deliberately flips a payload byte —
 scan_root rejecting corrupted NBT into the full-parse fallback is the
 designed behavior, not a regression.
+
+0.9.12 encoder-to-shift facts reuse: build timers split the shift build
+(id 4.8 / unp 60.0 / key 2.8 / fp 11.6 ms) and showed the unpack+fill —
+which the encoder already performs with the same comparator and the same
+counts — was 74% of it. The encoder now hands the voxel stream and the
+canonical order to the shift pass (moved, zero copy); the ShiftSec build
+keeps only id interning + ident fill + plane fingerprints. Shift build
+81.3 -> 24.3 ms, shift stage 141 -> 62.6 µs/chunk, scan 641 -> 561
+µs/chunk, import ST 43.2-44.3 -> 47.1-48.1 MB/s (3-repeat confirmed;
+first post-rebuild run reads low — measurement noise, p99.9 bimodal).
+Match decisions and container bytes identical; enc_fp unchanged.
