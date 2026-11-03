@@ -2258,6 +2258,9 @@ impl Store {
         let cnt = group.len();
         {
             let mut blobs = self.blobs.write();
+            // one ids guard for the whole group (was acquired PER MEMBER —
+            // 130 lock round-trips per chunk, real MT contention on 2 threads)
+            let mut ids = self.ids.write();
             for (i, (h, id, raw)) in group.iter().enumerate() {
                 blobs.entry(*h).or_insert(BlobLoc {
                     seg,
@@ -2278,7 +2281,7 @@ impl Store {
                     slab_raw: raw_total,
                     slab_comp: comp.len() as u32,
                 });
-                self.ids.write().insert(*id, *h);
+                ids.insert(*id, *h);
             }
             let mut cursor = tab_len;
             for (h, _, raw) in &group {
