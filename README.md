@@ -154,6 +154,26 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.16 — fused unpack+counts+bounds + no-straddle pack fast paths: import +20%
+
+The encoder core made THREE full passes over the same 4096 voxels per
+section (unpack, sanity `any()`, counts loop) and packed through generic
+variable-shift loops. `unpack_counts_vox` fuses all three into ONE pass
+with width-specialized inner loops (bits 8 = `to_le_bytes` byte stream,
+bits 4 = constant nibble shifts; vanilla no-straddle packing never crosses
+a long so per-long extraction is independent), `dense_pack_mapped` takes
+bits 4/8 (and wide bits 16) no-straddle byte paths. Per dense section:
+enc 16.3 -> 10.3 µs, unp 3.8 -> 2.9 (counts fused in), pal 2.5 -> 0.07
+(counts moved out), scan 465 -> 351 µs/chunk, shift 61.3 -> 48.8 (warm
+facts.v cache side effect). Results (3-repeat confirmed): import ST
+59.3-59.4 -> **70.6-72.6 MB/s** (+91% over 0.9.10), import MT 96.9-105.2
+MB/s @ 2 threads, warm read 1321.9, p90 2300 -> 1786-1798 µs. All outputs
+byte-identical — `enc_fp` fp 6d240d7166cdda99 members 12130 bytes 9971843
+unchanged, probe_lite 42218 sections 0 mismatches, 53/53 tests, verify
+728/728 + 218/218 + 1280/1280, bench_size x0.08 vs anvil compact,
+container 1.66 MiB (x7.51), match pins unchanged (plane0=327, full=327,
+dense_match=198).
+
 ## v0.9.15 — interleaved plane fingerprints: the shift build's fp pass ×3.25
 
 The stage timers left the shift build at 14.6 ms of which the plane

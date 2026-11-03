@@ -437,6 +437,33 @@ fn dense_pack_wide(entries: &[u16], bits: u32) -> Vec<u8> {
 /// without materializing the mapped stream (remap is injective on 0..n and
 /// every entry is < n, so per-entry mapping and packing fuse losslessly).
 fn dense_pack_mapped(entries: &[u32], remap: &[u8], bits: u32) -> Vec<u8> {
+    // v0.9.16 fast paths: bits 8 and 4 never straddle — the dense CSEC stream
+    // is a plain remapped byte/nibble stream. Identical bytes to the generic
+    // bit-packer below (pinned by enc_fp).
+    match bits {
+        8 => {
+            let mut out = Vec::with_capacity(entries.len() + 8);
+            for &e in entries {
+                out.push(remap[e as usize]);
+            }
+            return out;
+        }
+        4 => {
+            let mut out = Vec::with_capacity(entries.len() / 2 + 8);
+            let mut i = 0usize;
+            while i + 1 < entries.len() {
+                out.push(
+                    remap[entries[i] as usize] | (remap[entries[i + 1] as usize] << 4),
+                );
+                i += 2;
+            }
+            if i < entries.len() {
+                out.push(remap[entries[i] as usize]);
+            }
+            return out;
+        }
+        _ => {}
+    }
     let b = bits as usize;
     let mut out = Vec::with_capacity((entries.len() * b + 7) / 8 + 8);
     let mut acc: u64 = 0;
@@ -461,6 +488,14 @@ fn dense_pack_mapped(entries: &[u32], remap: &[u8], bits: u32) -> Vec<u8> {
 /// Wide (palette > 256) twin of dense_pack_mapped: emits exactly the bytes
 /// of dense_pack_wide over the materialized remapped u16 stream.
 fn dense_pack_wide_mapped(entries: &[u32], remap: &[u16], bits: u32) -> Vec<u8> {
+    // v0.9.16 fast path: bits 16 never straddles — two LE bytes per entry.
+    if bits == 16 {
+        let mut out = Vec::with_capacity(entries.len() * 2 + 8);
+        for &e in entries {
+            out.extend_from_slice(&remap[e as usize].to_le_bytes());
+        }
+        return out;
+    }
     let b = bits as usize;
     let mut out = Vec::with_capacity((entries.len() * b + 7) / 8 + 8);
     let mut acc: u64 = 0;
@@ -1291,6 +1326,83 @@ fn unpack_nostroddle_vox(longs: &[i64], n: usize, bits: u32) -> Vec<u32> {
     }
 }
 
+/// Fused vanilla unpack (v0.9.16): extracts the voxel stream AND fills the
+/// frequency counts AND validates every voxel index (None when any index is
+/// outside the palette) in ONE pass — the encoder used to make three passes
+/// over the same 4096 entries (unpack, sanity `any()`, counts loop).
+/// Outputs are identical: same stream, same counts, same fallback decision
+/// (pinned by enc_fp). bits 4 and 8 take constant-shift / byte-copy inner
+/// loops (vanilla no-straddle packing never crosses a long, so per-long
+/// extraction is independent); every width produces the same values.
+fn unpack_counts_vox(
+    longs: &[i64],
+    entries: usize,
+    bits: u32,
+    pal_n: usize,
+    counts: &mut [u32],
+) -> Option<Vec<u32>> {
+    let per = (64 / bits) as usize;
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mut out: Vec<u32> = Vec::with_capacity(entries);
+    let mut li = 0usize;
+    // full longs: exactly `per` entries each, no per-element tail check
+    while li < longs.len() && out.len() + per <= entries {
+        let lu = longs[li] as u64;
+        match bits {
+            8 => {
+                for x in lu.to_le_bytes() {
+                    let x = x as u32;
+                    if x as usize >= pal_n {
+                        return None;
+                    }
+                    counts[x as usize] += 1;
+                    out.push(x);
+                }
+            }
+            4 => {
+                let mut s = 0usize;
+                while s < 64 {
+                    let x = ((lu >> s) & 0xF) as u32;
+                    if x as usize >= pal_n {
+                        return None;
+                    }
+                    counts[x as usize] += 1;
+                    out.push(x);
+                    s += 4;
+                }
+            }
+            _ => {
+                for i in 0..per {
+                    let x = ((lu >> (i * bits as usize)) & mask) as u32;
+                    if x as usize >= pal_n {
+                        return None;
+                    }
+                    counts[x as usize] += 1;
+                    out.push(x);
+                }
+            }
+        }
+        li += 1;
+    }
+    // tail: a partial final long (entries % per != 0) — rare, generic path
+    while out.len() < entries && li < longs.len() {
+        let lu = longs[li] as u64;
+        for i in 0..per {
+            if out.len() == entries {
+                break;
+            }
+            let x = ((lu >> (i * bits as usize)) & mask) as u32;
+            if x as usize >= pal_n {
+                return None;
+            }
+            counts[x as usize] += 1;
+            out.push(x);
+        }
+        li += 1;
+    }
+    Some(out)
+}
+
 /// Encode one section compound into the custom form (v3). Returns None when
 /// the section contains keys or shapes outside the understood set.
 ///
@@ -1986,18 +2098,19 @@ fn section_encode_view(
         if data.len() != (entries + per - 1) / per {
             return None;
         }
-        let v = unpack_nostroddle_vox(data, entries, in_bits);
-        // sanity: every voxel index must be inside the palette. Valid vanilla
-        // data always is; a mismatch means malformed/mutated source bytes
-        // (garbage in unused codes). Fall back to raw NBT storage instead of
-        // panicking on the server thread — the section just loses the CSEC
-        // savings, semantics are untouched.
-        if v.iter().any(|x| (*x as usize) >= n) {
-            ST_ENC_FALLBACK.fetch_add(1, Ordering::Relaxed);
-            SPLT_UNP.0.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            SPLT_UNP.1.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
+        // v0.9.16: unpack + bounds + counts fused into one pass (was three
+        // passes over the same stream: unpack, sanity any(), counts loop).
+        // The fallback decision is identical (first out-of-range voxel).
+        let mut counts = vec![0u32; n];
+        let v = match unpack_counts_vox(data, entries, in_bits, n, &mut counts) {
+            Some(v) => v,
+            None => {
+                ST_ENC_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                SPLT_UNP.0.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_UNP.1.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
         SPLT_UNP.0.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_UNP.1.fetch_add(1, Ordering::Relaxed);
         // Frequency-canonical order: the dominant state becomes index 0, so
@@ -2005,10 +2118,6 @@ fn section_encode_view(
         // extremely well. Ties break by (plain, name, props) so the order is
         // a pure function of content (deterministic => dedup-stable).
         let t_pal = std::time::Instant::now();
-        let mut counts = vec![0u32; n];
-        for &x in &v {
-            counts[x as usize] += 1;
-        }
         // canonical order as a sorted INDEX vec over the shared palette
         // (stable sort: ties keep original index order, exactly like the old
         // (entry, old_index) pair sort)
