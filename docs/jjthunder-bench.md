@@ -599,3 +599,16 @@ Same-corpus, same-machine numbers (v0.9.10 -> v0.9.11):
 
 Equivalence pins: `enc_fp` fp=6d240d7166cdda99 (12 130 members, byte-exact),
 `verify ok=946 bad=0`, tests 53/53.
+
+0.9.11.1 diagnostics follow-up: the deepest-walk beacon became an exact
+failure-position store (SCAN_FAIL_POS at the failing site, no per-call
+atomic on the hot path), `scan_fail` in the split-stage JSON carries
+`{why, pos}`, and the JSON key quoting bug is fixed. `probe_keys` (new
+example) cross-checks every corpus chunk against fastnbt: 728/728 scan
+walks succeed, 0 failures. Independent re-run of speed_bench after the
+rebase: import ST 44.3 MB/s (p50 240 µs), warm read 1349.8 MB/s, steady
+write 82.8 MB/s, dirty10 612.9 MB/s, container x7.51 smaller than Anvil
+sector-padded. The remaining `scan_root fail` lines in speed_bench logs
+originate in the G2 dirty phase, which deliberately flips a payload byte —
+scan_root rejecting corrupted NBT into the full-parse fallback is the
+designed behavior, not a regression.

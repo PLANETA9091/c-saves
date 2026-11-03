@@ -140,6 +140,20 @@ p50 17.1-17.3 µs); container unchanged (2.96 MiB = x0.08 vs Anvil in
 bench_size). `enc_fp` byte-exact (fp 6d240d7166cdda99, 12 130 members),
 corpus verify 946/946 bad=0, tests 53/53.
 
+Follow-up (0.9.11.1): the SKIP_LAST_POS deepest-walk beacon was replaced
+by SCAN_FAIL_POS — the exact byte position stored at the failing site
+(zero cost on success, and one less relaxed atomic store per skip_value
+call on the hot path); `scan_fail` in `split_stage_json` now carries
+`{why, pos}`, and the per-key opening quotes it lost in the format-string
+refactor are back (the JSON was invalid). A new `pub scan_probe` hook plus
+`examples/probe_keys.rs` walk every corpus region chunk and cross-check
+scan_root against fastnbt as the authority: 728/728 pass, 0 failures. A
+re-run of speed_bench on this machine after the rebase measured import ST
+44.3 MB/s (p50 240 µs), warm read 1349.8 MB/s — the residual scan_root
+fail lines in bench logs come from the G2 dirty phase deliberately
+flipping a payload byte; scan_root rejecting corrupted NBT into the
+full-parse fallback is the designed safety behavior.
+
 ## v0.9.9 — skip discarded tail compression on blob-path tails
 
 `write_chunk_mode` compressed every chunk tail at z6 BEFORE the size branch;
