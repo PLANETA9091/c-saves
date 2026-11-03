@@ -154,6 +154,40 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.13 — typed borrowed sections parse (lite): the sections list without a Value tree
+
+The scan-split path handed the sections list to fastnbt as a `Value` tree:
+one HashMap per palette entry plus two Strings per property, ~125 µs/chunk
+(SPLT_SCANP) of allocations that never survive encoding. A serde typed parse
+over the SAME bytes (`SecLite`: `Cow<str>` palette names/properties via a
+custom visitor, BTreeMap properties — canonical order for free, borrowed
+light slices, `LongArray` data) parses the same list **2.4x faster**; all
+728 corpus chunks take the lite path (SPLT_LITE), scanp 125.1 -> **62.5
+µs/chunk**, scan total 590.7 -> 479.0 µs, import ST 47.1-48.1 -> **53.5-56.3
+MB/s** (+50% over 0.9.10, p50 240 -> 112 µs), import MT 69.5 -> 81-82 MB/s,
+dirty10 612.9 -> 736.6 MB/s; warm read parity (1252.6), container unchanged
+(1.66 MiB, x7.51 / x0.08).
+
+Both parse currencies feed the SAME `SecView` (palette entries as
+(name, props) borrows + data slice): `section_encode_view`, the shift pass
+(`SecListSrc::Values` / `SecListSrc::Lite`) and the winner-assembly run
+unchanged over either source. Shape-strict by construction
+(`deny_unknown_fields` over exactly the 7 KNOWN section keys, Y: i8, palette
+string-or-{Name, Properties}, data LongArray): ANY deviation fails the parse
+and the chunk takes the old Value path unchanged — the lite path is a pure
+fast path, never a behavior change. Encoder-None sections (oversized
+palettes, malformed data) fall back to a hand-rolled valid-NBT serializer
+(`sec_lite_to_bytes`, homogeneous list element types, no per-element tag
+bytes). `CSAVES_NO_LITE=1` force-disables the lite path (bisect switch).
+
+Byte-identity evidence: `examples/probe_lite.rs` asserts per corpus section
+semantic equality, `hash_lite == structural_hash(stripped Value)` (the
+enc-cache keys align across paths — feed_lite mirrors feed's sorted-key
+byte stream) and IDENTICAL encoded bytes across both currencies — 42218
+sections, 0 mismatches everywhere. Gates re-run: `enc_fp` fp
+6d240d7166cdda99 members 12130 (byte-exact vs the 0.9.8 pin), 53/53 tests,
+verify 728/728 + 218/218, bench_size x0.08 vs anvil compact.
+
 ## v0.9.12 — encoder-to-shift facts reuse: build once, use twice
 
 Fine-grained build timers attributed 74% of the shift build (60 of

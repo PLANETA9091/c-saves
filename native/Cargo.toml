@@ -23,6 +23,7 @@ crc32fast = "1"
 parking_lot = "0.12"
 flate2 = "1"
 memmap2 = "0.9"
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
 
 [profile.release]
 opt-level = 3

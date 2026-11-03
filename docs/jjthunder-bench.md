@@ -623,3 +623,22 @@ keeps only id interning + ident fill + plane fingerprints. Shift build
 µs/chunk, import ST 43.2-44.3 -> 47.1-48.1 MB/s (3-repeat confirmed;
 first post-rebuild run reads low — measurement noise, p99.9 bimodal).
 Match decisions and container bytes identical; enc_fp unchanged.
+
+0.9.13 typed borrowed sections parse (lite): the sections-only fastnbt parse
+inside scan_split materialized a full Value tree — a HashMap per palette
+entry plus two Strings per property, 125.1 µs/chunk of allocations that the
+encoder drops immediately. The lite path deserializes the same bytes into
+borrowed structs (Cow strings via a custom serde visitor, BTreeMap props,
+borrowed light slices): 2.4x faster parse, scanp 125.1 -> 62.5 µs/chunk,
+scan 590.7 -> 479.0 µs, import ST 47.1-48.1 -> 53.5-56.3 MB/s (p50
+240 -> 112 µs; 3-repeat confirmed), MT import 69.5 -> 81-82, dirty10 736.6.
+Both currencies share SecView, so encode/shift bytes are pinned identical:
+probe_lite asserts hash + encoded-byte parity over 42218 corpus sections
+(0 mismatches), enc_fp fp 6d240d7166cdda99 members 12130 unchanged,
+53/53 tests, verify 946/946 bad=0, container bytes unchanged. Any section
+shape outside the 7 KNOWN keys fails the typed parse and the chunk takes
+the unchanged Value path — the lite path cannot alter behavior, only speed.
+Known follow-up: the shift build's view materialization (2977 builds) adds
+~8 µs/build (unp_ms 6.2 -> 30 across bench phases) — interning identities
+directly from the lite palette without the props-Vec materialization is the
+next micro-lever.

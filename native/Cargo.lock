@@ -33,6 +33,7 @@ dependencies = [
  "jvmti-bindings",
  "memmap2",
  "parking_lot",
+ "serde",
  "xxhash-rust",
  "zstd",
  "zstd-safe",

@@ -26,9 +26,12 @@
 
 use fastnbt::Value;
 use parking_lot::Mutex;
+use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use xxhash_rust::xxh3::{xxh3_128, Xxh3};
 
 pub type Hash = u128;
@@ -537,6 +540,9 @@ static SPLT_SCAN_OK: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new
 /// v0.9.12: fastnbt parse of the sections-only wrapper inside scan_split
 /// (the residual walk cost = SPLT_SCAN - SPLT_SCANP - enc - shift).
 static SPLT_SCANP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// v0.9.13: scan_split chunks whose sections parsed through the typed
+/// borrowed lite form (the rest fell back to the Value parse). Calls only.
+static SPLT_LITE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 /// Last scan_root failure reason: 1=root hdr, 2=sections skip, 3=hmap walk,
 /// 4=light patch, 5=generic key skip, 6=no sections key, 7=root key name.
 static SCAN_FAIL: AtomicU64 = AtomicU64::new(0);
@@ -558,7 +564,7 @@ pub fn split_stage_json() -> String {
         )
     }
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
         f("parse", &SPLT_PARSE),
         f("sections", &SPLT_SECS),
         f("sh", &SPLT_SH),
@@ -570,7 +576,8 @@ pub fn split_stage_json() -> String {
         f("tail", &SPLT_TAIL),
         f("scan", &SPLT_SCAN),
         f("scan_ok", &SPLT_SCAN_OK),
-        f("scanp", &SPLT_SCANP)
+        f("scanp", &SPLT_SCANP),
+        f("lite", &SPLT_LITE)
     )
     + &format!(
         r#","scan_fail":{{"why":{},"pos":{}}}"#,
@@ -1309,6 +1316,593 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
     section_encode_impl(sec, false).map(|(b, _)| b)
 }
 
+// ------------------------------------ typed borrowed sections (v0.9.13) -----
+//
+// The scan-split path parsed the sections list into a fastnbt Value tree
+// (SPLT_SCANP ~125 us/chunk): one HashMap per palette entry plus two String
+// allocations per property, none of which survive encoding — the encoder
+// borrows name/props through parse_entry and drops the tree. A serde typed
+// parse over the same bytes (Cow<'a, str> palette names and properties,
+// BTreeMap properties, borrowed light slices) parses the SAME list ~2.4x
+// faster (probe: 42218 corpus sections, semantic equality 0 mismatches).
+//
+// The typed parse is byte-shape-strict: deny_unknown_fields over exactly the
+// 7 KNOWN section keys, Y: i8, palette entries string-or-{Name, Properties},
+// data LongArray. ANY deviation fails the parse and the whole chunk takes
+// the old Value path (identical outputs, just slower) — the lite path is a
+// pure fast-path, never a behavior change.
+//
+// Downstream, both paths feed the SAME SecView currency (palette entries as
+// (name, props) borrows + data slice), so section_encode_view and the shift
+// pass run unchanged over either source, and enc/shift outputs are pinned
+// byte-identical by enc_fp.
+
+/// Borrowed palette entry — the encoder's currency (moved out of
+/// section_encode_impl so the Value and lite paths feed the same code).
+#[derive(Clone)]
+struct PalEntry<'a> {
+    name: &'a str,
+    props: Vec<(&'a str, &'a str)>,
+    plain: bool, // was a bare string
+}
+
+fn parse_entry<'a>(v: &'a Value) -> Option<PalEntry<'a>> {
+    match v {
+        Value::String(s) => Some(PalEntry { name: s.as_str(), props: Vec::new(), plain: true }),
+        Value::Compound(cm) => {
+            let Value::String(name) = cm.get("Name")? else { return None };
+            let mut props = Vec::new();
+            match cm.get("Properties") {
+                Some(Value::Compound(pn)) => {
+                    for (k, kv) in pn {
+                        let Value::String(vv) = kv else { return None };
+                        props.push((k.as_str(), vv.as_str()));
+                    }
+                }
+                None => {}
+                _ => return None,
+            }
+            props.sort();
+            Some(PalEntry { name: name.as_str(), props, plain: false })
+        }
+        _ => None,
+    }
+}
+
+fn pal_entry_from_lit<'a>(l: &'a PalLit<'a>) -> Option<PalEntry<'a>> {
+    match l {
+        PalLit::Plain(s) => Some(PalEntry { name: s, props: Vec::new(), plain: true }),
+        PalLit::Named { name, props } => {
+            let mut props: Vec<(&str, &str)> = match props {
+                Some(m) => m.iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect(),
+                None => Vec::new(),
+            };
+            props.sort();
+            Some(PalEntry { name, props, plain: false })
+        }
+    }
+}
+
+fn put_entry(out: &mut Vec<u8>, e: &PalEntry) -> Option<()> {
+    let nb = e.name.as_bytes();
+    if nb.len() > 65535 {
+        return None;
+    }
+    if e.plain {
+        out.push(0u8);
+    } else if e.props.is_empty() {
+        out.push(1u8);
+    } else {
+        out.push(2u8);
+    }
+    out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+    out.extend_from_slice(nb);
+    if !e.plain && !e.props.is_empty() {
+        if e.props.len() > 255 {
+            return None;
+        }
+        out.push(e.props.len() as u8);
+        for (k, v) in &e.props {
+            let kb = k.as_bytes();
+            let vb = v.as_bytes();
+            if kb.len() > 65535 || vb.len() > 65535 {
+                return None;
+            }
+            out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+            out.extend_from_slice(kb);
+            out.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+            out.extend_from_slice(vb);
+        }
+    }
+    Some(())
+}
+
+/// Typed borrowed palette entry (serde): string form, or compound
+/// {Name, Properties?}. Unknown keys inside the entry compound are ignored
+/// (mirrors parse_entry, which only reads Name/Properties); non-string
+/// property values fail the parse (mirrors parse_entry -> None).
+#[derive(Debug)]
+enum PalLit<'a> {
+    Plain(Cow<'a, str>),
+    Named {
+        name: Cow<'a, str>,
+        props: Option<BTreeMap<Cow<'a, str>, Cow<'a, str>>>,
+    },
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for PalLit<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for V<'a> {
+            type Value = PalLit<'a>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("palette entry (string or {Name, Properties})")
+            }
+            fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(PalLit::Plain(Cow::Borrowed(v)))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(PalLit::Plain(Cow::Owned(v.to_string())))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+                let mut name: Option<Cow<'a, str>> = None;
+                let mut props: Option<BTreeMap<Cow<'a, str>, Cow<'a, str>>> = None;
+                while let Some(k) = a.next_key::<Cow<'de, str>>()? {
+                    match k.as_ref() {
+                        "Name" => {
+                            let v: Cow<'de, str> = a.next_value()?;
+                            name = Some(v);
+                        }
+                        "Properties" => {
+                            let m: PropsMap = a.next_value()?;
+                            props = Some(m.0);
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = a.next_value()?;
+                        }
+                    }
+                }
+                let name = name.ok_or_else(|| serde::de::Error::missing_field("Name"))?;
+                Ok(PalLit::Named { name, props })
+            }
+        }
+        d.deserialize_any(V(std::marker::PhantomData))
+    }
+}
+
+/// Sorted string->string properties (BTreeMap: canonical order for free —
+/// the same order parse_entry sorts to).
+#[derive(Debug)]
+struct PropsMap<'a>(BTreeMap<Cow<'a, str>, Cow<'a, str>>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for PropsMap<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for V<'a> {
+            type Value = PropsMap<'a>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("string->string properties map")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut m = BTreeMap::new();
+                while let Some((k, v)) = a.next_entry::<Cow<'de, str>, Cow<'de, str>>()? {
+                    m.insert(k, v);
+                }
+                Ok(PropsMap(m))
+            }
+        }
+        d.deserialize_map(V(std::marker::PhantomData))
+    }
+}
+
+/// Typed borrowed palette+data pair (block_states / biomes).
+#[derive(Deserialize)]
+struct PalData<'a> {
+    #[serde(borrow)]
+    palette: Vec<PalLit<'a>>,
+    #[serde(default)]
+    data: Option<fastnbt::LongArray>,
+}
+
+/// Typed borrowed section. Exactly the 7 KNOWN keys; anything else fails the
+/// parse and the chunk takes the Value path. Derived fields (light arrays,
+/// starlight states) ride as borrows/integers — the encoder re-emits them
+/// exactly like the Value path does (uniform flags / raw bytes / f2 bits).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecLite<'a> {
+    #[serde(rename = "Y")]
+    y: i8,
+    #[serde(borrow)]
+    block_states: Option<PalData<'a>>,
+    #[serde(borrow)]
+    biomes: Option<PalData<'a>>,
+    #[serde(rename = "SkyLight", borrow)]
+    skylight: Option<&'a [u8]>,
+    #[serde(rename = "BlockLight", borrow)]
+    blocklight: Option<&'a [u8]>,
+    #[serde(rename = "starlight.skylight_state")]
+    sl_state: Option<i32>,
+    #[serde(rename = "starlight.blocklight_state")]
+    bl_state: Option<i32>,
+}
+
+/// Root wrapper: the sections list rides under the "" key of the wrap
+/// compound built for fastnbt (NBT roots must be compounds).
+#[derive(Deserialize)]
+struct RootList<'a> {
+    #[serde(rename = "", borrow)]
+    list: Vec<SecLite<'a>>,
+}
+
+/// Everything section_encode_view and the shift pass consume from a section,
+/// borrowed. Built from either the Value tree or the typed lite parse.
+#[derive(Clone)]
+struct PalDataV<'a> {
+    palette: Vec<PalEntry<'a>>,
+    data: Option<&'a [i64]>,
+}
+
+#[derive(Clone)]
+struct SecView<'a> {
+    y: i8,
+    bs: Option<PalDataV<'a>>,
+    bio: Option<PalDataV<'a>>,
+    skylight: Option<Vec<u8>>,
+    blocklight: Option<Vec<u8>>,
+    sl: Option<i32>,
+    bl: Option<i32>,
+}
+
+const SEC_KNOWN: [&str; 7] = [
+    "Y",
+    "block_states",
+    "biomes",
+    "SkyLight",
+    "BlockLight",
+    "starlight.skylight_state",
+    "starlight.blocklight_state",
+];
+
+/// Value -> SecView. Mirrors section_encode_impl's checks exactly: any key
+/// outside the 7 KNOWN ones, a non-Byte Y, a non-compound block_states/
+/// biomes, a missing/ill-typed palette or an ill-typed data array all yield
+/// None (the encoder's None -> raw-NBT storage). Non-array light fields and
+/// non-int starlight states are silently skipped (the old `else { continue }`
+/// arms), NOT errors.
+fn sec_view_of_value(sec: &Value) -> Option<SecView> {
+    let Value::Compound(m) = sec else { return None };
+    if m.keys().any(|k| !SEC_KNOWN.contains(&k.as_str())) {
+        return None;
+    }
+    let y = match m.get("Y") {
+        Some(Value::Byte(b)) => *b,
+        _ => return None,
+    };
+    let bs = match m.get("block_states") {
+        None => None,
+        Some(Value::Compound(bm)) => Some(pal_data_view_of_value(bm)?),
+        Some(_) => return None,
+    };
+    let bio = match m.get("biomes") {
+        None => None,
+        Some(Value::Compound(bm)) => Some(pal_data_view_of_value(bm)?),
+        Some(_) => return None,
+    };
+    let skylight = match m.get("SkyLight") {
+        Some(Value::ByteArray(ba)) => Some(ba.as_ref().iter().map(|x| *x as u8).collect()),
+        _ => None,
+    };
+    let blocklight = match m.get("BlockLight") {
+        Some(Value::ByteArray(ba)) => Some(ba.as_ref().iter().map(|x| *x as u8).collect()),
+        _ => None,
+    };
+    let sl = match m.get("starlight.skylight_state") {
+        Some(Value::Int(v)) => Some(*v),
+        _ => None,
+    };
+    let bl = match m.get("starlight.blocklight_state") {
+        Some(Value::Int(v)) => Some(*v),
+        _ => None,
+    };
+    Some(SecView { y, bs, bio, skylight, blocklight, sl, bl })
+}
+
+fn pal_data_view_of_value(bm: &std::collections::HashMap<String, Value>) -> Option<PalDataV> {
+    let Some(Value::List(pal)) = bm.get("palette") else { return None };
+    let mut palette = Vec::with_capacity(pal.len());
+    for p in pal {
+        palette.push(parse_entry(p)?);
+    }
+    let data = match bm.get("data") {
+        Some(Value::LongArray(la)) => Some(la.as_ref()),
+        Some(_) => return None,
+        None => None,
+    };
+    Some(PalDataV { palette, data })
+}
+
+/// SecLite -> SecView. `strip` drops the derived fields exactly like
+/// strip_derived_section did before hashing/encoding on the Value path.
+fn sec_view_of_lite<'a>(s: &'a SecLite<'a>, strip: bool) -> Option<SecView<'a>> {
+    let bs = match &s.block_states {
+        None => None,
+        Some(pd) => Some(pal_data_view_of_lit(pd)?),
+    };
+    let bio = match &s.biomes {
+        None => None,
+        Some(pd) => Some(pal_data_view_of_lit(pd)?),
+    };
+    if strip {
+        return Some(SecView { y: s.y, bs, bio, skylight: None, blocklight: None, sl: None, bl: None });
+    }
+    Some(SecView {
+        y: s.y,
+        bs,
+        bio,
+        skylight: s.skylight.map(|b| b.to_vec()),
+        blocklight: s.blocklight.map(|b| b.to_vec()),
+        sl: s.sl_state,
+        bl: s.bl_state,
+    })
+}
+
+fn pal_data_view_of_lit<'a>(pd: &'a PalData<'a>) -> Option<PalDataV<'a>> {
+    let mut palette = Vec::with_capacity(pd.palette.len());
+    for p in &pd.palette {
+        palette.push(pal_entry_from_lit(p)?);
+    }
+    let data = pd.data.as_ref().map(|la| la.as_ref() as &[i64]);
+    Some(PalDataV { palette, data })
+}
+
+/// feed() over the lite form. Byte-stream-identical to feed(&Value) for the
+/// equivalent section: compounds feed [10][len][sorted keys...], the sorted
+/// key order is ASCII ("BlockLight" < "SkyLight" < "Y" < "biomes" <
+/// "block_states" < "starlight.blocklight_state" < "starlight.skylight_state"),
+/// inner palette/data compounds sort "data" < "palette", entries "Name" <
+/// "Properties". `strip` mirrors strip_derived_section: derived fields are
+/// not fed at all.
+fn feed_lite(h: &mut Xxh3, s: &SecLite, strip: bool) {
+    // (key, present) pairs in ASCII order; emit only present keys
+    fn w(h: &mut Xxh3, b: &[u8]) {
+        h.update(b);
+    }
+    let mut keys: [(&str, bool); 7] = [("", false); 7];
+    let mut nk = 0usize;
+    if !strip {
+        if s.blocklight.is_some() {
+            keys[nk] = ("BlockLight", true);
+            nk += 1;
+        }
+        if s.skylight.is_some() {
+            keys[nk] = ("SkyLight", true);
+            nk += 1;
+        }
+    }
+    keys[nk] = ("Y", true);
+    nk += 1;
+    keys[nk] = ("biomes", s.biomes.is_some());
+    nk += 1;
+    keys[nk] = ("block_states", s.block_states.is_some());
+    nk += 1;
+    if !strip {
+        if s.bl_state.is_some() {
+            keys[nk] = ("starlight.blocklight_state", true);
+            nk += 1;
+        }
+        if s.sl_state.is_some() {
+            keys[nk] = ("starlight.skylight_state", true);
+            nk += 1;
+        }
+    }
+    // count = number of present keys
+    let nkeys = keys[..nk].iter().filter(|(_, p)| *p).count() as u64;
+    w(h, &[10]);
+    w(h, &nkeys.to_le_bytes());
+    for (k, present) in keys[..nk].iter() {
+        if !present {
+            continue;
+        }
+        w(h, &(k.len() as u64).to_le_bytes());
+        w(h, k.as_bytes());
+        match *k {
+            "Y" => {
+                w(h, &[1]);
+                w(h, &s.y.to_le_bytes());
+            }
+            "SkyLight" => {
+                let b = s.skylight.unwrap_or(&[]);
+                w(h, &[7]);
+                w(h, &(b.len() as u64).to_le_bytes());
+                w(h, b);
+            }
+            "BlockLight" => {
+                let b = s.blocklight.unwrap_or(&[]);
+                w(h, &[7]);
+                w(h, &(b.len() as u64).to_le_bytes());
+                w(h, b);
+            }
+            "biomes" => feed_lite_pal_data(h, s.biomes.as_ref().unwrap()),
+            "block_states" => feed_lite_pal_data(h, s.block_states.as_ref().unwrap()),
+            "starlight.skylight_state" => {
+                w(h, &[3]);
+                w(h, &s.sl_state.unwrap_or(0).to_le_bytes());
+            }
+            "starlight.blocklight_state" => {
+                w(h, &[3]);
+                w(h, &s.bl_state.unwrap_or(0).to_le_bytes());
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// feed() over a lite palette+data compound: [10][nkeys]["data" LongArray?]
+/// ["palette" List?] in ASCII order ("data" < "palette").
+fn feed_lite_pal_data(h: &mut Xxh3, pd: &PalData) {
+    let has_data = pd.data.is_some();
+    let nkeys = 1 + has_data as u64;
+    h.update(&[10]);
+    h.update(&nkeys.to_le_bytes());
+    if let Some(d) = &pd.data {
+        h.update(&4u64.to_le_bytes());
+        h.update(b"data");
+        h.update(&[12]);
+        h.update(&(d.len() as u64).to_le_bytes());
+        // identical stream to feed(Value::LongArray): raw LE bytes of the
+        // parsed i64s (both parse from the same big-endian source)
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(d.as_ptr() as *const u8, d.len() * 8)
+        };
+        h.update(bytes);
+    }
+    h.update(&7u64.to_le_bytes());
+    h.update(b"palette");
+    h.update(&[9]);
+    h.update(&(pd.palette.len() as u64).to_le_bytes());
+    for p in &pd.palette {
+        match p {
+            PalLit::Plain(s) => {
+                h.update(&[8]);
+                h.update(&(s.len() as u64).to_le_bytes());
+                h.update(s.as_bytes());
+            }
+            PalLit::Named { name, props } => {
+                // compound: keys sorted "Name" < "Properties"
+                let nkeys = 1 + props.is_some() as u64;
+                h.update(&[10]);
+                h.update(&nkeys.to_le_bytes());
+                h.update(&4u64.to_le_bytes());
+                h.update(b"Name");
+                h.update(&[8]);
+                h.update(&(name.len() as u64).to_le_bytes());
+                h.update(name.as_bytes());
+                if let Some(m) = props {
+                    h.update(&10u64.to_le_bytes());
+                    h.update(b"Properties");
+                    h.update(&[10]);
+                    h.update(&(m.len() as u64).to_le_bytes());
+                    for (k, v) in m {
+                        h.update(&(k.len() as u64).to_le_bytes());
+                        h.update(k.as_bytes());
+                        h.update(&[8]);
+                        h.update(&(v.len() as u64).to_le_bytes());
+                        h.update(v.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Raw-NBT fallback for lite sections whose encoder returns None (rare:
+/// oversized palettes, out-of-range starlight, malformed data). Deterministic
+/// sorted-key order (the old to_bytes(s) ran over a HashMap-ordered tree, so
+/// byte order was never reproducible there; the join side parses NBT
+/// order-insensitively).
+fn sec_lite_to_bytes(s: &SecLite, strip: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.push(0x0A); // TAG_Compound root, name ""
+    out.extend_from_slice(&0u16.to_be_bytes());
+    let mut put_key = |out: &mut Vec<u8>, tag: u8, name: &str| {
+        out.push(tag);
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+    };
+    // list elements carry NO tag byte (the element type is declared once in
+    // the list header); a palette is homogeneous by NBT construction, so the
+    // element type is derivable — and a plain entry inside a compound-typed
+    // list (impossible from a parsed NBT list, kept for safety) is emitted in
+    // the interchangeable {Name} form so the bytes stay valid.
+    let put_palette = |out: &mut Vec<u8>, pd: &PalData| {
+        out.push(0x09);
+        out.extend_from_slice(&(7u16).to_be_bytes());
+        out.extend_from_slice(b"palette");
+        let all_plain = pd.palette.iter().all(|p| matches!(p, PalLit::Plain(_)));
+        out.push(if all_plain { 0x08 } else { 0x0A });
+        out.extend_from_slice(&(pd.palette.len() as i32).to_be_bytes());
+        for p in &pd.palette {
+            match p {
+                PalLit::Plain(name) => {
+                    if all_plain {
+                        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                        out.extend_from_slice(name.as_bytes());
+                    } else {
+                        // unreachable from a parsed NBT list; {Name} form
+                        out.extend_from_slice(&(4u16).to_be_bytes());
+                        out.extend_from_slice(b"Name");
+                        out.push(0x08);
+                        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                        out.extend_from_slice(name.as_bytes());
+                        out.push(0x00);
+                    }
+                }
+                PalLit::Named { name, props } => {
+                    out.extend_from_slice(&(4u16).to_be_bytes());
+                    out.extend_from_slice(b"Name");
+                    out.push(0x08);
+                    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                    out.extend_from_slice(name.as_bytes());
+                    if let Some(m) = props {
+                        out.extend_from_slice(&(10u16).to_be_bytes());
+                        out.extend_from_slice(b"Properties");
+                        out.push(0x0A);
+                        out.extend_from_slice(&(m.len() as i32).to_be_bytes());
+                        for (k, v) in m {
+                            out.push(0x08);
+                            out.extend_from_slice(&(k.len() as u16).to_be_bytes());
+                            out.extend_from_slice(k.as_bytes());
+                            out.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                            out.extend_from_slice(v.as_bytes());
+                        }
+                    }
+                    out.push(0x00); // END of the entry compound
+                }
+            }
+        }
+    };
+    put_key(&mut out, 0x01, "Y");
+    out.push(s.y as u8);
+    for (pd, name) in [(&s.biomes, "biomes"), (&s.block_states, "block_states")] {
+        let Some(pd) = pd else { continue };
+        put_key(&mut out, 0x0A, name);
+        // inner compound entries (tagged): "data" < "palette" in ASCII order
+        if let Some(d) = &pd.data {
+            out.push(0x0C);
+            out.extend_from_slice(&(4u16).to_be_bytes());
+            out.extend_from_slice(b"data");
+            out.extend_from_slice(&(d.len() as i32).to_be_bytes());
+            for l in d.iter() {
+                out.extend_from_slice(&l.to_be_bytes());
+            }
+        }
+        put_palette(&mut out, pd);
+        out.push(0x00); // END of the pal-data compound
+    }
+    if !strip {
+        for (b, name) in [(s.blocklight, "BlockLight"), (s.skylight, "SkyLight")] {
+            if let Some(b) = b {
+                put_key(&mut out, 0x07, name);
+                out.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                out.extend_from_slice(b);
+            }
+        }
+        for (v, name) in [(s.bl_state, "starlight.blocklight_state"), (s.sl_state, "starlight.skylight_state")] {
+            if let Some(v) = v {
+                put_key(&mut out, 0x03, name);
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+    }
+    out.push(0x00); // END of root
+    out
+}
+
+
 /// Encoder with optional shift-facts capture (v0.9.12): when `want_facts`,
 /// the dense-analysis artifacts (orig-index voxel stream + canonical
 /// orig-index order) are returned alongside the bytes, so the shift pass
@@ -1319,169 +1913,45 @@ fn section_encode_impl(
     sec: &Value,
     want_facts: bool,
 ) -> Option<(Vec<u8>, Option<SectionFacts>)> {
-    let Value::Compound(m) = sec else { return None };
-    const KNOWN: [&str; 7] = [
-        "Y",
-        "block_states",
-        "biomes",
-        "SkyLight",
-        "BlockLight",
-        "starlight.skylight_state",
-        "starlight.blocklight_state",
-    ];
-    if m.keys().any(|k| !KNOWN.contains(&k.as_str())) {
-        return None;
-    }
-    let y = match m.get("Y") {
-        Some(Value::Byte(b)) => *b,
-        _ => return None,
-    };
+    let view = sec_view_of_value(sec)?;
+    section_encode_view(&view, want_facts)
+}
+
+/// Encoder over the SecView currency (v0.9.13): byte-identical output to the
+/// old &Value body — sec_view_of_value / sec_view_of_lite reproduce every
+/// check (KNOWN keys, Y byte, palette/data types, light-skip semantics)
+/// before we get here. Fed by both the Value path and the typed lite path.
+fn section_encode_view(
+    view: &SecView,
+    want_facts: bool,
+) -> Option<(Vec<u8>, Option<SectionFacts>)> {
     // 5-byte v4 header; patched down to the 4-byte v3 form when f3 stays 0.
-    let mut out = vec![CSEC4_MAGIC, 0u8, 0u8, 0u8, y as u8];
+    let mut out = vec![CSEC4_MAGIC, 0u8, 0u8, 0u8, view.y as u8];
     let mut f1 = 0u8;
     // shift-facts capture (filled by the block_states encode below)
     let mut block_facts: Option<SectionFacts> = None;
     let mut f2 = 0u8;
     let mut f3 = 0u8;
 
-    /// One palette entry, normalized from either the string form or the
-    /// modern compound form {Name, Properties}. Borrows the strings from the
-    /// parsed NBT tree — the encoder used to clone name + every property
-    /// (hundreds of allocations per section on modded palettes) for bytes
-    /// it only writes straight back out.
-    struct PalEntry<'a> {
-        name: &'a str,
-        props: Vec<(&'a str, &'a str)>,
-        plain: bool, // was a bare string
-    }
-
-    fn parse_entry<'a>(v: &'a Value) -> Option<PalEntry<'a>> {
-        match v {
-            Value::String(s) => Some(PalEntry { name: s.as_str(), props: Vec::new(), plain: true }),
-            Value::Compound(cm) => {
-                let Value::String(name) = cm.get("Name")? else { return None };
-                let mut props = Vec::new();
-                match cm.get("Properties") {
-                    Some(Value::Compound(pn)) => {
-                        for (k, kv) in pn {
-                            let Value::String(vv) = kv else { return None };
-                            props.push((k.as_str(), vv.as_str()));
-                        }
-                    }
-                    None => {}
-                    _ => return None,
-                }
-                props.sort();
-                Some(PalEntry { name: name.as_str(), props, plain: false })
-            }
-            _ => None,
-        }
-    }
-
-    fn put_entry(out: &mut Vec<u8>, e: &PalEntry) -> Option<()> {
-        let nb = e.name.as_bytes();
-        if nb.len() > 65535 {
-            return None;
-        }
-        if e.plain {
-            out.push(0u8);
-        } else if e.props.is_empty() {
-            out.push(1u8);
-        } else {
-            out.push(2u8);
-        }
-        out.extend_from_slice(&(nb.len() as u16).to_le_bytes());
-        out.extend_from_slice(nb);
-        if !e.plain && !e.props.is_empty() {
-            if e.props.len() > 255 {
-                return None;
-            }
-            out.push(e.props.len() as u8);
-            for (k, v) in &e.props {
-                let kb = k.as_bytes();
-                let vb = v.as_bytes();
-                if kb.len() > 65535 || vb.len() > 65535 {
-                    return None;
-                }
-                out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
-                out.extend_from_slice(kb);
-                out.extend_from_slice(&(vb.len() as u16).to_le_bytes());
-                out.extend_from_slice(vb);
-            }
-        }
-        Some(())
-    }
-
-    /// Encode one palette+data compound canonically.
-    fn enc_pal_data(out: &mut Vec<u8>, bs: &Value, entries: usize) -> Option<bool> {
-        let Value::Compound(bm) = bs else { return None };
-        let Value::List(pal) = bm.get("palette")? else { return None };
-        let n = pal.len();
-        if n == 0 || n > 65535 {
-            return None;
-        }
-        let mut ents: Vec<PalEntry> = Vec::with_capacity(n);
-        for p in pal {
-            ents.push(parse_entry(p)?);
-        }
-        // canonical order = sort by (name, props); stable on ties
-        ents.sort_by(|a, b| {
-            a.name.cmp(&b.name)
-                .then_with(|| a.props.cmp(&b.props))
-        });
-        out.extend_from_slice(&(n as u16).to_le_bytes());
-        for e in &ents {
-            put_entry(out, e)?;
-        }
-        let data = match bm.get("data") {
-            Some(Value::LongArray(la)) => la.as_ref(),
-            Some(_) => return None,
-            None => {
-                if n > 1 {
-                    return None; // vanilla always has data when palette > 1
-                }
-                return Some(false);
-            }
-        };
-        let bits = bits_for(n);
-        let per = (64 / bits) as usize;
-        if data.len() != (entries + per - 1) / per {
-            return None; // unexpected packing -> bail
-        }
-        // no remap needed: entries were sorted in place, data indices refer to
-        // positions in the ORIGINAL list, so build old->new order and remap.
-        // (sorting moved entries; reconstruct permutation by matching the
-        // sorted entries back to their original positions)
-        // -- NOTE: `ents` was sorted; we must recover the permutation. To keep
-        //    this simple and unambiguous we re-derive it from the ORIGINAL
-        //    list order captured before the sort.
-        // (implemented by the caller passing original entries; see below)
-        let _ = ents;
-        unreachable!()
-    }
-
-    // The generic enc_pal_data above cannot recover the permutation after
-    // sorting, so the real implementation works on (entry, old_index) pairs.
-    // Returns (has_data, f2 flag bits): dense form sets `narrow_bit` when the
-    // stream is packed at ceillog2(n) (beats the vanilla 4-bit clamp for
-    // palettes under 16 entries); RLE forms set (order << order_shift).
+    // The real implementation works on palette index order (v0.9.13: a sorted
+    // index vec instead of moving (entry, old_index) pairs — the entries live
+    // in the caller's PalDataV and are shared with the shift pass's identity
+    // interning). Returns (has_data, f2 flag bits): dense form sets
+    // `narrow_bit` when the stream is packed at ceillog2(n) (beats the vanilla
+    // 4-bit clamp for palettes under 16 entries); RLE forms set
+    // (order << order_shift).
     fn enc_pal_data_canon(
         out: &mut Vec<u8>,
-        bs: &Value,
+        pdv: &PalDataV,
         entries: usize,
         narrow_bit: u8,
         order_shift: u32,
         facts_out: &mut Option<SectionFacts>,
     ) -> Option<(bool, u8)> {
-        let Value::Compound(bm) = bs else { return None };
-        let Value::List(pal) = bm.get("palette")? else { return None };
+        let pal = &pdv.palette;
         let n = pal.len();
         if n == 0 || n > 65535 {
             return None;
-        }
-        let mut ents: Vec<(PalEntry, usize)> = Vec::with_capacity(n);
-        for (i, p) in pal.iter().enumerate() {
-            ents.push((parse_entry(p)?, i));
         }
         // One unpack feeds everything downstream (v0.9.7): frequency counts
         // for the canonical order, the remap, and the dense/RLE candidates
@@ -1489,22 +1959,23 @@ fn section_encode_impl(
         // Failure modes keep the old outputs: malformed data still yields
         // None (via the sanity check below), and the no-data path keeps the
         // all-zero counts order.
-        let data: &[i64] = match bm.get("data") {
-            Some(Value::LongArray(la)) => la.as_ref(),
-            Some(_) => return None,
+        let data: &[i64] = match pdv.data {
+            Some(d) => d,
             None => {
                 if n > 1 {
                     return None;
                 }
                 let t_pal0 = std::time::Instant::now();
-                ents.sort_by(|a, b| {
-                    (a.0.plain, &a.0.name, &a.0.props).cmp(&(b.0.plain, &b.0.name, &b.0.props))
+                let mut order_idx: Vec<usize> = (0..n).collect();
+                order_idx.sort_by(|&a, &b| {
+                    (pal[a].plain, pal[a].name, &pal[a].props)
+                        .cmp(&(pal[b].plain, pal[b].name, &pal[b].props))
                 });
                 SPLT_PAL.0.fetch_add(t_pal0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 SPLT_PAL.1.fetch_add(1, Ordering::Relaxed);
                 out.extend_from_slice(&(n as u16).to_le_bytes());
-                for (e, _) in &ents {
-                    put_entry(out, e)?;
+                for &oi in &order_idx {
+                    put_entry(out, &pal[oi])?;
                 }
                 return Some((false, 0));
             }
@@ -1538,16 +2009,23 @@ fn section_encode_impl(
         for &x in &v {
             counts[x as usize] += 1;
         }
-        ents.sort_by(|a, b| {
-            counts[b.1]
-                .cmp(&counts[a.1])
-                .then_with(|| (a.0.plain, &a.0.name, &a.0.props).cmp(&(b.0.plain, &b.0.name, &b.0.props)))
+        // canonical order as a sorted INDEX vec over the shared palette
+        // (stable sort: ties keep original index order, exactly like the old
+        // (entry, old_index) pair sort)
+        let mut order_idx: Vec<usize> = (0..n).collect();
+        order_idx.sort_by(|&a, &b| {
+            counts[b]
+                .cmp(&counts[a])
+                .then_with(|| {
+                    (pal[a].plain, pal[a].name, &pal[a].props)
+                        .cmp(&(pal[b].plain, pal[b].name, &pal[b].props))
+                })
         });
         SPLT_PAL.0.fetch_add(t_pal.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_PAL.1.fetch_add(1, Ordering::Relaxed);
         out.extend_from_slice(&(n as u16).to_le_bytes());
-        for (e, _) in &ents {
-            put_entry(out, e)?;
+        for &oi in &order_idx {
+            put_entry(out, &pal[oi])?;
         }
         // Narrow packing: vanilla clamps linear palettes to 4 bits/entry, so
         // a 2-entry palette wastes 4x (2 KiB vs 512 B per section). Under
@@ -1563,19 +2041,19 @@ fn section_encode_impl(
         let identity = !narrow
             && in_bits == out_bits
             && matches!(in_bits, 1 | 2 | 4 | 8 | 16 | 32)
-            && ents.iter().enumerate().all(|(i, (_, old))| *old == i);
+            && order_idx.iter().enumerate().all(|(i, &old)| old == i);
         // remap old palette index -> canonical index
         let mut remap = vec![0u8; n];
-        for (new_i, (_, old_i)) in ents.iter().enumerate() {
-            remap[*old_i] = new_i as u8;
+        for (new_i, &old_i) in order_idx.iter().enumerate() {
+            remap[old_i] = new_i as u8;
         }
         if n > 256 {
             // wide palettes: remap table must be u16; RLE (byte indices)
             // does not apply — dense only. The remap fuses into the pack
             // loop (identical bytes to packing the materialized stream).
             let mut remap16 = vec![0u16; n];
-            for (new_i, (_, old_i)) in ents.iter().enumerate() {
-                remap16[*old_i] = new_i as u16;
+            for (new_i, &old_i) in order_idx.iter().enumerate() {
+                remap16[old_i] = new_i as u16;
             }
             out.extend_from_slice(&dense_pack_wide_mapped(&v, &remap16, out_bits));
             ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
@@ -1583,7 +2061,7 @@ fn section_encode_impl(
             // returns immediately) — hand them to the shift pass for free.
             *facts_out = Some(SectionFacts {
                 v,
-                order: ents.iter().map(|(_, i)| *i as u32).collect(),
+                order: order_idx.iter().map(|&i| i as u32).collect(),
             });
             return Some((true, 0));
         }
@@ -1653,7 +2131,7 @@ fn section_encode_impl(
         // counts).
         *facts_out = Some(SectionFacts {
             v,
-            order: ents.iter().map(|(_, i)| *i as u32).collect(),
+            order: order_idx.iter().map(|&i| i as u32).collect(),
         });
         match best {
             None => {
@@ -1674,7 +2152,7 @@ fn section_encode_impl(
         }
     }
 
-    if let Some(bs) = m.get("block_states") {
+    if let Some(bs) = &view.bs {
         let mut facts: Option<SectionFacts> = None;
         let (has_data, f2b) = enc_pal_data_canon(&mut out, bs, 4096, 4, 4, &mut facts)?;
         f1 |= 1;
@@ -1684,7 +2162,7 @@ fn section_encode_impl(
         f2 |= f2b;
         block_facts = facts;
     }
-    if let Some(bs) = m.get("biomes") {
+    if let Some(bs) = &view.bio {
         let mut no_facts: Option<SectionFacts> = None;
         let (has_data, f2b) = enc_pal_data_canon(&mut out, bs, 64, 8, 6, &mut no_facts)?;
         f1 |= 4;
@@ -1693,12 +2171,11 @@ fn section_encode_impl(
         }
         f2 |= f2b;
     }
-    for (key, uni_bit, raw_bit, all, zero_to_f3) in [
-        ("SkyLight", 16u8, 64u8, 0xffu8, false),
-        ("BlockLight", 0u8, 128u8, 0u8, true),
+    for (b, uni_bit, raw_bit, all, zero_to_f3) in [
+        (view.skylight.as_deref(), 16u8, 64u8, 0xffu8, false),
+        (view.blocklight.as_deref(), 0u8, 128u8, 0u8, true),
     ] {
-        let Some(Value::ByteArray(ba)) = m.get(key) else { continue };
-        let b: Vec<u8> = ba.as_ref().iter().map(|x| *x as u8).collect();
+        let Some(b) = b else { continue };
         // Uniform forms require the standard 2048-byte light array (custom
         // world heights do not change section light size, but stay safe).
         if b.len() == 2048 && uni_bit != 0 && b.iter().all(|x| *x == all) {
@@ -1717,22 +2194,22 @@ fn section_encode_impl(
             }
             f1 |= raw_bit;
             out.extend_from_slice(&(b.len() as u16).to_le_bytes());
-            out.extend_from_slice(&b);
+            out.extend_from_slice(b);
         }
     }
-    if let Some(Value::Int(v)) = m.get("starlight.skylight_state") {
-        if !(0..=255).contains(v) {
+    if let Some(v) = view.sl {
+        if !(0..=255).contains(&v) {
             return None;
         }
         f2 |= 1;
-        out.push(*v as u8);
+        out.push(v as u8);
     }
-    if let Some(Value::Int(v)) = m.get("starlight.blocklight_state") {
-        if !(0..=255).contains(v) {
+    if let Some(v) = view.bl {
+        if !(0..=255).contains(&v) {
             return None;
         }
         f2 |= 2;
-        out.push(*v as u8);
+        out.push(v as u8);
     }
     out[1] = f1;
     out[2] = f2;
@@ -1812,6 +2289,35 @@ fn pal_entry_identity_into(v: &Value, out: &mut Vec<u8>) -> Option<()> {
             }
         }
         _ => return None,
+    }
+    Some(())
+}
+
+/// pal_entry_identity over a shared view entry: the props vec is pre-sorted
+/// by both view builders (parse_entry / pal_entry_from_lit), so the bytes are
+/// identical to the Value variant. Debug-only guard keeps that invariant
+/// honest.
+fn identity_from_entry(e: &PalEntry, out: &mut Vec<u8>) -> Option<()> {
+    debug_assert!(
+        e.props.windows(2).all(|w| w[0] <= w[1]),
+        "view palette props must be pre-sorted"
+    );
+    out.clear();
+    if e.plain {
+        out.push(1u8);
+        out.extend_from_slice(e.name.as_bytes());
+        return Some(());
+    }
+    out.push(0u8);
+    out.extend_from_slice(e.name.as_bytes());
+    out.push(0x00);
+    for (i, (k, vv)) in e.props.iter().enumerate() {
+        if i > 0 {
+            out.push(0x1f);
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(vv.as_bytes());
     }
     Some(())
 }
@@ -1971,23 +2477,19 @@ struct SectionFacts {
     order: Vec<u32>,
 }
 
-fn shift_sec_of(
-    s: &Value,
+/// Identity interning over shared view entries: one id per distinct palette
+/// entry identity, in first-appearance order (chunk-global table). Shared by
+/// both ShiftSec builds.
+fn intern_ids(
+    pal: &[PalEntry],
     tab: &mut HashMap<Box<[u8]>, u32>,
     idbuf: &mut Vec<u8>,
-) -> Option<ShiftSec> {
-    let Value::Compound(m) = s else { return None };
-    let bs = m.get("block_states")?;
-    let Value::Compound(bm) = bs else { return None };
-    let Value::List(pal) = bm.get("palette")? else { return None };
+) -> Option<Vec<u32>> {
     let n = pal.len();
-    if n == 0 || n > 65535 {
-        return None;
-    }
     let mut id_of_orig = vec![0u32; n];
     let t_id = std::time::Instant::now();
-    for (i, p) in pal.iter().enumerate() {
-        pal_entry_identity_into(p, idbuf)?;
+    for (i, e) in pal.iter().enumerate() {
+        identity_from_entry(e, idbuf)?;
         let nid = tab.len() as u32;
         let id = match tab.get(idbuf.as_slice()) {
             Some(&x) => x,
@@ -1999,6 +2501,24 @@ fn shift_sec_of(
         id_of_orig[i] = id;
     }
     ST_SHIFT_ID_NS.fetch_add(t_id.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Some(id_of_orig)
+}
+
+/// Full ShiftSec build over the SecView currency (v0.9.13): identical output
+/// to the old &Value shift_sec_of — same unpack, same counts, same
+/// comparator (counts desc, then (plain, name, props-sorted)).
+fn shift_sec_of_view(
+    v: &SecView,
+    tab: &mut HashMap<Box<[u8]>, u32>,
+    idbuf: &mut Vec<u8>,
+) -> Option<ShiftSec> {
+    let bs = v.bs.as_ref()?;
+    let pal = &bs.palette;
+    let n = pal.len();
+    if n == 0 || n > 65535 {
+        return None;
+    }
+    let id_of_orig = intern_ids(pal, tab, idbuf)?;
     let mut ident = vec![0u32; 4096];
     // one unpack feeds ident AND the frequency counts (the canonical order
     // mirrors enc_pal_data_canon: counts desc, then (plain, name, props)) —
@@ -2007,18 +2527,15 @@ fn shift_sec_of(
     // section per chunk).
     let t_unp = std::time::Instant::now();
     let mut counts = vec![0u32; n];
-    match bm.get("data") {
-        Some(Value::LongArray(la)) => {
-            let bits = section_data_bits(n, 4096, la.as_ref().len());
+    match bs.data {
+        Some(data) => {
+            let bits = section_data_bits(n, 4096, data.len());
             let per = (64 / bits) as usize;
-            if la.as_ref().len() != (4096 + per - 1) / per {
+            if data.len() != (4096 + per - 1) / per {
                 return None;
             }
-            for (i, v) in unpack_nostroddle_vox(la.as_ref(), 4096, bits)
-                .into_iter()
-                .enumerate()
-            {
-                let o = v as usize;
+            for (i, x) in unpack_nostroddle_vox(data, 4096, bits).into_iter().enumerate() {
+                let o = x as usize;
                 if o >= n {
                     return None;
                 }
@@ -2026,7 +2543,6 @@ fn shift_sec_of(
                 counts[o] += 1;
             }
         }
-        Some(_) => return None,
         None => {
             if n > 1 {
                 return None;
@@ -2037,41 +2553,14 @@ fn shift_sec_of(
         }
     }
     ST_SHIFT_UNP_NS.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    // precompute sort keys to avoid borrows crossing the sort — borrowed
-    // from the parsed tree (the cloned-String version spent hundreds of
-    // allocations per build on wide palettes; the comparison order, hence
-    // the canonical order, is identical)
+    // sort keys borrowed straight from the shared view entries (props
+    // pre-sorted by both view builders; the comparison order, hence the
+    // canonical order, is identical to the old parsed-tree keys)
     let t_key = std::time::Instant::now();
-    let keys: Vec<(bool, &str, Vec<(&str, &str)>)> = (0..n)
-        .map(|i| match &pal[i] {
-            Value::String(s) => (true, s.as_str(), Vec::new()),
-            Value::Compound(cm) => {
-                let name = match cm.get("Name") {
-                    Some(Value::String(s)) => s.as_str(),
-                    _ => "",
-                };
-                let mut ps: Vec<(&str, &str)> = match cm.get("Properties") {
-                    Some(Value::Compound(pn)) => pn
-                        .iter()
-                        .filter_map(|(k, kv)| match kv {
-                            Value::String(vv) => Some((k.as_str(), vv.as_str())),
-                            _ => None,
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                ps.sort();
-                (false, name, ps)
-            }
-            _ => (false, "", Vec::new()),
-        })
-        .collect();
+    let keys: Vec<(bool, &str, &Vec<(&str, &str)>)> =
+        pal.iter().map(|e| (e.plain, e.name, &e.props)).collect();
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        counts[b]
-            .cmp(&counts[a])
-            .then_with(|| keys[a].cmp(&keys[b]))
-    });
+    order.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then_with(|| keys[a].cmp(&keys[b])));
     let mut canon_of_orig = vec![0u32; n];
     for (pos, &oi) in order.iter().enumerate() {
         canon_of_orig[oi] = pos as u32;
@@ -2090,7 +2579,6 @@ fn shift_sec_of(
     ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
 }
-
 /// ShiftSec build from encoder facts (v0.9.12): identical output to
 /// shift_sec_of for the same section — the canonical order is the same
 /// comparator (counts desc, then (plain, name, props-sorted)) over the same
@@ -2100,35 +2588,19 @@ fn shift_sec_of(
 /// plane fingerprints.
 pub static ST_SHIFT_FAST: AtomicU64 = AtomicU64::new(0);
 
-fn shift_sec_from_facts(
-    s: &Value,
+fn shift_sec_from_facts_view(
+    v: &SecView,
     tab: &mut HashMap<Box<[u8]>, u32>,
     idbuf: &mut Vec<u8>,
     facts: SectionFacts,
 ) -> Option<ShiftSec> {
-    let Value::Compound(m) = s else { return None };
-    let bs = m.get("block_states")?;
-    let Value::Compound(bm) = bs else { return None };
-    let Value::List(pal) = bm.get("palette")? else { return None };
+    let bs = v.bs.as_ref()?;
+    let pal = &bs.palette;
     let n = pal.len();
     if n == 0 || n > 65535 {
         return None;
     }
-    let mut id_of_orig = vec![0u32; n];
-    let t_id = std::time::Instant::now();
-    for (i, p) in pal.iter().enumerate() {
-        pal_entry_identity_into(p, idbuf)?;
-        let nid = tab.len() as u32;
-        let id = match tab.get(idbuf.as_slice()) {
-            Some(&x) => x,
-            None => {
-                tab.insert(idbuf.as_slice().into(), nid);
-                nid
-            }
-        };
-        id_of_orig[i] = id;
-    }
-    ST_SHIFT_ID_NS.fetch_add(t_id.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let id_of_orig = intern_ids(pal, tab, idbuf)?;
     let mut ident = vec![0u32; 4096];
     let t_unp = std::time::Instant::now();
     for (i, &o) in facts.v.iter().enumerate() {
@@ -2179,9 +2651,18 @@ pub static ST_SHIFT_UNP_NS: AtomicU64 = AtomicU64::new(0);
 pub static ST_SHIFT_KEY_NS: AtomicU64 = AtomicU64::new(0);
 pub static ST_SHIFT_FP_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Section LIST source for the shift pass (v0.9.13): the parsed Value list
+/// (whole-parse fallback path) or the typed borrowed list (scan-split lite
+/// path, with the strip flag the views must honor). ShiftSec builds go
+/// through SecView either way, so encode/shift decisions are identical.
+enum SecListSrc<'a> {
+    Values(&'a [Value]),
+    Lite(&'a [SecLite<'a>], bool),
+}
+
 fn shift_ref_pass(
     sections: &mut [(Hash, SecBytes)],
-    vals: &[Value],
+    src: &SecListSrc,
     cache_hit: &[bool],
     facts: &mut [Option<SectionFacts>],
 ) {
@@ -2189,7 +2670,10 @@ fn shift_ref_pass(
     const MAX_K: usize = 15;
     const CANDIDATES: usize = 64;
     const MIN_WIN: usize = 256; // at least one plane must match
-    let n_sec = sections.len().min(vals.len());
+    let n_sec = match src {
+        SecListSrc::Values(vals) => sections.len().min(vals.len()),
+        SecListSrc::Lite(list, _) => sections.len().min(list.len()),
+    };
     if n_sec < 2 {
         return;
     }
@@ -2223,8 +2707,11 @@ fn shift_ref_pass(
         }
     }
     let mut built: HashMap<usize, Option<Arc<ShiftSec>>> = HashMap::new();
+    // lazily built SecViews (parse_entry per palette entry), filled at build
+    // time and reused by the winner assembly below
+    let mut view_cache: Vec<Option<SecView>> = (0..n_sec).map(|_| None).collect();
     // macro, not a closure: the getter needs &mut tab/meta_cache/built while
-    // the match loop holds & sections / & vals (disjoint borrows).
+    // the match loop holds & sections / & src (disjoint borrows).
     // The eligibility check lives INSIDE the getter — ineligible slots must
     // yield None without building, exactly like the eager `secs` vector did
     // (a target that is not buildable must neither consume the candidate
@@ -2241,18 +2728,29 @@ fn shift_ref_pass(
                             Some(a) => Some(a.clone()),
                             None => {
                                 let t_b = std::time::Instant::now();
-                                let r = match facts[$ix].take() {
-                                    Some(f) => shift_sec_from_facts(
-                                        &vals[$ix],
-                                        &mut tab,
-                                        &mut idbuf,
-                                        f,
-                                    )
-                                    .map(Arc::new),
-                                    None => {
-                                        shift_sec_of(&vals[$ix], &mut tab, &mut idbuf)
-                                            .map(Arc::new)
-                                    }
+                                if view_cache[$ix].is_none() {
+                                    view_cache[$ix] = match src {
+                                        SecListSrc::Values(vals) => sec_view_of_value(&vals[$ix]),
+                                        SecListSrc::Lite(list, strip) => {
+                                            sec_view_of_lite(&list[$ix], *strip)
+                                        }
+                                    };
+                                }
+                                let r = match view_cache[$ix].as_ref() {
+                                    Some(vw) => match facts[$ix].take() {
+                                        Some(f) => shift_sec_from_facts_view(
+                                            vw,
+                                            &mut tab,
+                                            &mut idbuf,
+                                            f,
+                                        )
+                                        .map(Arc::new),
+                                        None => {
+                                            shift_sec_of_view(vw, &mut tab, &mut idbuf)
+                                                .map(Arc::new)
+                                        }
+                                    },
+                                    None => None,
                                 };
                                 ST_SHIFT_BUILD_NS.fetch_add(
                                     t_b.elapsed().as_nanos() as u64,
@@ -2388,20 +2886,16 @@ fn shift_ref_pass(
         if !ok || n_t + extras.len() > 65535 {
             continue;
         }
-        // non-block_states fields: re-encode the section Value without
+        // non-block_states fields: re-encode the section view without
         // block_states (f1 block_states bits stay clear)
-        let s2 = match &vals[i] {
-            Value::Compound(m) => {
-                let mut mm = m.clone();
-                if mm.remove("block_states").is_none() {
-                    continue;
-                }
-                Value::Compound(mm)
-            }
-            _ => continue,
-        };
-        let csec2 = match section_encode(&s2) {
-            Some(c) if is_csec4(c.first()) && c.len() >= 4 => c,
+        let Some(src_view) = view_cache[i].as_ref() else { continue };
+        if src_view.bs.is_none() {
+            continue;
+        }
+        let mut view2 = src_view.clone();
+        view2.bs = None;
+        let csec2 = match section_encode_view(&view2, false) {
+            Some((c, _)) if is_csec4(c.first()) && c.len() >= 4 => c,
             _ => continue,
         };
         let c4 = csec2[0] == CSEC4_MAGIC;
@@ -2425,10 +2919,11 @@ fn shift_ref_pass(
         mbr.extend_from_slice(&(extras.len() as u16).to_le_bytes());
         // extras in first-appearance order (must match ref-space numbering)
         'ex: for &pos in &extras {
-            let Value::Compound(m) = &vals[i] else { break 'ex };
-            let Some(Value::Compound(bm)) = m.get("block_states") else { break 'ex };
-            let Some(Value::List(pal)) = bm.get("palette") else { break 'ex };
-            if put_entry_standalone(&pal[pos], &mut mbr).is_none() {
+            let Some(bs) = view_cache[i].as_ref().and_then(|v| v.bs.as_ref()) else {
+                break 'ex
+            };
+            let Some(e) = bs.palette.get(pos) else { break 'ex };
+            if put_entry(&mut mbr, e).is_none() {
                 break 'ex;
             }
         }
@@ -3164,6 +3659,15 @@ pub fn structural_hash(v: &Value) -> Hash {
     h.digest128()
 }
 
+/// structural_hash over the typed lite form — byte-stream-identical to
+/// structural_hash(&stripped Value) (feed_lite mirrors feed; corpus-verified
+/// in probe_lite). Enc-cache keys therefore align across both paths.
+fn hash_lite(s: &SecLite, strip: bool) -> Hash {
+    let mut h = Xxh3::new();
+    feed_lite(&mut h, s, strip);
+    h.digest128()
+}
+
 macro_rules! w {
     ($h:expr, $b:expr) => {
         $h.update($b)
@@ -3340,6 +3844,62 @@ fn encode_section_list(
     (sections, cache_hit, facts_list)
 }
 
+/// Typed-lite twin of encode_section_list (v0.9.13): same flow, but the
+/// enc-cache key is hash_lite (byte-stream-identical to the Value path's
+/// structural_hash over the stripped section — keys align across paths) and
+/// the encoder-None fallback serializes the lite section itself
+/// (sec_lite_to_bytes) instead of to_bytes(&Value).
+fn encode_section_list_lite(
+    list: &[SecLite],
+    strip: bool,
+    want_facts: bool,
+) -> (
+    Vec<(Hash, SecBytes)>,
+    Vec<bool>,
+    Vec<Option<SectionFacts>>,
+) {
+    let mut sections = Vec::with_capacity(list.len());
+    let mut cache_hit = vec![false; list.len()];
+    let mut facts_list: Vec<Option<SectionFacts>> = Vec::with_capacity(list.len());
+    for s in list.iter() {
+        // encode-cache: identical discipline to the Value path; hash_lite
+        // equals structural_hash(&stripped Value) so keys align across paths
+        let t_sh = std::time::Instant::now();
+        let sh = hash_lite(s, strip);
+        SPLT_SH.0.fetch_add(t_sh.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLT_SH.1.fetch_add(1, Ordering::Relaxed);
+        if let Some((h, shared)) = enc_cache_get(sh) {
+            cache_hit[sections.len()] = true;
+            sections.push((h, SecBytes::Shared(shared)));
+            facts_list.push(None); // no fresh encode -> no facts
+            continue;
+        }
+        let t_enc = std::time::Instant::now();
+        match sec_view_of_lite(s, strip).and_then(|v| section_encode_view(&v, want_facts)) {
+            Some((c, f)) => {
+                SPLT_ENC.0.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_ENC.1.fetch_add(1, Ordering::Relaxed);
+                if is_csec4(c.first()) {
+                    let h = hash_of(&c);
+                    let arc = Arc::new(c);
+                    enc_cache_put(sh, h, arc.clone());
+                    sections.push((h, SecBytes::Shared(arc)));
+                } else {
+                    sections.push((sh, SecBytes::Owned(c)));
+                }
+                facts_list.push(f);
+            }
+            None => {
+                SPLT_ENC.0.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_ENC.1.fetch_add(1, Ordering::Relaxed);
+                sections.push((sh, SecBytes::Owned(sec_lite_to_bytes(s, strip))));
+                facts_list.push(None);
+            }
+        }
+    }
+    (sections, cache_hit, facts_list)
+}
+
 /// The shift-ref stage shared by both split paths: collapse sections that
 /// are vertical shifts of a lower section of this chunk (mountain strata /
 /// ocean floors / cave ceilings) into ~15-30 byte refs; the top k planes
@@ -3348,13 +3908,13 @@ fn encode_section_list(
 /// free, which always beats a chunk-local ref.
 fn shift_stage(
     sections: &mut Vec<(Hash, SecBytes)>,
-    vals: &[Value],
+    src: &SecListSrc,
     cache_hit: &[bool],
     facts: &mut [Option<SectionFacts>],
 ) {
     if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
         let t_sp = std::time::Instant::now();
-        shift_ref_pass(sections, vals, cache_hit, facts);
+        shift_ref_pass(sections, src, cache_hit, facts);
         SPLT_SHIFT.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_SHIFT.1.fetch_add(1, Ordering::Relaxed);
     }
@@ -3599,9 +4159,30 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
     buf.extend_from_slice(&[0x0A, 0x00, 0x00, 0x09, 0x00, 0x00]);
     buf.extend_from_slice(&payload[sp0..sp1]);
     buf.push(0x00);
+    let want_facts = std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1");
+    // v0.9.13: typed borrowed parse first (no per-entry HashMap/String
+    // allocations; light fields ride as borrows). Any shape doubt fails the
+    // parse and the chunk takes the Value path below — outputs identical
+    // either way (pinned by enc_fp + hash_lite == structural_hash).
     let t_sp2 = std::time::Instant::now();
+    let lite = if std::env::var("CSAVES_NO_LITE").as_deref() == Ok("1") {
+        None
+    } else {
+        fastnbt::from_bytes::<RootList>(&buf).ok()
+    };
+    if let Some(RootList { list: litelist }) = lite {
+        SPLT_SCANP.0.fetch_add(t_sp2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLT_SCANP.1.fetch_add(1, Ordering::Relaxed);
+        SPLT_LITE.1.fetch_add(1, Ordering::Relaxed);
+        let (mut sections, cache_hit, mut facts) =
+            encode_section_list_lite(&litelist, strip, want_facts);
+        shift_stage(&mut sections, &SecListSrc::Lite(&litelist, strip), &cache_hit, &mut facts);
+        let tail = build_scan_tail(payload, &out)?;
+        return Some(Split::Split { sections, tail });
+    }
+    let t_sp3 = std::time::Instant::now();
     let root: Value = fastnbt::from_bytes(&buf).ok()?;
-    SPLT_SCANP.0.fetch_add(t_sp2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SPLT_SCANP.0.fetch_add(t_sp3.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_SCANP.1.fetch_add(1, Ordering::Relaxed);
     let Value::Compound(mut m) = root else { return None };
     let Some(Value::List(mut list)) = m.remove("") else { return None };
@@ -3610,11 +4191,15 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
             strip_derived_section(s);
         }
     }
-    let want_facts = std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1");
     let (mut sections, cache_hit, mut facts) = encode_section_list(&list, want_facts);
-    shift_stage(&mut sections, &list, &cache_hit, &mut facts);
-    // tail = payload minus the sections range, with the heightmap/isLightOn
-    // edits applied; the root END byte is re-emitted after any light insert
+    shift_stage(&mut sections, &SecListSrc::Values(&list), &cache_hit, &mut facts);
+    let tail = build_scan_tail(payload, &out)?;
+    Some(Split::Split { sections, tail })
+}
+
+/// tail = payload minus the sections range, with the heightmap/isLightOn
+/// edits applied; the root END byte is re-emitted after any light insert.
+fn build_scan_tail(payload: &[u8], out: &ScanOut) -> Option<Vec<u8>> {
     let mut tail = Vec::with_capacity(payload.len());
     let mut pos = 0usize;
     for (ep, el, bytes) in &out.edits {
@@ -3629,7 +4214,7 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
         ]);
     }
     tail.push(0x00);
-    Some(Split::Split { sections, tail })
+    Some(tail)
 }
 
 /// Diagnostic hook for probes: run scan_root on one payload and report
@@ -3645,6 +4230,59 @@ pub fn scan_probe(payload: &[u8], strip: bool) -> (u64, u64, bool) {
         ),
     }
 }
+
+/// Diagnostic hook for probes: the byte range of the sections LIST inside the
+/// payload (what scan_split hands to fastnbt), or None if the scan walk
+/// rejects the payload. Independent of `strip` (the range is recorded before
+/// any edit application).
+#[doc(hidden)]
+pub fn scan_sections_range(payload: &[u8]) -> Option<(usize, usize)> {
+    scan_root(payload, false).map(|out| out.sections_payload)
+}
+
+/// Diagnostic hook (v0.9.13): per-section (structural_hash, hash_lite,
+/// encode(Value view), encode(lite view)) over one wrapped sections list.
+/// The probe asserts hash and encoded-byte equality across both currencies —
+/// the enc-cache alignment + byte-identity guarantee of the lite path.
+#[doc(hidden)]
+pub fn lite_parity_probe(
+    list_bytes: &[u8],
+    strip: bool,
+) -> Option<Vec<(u128, u128, Option<Vec<u8>>, Option<Vec<u8>>)>> {
+    let mut buf = Vec::with_capacity(6 + list_bytes.len());
+    buf.extend_from_slice(&[0x0A, 0x00, 0x00, 0x09, 0x00, 0x00]);
+    buf.extend_from_slice(list_bytes);
+    buf.push(0x00);
+    let litelist = fastnbt::from_bytes::<RootList>(&buf).ok()?.list;
+    let root: Value = fastnbt::from_bytes(&buf).ok()?;
+    let Value::Compound(mut m) = root else { return None };
+    let Some(Value::List(list)) = m.remove("") else { return None };
+    if list.len() != litelist.len() {
+        return None;
+    }
+    Some(
+        list.iter()
+            .zip(litelist.iter())
+            .map(|(v, s)| {
+                let mut v2 = v.clone();
+                if strip {
+                    strip_derived_section(&mut v2);
+                }
+                let hv = structural_hash(&v2);
+                let hl = hash_lite(s, strip);
+                let ev = sec_view_of_value(&v2)
+                    .and_then(|vw| section_encode_view(&vw, false))
+                    .map(|(b, _)| b);
+                let el = sec_view_of_lite(s, strip)
+                    .and_then(|vw| section_encode_view(&vw, false))
+                    .map(|(b, _)| b);
+                (hv, hl, ev, el)
+            })
+            .collect(),
+    )
+}
+
+
 
 /// Sectioned split over an ALREADY-parsed chunk (root is consumed for the
 /// tail — no tree clone).
@@ -3680,7 +4318,7 @@ fn split_parsed(
         }
         let want_facts = std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1");
         let (mut secs, cache_hit, mut facts) = encode_section_list(list, want_facts);
-        shift_stage(&mut secs, list, &cache_hit, &mut facts);
+        shift_stage(&mut secs, &SecListSrc::Values(list), &cache_hit, &mut facts);
         sections = secs;
     }
     SPLT_SECS.0.fetch_add(t_ss.elapsed().as_nanos() as u64, Ordering::Relaxed);
