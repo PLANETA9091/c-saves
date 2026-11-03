@@ -2493,6 +2493,35 @@ struct ShiftSec {
     id_of_orig: Vec<u32>,
     n: usize,
 }
+
+/// Plane fingerprints of a ShiftSec ident stream (16 planes x 256 entries).
+/// v0.9.15: the per-plane FNV chain is UNCHANGED — the four chains of each
+/// 4-plane group are interleaved so their independent dependency chains
+/// overlap (the serial per-plane loop was latency-bound at ~3.5 cycles per
+/// mul link; ~1 ns/step over 4096 entries = 11.7 ms per 728-chunk import).
+/// Same values, same order — pure scheduling, zero semantic change.
+#[inline]
+fn plane_fps(ident: &[u32]) -> [u64; 16] {
+    let mut plane_fp = [0u64; 16];
+    for g in 0..4 {
+        let mut h0 = 0xcbf29ce484222325u64;
+        let mut h1 = 0xcbf29ce484222325u64;
+        let mut h2 = 0xcbf29ce484222325u64;
+        let mut h3 = 0xcbf29ce484222325u64;
+        let b = g * 1024;
+        for i in 0..256 {
+            h0 = (h0 ^ ident[b + i] as u64).wrapping_mul(0x100000001b3);
+            h1 = (h1 ^ ident[b + 256 + i] as u64).wrapping_mul(0x100000001b3);
+            h2 = (h2 ^ ident[b + 512 + i] as u64).wrapping_mul(0x100000001b3);
+            h3 = (h3 ^ ident[b + 768 + i] as u64).wrapping_mul(0x100000001b3);
+        }
+        plane_fp[g * 4] = h0;
+        plane_fp[g * 4 + 1] = h1;
+        plane_fp[g * 4 + 2] = h2;
+        plane_fp[g * 4 + 3] = h3;
+    }
+    plane_fp
+}
 /// Build the ShiftSec for one section Value (None = not usable).
 /// `tab` interns palette-entry identity bytes chunk-globally (owned copies
 /// only for NEW identities; lookups hash the scratch slice); `idbuf` is a
@@ -2625,15 +2654,7 @@ fn shift_sec_of_view(
     }
     ST_SHIFT_KEY_NS.fetch_add(t_key.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let t_fp = std::time::Instant::now();
-    let mut plane_fp = [0u64; 16];
-    for (py, fp) in plane_fp.iter_mut().enumerate() {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &x in &ident[py * 256..(py + 1) * 256] {
-            h ^= x as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        *fp = h;
-    }
+    let plane_fp = plane_fps(&ident);
     ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
 }
@@ -2680,15 +2701,7 @@ fn shift_sec_from_facts_view(
     }
     ST_SHIFT_KEY_NS.fetch_add(t_key.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let t_fp = std::time::Instant::now();
-    let mut plane_fp = [0u64; 16];
-    for (py, fp) in plane_fp.iter_mut().enumerate() {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &x in &ident[py * 256..(py + 1) * 256] {
-            h ^= x as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        *fp = h;
-    }
+    let plane_fp = plane_fps(&ident);
     ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ST_SHIFT_FAST.fetch_add(1, Ordering::Relaxed);
     Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
@@ -2736,15 +2749,7 @@ fn shift_sec_from_facts_lite(
     }
     ST_SHIFT_KEY_NS.fetch_add(t_key.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let t_fp = std::time::Instant::now();
-    let mut plane_fp = [0u64; 16];
-    for (py, fp) in plane_fp.iter_mut().enumerate() {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for &x in &ident[py * 256..(py + 1) * 256] {
-            h ^= x as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        *fp = h;
-    }
+    let plane_fp = plane_fps(&ident);
     ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ST_SHIFT_FAST.fetch_add(1, Ordering::Relaxed);
     Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })

@@ -154,6 +154,23 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.15 — interleaved plane fingerprints: the shift build's fp pass ×3.25
+
+The stage timers left the shift build at 14.6 ms of which the plane
+fingerprint pass was the biggest slice (fp_ms 11.7 of 22.6-23.4): the
+per-plane loop hashed the 256-entry FNV chain SEQUENTIALLY — 16 serial
+dependency chains of ~3.5-cycle mul links, latency-bound at ~1 ns/step
+over 4096 entries. `plane_fps` (shared by all three ShiftSec builders)
+interleaves the four chains of each 4-plane group so they overlap:
+fp_ms 11.7 -> **3.6**, shift build 22.6-23.4 -> **14.6 ms**, import ST
+56.9-58.5 -> **59.3-59.4 MB/s** (+58% over 0.9.10), import MT 83.0-85.3,
+warm read parity (1238-1266). The per-plane hash values are IDENTICAL —
+pure scheduling — proven by the unchanged diagnostic pins: cand=447213,
+plane0=327, full=327, ksum=3041, dense_match=198. Gates: `enc_fp`
+fp 6d240d7166cdda99 members 12130 bytes 9971843 (byte-exact), probe_lite
+42218 sections 0 mismatches, 53/53 tests, verify 728/728 + 218/218 +
+1280/1280, bench_size x0.08 vs anvil compact, container 1.66 MiB (x7.51).
+
 ## v0.9.14 — shift build interns identities straight from the lite palette
 
 The 0.9.13 shift build still materialized a full `SecView` per built

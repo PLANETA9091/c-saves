@@ -658,3 +658,19 @@ full=327, ksum=3041, cand=447213); enc_fp fp 6d240d7166cdda99 members 12130
 unchanged, probe_lite 42218 sections 0 mismatches, 53/53 tests, verify
 728/728 + 218/218 + 1280/1280, bench_size x0.08 vs anvil compact, container
 1.66 MiB (x7.51).
+
+0.9.15 interleaved plane fingerprints: the stage timers left the shift
+build at 14.6 ms of which the fp pass was the biggest slice (fp_ms 11.7 of
+22.6-23.4) — the per-plane loop hashed each 256-entry FNV chain
+sequentially, 16 latency-bound serial mul chains (~3.5 cycles per link,
+~1 ns/step over 4096 entries). plane_fps (now the single fp source for all
+three ShiftSec builders) interleaves the four chains of each 4-plane group
+so they overlap: fp_ms 11.7 -> 3.6 (x3.25), shift build 22.6-23.4 ->
+14.6 ms, import ST 56.9-58.5 -> 59.3-59.4 MB/s (3-repeat confirmed;
++58% over 0.9.10), import MT 83.0-85.3, warm read parity 1238-1266.
+Per-plane hash values IDENTICAL (pure scheduling) — the diagnostic pins
+are unchanged: cand=447213, plane0=327, full=327, ksum=3041,
+dense_match=198. Gates: enc_fp fp 6d240d7166cdda99 members 12130 bytes
+9971843 (byte-exact), probe_lite 42218 sections 0 mismatches, 53/53
+tests, verify 728/728 + 218/218 + 1280/1280, bench_size x0.08 vs anvil
+compact, container 1.66 MiB (x7.51).
