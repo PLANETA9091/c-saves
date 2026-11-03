@@ -62,6 +62,83 @@ const SLAB_KIND_HOT: u8 = 0x40;
 /// the real (rec_off, stream_off, len) is in `batch_idx`.
 const BATCHED: u32 = u32::MAX;
 
+/// Bucket hasher for keys that are ALREADY fingerprints: Hash (128-bit
+/// content hash) and sequential u32 blob ids. Map correctness never relies
+/// on the bucket hash (every probe full-key-compares), so uniformity is all
+/// we need — one multiply per 64-bit half beats SipHash's ~25 ns on the
+/// ~520 map ops each import chunk does in ensure_blobs.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct RawHasher(u64);
+impl std::hash::Hasher for RawHasher {
+    #[inline]
+    fn write_u128(&mut self, v: u128) {
+        self.0 = (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ ((v >> 64) as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.0 = v as u64;
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0 ^ 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h = (h ^ *b as u64).wrapping_mul(0x1000_0000_01B3);
+        }
+        self.0 = h;
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+/// BuildHasher pair for RawHasher (Default = zeroed).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct RawBuild;
+impl std::hash::BuildHasher for RawBuild {
+    type Hasher = RawHasher;
+    #[inline]
+    fn build_hasher(&self) -> RawHasher {
+        RawHasher(0)
+    }
+}
+
+/// Per-thread reusable zstd compressor: zstd::bulk::compress creates a fresh
+/// CCtx (workspace alloc + param setup) per call; the slab path compresses
+/// one ~34 KiB frame per chunk, so the setup is pure overhead. Cached per
+/// level — import threads stay on hot_level, the maintenance thread on
+/// cold_level. Output is byte-identical to bulk::compress (same code path,
+/// only the context lifetime differs).
+thread_local! {
+    static HOT_COMP: std::cell::RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+fn bulk_compress(data: &[u8], level: i32) -> (u8, Vec<u8>) {
+    HOT_COMP.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let hit = matches!(slot.as_ref(), Some((lv, _)) if *lv == level);
+        if hit {
+            let (_, comp) = slot.as_mut().unwrap();
+            match comp.compress(data) {
+                Ok(out) => (0, out),
+                Err(_) => (0, data.to_vec()),
+            }
+        } else {
+            match zstd::bulk::Compressor::new(level) {
+                Ok(mut comp) => {
+                    let r = comp.compress(data);
+                    *slot = Some((level, comp));
+                    match r {
+                        Ok(out) => (0, out),
+                        Err(_) => (0, data.to_vec()),
+                    }
+                }
+                Err(_) => (0, data.to_vec()),
+            }
+        }
+    })
+}
+
 // ------------------------------------------------------------- config -----
 
 #[derive(Clone, Debug)]
@@ -373,7 +450,11 @@ fn crc_of(b: &[u8]) -> u32 {
 impl Recipe {
     /// Parse any recipe mode. `id2h` resolves BLOB2 ids (pass-1 complete);
     /// `keytab` resolves mode-5 interned key ids.
-    fn parse(b: &[u8], id2h: &HashMap<u32, Hash>, keytab: &[String]) -> Option<Recipe> {
+    fn parse<S: std::hash::BuildHasher>(
+        b: &[u8],
+        id2h: &HashMap<u32, Hash, S>,
+        keytab: &[String],
+    ) -> Option<Recipe> {
         const EMPTY: Recipe = Recipe {
             whole: None,
             sections: Vec::new(),
@@ -957,8 +1038,8 @@ pub struct Store {
     dir: PathBuf,
     cfg: Cfg,
     segs: RwLock<HashMap<u32, Arc<Seg>>>,
-    blobs: RwLock<HashMap<Hash, BlobLoc>>,
-    ids: RwLock<HashMap<u32, Hash>>,
+    blobs: RwLock<HashMap<Hash, BlobLoc, RawBuild>>,
+    ids: RwLock<HashMap<u32, Hash, RawBuild>>,
     chunks: RwLock<HashMap<u64, (u32, u64, u32)>>,
     /// Interned recipe key names (mode 5); persisted as kind-6 records.
     keys_tab: RwLock<Vec<String>>,
@@ -1035,8 +1116,8 @@ impl Store {
             dir: dir.to_path_buf(),
             cfg,
             segs: RwLock::new(HashMap::new()),
-            blobs: RwLock::new(HashMap::new()),
-            ids: RwLock::new(HashMap::new()),
+            blobs: RwLock::new(HashMap::with_hasher(RawBuild)),
+            ids: RwLock::new(HashMap::with_hasher(RawBuild)),
             chunks: RwLock::new(HashMap::new()),
             keys_tab: RwLock::new(Vec::new()),
             key_refcnt: RwLock::new(HashMap::new()),
@@ -1975,19 +2056,13 @@ impl Store {
     /// header cost and dilutes match search.
     fn compress_tier_plain(&self, data: &[u8], cold: bool) -> (u8, Vec<u8>) {
         let level = if cold { self.cfg.cold_level } else { self.cfg.hot_level };
-        match zstd::bulk::compress(data, level) {
-            Ok(out) => (0, out),
-            Err(_) => (0, data.to_vec()),
-        }
+        bulk_compress(data, level)
     }
 
     /// Explicit-level variant (recipe-batch flush): same no-dictionary path,
     /// caller picks the zstd level.
     fn compress_tier_level(&self, data: &[u8], level: i32) -> (u8, Vec<u8>) {
-        match zstd::bulk::compress(data, level) {
-            Ok(out) => (0, out),
-            Err(_) => (0, data.to_vec()),
-        }
+        bulk_compress(data, level)
     }
 
     fn compress_tier(&self, data: &[u8], cold: bool) -> (u8, Vec<u8>) {
@@ -2092,6 +2167,8 @@ impl Store {
     /// duplicates never enter the frame.
     fn ensure_blobs_batch<'a>(&self, items: &[(Hash, &'a [u8])]) -> Result<(), String> {
         let mut misses: Vec<(Hash, u32, &'a [u8])> = Vec::with_capacity(items.len());
+        let mut seen: std::collections::HashSet<Hash, RawBuild> =
+            std::collections::HashSet::with_capacity_and_hasher(items.len(), RawBuild);
         {
             let blobs = self.blobs.read();
             for (h, raw) in items {
@@ -2099,7 +2176,7 @@ impl Store {
                     self.dedup_hits.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                if misses.iter().any(|m| m.0 == *h) {
+                if !seen.insert(*h) {
                     continue; // in-batch duplicate of an earlier miss
                 }
                 misses.push((*h, 0, raw));
