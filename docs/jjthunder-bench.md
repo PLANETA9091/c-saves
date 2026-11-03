@@ -638,7 +638,23 @@ probe_lite asserts hash + encoded-byte parity over 42218 corpus sections
 53/53 tests, verify 946/946 bad=0, container bytes unchanged. Any section
 shape outside the 7 KNOWN keys fails the typed parse and the chunk takes
 the unchanged Value path — the lite path cannot alter behavior, only speed.
-Known follow-up: the shift build's view materialization (2977 builds) adds
-~8 µs/build (unp_ms 6.2 -> 30 across bench phases) — interning identities
-directly from the lite palette without the props-Vec materialization is the
-next micro-lever.
+0.9.14 shift build interns identities straight from the lite palette: the
+0.9.13 build still materialized a full SecView per built section (per-entry
+props Vecs + light-byte copies, ~8 µs x 2977 builds) only to feed
+intern_ids, and that allocation churn was the unp_ms 6.2 -> 30 inflation
+across bench phases. identity_from_lit / intern_ids_lit now serialize
+identity bytes directly from the typed PalLit palette (BTreeMap props
+iterate in exactly the canonical sorted order the view builders sort to —
+same bytes, same chunk-global ids) and shift_sec_from_facts_lite builds
+the ShiftSec with no view at all; the SecView is materialized lazily at
+first winner-assembly use (vw_get! + view_ready mask — real builds mark
+their slot, meta-cache hits stay not-ready and keep being skipped by the
+assembly exactly as before). The rare lite full build and the Value path
+keep the eager view. Results (3-repeat confirmed): import ST 53.5-56.3 ->
+56.9-58.5 MB/s (+60% over 0.9.10, p50 112.9-115.9 µs), import MT 79.2-84.1,
+warm read 1260.2-1302.3 MB/s, shift build 22.6-23.4 ms with unp_ms stable
+at 5.9-6.2 across all phases. Match decisions byte-identical (dense_match=198,
+full=327, ksum=3041, cand=447213); enc_fp fp 6d240d7166cdda99 members 12130
+unchanged, probe_lite 42218 sections 0 mismatches, 53/53 tests, verify
+728/728 + 218/218 + 1280/1280, bench_size x0.08 vs anvil compact, container
+1.66 MiB (x7.51).

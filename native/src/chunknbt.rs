@@ -2322,6 +2322,36 @@ fn identity_from_entry(e: &PalEntry, out: &mut Vec<u8>) -> Option<()> {
     Some(())
 }
 
+/// identity_from_entry over the RAW typed lite entry (v0.9.14): the
+/// BTreeMap props iterate in exactly the canonical sorted order
+/// parse_entry/pal_entry_from_lit sort their Vecs to (both unique keys),
+/// so the bytes are identical — one interning table feeds both paths.
+/// Infallible: PalLit carries no failure mode (serde already validated it).
+fn identity_from_lit(l: &PalLit, out: &mut Vec<u8>) {
+    out.clear();
+    match l {
+        PalLit::Plain(s) => {
+            out.push(1u8);
+            out.extend_from_slice(s.as_bytes());
+        }
+        PalLit::Named { name, props } => {
+            out.push(0u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(0x00);
+            if let Some(m) = props {
+                for (i, (k, vv)) in m.iter().enumerate() {
+                    if i > 0 {
+                        out.push(0x1f);
+                    }
+                    out.extend_from_slice(k.as_bytes());
+                    out.push(b'=');
+                    out.extend_from_slice(vv.as_bytes());
+                }
+            }
+        }
+    }
+}
+
 /// put_entry-form bytes for one palette entry (the CSEC wire encoding,
 /// mirrored standalone so the shift pass can write extras without nesting).
 fn put_entry_standalone(v: &Value, out: &mut Vec<u8>) -> Option<()> {
@@ -2504,6 +2534,34 @@ fn intern_ids(
     Some(id_of_orig)
 }
 
+/// intern_ids over the RAW typed lite palette (v0.9.14): same chunk-global
+/// table, same identity bytes (identity_from_lit), so ids line up with the
+/// Value path — without materializing the SecView (per-entry props Vecs,
+/// light byte copies) for sections that only need interning.
+fn intern_ids_lit(
+    pal: &[PalLit],
+    tab: &mut HashMap<Box<[u8]>, u32>,
+    idbuf: &mut Vec<u8>,
+) -> Vec<u32> {
+    let n = pal.len();
+    let mut id_of_orig = vec![0u32; n];
+    let t_id = std::time::Instant::now();
+    for (i, e) in pal.iter().enumerate() {
+        identity_from_lit(e, idbuf);
+        let nid = tab.len() as u32;
+        let id = match tab.get(idbuf.as_slice()) {
+            Some(&x) => x,
+            None => {
+                tab.insert(idbuf.as_slice().into(), nid);
+                nid
+            }
+        };
+        id_of_orig[i] = id;
+    }
+    ST_SHIFT_ID_NS.fetch_add(t_id.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    id_of_orig
+}
+
 /// Full ShiftSec build over the SecView currency (v0.9.13): identical output
 /// to the old &Value shift_sec_of — same unpack, same counts, same
 /// comparator (counts desc, then (plain, name, props-sorted)).
@@ -2636,6 +2694,62 @@ fn shift_sec_from_facts_view(
     Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
 }
 
+/// ShiftSec build straight from the typed lite section (v0.9.14): identical
+/// output to shift_sec_from_facts_view for the same section — the ids come
+/// from the same identity bytes (identity_from_lit == identity_from_entry),
+/// ident/canon/fps from the same encoder facts — WITHOUT materializing the
+/// SecView (per-entry props Vecs + light byte copies, ~8 µs per build).
+/// None only when block_states is absent or the palette size is out of
+/// range: the lite view build is infallible, so this covers every case the
+/// view path could reject.
+fn shift_sec_from_facts_lite(
+    s: &SecLite,
+    tab: &mut HashMap<Box<[u8]>, u32>,
+    idbuf: &mut Vec<u8>,
+    facts: SectionFacts,
+) -> Option<ShiftSec> {
+    let bs = s.block_states.as_ref()?;
+    let pal = &bs.palette;
+    let n = pal.len();
+    if n == 0 || n > 65535 {
+        return None;
+    }
+    let id_of_orig = intern_ids_lit(pal, tab, idbuf);
+    let mut ident = vec![0u32; 4096];
+    let t_unp = std::time::Instant::now();
+    for (i, &o) in facts.v.iter().enumerate() {
+        let o = o as usize;
+        if o >= n {
+            return None; // belt & braces — the encoder validated this
+        }
+        ident[i] = id_of_orig[o];
+    }
+    ST_SHIFT_UNP_NS.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t_key = std::time::Instant::now();
+    let mut canon_of_orig = vec![0u32; n];
+    for (pos, &oi) in facts.order.iter().enumerate() {
+        let oi = oi as usize;
+        if oi >= n {
+            return None;
+        }
+        canon_of_orig[oi] = pos as u32;
+    }
+    ST_SHIFT_KEY_NS.fetch_add(t_key.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t_fp = std::time::Instant::now();
+    let mut plane_fp = [0u64; 16];
+    for (py, fp) in plane_fp.iter_mut().enumerate() {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &x in &ident[py * 256..(py + 1) * 256] {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        *fp = h;
+    }
+    ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_SHIFT_FAST.fetch_add(1, Ordering::Relaxed);
+    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
+}
+
 /// The shift pass: replace dense CSEC3 sections with shift refs where a
 /// lower section of this chunk contains them shifted by k planes. Runs on
 /// the freshly split section list (Values in `vals` are parallel to
@@ -2710,6 +2824,14 @@ fn shift_ref_pass(
     // lazily built SecViews (parse_entry per palette entry), filled at build
     // time and reused by the winner assembly below
     let mut view_cache: Vec<Option<SecView>> = (0..n_sec).map(|_| None).collect();
+    // v0.9.14: which slots may lazily materialize their view. A REAL build
+    // marks the slot: the lite+facts build interns straight from the typed
+    // palette and defers the SecView to first ASSEMBLY use (vw_get! below);
+    // the other builds populate the cache right away, as before. meta_cache
+    // hits stay not-ready — the assembly has always skipped such sections
+    // (no cached view at line "src_view") and must keep doing so for
+    // byte-identical output.
+    let mut view_ready: Vec<bool> = vec![false; n_sec];
     // macro, not a closure: the getter needs &mut tab/meta_cache/built while
     // the match loop holds & sections / & src (disjoint borrows).
     // The eligibility check lives INSIDE the getter — ineligible slots must
@@ -2728,29 +2850,67 @@ fn shift_ref_pass(
                             Some(a) => Some(a.clone()),
                             None => {
                                 let t_b = std::time::Instant::now();
-                                if view_cache[$ix].is_none() {
-                                    view_cache[$ix] = match src {
-                                        SecListSrc::Values(vals) => sec_view_of_value(&vals[$ix]),
-                                        SecListSrc::Lite(list, strip) => {
-                                            sec_view_of_lite(&list[$ix], *strip)
+                                view_ready[$ix] = true;
+                                // v0.9.14: the lite+facts path (2973/2977
+                                // builds) interns straight from the typed
+                                // palette — NO SecView materialization
+                                // (per-entry props Vecs, light byte copies,
+                                // ~8 µs/build). The view is built lazily at
+                                // first assembly use (winners only). The view
+                                // still feeds: the Values path (its build
+                                // functions consume it) and the rare lite
+                                // full build (unpack data + comparator keys).
+                                let r = match src {
+                                    SecListSrc::Lite(list, strip) => {
+                                        match facts[$ix].take() {
+                                            Some(f) => shift_sec_from_facts_lite(
+                                                &list[$ix],
+                                                &mut tab,
+                                                &mut idbuf,
+                                                f,
+                                            )
+                                            .map(Arc::new),
+                                            None => {
+                                                if view_cache[$ix].is_none() {
+                                                    view_cache[$ix] = sec_view_of_lite(
+                                                        &list[$ix],
+                                                        *strip,
+                                                    );
+                                                }
+                                                match view_cache[$ix].as_ref() {
+                                                    Some(vw) => shift_sec_of_view(
+                                                        vw,
+                                                        &mut tab,
+                                                        &mut idbuf,
+                                                    )
+                                                    .map(Arc::new),
+                                                    None => None,
+                                                }
+                                            }
                                         }
-                                    };
-                                }
-                                let r = match view_cache[$ix].as_ref() {
-                                    Some(vw) => match facts[$ix].take() {
-                                        Some(f) => shift_sec_from_facts_view(
-                                            vw,
-                                            &mut tab,
-                                            &mut idbuf,
-                                            f,
-                                        )
-                                        .map(Arc::new),
-                                        None => {
-                                            shift_sec_of_view(vw, &mut tab, &mut idbuf)
-                                                .map(Arc::new)
+                                    }
+                                    SecListSrc::Values(vals) => {
+                                        if view_cache[$ix].is_none() {
+                                            view_cache[$ix] =
+                                                sec_view_of_value(&vals[$ix]);
                                         }
-                                    },
-                                    None => None,
+                                        match view_cache[$ix].as_ref() {
+                                            Some(vw) => match facts[$ix].take() {
+                                                Some(f) => shift_sec_from_facts_view(
+                                                    vw,
+                                                    &mut tab,
+                                                    &mut idbuf,
+                                                    f,
+                                                )
+                                                .map(Arc::new),
+                                                None => {
+                                                    shift_sec_of_view(vw, &mut tab, &mut idbuf)
+                                                        .map(Arc::new)
+                                                }
+                                            },
+                                            None => None,
+                                        }
+                                    }
                                 };
                                 ST_SHIFT_BUILD_NS.fetch_add(
                                     t_b.elapsed().as_nanos() as u64,
@@ -2769,6 +2929,23 @@ fn shift_ref_pass(
                 }
             }
         };
+    }
+    // v0.9.14 lazy view getter for the winner assembly: materializes the
+    // view on first use for slots a real build marked view-ready (the
+    // lite+facts build no longer does it eagerly). Same construction the
+    // build path used — sec_view_of_value / sec_view_of_lite — so the
+    // assembled bytes are identical. Not-ready slots (meta_cache hits)
+    // yield None, preserving today's skip behavior exactly.
+    macro_rules! vw_get {
+        ($ix:expr) => {{
+            if view_ready[$ix] && view_cache[$ix].is_none() {
+                view_cache[$ix] = match src {
+                    SecListSrc::Values(vals) => sec_view_of_value(&vals[$ix]),
+                    SecListSrc::Lite(list, strip) => sec_view_of_lite(&list[$ix], *strip),
+                };
+            }
+            view_cache[$ix].as_ref()
+        }};
     }
     for i in 0..n_sec {
         if cache_hit.get(i).copied().unwrap_or(false) {
@@ -2888,7 +3065,7 @@ fn shift_ref_pass(
         }
         // non-block_states fields: re-encode the section view without
         // block_states (f1 block_states bits stay clear)
-        let Some(src_view) = view_cache[i].as_ref() else { continue };
+        let Some(src_view) = vw_get!(i) else { continue };
         if src_view.bs.is_none() {
             continue;
         }
@@ -2919,7 +3096,7 @@ fn shift_ref_pass(
         mbr.extend_from_slice(&(extras.len() as u16).to_le_bytes());
         // extras in first-appearance order (must match ref-space numbering)
         'ex: for &pos in &extras {
-            let Some(bs) = view_cache[i].as_ref().and_then(|v| v.bs.as_ref()) else {
+            let Some(bs) = vw_get!(i).and_then(|v| v.bs.as_ref()) else {
                 break 'ex
             };
             let Some(e) = bs.palette.get(pos) else { break 'ex };

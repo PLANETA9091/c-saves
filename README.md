@@ -154,6 +154,33 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.14 — shift build interns identities straight from the lite palette
+
+The 0.9.13 shift build still materialized a full `SecView` per built
+section (per-entry `props` Vecs + light-byte copies, ~8 µs × 2977 builds)
+only to feed `intern_ids` with palette entries — and the allocation churn
+was the "unp_ms 6.2 -> 30 across bench phases" inflation in the stage
+timers. The lite path now interns identity bytes DIRECTLY from the typed
+`PalLit` palette (`identity_from_lit` / `intern_ids_lit`: BTreeMap props
+iterate in exactly the canonical sorted order the view builders sort to,
+so the bytes — hence the chunk-global ids — are identical) and
+`shift_sec_from_facts_lite` builds the ShiftSec without any view at all.
+The view is materialized lazily at first winner-assembly use (`vw_get!` +
+a `view_ready` mask: real builds mark their slot, meta-cache hits stay
+not-ready and keep being skipped by the assembly exactly as before —
+byte-identical output). The rare lite full build and the whole Value path
+keep the eager view (their build functions consume it).
+
+Results (same corpus, 3-repeat confirmed): import ST 53.5-56.3 ->
+**56.9-58.5 MB/s** (+60% over 0.9.10, p50 112.9-115.9 µs), import MT
+81-82 -> **79.2-84.1 MB/s**, warm read 1252.6 -> **1260.2-1302.3 MB/s**,
+shift build 23.4/22.8/22.6 ms with unp_ms stable at 5.9-6.2 across all
+phases (no inflation). Match decisions byte-identical (dense_match=198,
+full=327, ksum=3041, cand=447213); `enc_fp` fp 6d240d7166cdda99 members
+12130 unchanged, probe_lite 42218 sections 0 mismatches, 53/53 tests,
+verify 728/728 + 218/218 + 1280/1280, bench_size x0.08 vs anvil compact,
+container 1.66 MiB (x7.51).
+
 ## v0.9.13 — typed borrowed sections parse (lite): the sections list without a Value tree
 
 The scan-split path handed the sections list to fastnbt as a `Value` tree:
