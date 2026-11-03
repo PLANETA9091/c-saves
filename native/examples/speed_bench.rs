@@ -378,15 +378,20 @@ fn main() {
             use c_saves::chunknbt::*;
             use std::sync::atomic::Ordering::Relaxed;
             println!(
-                "SPEED stages-shift: build_ms={:.1} secs_ok={} cand={} plane0={} full={} ksum={} dense_nomatch={} dense_match={}",
+                "SPEED stages-shift: build_ms={:.1} secs_ok={} fast={} cand={} plane0={} full={} ksum={} dense_nomatch={} dense_match={} id_ms={:.1} unp_ms={:.1} key_ms={:.1} fp_ms={:.1}",
                 ST_SHIFT_BUILD_NS.load(Relaxed) as f64 / 1e6,
                 ST_SHIFT_SECS_OK.load(Relaxed),
+                ST_SHIFT_FAST.load(Relaxed),
                 ST_SHIFT_CAND.load(Relaxed),
                 ST_SHIFT_PLANE0.load(Relaxed),
                 ST_SHIFT_FULL.load(Relaxed),
                 ST_SHIFT_KSUM.load(Relaxed),
                 ST_SHIFT_DENSE_NOMATCH.load(Relaxed),
                 ST_SHIFT_DENSE_MATCH.load(Relaxed),
+                ST_SHIFT_ID_NS.load(Relaxed) as f64 / 1e6,
+                ST_SHIFT_UNP_NS.load(Relaxed) as f64 / 1e6,
+                ST_SHIFT_KEY_NS.load(Relaxed) as f64 / 1e6,
+                ST_SHIFT_FP_NS.load(Relaxed) as f64 / 1e6,
             );
         }
     }

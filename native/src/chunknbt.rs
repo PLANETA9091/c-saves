@@ -534,6 +534,9 @@ static SPLT_PACK: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0)
 /// scan-split attempts (fast path; falls back to the full parse on doubt)
 static SPLT_SCAN: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static SPLT_SCAN_OK: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// v0.9.12: fastnbt parse of the sections-only wrapper inside scan_split
+/// (the residual walk cost = SPLT_SCAN - SPLT_SCANP - enc - shift).
+static SPLT_SCANP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 /// Last scan_root failure reason: 1=root hdr, 2=sections skip, 3=hmap walk,
 /// 4=light patch, 5=generic key skip, 6=no sections key, 7=root key name.
 static SCAN_FAIL: AtomicU64 = AtomicU64::new(0);
@@ -555,7 +558,7 @@ pub fn split_stage_json() -> String {
         )
     }
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{}}}",
         f("parse", &SPLT_PARSE),
         f("sections", &SPLT_SECS),
         f("sh", &SPLT_SH),
@@ -566,7 +569,8 @@ pub fn split_stage_json() -> String {
         f("shift", &SPLT_SHIFT),
         f("tail", &SPLT_TAIL),
         f("scan", &SPLT_SCAN),
-        f("scan_ok", &SPLT_SCAN_OK)
+        f("scan_ok", &SPLT_SCAN_OK),
+        f("scanp", &SPLT_SCANP)
     )
     + &format!(
         r#","scan_fail":{{"why":{},"pos":{}}}"#,
@@ -1302,6 +1306,19 @@ fn unpack_nostroddle_vox(longs: &[i64], n: usize, bits: u32) -> Vec<u32> {
 /// decodes to the exact same block states. Sorting maximizes section dedup
 /// across palette permutations and makes the encoding deterministic.
 pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
+    section_encode_impl(sec, false).map(|(b, _)| b)
+}
+
+/// Encoder with optional shift-facts capture (v0.9.12): when `want_facts`,
+/// the dense-analysis artifacts (orig-index voxel stream + canonical
+/// orig-index order) are returned alongside the bytes, so the shift pass
+/// reuses them instead of re-unpacking and re-sorting (~20 µs per dense
+/// section). Byte output is identical either way (facts capture happens
+/// after the pack/RLE decision, on values that were dead anyway).
+fn section_encode_impl(
+    sec: &Value,
+    want_facts: bool,
+) -> Option<(Vec<u8>, Option<SectionFacts>)> {
     let Value::Compound(m) = sec else { return None };
     const KNOWN: [&str; 7] = [
         "Y",
@@ -1322,6 +1339,8 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
     // 5-byte v4 header; patched down to the 4-byte v3 form when f3 stays 0.
     let mut out = vec![CSEC4_MAGIC, 0u8, 0u8, 0u8, y as u8];
     let mut f1 = 0u8;
+    // shift-facts capture (filled by the block_states encode below)
+    let mut block_facts: Option<SectionFacts> = None;
     let mut f2 = 0u8;
     let mut f3 = 0u8;
 
@@ -1452,6 +1471,7 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         entries: usize,
         narrow_bit: u8,
         order_shift: u32,
+        facts_out: &mut Option<SectionFacts>,
     ) -> Option<(bool, u8)> {
         let Value::Compound(bm) = bs else { return None };
         let Value::List(pal) = bm.get("palette")? else { return None };
@@ -1559,6 +1579,12 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
             }
             out.extend_from_slice(&dense_pack_wide_mapped(&v, &remap16, out_bits));
             ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
+            // facts capture: v/ents are dead after this point (wide path
+            // returns immediately) — hand them to the shift pass for free.
+            *facts_out = Some(SectionFacts {
+                v,
+                order: ents.iter().map(|(_, i)| *i as u32).collect(),
+            });
             return Some((true, 0));
         }
         // v0.9.11: the mapped stream is never materialized. remap is
@@ -1621,6 +1647,14 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
         }
         SPLT_PACK.0.fetch_add(t_pack.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_PACK.1.fetch_add(1, Ordering::Relaxed);
+        // facts capture (narrow path): v died in the RLE scans above, ents
+        // died in the identity check — both move out for free. The canonical
+        // order here IS the shift pass's order (same comparator, same
+        // counts).
+        *facts_out = Some(SectionFacts {
+            v,
+            order: ents.iter().map(|(_, i)| *i as u32).collect(),
+        });
         match best {
             None => {
                 out.extend_from_slice(&dense);
@@ -1641,15 +1675,18 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
     }
 
     if let Some(bs) = m.get("block_states") {
-        let (has_data, f2b) = enc_pal_data_canon(&mut out, bs, 4096, 4, 4)?;
+        let mut facts: Option<SectionFacts> = None;
+        let (has_data, f2b) = enc_pal_data_canon(&mut out, bs, 4096, 4, 4, &mut facts)?;
         f1 |= 1;
         if has_data {
             f1 |= 2;
         }
         f2 |= f2b;
+        block_facts = facts;
     }
     if let Some(bs) = m.get("biomes") {
-        let (has_data, f2b) = enc_pal_data_canon(&mut out, bs, 64, 8, 6)?;
+        let mut no_facts: Option<SectionFacts> = None;
+        let (has_data, f2b) = enc_pal_data_canon(&mut out, bs, 64, 8, 6, &mut no_facts)?;
         f1 |= 4;
         if has_data {
             f1 |= 8;
@@ -1706,7 +1743,7 @@ pub fn section_encode(sec: &Value) -> Option<Vec<u8>> {
     } else {
         out[3] = f3;
     }
-    Some(out)
+    Some((out, if want_facts { block_facts } else { None }))
 }
 
 // ------------------------------------------------- shift-ref codec (v0.7) --
@@ -1924,6 +1961,16 @@ struct ShiftSec {
 /// `tab` interns palette-entry identity bytes chunk-globally (owned copies
 /// only for NEW identities; lookups hash the scratch slice); `idbuf` is a
 /// reusable identity-serialization buffer.
+/// Facts captured by the encoder for one section's block_states (v0.9.12):
+/// the raw orig-index voxel stream and the canonical orig-index order —
+/// exactly what the shift pass re-derives from scratch today (unpack +
+/// counts + sort ≈ 20 µs per dense build). The voxel stream is MOVED out of
+/// the encoder (it dies after the pack/RLE decision), so reuse is free.
+struct SectionFacts {
+    v: Vec<u32>,
+    order: Vec<u32>,
+}
+
 fn shift_sec_of(
     s: &Value,
     tab: &mut HashMap<Box<[u8]>, u32>,
@@ -1938,6 +1985,7 @@ fn shift_sec_of(
         return None;
     }
     let mut id_of_orig = vec![0u32; n];
+    let t_id = std::time::Instant::now();
     for (i, p) in pal.iter().enumerate() {
         pal_entry_identity_into(p, idbuf)?;
         let nid = tab.len() as u32;
@@ -1950,12 +1998,14 @@ fn shift_sec_of(
         };
         id_of_orig[i] = id;
     }
+    ST_SHIFT_ID_NS.fetch_add(t_id.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let mut ident = vec![0u32; 4096];
     // one unpack feeds ident AND the frequency counts (the canonical order
     // mirrors enc_pal_data_canon: counts desc, then (plain, name, props)) —
     // the two passes used to re-unpack the same 4096 voxels (~40% of the
     // build cost; the shift pass builds one of these per distinct dense
     // section per chunk).
+    let t_unp = std::time::Instant::now();
     let mut counts = vec![0u32; n];
     match bm.get("data") {
         Some(Value::LongArray(la)) => {
@@ -1986,10 +2036,12 @@ fn shift_sec_of(
             ident.iter_mut().for_each(|x| *x = id_of_orig[0]);
         }
     }
+    ST_SHIFT_UNP_NS.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // precompute sort keys to avoid borrows crossing the sort — borrowed
     // from the parsed tree (the cloned-String version spent hundreds of
     // allocations per build on wide palettes; the comparison order, hence
     // the canonical order, is identical)
+    let t_key = std::time::Instant::now();
     let keys: Vec<(bool, &str, Vec<(&str, &str)>)> = (0..n)
         .map(|i| match &pal[i] {
             Value::String(s) => (true, s.as_str(), Vec::new()),
@@ -2024,6 +2076,8 @@ fn shift_sec_of(
     for (pos, &oi) in order.iter().enumerate() {
         canon_of_orig[oi] = pos as u32;
     }
+    ST_SHIFT_KEY_NS.fetch_add(t_key.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t_fp = std::time::Instant::now();
     let mut plane_fp = [0u64; 16];
     for (py, fp) in plane_fp.iter_mut().enumerate() {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -2033,6 +2087,80 @@ fn shift_sec_of(
         }
         *fp = h;
     }
+    ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
+}
+
+/// ShiftSec build from encoder facts (v0.9.12): identical output to
+/// shift_sec_of for the same section — the canonical order is the same
+/// comparator (counts desc, then (plain, name, props-sorted)) over the same
+/// counts (both derive from the same unpacked voxel stream), so the
+/// encoder's sorted order IS the shift pass's order. Skips the unpack, the
+/// counts pass and the key sort; keeps id interning, the ident fill and the
+/// plane fingerprints.
+pub static ST_SHIFT_FAST: AtomicU64 = AtomicU64::new(0);
+
+fn shift_sec_from_facts(
+    s: &Value,
+    tab: &mut HashMap<Box<[u8]>, u32>,
+    idbuf: &mut Vec<u8>,
+    facts: SectionFacts,
+) -> Option<ShiftSec> {
+    let Value::Compound(m) = s else { return None };
+    let bs = m.get("block_states")?;
+    let Value::Compound(bm) = bs else { return None };
+    let Value::List(pal) = bm.get("palette")? else { return None };
+    let n = pal.len();
+    if n == 0 || n > 65535 {
+        return None;
+    }
+    let mut id_of_orig = vec![0u32; n];
+    let t_id = std::time::Instant::now();
+    for (i, p) in pal.iter().enumerate() {
+        pal_entry_identity_into(p, idbuf)?;
+        let nid = tab.len() as u32;
+        let id = match tab.get(idbuf.as_slice()) {
+            Some(&x) => x,
+            None => {
+                tab.insert(idbuf.as_slice().into(), nid);
+                nid
+            }
+        };
+        id_of_orig[i] = id;
+    }
+    ST_SHIFT_ID_NS.fetch_add(t_id.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let mut ident = vec![0u32; 4096];
+    let t_unp = std::time::Instant::now();
+    for (i, &o) in facts.v.iter().enumerate() {
+        let o = o as usize;
+        if o >= n {
+            return None; // belt & braces — the encoder validated this
+        }
+        ident[i] = id_of_orig[o];
+    }
+    ST_SHIFT_UNP_NS.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t_key = std::time::Instant::now();
+    let mut canon_of_orig = vec![0u32; n];
+    for (pos, &oi) in facts.order.iter().enumerate() {
+        let oi = oi as usize;
+        if oi >= n {
+            return None;
+        }
+        canon_of_orig[oi] = pos as u32;
+    }
+    ST_SHIFT_KEY_NS.fetch_add(t_key.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let t_fp = std::time::Instant::now();
+    let mut plane_fp = [0u64; 16];
+    for (py, fp) in plane_fp.iter_mut().enumerate() {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &x in &ident[py * 256..(py + 1) * 256] {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        *fp = h;
+    }
+    ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_SHIFT_FAST.fetch_add(1, Ordering::Relaxed);
     Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
 }
 
@@ -2043,8 +2171,20 @@ fn shift_sec_of(
 pub static ST_SHIFT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
 pub static ST_SHIFT_TAIL_NS: AtomicU64 = AtomicU64::new(0);
 pub static ST_SHIFT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+/// v0.9.12 build breakdown: identity interning (serialize+hash per palette
+/// entry), voxel unpack + ident/counts fill, sort keys + order/canon, plane
+/// fingerprints. Sum ~= ST_SHIFT_BUILD_NS (non-overlapping inner timers).
+pub static ST_SHIFT_ID_NS: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_UNP_NS: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_KEY_NS: AtomicU64 = AtomicU64::new(0);
+pub static ST_SHIFT_FP_NS: AtomicU64 = AtomicU64::new(0);
 
-fn shift_ref_pass(sections: &mut [(Hash, SecBytes)], vals: &[Value], cache_hit: &[bool]) {
+fn shift_ref_pass(
+    sections: &mut [(Hash, SecBytes)],
+    vals: &[Value],
+    cache_hit: &[bool],
+    facts: &mut [Option<SectionFacts>],
+) {
     let t_all = std::time::Instant::now();
     const MAX_K: usize = 15;
     const CANDIDATES: usize = 64;
@@ -2101,8 +2241,19 @@ fn shift_ref_pass(sections: &mut [(Hash, SecBytes)], vals: &[Value], cache_hit: 
                             Some(a) => Some(a.clone()),
                             None => {
                                 let t_b = std::time::Instant::now();
-                                let r =
-                                    shift_sec_of(&vals[$ix], &mut tab, &mut idbuf).map(Arc::new);
+                                let r = match facts[$ix].take() {
+                                    Some(f) => shift_sec_from_facts(
+                                        &vals[$ix],
+                                        &mut tab,
+                                        &mut idbuf,
+                                        f,
+                                    )
+                                    .map(Arc::new),
+                                    None => {
+                                        shift_sec_of(&vals[$ix], &mut tab, &mut idbuf)
+                                            .map(Arc::new)
+                                    }
+                                };
                                 ST_SHIFT_BUILD_NS.fetch_add(
                                     t_b.elapsed().as_nanos() as u64,
                                     Ordering::Relaxed,
@@ -3135,9 +3286,17 @@ pub fn split(
 
 /// Section encode + dedup-cache lookup, shared by the scan-split fast path
 /// and the full-parse fallback (identical decisions on identical inputs).
-fn encode_section_list(list: &[Value]) -> (Vec<(Hash, SecBytes)>, Vec<bool>) {
+fn encode_section_list(
+    list: &[Value],
+    want_facts: bool,
+) -> (
+    Vec<(Hash, SecBytes)>,
+    Vec<bool>,
+    Vec<Option<SectionFacts>>,
+) {
     let mut sections = Vec::with_capacity(list.len());
     let mut cache_hit = vec![false; list.len()];
+    let mut facts_list: Vec<Option<SectionFacts>> = Vec::with_capacity(list.len());
     for s in list.iter() {
         // encode-cache: re-saving a chunk re-encodes every section; the
         // structural hash is order-free, so unchanged sections hit the
@@ -3149,14 +3308,15 @@ fn encode_section_list(list: &[Value]) -> (Vec<(Hash, SecBytes)>, Vec<bool>) {
         if let Some((h, shared)) = enc_cache_get(sh) {
             cache_hit[sections.len()] = true;
             sections.push((h, SecBytes::Shared(shared)));
+            facts_list.push(None); // no fresh encode -> no facts
             continue;
         }
         // custom form when possible (marker-detectable), NBT bytes otherwise.
         // v3 output is canonical, so identical content yields identical bytes
         // regardless of the original palette order -> hash the bytes.
         let t_enc = std::time::Instant::now();
-        match section_encode(s) {
-            Some(c) => {
+        match section_encode_impl(s, want_facts) {
+            Some((c, f)) => {
                 SPLT_ENC.0.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 SPLT_ENC.1.fetch_add(1, Ordering::Relaxed);
                 if is_csec4(c.first()) {
@@ -3167,15 +3327,17 @@ fn encode_section_list(list: &[Value]) -> (Vec<(Hash, SecBytes)>, Vec<bool>) {
                 } else {
                     sections.push((structural_hash(s), SecBytes::Owned(c)));
                 }
+                facts_list.push(f);
             }
             None => {
                 SPLT_ENC.0.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 SPLT_ENC.1.fetch_add(1, Ordering::Relaxed);
-                sections.push((structural_hash(s), SecBytes::Owned(to_bytes(s))))
+                sections.push((structural_hash(s), SecBytes::Owned(to_bytes(s))));
+                facts_list.push(None);
             }
         }
     }
-    (sections, cache_hit)
+    (sections, cache_hit, facts_list)
 }
 
 /// The shift-ref stage shared by both split paths: collapse sections that
@@ -3184,10 +3346,15 @@ fn encode_section_list(list: &[Value]) -> (Vec<(Hash, SecBytes)>, Vec<bool>) {
 /// stay explicit. Sections whose content was seen in an earlier chunk
 /// (enc-cache hit) are skipped: their full members dedup across chunks for
 /// free, which always beats a chunk-local ref.
-fn shift_stage(sections: &mut Vec<(Hash, SecBytes)>, vals: &[Value], cache_hit: &[bool]) {
+fn shift_stage(
+    sections: &mut Vec<(Hash, SecBytes)>,
+    vals: &[Value],
+    cache_hit: &[bool],
+    facts: &mut [Option<SectionFacts>],
+) {
     if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
         let t_sp = std::time::Instant::now();
-        shift_ref_pass(sections, vals, cache_hit);
+        shift_ref_pass(sections, vals, cache_hit, facts);
         SPLT_SHIFT.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_SHIFT.1.fetch_add(1, Ordering::Relaxed);
     }
@@ -3432,7 +3599,10 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
     buf.extend_from_slice(&[0x0A, 0x00, 0x00, 0x09, 0x00, 0x00]);
     buf.extend_from_slice(&payload[sp0..sp1]);
     buf.push(0x00);
+    let t_sp2 = std::time::Instant::now();
     let root: Value = fastnbt::from_bytes(&buf).ok()?;
+    SPLT_SCANP.0.fetch_add(t_sp2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SPLT_SCANP.1.fetch_add(1, Ordering::Relaxed);
     let Value::Compound(mut m) = root else { return None };
     let Some(Value::List(mut list)) = m.remove("") else { return None };
     if strip {
@@ -3440,8 +3610,9 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
             strip_derived_section(s);
         }
     }
-    let (mut sections, cache_hit) = encode_section_list(&list);
-    shift_stage(&mut sections, &list, &cache_hit);
+    let want_facts = std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1");
+    let (mut sections, cache_hit, mut facts) = encode_section_list(&list, want_facts);
+    shift_stage(&mut sections, &list, &cache_hit, &mut facts);
     // tail = payload minus the sections range, with the heightmap/isLightOn
     // edits applied; the root END byte is re-emitted after any light insert
     let mut tail = Vec::with_capacity(payload.len());
@@ -3507,8 +3678,9 @@ fn split_parsed(
                 strip_derived_section(s);
             }
         }
-        let (mut secs, cache_hit) = encode_section_list(list);
-        shift_stage(&mut secs, list, &cache_hit);
+        let want_facts = std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1");
+        let (mut secs, cache_hit, mut facts) = encode_section_list(list, want_facts);
+        shift_stage(&mut secs, list, &cache_hit, &mut facts);
         sections = secs;
     }
     SPLT_SECS.0.fetch_add(t_ss.elapsed().as_nanos() as u64, Ordering::Relaxed);
