@@ -723,3 +723,51 @@ mismatches, 53/53 tests, verify 728/728 + 218/218 + 1280/1280,
 bench_size x0.08 vs anvil compact, container 1.66 MiB (x7.51), match
 pins unchanged (plane0=327, full=327, ksum=3041, cand=447213,
 dense_match=198).
+
+0.9.18 dir_bytes header fix — direct parser covers 100% of the corpus,
+fb 66 -> 0: the v0.9.17 in-place parser refused 66/728 chunks (9%) into
+the fastnbt wrap-parse. The direct.whys refusal histogram (new: wired
+into every refusal class) showed 14 unknown-field + 49 Y-context + 3
+uncounted refusals; an offline NBT replay of the first refusing payload
+traced the walk to dir_bytes, which consumed len bytes but never ADDED
+the 4-byte ByteArray length header — every SkyLight/BlockLight-bearing
+section drifted 4 bytes left, the misread tail usually ends 0x00, the
+compound "ends" early, and the cascade of garbage fields (tag 0x99,
+39321-byte "names") tripped the refusal. The fastnbt fallback silently
+papered over it: outputs were identical (every parity gate stayed green
+across 0.9.17), only the path was slower. Fix: end = p + 4 + len.
+direct ok=728 fb=0 whys all zero, scanp 35.3 -> 22.3 us/chunk (-37%:
+zero fastnbt wrap-parses remain on the corpus), import ST 81-84 ->
+87-89 MB/s (p50 77.6 -> 76.5 us), +132% over 0.9.10's 37.5. All pins
+unchanged.
+
+0.9.19 ensure_blobs: O(n) in-batch dedup, fingerprint hasher, reused
+zstd CCtx. ensure_blobs_batch carried three invisible per-chunk costs:
+a linear misses.iter().any() duplicate scan (O(n^2), ~8.4k tuple
+compares per ~130-section chunk), SipHash on already-fingerprint keys
+in the blobs/ids maps (~520 map ops per chunk; Hash IS a 128-bit
+content hash and ids are sequential u32 — the bucket hasher needs
+uniformity only, full-key compare still guards every probe), and a
+fresh zstd CCtx per slab frame. Now: HashSet dedup + blobs/ids on
+RawBuild (one multiply per 64-bit half) + a per-thread reusable
+bulk::Compressor cached by level (byte-identical; recipe_batch
+8.7 -> 5.8 us/chunk side effect). ensure_blobs 87.0 -> 79.8 us/chunk,
+import p50 76.5 -> 72.4 us, import MT 120 -> 125.8 MB/s @ 2 threads.
+
+0.9.20 one ids lock per slab group: flush_hot_slab_group acquired
+ids.write() per member (130 RwLock round-trips per chunk on top of the
+single blobs guard); one guard now covers the loop. Neutral on the
+2-core sandbox (compute-bound), removes real cross-thread lock traffic
+for multi-core import hosts. Also probed and DISCARDED in this window
+(after differential testing against the accumulator, both byte-exact
+on the corpus and 0-mismatch on random inputs bits 1..16): 4-way
+group lockstep pack (+5.6% pack time — four interleaved remap load
+streams thrash L1) and cursor-gather / closed-form packing (-4.5%
+import — the per-value remap load and branch structure dominate, the
+acc chain was already hidden by the 2-way lockstep). The 2-way group
+packer stands.
+
+Cumulative: import ST 37.5 (0.9.10) -> 87-89 MB/s (+132%), p50
+113.7 -> 72.9 us/chunk, scanp 65.4 -> 22.3, ensure_blobs 87.0 -> 79.8,
+warm read ~1530 MB/s, container and every byte-level pin unchanged
+throughout.

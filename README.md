@@ -154,6 +154,47 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.20 — one ids lock per slab group
+
+flush_hot_slab_group acquired `ids.write()` per member (130 RwLock
+round-trips per chunk on top of the single blobs guard); one guard now
+covers the loop. Neutral on the 2-core sandbox (compute-bound), removes
+real cross-thread lock traffic for multi-core import hosts.
+
+## v0.9.19 — ensure_blobs: O(n) dedup, fingerprint hasher, reused zstd CCtx
+
+ensure_blobs_batch spent real time on three invisible per-chunk costs:
+(1) in-batch duplicate detection was a linear `misses.iter().any()`
+scan — O(n²), ~8.4k tuple compares per chunk; (2) the blobs/ids maps
+hashed already-fingerprint keys through SipHash (Hash is a 128-bit
+content hash, ids sequential u32) — ~520 map ops per chunk; (3) every
+slab frame built a fresh zstd CCtx. Now: a HashSet with a
+fingerprint-grade bucket hasher (RawBuild — bucket hash needs
+uniformity only, every probe full-key-compares), blobs/ids on the same
+hasher, and a per-thread reusable `bulk::Compressor` cached by level
+(byte-identical output; recipe_batch 8.7 -> 5.8 µs/chunk as a side
+effect). ensure_blobs 87.0 -> 79.8 µs/chunk, import p50 76.5 ->
+72.4 µs, import MT 120 -> 125.8 MB/s. enc_fp byte-exact, 53/53 tests,
+container 1.66 MiB unchanged.
+
+## v0.9.18 — dir_bytes header fix: direct parser covers 100% of the corpus, fb 66 -> 0
+
+The v0.9.17 direct parser refused 66/728 chunks (9%) into the fastnbt
+wrap-parse. The new `direct.whys` refusal histogram showed 14
+unknown-field + 49 Y-context + 3 uncounted refusals; an offline NBT
+replay of the first refusing payload traced the walk to `dir_bytes`,
+which consumed `len` bytes but never ADDED the 4-byte ByteArray length
+header — every SkyLight/BlockLight-bearing section drifted 4 bytes
+left, the misread tail usually ends 0x00, the compound "ends" early,
+and the cascade of garbage fields (tag 0x99, 39321-byte "names")
+tripped the refusal. The fastnbt fallback silently papered over it —
+outputs were identical (all parity gates passed), only the path was
+slow. Fix: `end = p + 4 + len`. direct ok=728 fb=0 whys all zero,
+scanp 35.3 -> 22.3 µs/chunk (-37%), import ST 81-84 -> **87-89 MB/s**
+(p50 77.6 -> 76.5 µs), +132% over 0.9.10's 37.5. All pins unchanged
+(enc_fp fp 6d240d7166cdda99, probe_lite 42218x0, verify
+728+218+1280, bench_size x0.08, shift pins).
+
 ## v0.9.17 — direct sections parser (fastnbt off the hot path) + group-split pack + lazy dense: import +15%
 
 Three levers aimed at the split stage's remaining bulk (scanp 65 µs/chunk
