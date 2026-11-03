@@ -154,6 +154,46 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.17 — direct sections parser (fastnbt off the hot path) + group-split pack + lazy dense: import +15%
+
+Three levers aimed at the split stage's remaining bulk (scanp 65 µs/chunk
+of fastnbt serde work, pack 5.3 µs/data-array of latency-bound bit
+packing, and the unconditional dense pack that RLE-winning sections
+threw away):
+
+1. `parse_sections_direct` — the sections list now parses IN PLACE from
+   the chunk payload with a hand-rolled walker (no wrap-buffer copy, no
+   fastnbt serde machinery). Safety is ONE-SIDED: any shape doubt —
+   unknown field, wrong tag, bad UTF-8, count/position mismatch — returns
+   None and the chunk takes the exact v0.9.13 fastnbt wrap path, so every
+   chunk follows the route it took before. fastnbt's coercion semantics
+   are mirrored where proven (any NBT int tag feeds i8/i32 fields through
+   serde's num visitors, Long-only-when-it-fits); a refusal-reason
+   histogram (`direct.whys` in split_stage_json) tracks the ~9% of chunks
+   that still take the wrap path — pure diagnostics, outputs identical.
+   scanp 65.4 -> 34.6 µs/chunk, import p50 113.7 -> 76-78 µs.
+2. Group-split packing (`pack_groups`): 64 values x b bits = exactly b
+   longs, so the stream shards into independent 64-value groups; the old
+   single accumulator carried ONE or->shift->or dependency chain across
+   all 4096 voxels (~4.5 cycles/voxel), and even per-group state stayed
+   chained across groups (the renamer cannot break an acc->acc data
+   dependency through the reset), so TWO groups are packed in lockstep
+   with fully independent state — 2x ILP on the pack chain. Byte-identical
+   by construction (same values, same long positions), pinned by enc_fp.
+3. Lazy dense materialization: the RLE admission rule only consumes
+   dense.len(), which is known without packing ((entries*out_bits+7)/8
+   for the packer, data.len()*8 for the identity memcpy) — when an RLE
+   candidate wins (~10% of corpus data arrays) the dense pack is skipped
+   entirely.
+
+Results (3-repeat confirmed): import ST 70.6-72.6 -> **82.6-83.8 MB/s**
+(+122% over 0.9.10), import MT 117.3-121.6 MB/s @ 2 threads, warm read
+1257.5 (parity). All outputs byte-identical — enc_fp fp 6d240d7166cdda99
+members 12130 bytes 9971843 unchanged, probe_lite 42218 sections 0
+mismatches, 53/53 tests, verify 728/728 + 218/218 + 1280/1280, bench_size
+x0.08 vs anvil compact, container 1.66 MiB (x7.51), match pins unchanged
+(plane0=327, full=327, ksum=3041, cand=447213, dense_match=198).
+
 ## v0.9.16 — fused unpack+counts+bounds + no-straddle pack fast paths: import +20%
 
 The encoder core made THREE full passes over the same 4096 voxels per

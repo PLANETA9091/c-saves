@@ -466,9 +466,12 @@ fn dense_pack_mapped(entries: &[u32], remap: &[u8], bits: u32) -> Vec<u8> {
     }
     let b = bits as usize;
     let mut out = Vec::with_capacity((entries.len() * b + 7) / 8 + 8);
+    // v0.9.17: group-split packing (see pack_groups) — identical bytes.
+    let full = entries.len() - entries.len() % 64;
+    pack_groups(&entries[..full], b, &mut out, &|v| remap[v as usize] as u64);
     let mut acc: u64 = 0;
     let mut n: usize = 0;
-    for &e in entries {
+    for &e in &entries[full..] {
         let e = remap[e as usize];
         acc |= (e as u64) << n;
         n += b;
@@ -498,9 +501,12 @@ fn dense_pack_wide_mapped(entries: &[u32], remap: &[u16], bits: u32) -> Vec<u8> 
     }
     let b = bits as usize;
     let mut out = Vec::with_capacity((entries.len() * b + 7) / 8 + 8);
+    // v0.9.17: group-split packing (see pack_groups) — identical bytes.
+    let full = entries.len() - entries.len() % 64;
+    pack_groups(&entries[..full], b, &mut out, &|v| remap[v as usize] as u64);
     let mut acc: u64 = 0;
     let mut n: usize = 0;
-    for &e in entries {
+    for &e in &entries[full..] {
         let e = remap[e as usize];
         acc |= (e as u64) << n;
         n += b;
@@ -515,6 +521,87 @@ fn dense_pack_wide_mapped(entries: &[u32], remap: &[u16], bits: u32) -> Vec<u8> 
         out.extend_from_slice(&bytes[..(n + 7) / 8]);
     }
     out
+}
+
+/// v0.9.17: group-split bit packing. 64 values x bits bits = exactly `bits`
+/// longs, so the stream shards into independent 64-value groups (output longs
+/// [g*bits..g*bits+bits)). The single-accumulator loop carried ONE dependency
+/// chain (or->shift->or) across all 4096 voxels, latency-bound at ~4.5
+/// cycles/voxel — and even per-group state stays chained across groups (the
+/// renamer cannot break the acc->acc data dependency through the reset), so
+/// TWO groups are packed in lockstep with fully independent (acc, n) state:
+/// 2x ILP on the pack chain. The map closure is monomorphized+inlined (u8 and
+/// u16 remap callers, zero overhead). Byte-identical to the rolling
+/// accumulator: the same values land in the same long positions (pinned by
+/// enc_fp). `vals.len()` must be a multiple of 64.
+fn pack_groups<M: Fn(u32) -> u64>(vals: &[u32], bits: usize, out: &mut Vec<u8>, map: &M) {
+    let base = out.len();
+    out.resize(base + vals.len() / 64 * bits * 8, 0);
+    // per-group output longs land in a local array, copied once per group
+    // (one bounds-checked slice write per group, not per long)
+    let mut l0 = [0u64; 17];
+    let mut l1 = [0u64; 17];
+    let ng = vals.len() / 64;
+    let mut g = 0usize;
+    while g + 1 < ng {
+        // two groups in lockstep: values [g*64..g*64+64) and [(g+1)*64..+64)
+        let a = &vals[g * 64..g * 64 + 64];
+        let b = &vals[g * 64 + 64..g * 64 + 128];
+        let (mut acc0, mut n0, mut e0) = (0u64, 0usize, 0usize);
+        let (mut acc1, mut n1, mut e1) = (0u64, 0usize, 0usize);
+        for j in 0..64 {
+            let x0 = map(a[j]);
+            acc0 |= x0 << n0;
+            n0 += bits;
+            if n0 >= 64 {
+                l0[e0] = acc0.to_le();
+                e0 += 1;
+                n0 -= 64;
+                acc0 = if n0 == 0 { 0 } else { x0 >> (bits - n0) };
+            }
+            let x1 = map(b[j]);
+            acc1 |= x1 << n1;
+            n1 += bits;
+            if n1 >= 64 {
+                l1[e1] = acc1.to_le();
+                e1 += 1;
+                n1 -= 64;
+                acc1 = if n1 == 0 { 0 } else { x1 >> (bits - n1) };
+            }
+        }
+        debug_assert_eq!(n0, 0);
+        debug_assert_eq!(n1, 0);
+        let o0 = base + g * bits * 8;
+        out[o0..o0 + bits * 8].copy_from_slice(cast_longs(&l0[..bits]));
+        let o1 = o0 + bits * 8;
+        out[o1..o1 + bits * 8].copy_from_slice(cast_longs(&l1[..bits]));
+        g += 2;
+    }
+    if g < ng {
+        // odd group out: same lockstep shape with a dummy second chain
+        let a = &vals[g * 64..g * 64 + 64];
+        let (mut acc0, mut n0, mut e0) = (0u64, 0usize, 0usize);
+        for &v in a {
+            let x0 = map(v);
+            acc0 |= x0 << n0;
+            n0 += bits;
+            if n0 >= 64 {
+                l0[e0] = acc0.to_le();
+                e0 += 1;
+                n0 -= 64;
+                acc0 = if n0 == 0 { 0 } else { x0 >> (bits - n0) };
+            }
+        }
+        debug_assert_eq!(n0, 0);
+        let o0 = base + g * bits * 8;
+        out[o0..o0 + bits * 8].copy_from_slice(cast_longs(&l0[..bits]));
+    }
+}
+
+/// reinterpret &[u64] as LE bytes (to_le already applied element-wise)
+#[inline]
+fn cast_longs(l: &[u64]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(l.as_ptr() as *const u8, l.len() * 8) }
 }
 
 fn dense_unpack_wide(b: &[u8], n: usize, bits: u32) -> Option<Vec<u16>> {
@@ -575,6 +662,28 @@ static SPLT_SCAN_OK: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new
 /// v0.9.12: fastnbt parse of the sections-only wrapper inside scan_split
 /// (the residual walk cost = SPLT_SCAN - SPLT_SCANP - enc - shift).
 static SPLT_SCANP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// v0.9.17 direct sections parse: DIRT = in-place successes, DIRF = chunks
+/// that fell back to the fastnbt wrap parse (shape the direct parser refuses).
+static SPLT_DIRT: AtomicU64 = AtomicU64::new(0);
+static SPLT_DIRF: AtomicU64 = AtomicU64::new(0);
+/// refusal-reason histogram for the direct parser (debug: DIR_WHYS[k] counts)
+/// 1=list shape 2=unknown section field 3=Y 4=bs/bio tag 5=light tag
+/// 6=state dup/int 7=inside block_states/biomes
+pub static DIR_WHYS: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[inline]
+fn dir_fail<T>(why: usize) -> Option<T> {
+    DIR_WHYS[why].fetch_add(1, Ordering::Relaxed);
+    None
+}
 /// v0.9.13: scan_split chunks whose sections parsed through the typed
 /// borrowed lite form (the rest fell back to the Value parse). Calls only.
 static SPLT_LITE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -615,9 +724,19 @@ pub fn split_stage_json() -> String {
         f("lite", &SPLT_LITE)
     )
     + &format!(
-        r#","scan_fail":{{"why":{},"pos":{}}}"#,
+        r#","scan_fail":{{"why":{},"pos":{}}},"direct":{{"ok":{},"fb":{},"whys":[{},{},{},{},{},{},{},{}]}}"#,
         SCAN_FAIL.load(Ordering::Relaxed),
-        SCAN_FAIL_POS.load(Ordering::Relaxed)
+        SCAN_FAIL_POS.load(Ordering::Relaxed),
+        SPLT_DIRT.load(Ordering::Relaxed),
+        SPLT_DIRF.load(Ordering::Relaxed),
+        DIR_WHYS[0].load(Ordering::Relaxed),
+        DIR_WHYS[1].load(Ordering::Relaxed),
+        DIR_WHYS[2].load(Ordering::Relaxed),
+        DIR_WHYS[3].load(Ordering::Relaxed),
+        DIR_WHYS[4].load(Ordering::Relaxed),
+        DIR_WHYS[5].load(Ordering::Relaxed),
+        DIR_WHYS[6].load(Ordering::Relaxed),
+        DIR_WHYS[7].load(Ordering::Relaxed)
     )
 }
 
@@ -2182,15 +2301,17 @@ fn section_encode_view(
         // materialized formulation (pinned by enc_fp).
         // Dense candidate (identity => the raw vanilla longs, memcpy'd —
         // byte-identical to what dense_pack would produce).
+        // v0.9.17: the dense bytes materialize LAZILY. The RLE admission rule
+        // only consumes dense.len(), which is known without packing (identity:
+        // the vanilla longs verbatim; the packer: exactly ceil(entries*b/8)
+        // bytes — 4096*b and 64*b bits are whole longs, so the group packer's
+        // output length is the formula). When an RLE candidate wins (~10% of
+        // corpus sections) the dense pack is skipped entirely.
         let t_pack = std::time::Instant::now();
-        let dense: Vec<u8> = if identity {
-            let mut d = Vec::with_capacity(data.len() * 8);
-            for l in data {
-                d.extend_from_slice(&l.to_le_bytes());
-            }
-            d
+        let dense_len: usize = if identity {
+            data.len() * 8
         } else {
-            dense_pack_mapped(&v, &remap, out_bits)
+            (entries * out_bits as usize + 7) / 8
         };
         // RLE candidates (v0.6): vanilla order collapses horizontal strata
         // planes into single runs; the y-fast transposed stream collapses
@@ -2209,7 +2330,6 @@ fn section_encode_view(
         // streams compress only within themselves — so modest raw wins stay
         // dense (without the margin the real JJThunder corpus regressed
         // x2.83 -> x2.67). Deterministic => dedup-stable.
-        let mut best_len = dense.len();
         let mut best: Option<(u8, Vec<u8>)> = None;
         if side != 0 {
             // size-only scans: the admission rule (4x smaller AND 32+ bytes
@@ -2218,20 +2338,44 @@ fn section_encode_view(
             // same [idx][varint] framing), so decisions and chosen bytes are
             // identical to materializing both candidates.
             let la = rle_stream_len_mapped(&v, &remap);
-            let a_ok = la * 4 <= dense.len() as u64 && la + 32 <= dense.len() as u64;
+            let a_ok = la * 4 <= dense_len as u64 && la + 32 <= dense_len as u64;
             let lb = rle_transposed_len_mapped(&v, &remap, side);
-            let b_ok = lb * 4 <= dense.len() as u64 && lb + 32 <= dense.len() as u64;
+            let b_ok = lb * 4 <= dense_len as u64 && lb + 32 <= dense_len as u64;
             if b_ok && (!a_ok || lb < la) {
-                best_len = lb as usize;
                 best = Some((
                     2,
                     rle_encode_stream_mapped(&transpose_fast_y_u16(&v, side), &remap),
                 ));
             } else if a_ok {
-                best_len = la as usize;
                 best = Some((1, rle_encode_stream_mapped(&v, &remap)));
             }
         }
+        let narrow_flag = match best {
+            None => {
+                let dense: Vec<u8> = if identity {
+                    let mut d = Vec::with_capacity(data.len() * 8);
+                    for l in data {
+                        d.extend_from_slice(&l.to_le_bytes());
+                    }
+                    d
+                } else {
+                    dense_pack_mapped(&v, &remap, out_bits)
+                };
+                out.extend_from_slice(&dense);
+                ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
+                ST_ENC_DENSE_BYTES.fetch_add(dense.len() as u64, Ordering::Relaxed);
+                (if narrow { narrow_bit } else { 0 })
+            }
+            Some((ord, bytes)) => {
+                out.extend_from_slice(&bytes);
+                ST_ENC_RLE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                match ord {
+                    1 => ST_ENC_RLE_VAN.fetch_add(1, Ordering::Relaxed),
+                    _ => ST_ENC_RLE_COL.fetch_add(1, Ordering::Relaxed),
+                };
+                (ord << order_shift)
+            }
+        };
         SPLT_PACK.0.fetch_add(t_pack.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_PACK.1.fetch_add(1, Ordering::Relaxed);
         // facts capture (narrow path): v died in the RLE scans above, ents
@@ -2242,23 +2386,7 @@ fn section_encode_view(
             v,
             order: order_idx.iter().map(|&i| i as u32).collect(),
         });
-        match best {
-            None => {
-                out.extend_from_slice(&dense);
-                ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
-                ST_ENC_DENSE_BYTES.fetch_add(dense.len() as u64, Ordering::Relaxed);
-                Some((true, if narrow { narrow_bit } else { 0 }))
-            }
-            Some((ord, bytes)) => {
-                out.extend_from_slice(&bytes);
-                ST_ENC_RLE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                match ord {
-                    1 => ST_ENC_RLE_VAN.fetch_add(1, Ordering::Relaxed),
-                    _ => ST_ENC_RLE_COL.fetch_add(1, Ordering::Relaxed),
-                };
-                Some((true, ord << order_shift))
-            }
-        }
+        Some((true, narrow_flag))
     }
 
     if let Some(bs) = &view.bs {
@@ -4429,6 +4557,380 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
     }
 }
 
+// ------------------------------- direct sections parse (v0.9.17) -----------
+//
+// v0.9.16 left the import split at: scan_root's raw skip over the sections
+// list, then a WRAP-BUFFER COPY of the same range, then fastnbt's serde
+// machinery (derive field matching, per-value deserializer dispatch) to build
+// the Vec<SecLite> — ~65 us/chunk of parse on top of the ~30-40 us skip and
+// ~3 us copy. parse_sections_direct walks the list value IN PLACE and emits
+// the identical Vec<SecLite> with no intermediate buffer and no serde layer.
+//
+// Safety is ONE-SIDED: the direct parser only accepts the exact shapes it can
+// prove fastnbt accepts (strict tag checks, deny_unknown_fields semantics,
+// duplicate-field rejection, UTF-8 validation); ANY deviation — including
+// shapes fastnbt would tolerate — returns None and the caller re-parses with
+// fastnbt::from_bytes::<RootList> (v0.9.13 path) and then the Value path, so
+// every chunk takes exactly the route it took before. Output equality is
+// pinned by enc_fp + probe_lite + hash_lite == structural_hash.
+
+/// u16-length-prefixed raw name bytes (no UTF-8 check — names only ever
+/// compared against ASCII keys; an invalid-UTF-8 name can never match).
+#[inline]
+fn dir_name<'a>(b: &'a [u8], p: &mut usize) -> Option<&'a [u8]> {
+    let l = u16::from_be_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+    *p += 2;
+    let s = b.get(*p..*p + l)?;
+    *p += l;
+    Some(s)
+}
+
+/// u16-length-prefixed UTF-8 string VALUE (palette names / prop keys+vals —
+/// fastnbt validates UTF-8 for Cow<str>, so must the direct parser).
+#[inline]
+fn dir_str<'a>(b: &'a [u8], p: &mut usize) -> Option<&'a str> {
+    std::str::from_utf8(dir_name(b, p)?).ok()
+}
+
+/// TAG_Byte_Array payload as a borrowed slice (SkyLight / BlockLight).
+#[inline]
+fn dir_bytes<'a>(b: &'a [u8], p: &mut usize) -> Option<&'a [u8]> {
+    let l = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?);
+    if l < 0 {
+        return None;
+    }
+    let end = p.checked_add(l as usize)?;
+    let s = b.get(*p..end)?;
+    *p = end;
+    Some(s)
+}
+
+/// TAG_Long_Array payload -> owned BE-decoded Vec<i64>. fastnbt's owned
+/// LongArray consumes exactly len*8 bytes (negative len / short input error)
+/// and decodes the same chunks_exact(8) BE stream — identical result.
+fn dir_longs(b: &[u8], p: &mut usize) -> Option<Vec<i64>> {
+    let l = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?);
+    *p += 4;
+    if l < 0 {
+        return None;
+    }
+    let nb = (l as usize).checked_mul(8)?;
+    let raw = b.get(*p..*p + nb)?;
+    *p += nb;
+    let mut v = Vec::with_capacity(l as usize);
+    for c in raw.chunks_exact(8) {
+        v.push(i64::from_be_bytes(c.try_into().unwrap()));
+    }
+    Some(v)
+}
+
+/// Properties compound: (TAG_String key, TAG_String value) pairs; non-string
+/// value -> error (fastnbt next_entry::<Cow, Cow>), duplicates overwrite
+/// (BTreeMap::insert, same as PropsMap's visitor), TAG_End ends the map.
+fn dir_props<'a>(b: &'a [u8], p: &mut usize) -> Option<BTreeMap<Cow<'a, str>, Cow<'a, str>>> {
+    let mut m = BTreeMap::new();
+    loop {
+        let t = *b.get(*p)?;
+        *p += 1;
+        if t == 0 {
+            break;
+        }
+        let k = dir_str(b, p)?;
+        if t != 8 {
+            return dir_fail(7); // value tag must be String
+        }
+        let v = dir_str(b, p)?;
+        m.insert(Cow::Borrowed(k), Cow::Borrowed(v));
+    }
+    Some(m)
+}
+
+/// One palette entry compound {Name, Properties?, ...unknown ignored} — the
+/// PalLit Named visitor: duplicate Name/Properties OVERWRITE (the visitor
+/// reassigns, no error), unknown keys are IgnoredAny-skipped, missing Name
+/// fails.
+fn dir_pal_entry<'a>(b: &'a [u8], p: &mut usize) -> Option<PalLit<'a>> {
+    let mut name: Option<Cow<'a, str>> = None;
+    let mut props: Option<Option<BTreeMap<Cow<'a, str>, Cow<'a, str>>>> = None;
+    loop {
+        let t = *b.get(*p)?;
+        *p += 1;
+        if t == 0 {
+            break;
+        }
+        match dir_name(b, p)? {
+            b"Name" => {
+                if t != 8 {
+                    return None;
+                }
+                name = Some(Cow::Borrowed(dir_str(b, p)?));
+            }
+            b"Properties" => {
+                if t != 10 {
+                    return None;
+                }
+                props = Some(Some(dir_props(b, p)?));
+            }
+            _ => skip_value(b, p, t, 24)?,
+        }
+    }
+    let Some(name) = name else {
+        return dir_fail(7); // missing Name (serde missing_field)
+    };
+    Some(PalLit::Named {
+        name,
+        props: props.flatten(),
+    })
+}
+
+/// palette TAG_List: et 8 = all-string (Plain) entries, et 10 = all-compound
+/// (Named) entries, count 0 = empty (element type unchecked, same as
+/// fastnbt's zero-element seq); mixed/other element types error.
+fn dir_pal_list<'a>(b: &'a [u8], p: &mut usize) -> Option<Vec<PalLit<'a>>> {
+    let et = *b.get(*p)?;
+    *p += 1;
+    let cnt = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?);
+    *p += 4;
+    if cnt < 0 {
+        return None;
+    }
+    let cnt = cnt as usize;
+    if cnt > b.len() - *p {
+        return dir_fail(7); // every entry is >= 1 byte; guards with_capacity
+    }
+    let mut v: Vec<PalLit<'a>> = Vec::with_capacity(cnt);
+    if cnt == 0 {
+        return Some(v);
+    }
+    match et {
+        8 => {
+            for _ in 0..cnt {
+                v.push(PalLit::Plain(Cow::Borrowed(dir_str(b, p)?)));
+            }
+        }
+        10 => {
+            for _ in 0..cnt {
+                v.push(dir_pal_entry(b, p)?);
+            }
+        }
+        _ => return dir_fail(7),
+    }
+    Some(v)
+}
+
+/// block_states / biomes compound: {palette (required), data (default),
+/// unknown keys IGNORED (PalData has no deny_unknown_fields), duplicate
+/// palette/data error}. Negative/short arrays error like fastnbt.
+fn dir_pal_data<'a>(b: &'a [u8], p: &mut usize) -> Option<PalData<'a>> {
+    let mut palette: Option<Vec<PalLit<'a>>> = None;
+    let mut data: Option<Option<Vec<i64>>> = None;
+    loop {
+        let t = *b.get(*p)?;
+        *p += 1;
+        if t == 0 {
+            break;
+        }
+        match dir_name(b, p)? {
+            b"palette" => {
+                if palette.is_some() || t != 9 {
+                    return dir_fail(7);
+                }
+                palette = Some(dir_pal_list(b, p)?);
+            }
+            b"data" => {
+                if data.is_some() || t != 12 {
+                    return dir_fail(7);
+                }
+                data = Some(Some(dir_longs(b, p)?));
+            }
+            _ => skip_value(b, p, t, 24)?,
+        }
+    }
+    Some(PalData {
+        palette: palette?,
+        data: data.flatten().map(fastnbt::LongArray::new),
+    })
+}
+
+/// NBT integer at *p with value-tag `t`, range-checked into i32. Mirrors
+/// fastnbt's coercion: AnonymousValue forwards deserialize_i32 to any, which
+/// calls visit_i8/i16/i32/i64 per tag, and serde's num visitor TryFrom-checks
+/// the width — so Byte/Short/Int/Long ALL parse for an i32 field (Long only
+/// when the value fits). Paper writes starlight states as Byte.
+fn dir_int32(b: &[u8], p: &mut usize, t: u8) -> Option<i32> {
+    match t {
+        1 => {
+            let v = *b.get(*p)? as i8 as i32;
+            *p += 1;
+            Some(v)
+        }
+        2 => {
+            let v = i16::from_be_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as i32;
+            *p += 2;
+            Some(v)
+        }
+        3 => {
+            let v = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?);
+            *p += 4;
+            Some(v)
+        }
+        4 => {
+            let v = i64::from_be_bytes(b.get(*p..*p + 8)?.try_into().ok()?);
+            *p += 8;
+            i32::try_from(v).ok()
+        }
+        _ => None,
+    }
+}
+
+/// One section compound — exactly SecLite's derive: the 7 known keys with
+/// strict tags (Y=any NBT int range-checked to i8, block_states/biomes=
+/// Compound, SkyLight/BlockLight=ByteArray, starlight.*_state=any NBT int
+/// range-checked to i32), duplicate keys rejected, unknown keys rejected
+/// (deny_unknown_fields), Y required. Light/state-absent = None.
+fn dir_section<'a>(b: &'a [u8], p: &mut usize) -> Option<SecLite<'a>> {
+    let mut y: Option<i8> = None;
+    let (mut bs, mut bio): (Option<Option<PalData<'a>>>, Option<Option<PalData<'a>>>) = (None, None);
+    let (mut sky, mut blt): (Option<Option<&'a [u8]>>, Option<Option<&'a [u8]>>) = (None, None);
+    let (mut sl, mut bl): (Option<Option<i32>>, Option<Option<i32>>) = (None, None);
+    loop {
+        let t = *b.get(*p)?;
+        *p += 1;
+        if t == 0 {
+            break;
+        }
+        match dir_name(b, p)? {
+            b"Y" => {
+                if y.is_some() {
+                    return dir_fail(3);
+                }
+                // any int tag -> serde i8 (fastnbt visit_i8/i16/i32/i64)
+                let v: i64 = match t {
+                    1 => {
+                        let v = *b.get(*p)? as i8;
+                        *p += 1;
+                        v as i64
+                    }
+                    2 => {
+                        let v = i16::from_be_bytes(b.get(*p..*p + 2)?.try_into().ok()?);
+                        *p += 2;
+                        v as i64
+                    }
+                    3 => {
+                        let v = i32::from_be_bytes(b.get(*p..*p + 4)?.try_into().ok()?);
+                        *p += 4;
+                        v as i64
+                    }
+                    4 => {
+                        let v = i64::from_be_bytes(b.get(*p..*p + 8)?.try_into().ok()?);
+                        *p += 8;
+                        v
+                    }
+                    _ => return dir_fail(3),
+                };
+                y = Some(i8::try_from(v).ok()?);
+            }
+            b"block_states" => {
+                if bs.is_some() || t != 10 {
+                    return dir_fail(4);
+                }
+                bs = Some(Some(dir_pal_data(b, p)?));
+            }
+            b"biomes" => {
+                if bio.is_some() || t != 10 {
+                    return dir_fail(4);
+                }
+                bio = Some(Some(dir_pal_data(b, p)?));
+            }
+            b"SkyLight" => {
+                if sky.is_some() || t != 7 {
+                    return dir_fail(5);
+                }
+                sky = Some(Some(dir_bytes(b, p)?));
+            }
+            b"BlockLight" => {
+                if blt.is_some() || t != 7 {
+                    return dir_fail(5);
+                }
+                blt = Some(Some(dir_bytes(b, p)?));
+            }
+            b"starlight.skylight_state" => {
+                if sl.is_some() {
+                    return dir_fail(6);
+                }
+                sl = Some(Some(dir_int32(b, p, t)?));
+            }
+            b"starlight.blocklight_state" => {
+                if bl.is_some() {
+                    return dir_fail(6);
+                }
+                bl = Some(Some(dir_int32(b, p, t)?));
+            }
+            other => {
+                if std::env::var("CSAVES_SCAN_DEBUG").as_deref() == Ok("1") {
+                    let lo = p.saturating_sub(16);
+                    let hi = (*p + 16).min(b.len());
+                    let hex: String =
+                        b[lo..hi].iter().map(|x| format!("{x:02x} ")).collect();
+                    eprintln!(
+                        "dir: unknown section field {:?} tag={t} at {p}/{} prev={lo} [{hex}]",
+                        String::from_utf8_lossy(other),
+                        b.len(),
+                    );
+                }
+                return dir_fail(2);
+            }
+        }
+    }
+    let Some(y) = y else {
+        return dir_fail(3); // missing Y (serde missing_field)
+    };
+    Some(SecLite {
+        y,
+        block_states: bs.flatten(),
+        biomes: bio.flatten(),
+        skylight: sky.flatten(),
+        blocklight: blt.flatten(),
+        sl_state: sl.flatten(),
+        bl_state: bl.flatten(),
+    })
+}
+
+/// The sections list value in place: [et][i32 count][section compounds...].
+/// et must be Compound for non-empty lists; the walk must land exactly on
+/// sp1 (scan_root's independent skip of the same range) — a mismatch means
+/// the two walkers disagree about the payload -> fall back.
+fn parse_sections_direct<'a>(
+    payload: &'a [u8],
+    sp0: usize,
+    sp1: usize,
+) -> Option<Vec<SecLite<'a>>> {
+    let mut p = sp0;
+    let et = *payload.get(p)?;
+    p += 1;
+    let cnt = i32::from_be_bytes(payload.get(p..p + 4)?.try_into().ok()?);
+    p += 4;
+    if cnt < 0 {
+        return dir_fail(1);
+    }
+    let cnt = cnt as usize;
+    if cnt > payload.len() - p {
+        return dir_fail(1);
+    }
+    let mut out: Vec<SecLite<'a>> = Vec::with_capacity(cnt);
+    if cnt > 0 && et != 10 {
+        return dir_fail(1);
+    }
+    for _ in 0..cnt {
+        out.push(dir_section(payload, &mut p)?);
+    }
+    if p != sp1 {
+        return dir_fail(1);
+    }
+    SPLT_DIRT.fetch_add(1, Ordering::Relaxed);
+    Some(out)
+}
+
 /// Fast-path split: raw tail + sections-only parse. None = fall back to the
 /// full parse (any structural doubt, non-compound root, missing sections...).
 fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
@@ -4444,22 +4946,35 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
         return None;
     };
     let (sp0, sp1) = out.sections_payload;
-    // parse ONLY the sections list: wrap the payload as a named compound
-    // {"": <list>} — fastnbt requires a compound root.
-    let mut buf = Vec::with_capacity(6 + (sp1 - sp0));
-    buf.extend_from_slice(&[0x0A, 0x00, 0x00, 0x09, 0x00, 0x00]);
-    buf.extend_from_slice(&payload[sp0..sp1]);
-    buf.push(0x00);
     let want_facts = std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1");
     // v0.9.13: typed borrowed parse first (no per-entry HashMap/String
     // allocations; light fields ride as borrows). Any shape doubt fails the
     // parse and the chunk takes the Value path below — outputs identical
     // either way (pinned by enc_fp + hash_lite == structural_hash).
+    // v0.9.17: the typed parse runs IN PLACE first (parse_sections_direct —
+    // no wrap buffer, no serde machinery); only when it refuses a shape does
+    // the wrap buffer get built for the fastnbt RootList parse. Both produce
+    // the identical Vec<SecLite> or fall through to the Value path together.
     let t_sp2 = std::time::Instant::now();
+    // the wrap buffer stays a live binding for the whole lite branch: the
+    // fastnbt RootList borrows it, and the borrow must outlive litelist's use
+    let mut buf: Vec<u8> = Vec::new();
     let lite = if std::env::var("CSAVES_NO_LITE").as_deref() == Ok("1") {
         None
     } else {
-        fastnbt::from_bytes::<RootList>(&buf).ok()
+        match parse_sections_direct(payload, sp0, sp1) {
+            Some(list) => Some(RootList { list }),
+            None => {
+                SPLT_DIRF.fetch_add(1, Ordering::Relaxed);
+                // parse ONLY the sections list: wrap the payload as a named
+                // compound {"": <list>} — fastnbt requires a compound root.
+                buf = Vec::with_capacity(6 + (sp1 - sp0));
+                buf.extend_from_slice(&[0x0A, 0x00, 0x00, 0x09, 0x00, 0x00]);
+                buf.extend_from_slice(&payload[sp0..sp1]);
+                buf.push(0x00);
+                fastnbt::from_bytes::<RootList>(&buf).ok()
+            }
+        }
     };
     if let Some(RootList { list: litelist }) = lite {
         SPLT_SCANP.0.fetch_add(t_sp2.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -4472,6 +4987,10 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
         return Some(Split::Split { sections, tail });
     }
     let t_sp3 = std::time::Instant::now();
+    let mut buf = Vec::with_capacity(6 + (sp1 - sp0));
+    buf.extend_from_slice(&[0x0A, 0x00, 0x00, 0x09, 0x00, 0x00]);
+    buf.extend_from_slice(&payload[sp0..sp1]);
+    buf.push(0x00);
     let root: Value = fastnbt::from_bytes(&buf).ok()?;
     SPLT_SCANP.0.fetch_add(t_sp3.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_SCANP.1.fetch_add(1, Ordering::Relaxed);

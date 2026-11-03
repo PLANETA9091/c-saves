@@ -692,3 +692,34 @@ enc_fp fp 6d240d7166cdda99 members 12130 bytes 9971843 unchanged, probe_lite
 42218 sections 0 mismatches, 53/53 tests, verify 728/728 + 218/218 +
 1280/1280, bench_size x0.08 vs anvil compact, container 1.66 MiB (x7.51),
 match pins unchanged (plane0=327, full=327, dense_match=198).
+
+0.9.17 direct sections parser (fastnbt off the hot path) + group-split
+pack + lazy dense: the split stage's remaining bulk after 0.9.16 was
+scanp 65 us/chunk (fastnbt serde over a wrap-buffer COPY of the sections
+range), pack 5.3 us/data-array (a single or->shift->or accumulator chain
+spanning all 4096 voxels), and an unconditional dense pack whose bytes
+were discarded for the ~10% of data arrays where RLE wins. Three levers:
+(1) parse_sections_direct walks the sections list IN PLACE and emits the
+identical Vec<SecLite> — no wrap buffer, no serde machinery; safety is
+one-sided (any shape doubt -> None -> the exact v0.9.13 fastnbt wrap
+path), with fastnbt's int-tag coercion mirrored where proven (any NBT
+int tag feeds i8/i32 via serde num visitors) and a refusal-reason
+histogram (direct.whys) tracking the ~9% of chunks still taking the wrap
+path — diagnostics only, outputs identical; scanp 65.4 -> 34.6 us/chunk,
+import p50 113.7 -> 76-78 us. (2) pack_groups: 64 values x b bits =
+exactly b longs, so the stream shards into independent 64-value groups —
+and since even per-group state stays chained across groups (the renamer
+cannot break an acc->acc data dependency through the reset), TWO groups
+are packed in lockstep with fully independent (acc, n) state: 2x ILP on
+the pack chain; byte-identical by construction, pinned by enc_fp.
+(3) lazy dense: the RLE admission rule only consumes dense.len(), which
+is known without packing ((entries*out_bits+7)/8 for the packer,
+data.len()*8 for identity) — RLE winners skip the dense pack entirely.
+Results (3-repeat confirmed): import ST 70.6-72.6 -> 82.6-83.8 MB/s
+(+122% over 0.9.10), import MT 117.3-121.6 MB/s @ 2 threads, warm read
+1257.5 (parity). All outputs byte-identical: enc_fp fp 6d240d7166cdda99
+members 12130 bytes 9971843 unchanged, probe_lite 42218 sections 0
+mismatches, 53/53 tests, verify 728/728 + 218/218 + 1280/1280,
+bench_size x0.08 vs anvil compact, container 1.66 MiB (x7.51), match
+pins unchanged (plane0=327, full=327, ksum=3041, cand=447213,
+dense_match=198).
