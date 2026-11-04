@@ -2261,6 +2261,12 @@ impl Store {
             // one ids guard for the whole group (was acquired PER MEMBER —
             // 130 lock round-trips per chunk, real MT contention on 2 threads)
             let mut ids = self.ids.write();
+            // single pass: slab_off is known at insert time (cursor walks
+            // the member raws in group order starting at the table end) —
+            // the old code inserted slab_off: 0 and then re-probed every
+            // member with blobs.get_mut in a second map walk (~130 hash
+            // lookups per chunk for values it already had in hand).
+            let mut cursor = tab_len;
             for (i, (h, id, raw)) in group.iter().enumerate() {
                 blobs.entry(*h).or_insert(BlobLoc {
                     seg,
@@ -2277,17 +2283,11 @@ impl Store {
                     } else {
                         share
                     },
-                    slab_off: 0, // patched below in member order
+                    slab_off: cursor,
                     slab_raw: raw_total,
                     slab_comp: comp.len() as u32,
                 });
                 ids.insert(*id, *h);
-            }
-            let mut cursor = tab_len;
-            for (h, _, raw) in &group {
-                if let Some(l) = blobs.get_mut(h) {
-                    l.slab_off = cursor;
-                }
                 cursor += raw.len() as u32;
             }
         }

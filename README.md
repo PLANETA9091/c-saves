@@ -154,6 +154,17 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.22 — ensure_blobs single-pass slab insert
+
+flush_hot_slab_group inserted every member with `slab_off: 0` and then
+re-probed each of them with `blobs.get_mut` in a second map walk to patch
+the offset in — ~130 hash lookups per chunk for values the insert loop
+already had in hand (the cursor is tab_len plus the preceding member
+lens, known at insert time). One pass now; ensure_blobs 79.3 ->
+76.6 us/chunk, import ST 98-104 -> 103-104 MB/s on the warm corpus.
+enc_fp pin unchanged (6d240d7166cdda99), tests 56/56, verify
+728+218+1280 bad=0.
+
 ## v0.9.21 — bounded SIMD RLE admission: import +12-15%
 
 The pack-stage budget breakdown (new per-width `packb` timers in

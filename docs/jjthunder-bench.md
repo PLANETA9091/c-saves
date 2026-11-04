@@ -796,3 +796,11 @@ Cumulative: import ST 37.5 (0.9.10) -> 98-104 MB/s (+163-177%), p50
 113.7 -> ~74 us/chunk, scanp 65.4 -> 21.4, ensure_blobs 87.0 -> 79.8,
 warm read ~1530 MB/s, container and every byte-level pin unchanged
 throughout.
+
+0.9.22 ensure_blobs single-pass slab insert: flush_hot_slab_group
+patched slab_off in a second blobs.get_mut walk (~130 hash probes per
+chunk for values known at insert time). One pass; ensure_blobs 79.3 ->
+76.6 us/chunk, import ST 98-104 -> 103-104 MB/s (warm, median 103.3).
+enc_fp pin unchanged, tests 56/56, verify 728+218+1280 bad=0.
+
+Cumulative: import ST 37.5 (0.9.10) -> 103-104 MB/s (+175-177%).
