@@ -154,6 +154,24 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.24 — hot tier drops to zstd fast level -3: import +13%
+
+The hot tier is a staging area: the background pack pass decompresses hot
+slabs and re-compresses everything at the cold tier (level 19, 4-8 MiB
+window), so the hot level only bounds transient disk usage and write-path
+CPU. Level 3's own defense ("2.1x faster than 12 with identical packed
+size") applies all the way down into the zstd fast levels. Back-to-back
+corpus runs (same machine, warm): import 96.5 (L3) -> 109.1 (L-3) MB/s,
+ensure_blobs 79.2 -> 50.1 us/chunk (-37%), import p50 75.6 -> 65.8 us; a
+later same-session run measured 113.0 MB/s ST / 173.0 MB/s MT. Fast -5/-7
+bottom the ensure stage out at the same ~50 us (zstd stops being the term)
+without further import gains, so -3 is the best speed at the smallest
+transient size. The DRAINED container is byte-identical (jj x3.36, 728-chunk
+x7.51, survival x4.01), verify 946+1280+728+218 bad=0, enc_fp pin unchanged
+(6d240d7166cdda99 / 12130 / 9971843), tests 56/56. Cumulative import ST:
+37.5 (0.9.10) -> 109-113 MB/s (+190-201%). `CSAVES_HOT_LEVEL` still
+overrides (default now -3).
+
 ## v0.9.22 — ensure_blobs single-pass slab insert
 
 flush_hot_slab_group inserted every member with `slab_off: 0` and then

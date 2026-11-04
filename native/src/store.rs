@@ -23,9 +23,10 @@
 //!                         | 2 blob-by-varint-id | 3 blob-by-hash
 //!
 //! Size levers: section-level content dedup, tail dedup, id/varint recipes,
-//! 112KB retrained shared dictionaries, hot tier (level 3 — measured 2.1x
-//! faster than 12 with identical packed size) on the write path, cold tier
-//! (level 19) recompression during background compaction.
+//! 112KB retrained shared dictionaries, hot tier (zstd fast level -3 —
+//! import +13% vs level 3 at an identical DRAINED size, v0.9.24) on the
+//! write path, cold tier (level 19) recompression during background
+//! compaction.
 
 use crate::chunknbt::{self, Hash, Split};
 use crc32fast::Hasher as Crc;
@@ -202,7 +203,17 @@ impl Default for Cfg {
             // p99.9 10ms vs 30ms) with IDENTICAL steady-state size — the
             // background pack pass recompresses everything at the cold tier
             // anyway, so the hot level only bounds transient disk usage.
-            hot_level: 3,
+            // v0.9.24: the same argument pushes all the way into the zstd
+            // fast levels (-3 = 3x faster-than-1): back-to-back corpus runs
+            // measured import 96.5 (L3) -> 109.1 MB/s (L-3), ensure stage
+            // 79.2 -> 50.1 us/chunk (-37%), p50 75.6 -> 65.8 us — and the
+            // DRAINED container is byte-identical (x3.36/x7.51, verify
+            // 946/946), because the pack pass decompresses hot slabs and
+            // re-compresses at cold_level from the same content. Fast -5/-7
+            // bottom the ensure stage out at the same ~50 us (zstd is no
+            // longer the term) without further import gains, so -3 keeps the
+            // best speed at the smallest transient size of the winners.
+            hot_level: -3,
             cold_level: 19,
             recipe_level: 6,
             compact_min: 64 * 1024,
@@ -277,7 +288,7 @@ extern "C" {
 impl Cfg {
     pub fn from_env() -> Cfg {
         Cfg {
-            hot_level: env_parse("CSAVES_HOT_LEVEL", 3),
+            hot_level: env_parse("CSAVES_HOT_LEVEL", -3),
             cold_level: env_parse("CSAVES_COLD_LEVEL", 19),
             recipe_level: env_parse("CSAVES_RECIPE_LEVEL", 6),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 64 * 1024),

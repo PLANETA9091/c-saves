@@ -827,3 +827,34 @@ recorded so nobody re-digs these holes):
   the pass itself (fused unpack-remap-transpose without the 16 KB
   materialization, or SIMD on the long stream), not from re-decoding the
   same fields through a table.
+
+0.9.24 — hot tier drops to zstd fast level -3 (import +13%, drained
+container byte-identical). The 0.9.23 probes closed the pack-side micro
+holes, so the next honest lever was the write path's compression budget:
+ensure_blobs was 56.7 ms of the 162.9 ms import wall (25%) and its bulk is
+the hot-tier zstd call over each whole-chunk slab frame. The hot tier is
+transient material — the pack pass decompresses it and re-compresses at
+cold_level 19 from the same content, so the hot level never reaches the
+final container. Measured (back-to-back, same machine, warm-up enforced —
+the 0.9.22-era lesson that first runs after a rebuild are page-cache cold):
+
+  hot_level:    3       2       1      -3      -5      -7
+  import MB/s:  96.5   99.8   106.4   109.1   107.3   100.1
+  ensure us/ch: 79.2   68.6    60.8    50.1    49.5    49.7
+  p50 us/chunk: 75.6   72.9    71.5    65.8    65.9    86.0
+
+-3 shipped as the default (CSAVES_HOT_LEVEL still overrides). A later
+same-session run measured import ST 113.0 / MT 173.0 MB/s. Gates: jj
+verify 946/946 TOTAL x3.36, 728-chunk drained container x7.51 (identical
+across every level), survival x4.01 ok=1280, bench_size compact x0.08,
+enc_fp 6d240d7166cdda99 / 12130 / 9971843 unchanged, tests 56/56.
+
+- also recorded: the u8-pipeline WIP (byte-per-voxel unpack + AVX2 bits4
+  kernel + u8-twin scans/packs, ~860 lines) measured as a REGRESSION
+  back-to-back (import 95.7-99.9 vs 103.7, unp 2532 -> 3226 ns/call, enc
+  +12%, shift +20%) despite winning the isolated probe (8.9 vs 10.5 us on
+  synthetic bits4 data) — the real corpus bits4 call runs 9.4 us under the
+  kernel vs ~6.8 us under the plain u32 scalar loop. Parked on branch
+  wip-u8-pipeline with the full differential-test set; the lesson mirrors
+  0.9.23's: corpus microdata beats isolated micro-benches, and
+  per-stage timers on the real corpus are the only honest referee.
