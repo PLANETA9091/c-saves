@@ -858,3 +858,30 @@ enc_fp 6d240d7166cdda99 / 12130 / 9971843 unchanged, tests 56/56.
   wip-u8-pipeline with the full differential-test set; the lesson mirrors
   0.9.23's: corpus microdata beats isolated micro-benches, and
   per-stage timers on the real corpus are the only honest referee.
+
+0.9.24 CI verdict + probe window (tree back at 0.9.24; negative results
+recorded so nobody re-digs these holes):
+- CI (b250095): 7/7 green, import ST 107.8 / MT 203.0 MB/s, jj TOTAL x3.36
+  verify 946/946. The previous runner generation (5d32583 artifact) measured
+  166.9/336.8 but its anvil controls are 1.35-1.47x faster (read 1197 vs 817,
+  write 92.6 vs 68.9) — cross-runner deltas are noise; normalized, ensure
+  improved -27% and split is unchanged (also proven locally: the split stage
+  is byte-identical L3 vs L-3, scan 165.8 vs 164.4 ms).
+- ensure_blobs fully decomposed (temporary ensx timers, reverted): 53.3
+  us/chunk = slab compress 28.2 (53% — ~486 MB/s over the 13.7 KB frame,
+  the zstd fast-level codec floor; the -3/-5/-7 plateau was this, not a
+  non-zstd term) + tail block 9.7 (18% — 1614 per-tail small-buffer zstd
+  calls at 4.3 us each) + dedup/build/append/inserts ~7.6 + ~7.5 glue. No
+  hidden non-compression fish; the next ensure-class candidate is tail
+  batching (~+4-5% ceiling).
+- AVX2 bits4 unpack kernel: FINAL NEGATIVE, two-stage proof. Stage 1 (real
+  corpus probe, wip-u8-pipeline branch): the kernel's separate byte
+  histogram is 8.6 us of the 9.0 us call — unpack-only 3.7 us, memcpy floor
+  0.16 us. Stage 2 (hist-free kernel transplanted into the u32 path on
+  main, 58/58 tests, enc_fp exact): in-bench unp REGRESSED 35.2 -> 42.3 ms
+  (8.7 vs 6.8 us/call) — the fused counts+push pass (~4 us) is the shared
+  floor of BOTH formulations; splitting extract from counts adds a pass
+  that costs more than the SIMD extract saves. Full revert. A future win
+  needs a fully-fused SIMD counts design (pshufb/SAD accumulators, ~+5%
+  class) — noted, not dug. Branch wip-u8-pipeline keeps the full u8
+  pipeline + probes for reference.
