@@ -154,6 +154,42 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.21 — bounded SIMD RLE admission: import +12-15%
+
+The pack-stage budget breakdown (new per-width `packb` timers in
+`split_stage_json`) killed the vanilla-width passthrough hypothesis —
+bits 5-7 repack is only 5% of the dense-pack cost — and exposed the real
+lever: the RLE admission scans. Computing the transposed-stream
+transition count for every section (13714 calls per region pass) cost
+17.7 ms of the 45.0 ms pack stage — more than the dense pack itself
+(13.7 ms).
+
+Three cuts, all byte-exact (pinned by enc_fp, differential-tested):
+
+1. **Bounded scans.** cap = dense_len/8 exactly separates rejection
+   (transitions >= cap => runs*8 > dense_len is guaranteed) from
+   survival (transitions < cap => the exact count is already in hand),
+   so the AVX2 walk aborts the moment the running count reaches cap.
+   Noise-heavy sections (~90%) exit within the first row pairs instead
+   of streaming all 15: b-scan 1168 -> 460 ns/call.
+2. **Vectorized column boundaries.** the 255 transposed-stream boundary
+   pairs are order-independent; regrouped by z they become 15
+   elementwise compares of two contiguous 16-element windows (2 AVX2
+   loads each) plus 15 scalar cross-x pairs — no strided scalar walk.
+3. **UNI skip.** a uniform raw stream transposes to the same single
+   value, so both RLE candidates are one run with identical framing:
+   la == lb and the strict-< tie rule already picks (1) — the b-scan
+   is skipped entirely (0 fires on the layered JJThunder corpus, free
+   insurance for uniform-heavy survival worlds).
+
+Results (same corpus, warm runs): import ST **87-91 -> 98-104 MB/s**
+(median ~100.5, +12-15%), b-scan 17.7 -> 6.3 ms per region pass (-64%),
+enc stage 94.4 -> 75.6 ms, pack stage 45.0 -> 30.1 ms. Gates: tests
+56/56 (three new: AVX2-vs-naive transition counters, bounded-contract
+sweep, old-vs-new decision equivalence over a threshold-sweeping
+differential), enc_fp fp=6d240d7166cdda99 members=12130 bytes=9971843,
+verify 728+218+1280 bad=0, bench_size x0.08, survival_bench ok=1280.
+
 ## v0.9.20 — one ids lock per slab group
 
 flush_hot_slab_group acquired `ids.write()` per member (130 RwLock

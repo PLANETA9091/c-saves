@@ -687,6 +687,26 @@ fn dir_fail<T>(why: usize) -> Option<T> {
 /// v0.9.13: scan_split chunks whose sections parsed through the typed
 /// borrowed lite form (the rest fell back to the Value parse). Calls only.
 static SPLT_LITE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// v0.9.21 probe: per-out_bits dense-pack timers (index bits-1 for bits 1..=8,
+/// 8 = wider). NS[k]/N[k] — where does the 90 us/chunk pack budget go?
+pub static SPLT_PACK_B_NS: [AtomicU64; 9] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+pub static SPLT_PACK_B_N: [AtomicU64; 9] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// v0.9.21 probe: RLE evaluation split — vanilla-order scan (A), transposed
+/// scan (B), winner materialization (M). ns/n pairs.
+pub static SPLT_RLE_A: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static SPLT_RLE_B: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static SPLT_RLE_M: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// v0.9.21: sections where the raw stream is uniform (0 transitions) — the
+/// b-scan is skipped entirely because la == lb is proven for that case.
+pub static SPLT_RLE_UNI: AtomicU64 = AtomicU64::new(0);
 /// Last scan_root failure reason: 1=root hdr, 2=sections skip, 3=hmap walk,
 /// 4=light patch, 5=generic key skip, 6=no sections key, 7=root key name.
 static SCAN_FAIL: AtomicU64 = AtomicU64::new(0);
@@ -722,6 +742,37 @@ pub fn split_stage_json() -> String {
         f("scan_ok", &SPLT_SCAN_OK),
         f("scanp", &SPLT_SCANP),
         f("lite", &SPLT_LITE)
+    )
+    + &format!(
+        r#","rleabm":{{"a":[{},{}],"b":[{},{}],"m":[{},{}],"uni":{}}}"#,
+        SPLT_RLE_A.0.swap(0, Ordering::Relaxed),
+        SPLT_RLE_A.1.swap(0, Ordering::Relaxed),
+        SPLT_RLE_B.0.swap(0, Ordering::Relaxed),
+        SPLT_RLE_B.1.swap(0, Ordering::Relaxed),
+        SPLT_RLE_M.0.swap(0, Ordering::Relaxed),
+        SPLT_RLE_M.1.swap(0, Ordering::Relaxed),
+        SPLT_RLE_UNI.swap(0, Ordering::Relaxed),
+    )
+    + &format!(
+        r#","packb":[{},{},{},{},{},{},{},{},{}],"packbn":[{},{},{},{},{},{},{},{},{}]"#,
+        SPLT_PACK_B_NS[0].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_NS[1].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_NS[2].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_NS[3].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_NS[4].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_NS[5].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_NS[6].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_NS[7].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_NS[8].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[0].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[1].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[2].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[3].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[4].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[5].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[6].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[7].swap(0, Ordering::Relaxed),
+        SPLT_PACK_B_N[8].swap(0, Ordering::Relaxed),
     )
     + &format!(
         r#","scan_fail":{{"why":{},"pos":{}}},"direct":{{"ok":{},"fb":{},"whys":[{},{},{},{},{},{},{},{}]}}"#,
@@ -917,6 +968,190 @@ fn uvarint_len(mut v: u64) -> u64 {
         l += 1;
     }
     l
+}
+
+/// Number of adjacent-unequal pairs (v[i] != v[i+1]) — the transition count
+/// of the stream (runs = transitions + 1 for non-empty streams). AVX2 when
+/// available (contiguous 8-lane compares), scalar otherwise. Injective
+/// remaps preserve equality, so callers count on the RAW stream and the
+/// run structure of the mapped stream is identical (the [idx u8][varint run]
+/// framing length depends on run LENGTHS, not idx values).
+fn transitions_neq_u32(v: &[u32]) -> u64 {
+    transitions_neq_u32_bounded(v, u64::MAX)
+}
+
+/// Bounded variant: returns the EXACT count when it stays below `cap`;
+/// otherwise returns some value >= cap (an early exit is allowed once the
+/// running count reaches cap — the caller only uses the result to reject
+/// candidates whose run count provably busts the admission bound). The cap
+/// check after each 8-lane block is never taken for surviving streams
+/// (count stays < cap), so survivors pay one predictable branch per block.
+fn transitions_neq_u32_bounded(v: &[u32], cap: u64) -> u64 {
+    let n = v.len();
+    if n < 2 {
+        return 0;
+    }
+    if cap == 0 {
+        return cap;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 runtime-detected; reads v[i..i+9] for i+9 <= n.
+            return unsafe { transitions_neq_u32_avx2_bounded(v, cap) };
+        }
+    }
+    let mut c = 0u64;
+    for i in 0..n - 1 {
+        c += (v[i] != v[i + 1]) as u64;
+        if c >= cap {
+            return c;
+        }
+    }
+    c
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transitions_neq_u32_avx2_bounded(v: &[u32], cap: u64) -> u64 {
+    use std::arch::x86_64::*;
+    let n = v.len();
+    let mut c = 0u64;
+    let mut i = 0usize;
+    // chunk of 8 pairs (i..i+8 vs i+1..i+9); the 1-element overlap across
+    // chunks counts each pair exactly once
+    while i + 9 <= n {
+        let a = _mm256_loadu_si256(v.as_ptr().add(i) as *const __m256i);
+        let b = _mm256_loadu_si256(v.as_ptr().add(i + 1) as *const __m256i);
+        let eq = _mm256_cmpeq_epi32(a, b);
+        let m = _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32;
+        c += (8 - m.count_ones()) as u64;
+        if c >= cap {
+            return c;
+        }
+        i += 8;
+    }
+    while i + 1 < n {
+        c += (*v.get_unchecked(i) != *v.get_unchecked(i + 1)) as u64;
+        i += 1;
+    }
+    c
+}
+
+/// Transition count of the y-transposed stream (j = x*s2 + z*side + y)
+/// WITHOUT materializing the transpose. For a fixed y the within-column
+/// pairs (x, z, y)-(x, z, y+1) over ALL (x, z) are exactly the elementwise
+/// compares of the two CONTIGUOUS y-rows v[y*s2..+s2] and v[(y+1)*s2..+2*s2]
+/// (element k of a row is (x = k%side, z = k/side)) — so side*side*4 bytes
+/// stream through 8-lane AVX2 compares. The side*side-1 column-boundary
+/// pairs (y=15 of a column | y=0 of the next) run scalar.
+fn transposed_transitions_neq_u32(v: &[u32], side: usize) -> u64 {
+    transposed_transitions_neq_u32_bounded(v, side, u64::MAX)
+}
+
+/// Bounded variant (see transitions_neq_u32_bounded): exact below `cap`,
+/// any value >= cap otherwise. Noise-heavy sections (the ~90% rejection
+/// case) blow past cap within the first row pair or two, so the walk
+/// aborts long before side-1 rows.
+fn transposed_transitions_neq_u32_bounded(v: &[u32], side: usize, cap: u64) -> u64 {
+    let s2 = side * side;
+    let n = v.len();
+    if n < 2 || side == 0 {
+        return 0;
+    }
+    if cap == 0 {
+        return cap;
+    }
+    let mut c = 0u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if side == 16 && n >= side * s2 && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 runtime-detected; rows are s2=256 u32 apart and
+            // the last row pair reads up to n (n == side*s2 for callers).
+            return unsafe { transposed_transitions_neq_u32_avx2_bounded(v, cap) };
+        }
+    }
+    // scalar fallback: the same strided walk as rle_transposed_len_mapped
+    let mut run_val = 0u32;
+    let mut run_len = 0usize;
+    for x in 0..side {
+        for z in 0..side {
+            let base = z * side + x;
+            for y in 0..side {
+                let e = v[y * s2 + base];
+                if run_len > 0 && e == run_val {
+                    run_len += 1;
+                } else {
+                    if run_len > 0 {
+                        c += 1;
+                    }
+                    run_val = e;
+                    run_len = 1;
+                }
+            }
+            if c >= cap {
+                return c;
+            }
+        }
+    }
+    let _ = run_len;
+    c
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transposed_transitions_neq_u32_avx2_bounded(v: &[u32], cap: u64) -> u64 {
+    use std::arch::x86_64::*;
+    let side = 16usize;
+    let s2 = 256usize;
+    let mut c = 0u64;
+    let mut y = 0usize;
+    while y + 1 < side {
+        let a = v.as_ptr().add(y * s2);
+        let b = v.as_ptr().add((y + 1) * s2);
+        let mut k = 0usize;
+        while k + 8 <= s2 {
+            let va = _mm256_loadu_si256(a.add(k) as *const __m256i);
+            let vb = _mm256_loadu_si256(b.add(k) as *const __m256i);
+            let eq = _mm256_cmpeq_epi32(va, vb);
+            let m = _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32;
+            c += (8 - m.count_ones()) as u64;
+            k += 8;
+        }
+        if c >= cap {
+            return c;
+        }
+        y += 1;
+    }
+    // column boundaries, 255 pairs — the count is order-independent, so
+    // regroup them for SIMD: for a FIXED z the within-x successor pairs
+    // (col(x, z-1).y15 -> col(x, z).y0) over all x are the elementwise
+    // compares of two CONTIGUOUS 16-element windows (the y15 row slice at
+    // (z-1)*side and the y0 row slice at z*side); the 15 cross-x pairs
+    // (col(x, 15).y15 -> col(x+1, 0).y0) stay scalar.
+    for z in 1..side {
+        let a = v.as_ptr().add((side - 1) * s2 + (z - 1) * side);
+        let b = v.as_ptr().add(z * side);
+        let mut k = 0usize;
+        while k + 8 <= side {
+            let va = _mm256_loadu_si256(a.add(k) as *const __m256i);
+            let vb = _mm256_loadu_si256(b.add(k) as *const __m256i);
+            let eq = _mm256_cmpeq_epi32(va, vb);
+            let m = _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32;
+            c += (8 - m.count_ones()) as u64;
+            k += 8;
+        }
+        while k < side {
+            c += (*a.add(k) != *b.add(k)) as u64;
+            k += 1;
+        }
+    }
+    // cross-x boundaries: last of col(x, 15) vs first of col(x+1, 0)
+    let last_row = (side - 1) * s2 + (side - 1) * side;
+    for x in 0..side - 1 {
+        c += (*v.as_ptr().add(last_row + x) != *v.as_ptr().add(x + 1)) as u64;
+    }
+    c
 }
 
 /// RLE stream SIZE without materializing it: the same run walk as
@@ -2283,7 +2518,14 @@ fn section_encode_view(
             for (new_i, &old_i) in order_idx.iter().enumerate() {
                 remap16[old_i] = new_i as u16;
             }
-            out.extend_from_slice(&dense_pack_wide_mapped(&v, &remap16, out_bits));
+            out.extend_from_slice(&{
+                let t0 = std::time::Instant::now();
+                let d = dense_pack_wide_mapped(&v, &remap16, out_bits);
+                let k = (out_bits as usize - 1).min(8);
+                SPLT_PACK_B_NS[k].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_PACK_B_N[k].fetch_add(1, Ordering::Relaxed);
+                d
+            });
             ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
             // facts capture: v/ents are dead after this point (wide path
             // returns immediately) — hand them to the shift pass for free.
@@ -2332,22 +2574,78 @@ fn section_encode_view(
         // x2.83 -> x2.67). Deterministic => dedup-stable.
         let mut best: Option<(u8, Vec<u8>)> = None;
         if side != 0 {
-            // size-only scans: the admission rule (4x smaller AND 32+ bytes
-            // saved) rejects ~99% of noise-heavy sections — materialize only
-            // the winning candidate. The sizes are exact (same run walk,
-            // same [idx][varint] framing), so decisions and chosen bytes are
-            // identical to materializing both candidates.
-            let la = rle_stream_len_mapped(&v, &remap);
-            let a_ok = la * 4 <= dense_len as u64 && la + 32 <= dense_len as u64;
-            let lb = rle_transposed_len_mapped(&v, &remap, side);
-            let b_ok = lb * 4 <= dense_len as u64 && lb + 32 <= dense_len as u64;
-            if b_ok && (!a_ok || lb < la) {
-                best = Some((
-                    2,
-                    rle_encode_stream_mapped(&transpose_fast_y_u16(&v, side), &remap),
-                ));
+            // v0.9.21: EXACT SIMD pre-filter before the run walks. The remap
+            // is injective (equality-preserving), so run structure is a
+            // function of the RAW stream; the [idx u8][varint run] framing
+            // costs >= 2 bytes per run, so la >= 2*runs (runs = transitions
+            // + 1). When even the lower bound busts the admission rule (4x
+            // smaller AND 32+ bytes saved), the candidate cannot win and the
+            // exact walk is skipped entirely. The bound is a proven
+            // necessary condition — survivors take the IDENTICAL exact walk
+            // as before, so every decision and byte stays the same (pinned
+            // by enc_fp; differential-tested against the old path).
+            //
+            // v0.9.21b: the scans are BOUNDED — cap = dense_len/8 exactly
+            // separates rejection (transitions >= cap => runs*8 > dense_len
+            // is guaranteed) from survival (transitions < cap => exact
+            // count in hand), and the walk aborts the moment the running
+            // count reaches cap. Noise-heavy sections (~90%) exit within
+            // the first rows instead of streaming all 15 row pairs.
+            //
+            // v0.9.21c: UNI skip — a uniform raw stream (0 transitions)
+            // transposes to the same single value (transposing only
+            // permutes positions of equal elements), so both candidates are
+            // one run with the identical [idx][varint n] framing: la == lb,
+            // the strict-< tie rule already picks (1). The b-scan dies.
+            let t_a = std::time::Instant::now();
+            let cap = (dense_len as u64) / 8;
+            let tr_a = transitions_neq_u32_bounded(&v, cap);
+            let uni = tr_a == 0;
+            let la_opt: Option<u64> = if tr_a >= cap {
+                None
+            } else if (tr_a + 1) * 2 + 32 > dense_len as u64 {
+                None
+            } else {
+                Some(rle_stream_len_mapped(&v, &remap))
+            };
+            if uni && la_opt.is_some() {
+                SPLT_RLE_UNI.fetch_add(1, Ordering::Relaxed);
+            }
+            SPLT_RLE_A.0.fetch_add(t_a.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            SPLT_RLE_A.1.fetch_add(1, Ordering::Relaxed);
+            let t_b = std::time::Instant::now();
+            let lb_opt: Option<u64> = if uni {
+                // proven equal framing: both streams are a single run of
+                // `entries` voxels -> lb == la; feed the existing tie rule
+                la_opt
+            } else {
+                let tr_b = transposed_transitions_neq_u32_bounded(&v, side, cap);
+                if tr_b >= cap || (tr_b + 1) * 2 + 32 > dense_len as u64 {
+                    None
+                } else {
+                    Some(rle_transposed_len_mapped(&v, &remap, side))
+                }
+            };
+            SPLT_RLE_B.0.fetch_add(t_b.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            SPLT_RLE_B.1.fetch_add(1, Ordering::Relaxed);
+            let a_ok = la_opt.is_some()
+                && la_opt.unwrap() * 4 <= dense_len as u64
+                && la_opt.unwrap() + 32 <= dense_len as u64;
+            let b_ok = lb_opt.is_some()
+                && lb_opt.unwrap() * 4 <= dense_len as u64
+                && lb_opt.unwrap() + 32 <= dense_len as u64;
+            if b_ok && (!a_ok || lb_opt.unwrap() < la_opt.unwrap()) {
+                let t_m = std::time::Instant::now();
+                let bytes = rle_encode_stream_mapped(&transpose_fast_y_u16(&v, side), &remap);
+                SPLT_RLE_M.0.fetch_add(t_m.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_RLE_M.1.fetch_add(1, Ordering::Relaxed);
+                best = Some((2, bytes));
             } else if a_ok {
-                best = Some((1, rle_encode_stream_mapped(&v, &remap)));
+                let t_m = std::time::Instant::now();
+                let bytes = rle_encode_stream_mapped(&v, &remap);
+                SPLT_RLE_M.0.fetch_add(t_m.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_RLE_M.1.fetch_add(1, Ordering::Relaxed);
+                best = Some((1, bytes));
             }
         }
         let narrow_flag = match best {
@@ -2359,7 +2657,12 @@ fn section_encode_view(
                     }
                     d
                 } else {
-                    dense_pack_mapped(&v, &remap, out_bits)
+                    let t0 = std::time::Instant::now();
+                    let d = dense_pack_mapped(&v, &remap, out_bits);
+                    let k = (out_bits as usize - 1).min(8);
+                    SPLT_PACK_B_NS[k].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    SPLT_PACK_B_N[k].fetch_add(1, Ordering::Relaxed);
+                    d
                 };
                 out.extend_from_slice(&dense);
                 ST_ENC_DENSE.fetch_add(1, Ordering::Relaxed);
@@ -7112,6 +7415,212 @@ mod tests {
         be.push(Value::String("x".to_string()));
         root.insert("block_entities".to_string(), Value::List(be));
         to_bytes(&Value::Compound(root))
+    }
+
+    /// Deterministic LCG (xorshift-ish) for reproducible differential inputs.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    #[test]
+    fn transitions_neq_matches_naive() {
+        let mut rng = Lcg(0x5EED_1234_ABCD_0001);
+        for &len in &[
+            0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 255, 4095, 4096, 5000,
+        ] {
+            for alphabet in [1u32, 2, 3, 16, 256, 100000] {
+                let v: Vec<u32> = (0..len).map(|_| (rng.next() % alphabet as u64) as u32).collect();
+                let naive: u64 = if len < 2 {
+                    0
+                } else {
+                    (0..len - 1).filter(|&i| v[i] != v[i + 1]).count() as u64
+                };
+                assert_eq!(transitions_neq_u32(&v), naive, "len {len} alphabet {alphabet}");
+            }
+        }
+        // structured cases: fully uniform (0 transitions), strictly alternating
+        assert_eq!(transitions_neq_u32(&vec![7u32; 4096]), 0);
+        let alt: Vec<u32> = (0..4096).map(|i| (i & 1) as u32).collect();
+        assert_eq!(transitions_neq_u32(&alt), 4095);
+    }
+
+    #[test]
+    fn transposed_transitions_matches_materialized() {
+        let mut rng = Lcg(0x5EED_1234_ABCD_0002);
+        for &side in &[4usize, 16usize] {
+            let n = side * side * side;
+            for alphabet in [1u32, 2, 3, 16, 256] {
+                for _case in 0..8 {
+                    let v: Vec<u32> =
+                        (0..n).map(|_| (rng.next() % alphabet as u64) as u32).collect();
+                    let t = transpose_fast_y_u16(&v, side);
+                    let naive: u64 = (0..n - 1).filter(|&i| t[i] != t[i + 1]).count() as u64;
+                    assert_eq!(
+                        transposed_transitions_neq_u32(&v, side),
+                        naive,
+                        "side {side} alphabet {alphabet}"
+                    );
+                }
+            }
+        }
+        // uniform: whole transposed stream is one run -> 0 transitions
+        assert_eq!(transposed_transitions_neq_u32(&vec![9u32; 4096], 16), 0);
+    }
+
+    /// The v0.9.21 SIMD pre-filter (v0.9.21b bounded scans, v0.9.21c UNI
+    /// skip) must reproduce the old always-exact decision for EVERY
+    /// (stream, dense_len) pair: bound rejections are a proven necessary
+    /// condition, early exits return >= cap, survivors take the identical
+    /// exact walk, and uniform streams provably tie (la == lb).
+    #[test]
+    fn rle_decision_bound_equivalence() {
+        let mut rng = Lcg(0x5EED_1234_ABCD_0003);
+        // OLD decision: exact sizes always
+        fn old_decide(
+            v: &[u32],
+            remap: &[u8],
+            side: usize,
+            dense_len: u64,
+        ) -> (u8, u64, u64) {
+            let la = rle_stream_len_mapped(v, remap);
+            let lb = rle_transposed_len_mapped(v, remap, side);
+            let a_ok = la * 4 <= dense_len && la + 32 <= dense_len;
+            let b_ok = lb * 4 <= dense_len && lb + 32 <= dense_len;
+            let d = if b_ok && (!a_ok || lb < la) {
+                2u8
+            } else if a_ok {
+                1
+            } else {
+                0
+            };
+            (d, la, lb)
+        }
+        // NEW decision: bounded scans + UNI skip, mirroring production
+        fn new_decide(
+            v: &[u32],
+            remap: &[u8],
+            side: usize,
+            dense_len: u64,
+        ) -> u8 {
+            let cap = dense_len / 8;
+            let tr_a = transitions_neq_u32_bounded(v, cap);
+            let uni = tr_a == 0;
+            let la_opt: Option<u64> = if tr_a >= cap {
+                None
+            } else if (tr_a + 1) * 2 + 32 > dense_len {
+                None
+            } else {
+                Some(rle_stream_len_mapped(v, remap))
+            };
+            let lb_opt: Option<u64> = if uni {
+                la_opt
+            } else {
+                let tr_b = transposed_transitions_neq_u32_bounded(v, side, cap);
+                if tr_b >= cap || (tr_b + 1) * 2 + 32 > dense_len {
+                    None
+                } else {
+                    Some(rle_transposed_len_mapped(v, remap, side))
+                }
+            };
+            let a_ok = la_opt.is_some()
+                && la_opt.unwrap() * 4 <= dense_len
+                && la_opt.unwrap() + 32 <= dense_len;
+            let b_ok = lb_opt.is_some()
+                && lb_opt.unwrap() * 4 <= dense_len
+                && lb_opt.unwrap() + 32 <= dense_len;
+            if b_ok && (!a_ok || lb_opt.unwrap() < la_opt.unwrap()) {
+                2
+            } else if a_ok {
+                1
+            } else {
+                0
+            }
+        }
+        for &side in &[4usize, 16usize] {
+            let entries = side * side * side; // 64 / 4096 voxels
+            for _case in 0..64 {
+                let alphabet = 1 + (rng.next() % 256) as u32;
+                let mode = rng.next() % 4;
+                let v: Vec<u32> = (0..entries)
+                    .map(|i| match mode {
+                        0 => 0,
+                        1 => {
+                            if rng.next() % 32 == 0 {
+                                (rng.next() % alphabet as u64) as u32
+                            } else {
+                                0
+                            }
+                        }
+                        2 => {
+                            if i % 7 == 0 {
+                                (rng.next() % alphabet as u64) as u32
+                            } else {
+                                1
+                            }
+                        }
+                        _ => (rng.next() % alphabet as u64) as u32,
+                    })
+                    .collect();
+                let remap: Vec<u8> = (0..alphabet as usize).map(|i| i as u8).collect();
+                // dense_len sweeps the admission thresholds
+                for dense_len in [8u64, 32, 33, 34, 64, 128, 512, 1024, 1536, 2048, 4096] {
+                    let (old, la, lb) = old_decide(&v, &remap, side, dense_len);
+                    let new = new_decide(&v, &remap, side, dense_len);
+                    assert_eq!(
+                        new, old,
+                        "side {side} mode {mode} dense_len {dense_len} la {la} lb {lb}"
+                    );
+                }
+            }
+        }
+        // bounded contract: exact below cap, >= cap above
+        for &side in &[4usize, 16usize] {
+            let n = side * side * side;
+            for _case in 0..16 {
+                let alphabet = 1 + (rng.next() % 256) as u32;
+                let v: Vec<u32> =
+                    (0..n).map(|_| (rng.next() % alphabet as u64) as u32).collect();
+                let naive_a: u64 = (0..n - 1).filter(|&i| v[i] != v[i + 1]).count() as u64;
+                let t = transpose_fast_y_u16(&v, side);
+                let naive_b: u64 = (0..n - 1).filter(|&i| t[i] != t[i + 1]).count() as u64;
+                for cap in [1u64, 2, 7, 64, 256, 1000, u64::MAX] {
+                    let ba = transitions_neq_u32_bounded(&v, cap);
+                    if naive_a < cap {
+                        assert_eq!(ba, naive_a, "a exact cap {cap}");
+                    } else {
+                        assert!(ba >= cap, "a bounded cap {cap}");
+                    }
+                    let bb = transposed_transitions_neq_u32_bounded(&v, side, cap);
+                    if naive_b < cap {
+                        assert_eq!(bb, naive_b, "b exact cap {cap}");
+                    } else {
+                        assert!(bb >= cap, "b bounded cap {cap}");
+                    }
+                }
+            }
+        }
+        // uniform streams: la == lb is exactly what the UNI skip relies on
+        for &side in &[4usize, 16usize] {
+            let n = side * side * side;
+            for val in [0u32, 1, 255] {
+                let v = vec![val; n];
+                let remap: Vec<u8> = (0..256).map(|i| i as u8).collect();
+                assert_eq!(transitions_neq_u32(&v), 0);
+                assert_eq!(transposed_transitions_neq_u32(&v, side), 0);
+                assert_eq!(
+                    rle_stream_len_mapped(&v, &remap),
+                    rle_transposed_len_mapped(&v, &remap, side),
+                    "uniform la == lb side {side}"
+                );
+            }
+        }
     }
 
     #[test]

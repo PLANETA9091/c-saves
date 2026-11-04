@@ -771,3 +771,28 @@ Cumulative: import ST 37.5 (0.9.10) -> 87-89 MB/s (+132%), p50
 113.7 -> 72.9 us/chunk, scanp 65.4 -> 22.3, ensure_blobs 87.0 -> 79.8,
 warm read ~1530 MB/s, container and every byte-level pin unchanged
 throughout.
+
+0.9.21 bounded SIMD RLE admission: the new per-width packb timers
+disproved the vanilla-width passthrough hypothesis (bits 5-7 repack is
+only 5% of dense-pack cost; bits 2/3/4 are 85%) and exposed the real
+pack-stage item: the RLE admission scans. The transposed-stream
+transition count ran for every section — 17.7 ms of the 45.0 ms pack
+stage, more than the dense pack itself (13.7 ms). Three byte-exact
+cuts: (1) bounded scans — cap = dense_len/8 exactly separates
+rejection from survival, the AVX2 walk aborts at cap, noise-heavy
+sections exit within the first row pairs (b-scan 1168 -> 460 ns/call);
+(2) vectorized column boundaries — the 255 boundary pairs regrouped by
+z become 15 contiguous 16-element window compares + 15 scalar cross-x;
+(3) UNI skip — uniform raw stream transposes to the same single value,
+la == lb proven, b-scan skipped (0 fires on this layered corpus, free
+insurance for uniform survival worlds). Import ST 87-91 -> 98-104
+MB/s (median ~100.5, +12-15%); enc stage 94.4 -> 75.6 ms, pack stage
+45.0 -> 30.1 ms per region pass. Gates: tests 56/56 (3 new
+differential/contract tests), enc_fp fp=6d240d7166cdda99 members=12130
+bytes=9971843, verify 728+218+1280 bad=0, bench_size x0.08, survival
+ok=1280.
+
+Cumulative: import ST 37.5 (0.9.10) -> 98-104 MB/s (+163-177%), p50
+113.7 -> ~74 us/chunk, scanp 65.4 -> 21.4, ensure_blobs 87.0 -> 79.8,
+warm read ~1530 MB/s, container and every byte-level pin unchanged
+throughout.
