@@ -804,3 +804,26 @@ chunk for values known at insert time). One pass; ensure_blobs 79.3 ->
 enc_fp pin unchanged, tests 56/56, verify 728+218+1280 bad=0.
 
 Cumulative: import ST 37.5 (0.9.10) -> 103-104 MB/s (+175-177%).
+
+0.9.23 probe window (all REVERTED, tree back at 0.9.22; negative results
+recorded so nobody re-digs these holes):
+- vanilla-width passthrough for bits 5-7: the new per-width packb timers
+  show bits 5/6/7 repacks are 0.66 ms of the 13.7 ms dense-pack budget
+  (5%) — the format-flag + reader work cannot pay for itself. Bits 2/3/4
+  are 85% of dense-pack cost but they are ALREADY memcpy passthrough when
+  the canonical order is identity.
+- LUT unpack fast paths (bits 1/2/4, pal_n == 1<<bits): isolated
+  micro-bench said 19.8 -> 0.5 us per 4096-voxel bits=1 section, but the
+  corpus disagreed — with all arms on, unp doubled (2.57 -> 5.22 us/call,
+  import 106 -> 90 MB/s); arm-bisection pinned the damage on the bits=2/4
+  LUT arms (+34.6 ms of unp per region pass) while the bits=1 arm was a
+  noise-level -1.9 ms. The corpus microdata (run-layered two-state
+  sections, predictor-friendly scalar loop) defeats the LUT+memcpy
+  structure; a bits=1 arm kept alone measured 99.7-102.9 MB/s vs
+  106.2 baseline — inside the machine noise band, and not worth carrying
+  unexplained residual. Full revert; the differential test and the
+  old-vs-new unp_bench harness were removed with it.
+- lesson for the next unp attack: the win must come from restructuring
+  the pass itself (fused unpack-remap-transpose without the 16 KB
+  materialization, or SIMD on the long stream), not from re-decoding the
+  same fields through a table.
