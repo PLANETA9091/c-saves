@@ -988,3 +988,30 @@ factor. CSAVES_COLD_LEVEL=19 remains the size-obsessed opt-out. Gates:
 57/57 tests, enc_fp 6d240d7166cdda99/12130/9971843 EXACT, survival
 x4.01 ok=1280, bench_size x0.08, verify 728+218 bad=0, import 113.7 MB/s
 (warm read 1577.9) — import/read untouched, container x6.62.
+
+## 0.9.28 — palette-memo in section_to_glob: pack build phase 4x
+
+At z12 (0.9.27) the pack wall moved from compression to the BUILD phase:
+build 632 ms vs comp 511 ms of the 1.23 s pack. Decomposition by reading
+section_to_glob found the fish: the voxel loop called
+reg.get_or_insert(st.clone()) PER VOXEL — 4096 full-state hash lookups +
+4096 String clones per section, for a palette holding at most n distinct
+states. The fix is a lazy per-palette-index memo (pgid: Vec<u32> seeded
+with u32::MAX): states still register on their first REFERENCING voxel in
+the same voxel order (gid assignment order and registry bytes unchanged;
+unreferenced palette entries still never register), so the hash cost
+drops from 4096 to n lookups and n clones per section.
+
+Measured (JJ corpus, local 2-core, z12): pack 1.23 -> 0.76 s (-38%);
+pack-census build 631.6 -> 156.8 ms (4.0x); comp unchanged (511 ->
+515 ms); container 1.88 MiB (x6.61 vs x6.62 — within the +-46 B
+run-to-run tail noise). Import path untouched (section_to_glob is
+pack-only); enc_fp 6d240d7166cdda99/12130/9971843 EXACT re-verified.
+Gates: 57/57 tests, verify 728+218 and 946/946 bad=0 (jj_profile).
+
+Sanity note recorded: across this sandbox's recycle the jj_profile
+container grew 1.61 -> 1.83 MiB with IDENTICAL blobs/dedup/enc-modes and
+a degenerate 2239 B trained dict (was ~100 KB) — present with AND without
+the memo (old code measures 1.83 too), so it is an environment-level
+dict-training anomaly to chase separately, not a memo regression. CI
+remains the honest size judge (stable runner image).

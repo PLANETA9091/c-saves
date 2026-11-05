@@ -6722,11 +6722,24 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     // new states): gids above 255 switch this section's stream to the u16
     // width instead of refusing the conversion (registries up to 65536
     // states stay representable).
+    // PALETTE-MEMO: the voxel loop used to call reg.get_or_insert per
+    // VOXEL — 4096 full-state hash lookups + 4096 String clones per
+    // section, for a palette that holds at most n distinct states. A lazy
+    // per-palette-index memo keeps the gid ASSIGNMENT ORDER exactly the
+    // old one (states register on first REFERENCING voxel, unreferenced
+    // palette entries never register — registry bytes are unchanged, the
+    // drained container stays identical) while the hash cost drops from
+    // 4096 to n lookups and n clones.
+    let mut pgid: Vec<u32> = vec![u32::MAX; n];
     let mut gids: Vec<u32> = Vec::with_capacity(4096);
     let mut max_gid: u32 = 0;
     for v in &vox {
-        let st = &states[*v as usize];
-        let g = reg.get_or_insert(st.clone());
+        let vi = *v as usize;
+        let mut g = pgid[vi];
+        if g == u32::MAX {
+            g = reg.get_or_insert(states[vi].clone());
+            pgid[vi] = g;
+        }
         if g > 65535 {
             return None;
         }
