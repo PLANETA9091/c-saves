@@ -154,6 +154,43 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.30 — dictionary training stops being a lottery
+
+The sample pool behind the shared zstd dictionary was a Vec that froze at
+the first 2×dict_train arrivals. Which payloads arrive first depends on
+fs::read_dir order (bench imports) or player spawn direction (production),
+so dictionary quality was a coin flip: the same JJ corpus trained a
+degenerate 1662-7773 B dictionary on this sandbox and a healthy ~100 KB one
+on the previous one. The offline study (examples/dict_probe.rs,
+dict_sel.rs) pinned the physics: the COVER trainer's output swings 4.6-53 KB
+across 200-sample subsets of the SAME 982-sample stream, while the full
+stream in content-hash order is stable — order matters and subsets gamble.
+
+v0.9.30 replaces the pool with a content-hash bucket reservoir: identical
+payloads collapse into one bucket (uniform sections cannot flood it, tiny
+RLE forms are admitted like any other raw), each bucket keeps its LARGEST
+member (arrival-independent), and training consumes the hash-ordered prefix
+(32 samples, bounded so the COVER cost stays at the old ~35 ms on the pack
+wall). Retraining fires only on fresh coverage (≥ dict_train/4) or +25%
+bucket growth — no version churn. Regression test
+dict_training_is_arrival_order_independent pins byte-identical dictionaries
+across arrival rotations. The COLD tier is now dict-less, matching the pack
+path (bulk/mt compress never took the dictionary); the shared dictionary
+earns its keep on hot-tier small writes. Blobs carry their own dict_id, so
+dict-framed cold blobs from older stores decode exactly as stored — wire
+compatible both ways.
+
+Size-gate honesty: this work is size-NEUTRAL on every gate (jj TOTAL,
+survival TOTAL, bench_size compact all unchanged vs 0.9.29 same-env runs);
+the cross-sandbox deltas everyone chases (jj 1.61 ↔ 1.83 MiB, bench_size
+compact 3.58 ↔ 3.80 MiB) reproduce on UNCHANGED code and are environment
+drift, not dict-size effects — proven by A/B with git stash today. The big
+slab frames compress dict-less in the pack path; wiring the dictionary into
+pack Phase-B variant streams is the real (parked) size lever. Gates:
+58/58 tests (+1 new), jj verify 946/946, survival ok=1280, bench_size
+compact x0.11 (gate 0.15), enc_fp EXACT, pack 0.45 s = 0.9.29 parity,
+container x6.42.
+
 ## v0.9.29 — cold tier z12 → z6: the memo moved the knee
 
 The palette memo (v0.9.28) cut the pack BUILD phase 4x, so compression is

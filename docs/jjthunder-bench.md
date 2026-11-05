@@ -1049,3 +1049,31 @@ pack 1.43 -> 0.53 s (-63%), pack-census build 803 -> 97.6 ms (8.2x),
 import 174.7 MB/s ST / 335.9 MT (CI best), warm read 1983.9 MB/s,
 cold read 794.9 MB/s, container x6.61 flat, compact x0.10 — the memo
 delivered on CI with zero size movement.
+
+## 0.9.30 — dict training: the arrival lottery, measured and closed
+
+Root cause chain of the "degenerate dictionary" anomaly: the old pool was
+`Vec` truncated to the FIRST 2*dict_train arrivals -> which 400 payloads
+those are depends on fs::read_dir order / spawn direction -> the COVER
+trainer's output swings 4.6-53 KB across 200-sample subsets of the SAME
+982-sample stream (offline study, examples/dict_sel.rs) -> arrival order
+decided dict quality. Full stream in hash order: stable. Numbers logged on
+this env: 1662 B / 48656 B / 82873 B / 114688 B / 5302 B / 6450 B dicts
+from the same corpus under different selection policies; container did NOT
+move with any of them (pack Phase-B variant streams compress dict-less —
+the dict only feeds ensure/hot-frame/inline-tail paths).
+
+Fixes shipped: content-hash bucket reservoir (dedupe by content, keep
+largest per bucket, train on hash-ordered prefix capped at 32 samples /
+256 KiB = 35 ms trainer wall cost, pack parity with 0.9.29 at 0.45 s);
+retrain gate fresh>=dict_train/4 or +25% buckets; cold tier dict-less
+(pack-path consistency, wire-compatible via per-blob dict_id stamps);
+regression test pins byte-identical dicts across arrival rotations;
+trainer telemetry (size/ms/samples/bytes) in the trained log line.
+
+A/B honesty: bench_size compact 3.58 vs 3.80 MiB and jj 1.61 vs 1.83 MiB
+reproduce on UNCHANGED 0.9.29 code across sandbox states — environment
+drift, NOT dict effects (git-stash A/B today). CI's stable runner remains
+the size judge. Parked follow-up (the real size lever): dictionary into
+pack Phase-B variant streams — wire change, dict_id per stream, decode
+paths; multi-hour project.

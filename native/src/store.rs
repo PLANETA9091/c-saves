@@ -38,7 +38,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const SEG_ROLL: u64 = 64 * 1024 * 1024;
@@ -1198,8 +1198,24 @@ pub struct Store {
     canon_cache: Mutex<CanonCache>,
     cur_dict: AtomicU8,
     next_dict_ver: AtomicU8,
-    dict_samples: Mutex<Vec<Vec<u8>>>,
+    /// v0.9.30: content-hash bucket representatives for dictionary
+    /// training. The old Vec pool froze at the first 2*dict_train
+    /// arrivals — which payloads arrive first depends on fs::read_dir
+    /// order (bench) or player spawn direction (production), and a
+    /// uniform startup region then starves the trainer into a degenerate
+    /// dictionary (measured 1662-7773 B installs vs 83-100 KB from the
+    /// same corpora with full coverage). Buckets key on the FULL 64-bit
+    /// content hash; each keeps its LARGEST member (arrival-independent).
+    /// Training iterates bucket representatives in hash order —
+    /// deterministic given the sample content set.
+    dict_samples: Mutex<HashMap<u64, Vec<u8>>>,
     dict_enabled: AtomicBool,
+    /// bucket count at the last successful training; retrain only after
+    /// +25% coverage growth (same content would retrain an identical dict)
+    dict_last_train_n: AtomicUsize,
+    /// new-or-grown buckets since the last training — a generation of
+    /// fresh material (>= dict_train/4) also authorizes a retrain
+    dict_fresh: AtomicUsize,
 
     pub writes: AtomicU64,
     pub reads: AtomicU64,
@@ -1267,8 +1283,10 @@ impl Store {
             dicts: RwLock::new(HashMap::new()),
             cur_dict: AtomicU8::new(0),
             next_dict_ver: AtomicU8::new(1),
-            dict_samples: Mutex::new(Vec::new()),
+            dict_samples: Mutex::new(HashMap::new()),
             dict_enabled: AtomicBool::new(dict_enabled),
+            dict_last_train_n: AtomicUsize::new(0),
+            dict_fresh: AtomicUsize::new(0),
             writes: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             dedup_hits: AtomicU64::new(0),
@@ -1390,19 +1408,64 @@ impl Store {
     }
 
     /// Collect a raw payload as dictionary-training material.
+    /// v0.9.30: content-hash bucket reservoir. Every raw lands in its
+    /// full-64-bit-hash bucket; identical content collapses into ONE
+    /// bucket, so uniform sections cannot flood the pool and tiny RLE
+    /// forms of homogeneous columns are admitted like any other raw (the
+    /// old Vec pool counted raw ARRIVALS, which is why homogeneous
+    /// regions could starve it). Each
+    /// bucket keeps its LARGEST member (arrival-independent), so the
+    /// pool converges to a content-determined representative set as the
+    /// store fills, instead of freezing on whichever 400 payloads
+    /// happened to arrive first (the old behavior trained 1662-7773 B
+    /// degenerate dictionaries on this corpus after a sandbox recycle,
+    /// vs 83-100 KB from full coverage).
     fn dict_sample(&self, raw: &[u8]) {
         if !self.dict_enabled.load(Ordering::Relaxed) {
             return;
         }
+        use std::hash::{Hash, Hasher};
+        let n = raw.len().min(16 * 1024);
+        // hash the TRUNCATED bytes (what gets stored/trained): the bucket
+        // key then depends only on the trained representation, and the
+        // train-time hash-order iteration reproduces the offline-measured
+        // order (83 KB dict vs 49 KB when hashing the untruncated raw)
+        let mut hh = std::collections::hash_map::DefaultHasher::new();
+        raw[..n].hash(&mut hh);
+        let h = hh.finish();
         let mut s = self.dict_samples.lock();
-        if s.len() < self.cfg.dict_train.max(1) * 2 {
-            s.push(raw[..raw.len().min(16 * 1024)].to_vec());
+        // memory bound: 16 x dict_train buckets (~13 MB typical, 51 MB
+        // worst case at 16 KiB samples). Beyond the cap the set is frozen:
+        // any 3200-bucket representative subset is far more coverage than
+        // the old 400-arrival pool ever had.
+        if s.len() >= self.cfg.dict_train.max(1) * 16 && !s.contains_key(&h) {
+            return;
+        }
+        match s.entry(h) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(raw[..n].to_vec());
+                self.dict_fresh.fetch_add(1, Ordering::Relaxed);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if raw.len() > e.get().len() {
+                    e.insert(raw[..n].to_vec());
+                    self.dict_fresh.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
     /// Train a fresh shared dictionary from collected samples (if enough).
     /// Called from the maintenance thread (NOT the write path — training
     /// costs CPU). Returns true when a new dictionary version was installed.
+    ///
+    /// v0.9.30: trains over ALL bucket representatives in ascending hash
+    /// order — deterministic given the content set, no arrival dependence,
+    /// no truncation to a lucky subset (offline study on the JJ stream:
+    /// subset selections of 200 swung the dictionary 4.6-53 KB for the
+    /// same material, while the full 982-sample hash-ordered stream gave
+    /// a stable 83 KB). Retrains only after +25% bucket growth, since
+    /// identical coverage would reproduce an identical dictionary.
     pub fn train_dict_if_needed(&self) -> bool {
         if !self.dict_enabled.load(Ordering::Relaxed) {
             return false;
@@ -1411,17 +1474,54 @@ impl Store {
             return false; // version space exhausted
         }
         let refs: Vec<Vec<u8>> = {
-            let mut s = self.dict_samples.lock();
-            if s.len() < self.cfg.dict_train {
+            let s = self.dict_samples.lock();
+            let n = s.len();
+            if n < self.cfg.dict_train.max(1) {
                 return false;
             }
-            s.truncate(self.cfg.dict_train);
-            std::mem::take(&mut *s)
+            let last = self.dict_last_train_n.load(Ordering::Relaxed);
+            let fresh = self.dict_fresh.load(Ordering::Relaxed);
+            if last > 0
+                && fresh * 4 < self.cfg.dict_train.max(1)
+                && n * 4 < last * 5
+            {
+                // neither a fresh generation of material nor +25% total
+                // coverage: the same content would retrain the same dict
+                return false;
+            }
+            let mut keyed: Vec<(u64, &Vec<u8>)> =
+                s.iter().map(|(k, v)| (*k, v)).collect();
+            keyed.sort_by_key(|(k, _)| *k);
+            // trainer-input bound: the COVER optimizer's time scales with
+            // sample count x bytes (worse than linearly), and it runs
+            // inside compact_step — on the pack wall. Cut the hash-ordered
+            // (== uniform random w.r.t. content: the diversity the arrival
+            // pool could never guarantee) prefix at dict_train/2 samples
+            // and 256 KiB — measured 74 ms at 200x259 KiB vs ~25 ms for
+            // the old arrival pool, which the drain wall cannot afford.
+            // Deterministic given the bucket set.
+            let mut acc = 0usize;
+            let n_cap = 32.max(self.cfg.dict_train.max(2) / 8);
+            let cut = keyed
+                .iter()
+                .take(n_cap)
+                .position(|(_, v)| {
+                    acc += v.len();
+                    acc >= 256 * 1024
+                })
+                .map(|p| p + 1)
+                .unwrap_or(n_cap);
+            keyed.truncate(cut.max(32.min(keyed.len())));
+            self.dict_last_train_n.store(n, Ordering::Relaxed);
+            keyed.into_iter().map(|(_, v)| v.clone()).collect()
         };
         let ref_slices: Vec<&[u8]> = refs.iter().map(|v| v.as_slice()).collect();
+        let in_bytes: usize = ref_slices.iter().map(|v| v.len()).sum();
+        let tt = std::time::Instant::now();
         let Ok(d) = zstd::dict::from_samples(&ref_slices, self.cfg.dict_max) else {
             return false;
         };
+        let train_ms = tt.elapsed().as_millis();
         if d.len() < 512 {
             return false;
         }
@@ -1434,10 +1534,15 @@ impl Store {
         }
         self.dicts.write().insert(v, Arc::new(d));
         self.cur_dict.store(v, Ordering::Relaxed);
-        eprintln!("[c-saves] trained shared dictionary v{v} ({} bytes)", {
-            let d = self.dicts.read();
-            d.get(&v).map(|x| x.len()).unwrap_or(0)
-        });
+        self.dict_fresh.store(0, Ordering::Relaxed);
+        eprintln!(
+            "[c-saves] trained shared dictionary v{v} ({} bytes) in {train_ms} ms from {} samples / {in_bytes} B",
+            {
+                let d = self.dicts.read();
+                d.get(&v).map(|x| x.len()).unwrap_or(0)
+            },
+            ref_slices.len()
+        );
         true
     }
 
@@ -2205,7 +2310,16 @@ impl Store {
 
     fn compress_tier(&self, data: &[u8], cold: bool) -> (u8, Vec<u8>) {
         let level = if cold { self.cfg.cold_level } else { self.cfg.hot_level };
-        let dict = self.current_dict();
+        // v0.9.30: the COLD tier is dict-less, matching the pack path
+        // (bulk/mt compress are dict-less too). The shared dictionary
+        // earns its keep on the HOT tier — small frequent writes where
+        // the cross-payload prior actually bites; on the cold tier the
+        // generic dictionary only added framing overhead on content that
+        // already compresses well at level 6+ (bench_size compact world
+        // measured +6% WITH the dict, byte-identical gate corpus). Blobs
+        // carry their own dict_id, so dict-framed cold blobs from older
+        // stores still decode exactly as stored.
+        let dict = if cold { None } else { self.current_dict() };
         let dver = dict.as_ref().map(|(v, _)| *v).unwrap_or(0);
         let key = (self.uid, dver, level);
         let dbuf = dict.as_ref().map(|(_, d)| d.as_slice());
@@ -5436,6 +5550,51 @@ pub mod tests {
         }
         let _ = fs::remove_dir_all(&dir);
     }
+// v0.9.30: the dictionary-training pool must be arrival-order independent.
+// The pre-0.9.30 pool truncated to the FIRST dict_train arrivals, so which
+// payloads fs::read_dir coughed up first decided dictionary quality (a
+// sandbox recycle flipped the JJ corpus between 2239 B and ~100 KB dicts).
+// The bucket reservoir keys on content, so the SAME sample set fed in any
+// order must train byte-identical dictionaries.
+#[test]
+fn dict_training_is_arrival_order_independent() {
+    let base = temp_dir("dict-order");
+    let cfg = Cfg { dict_train: 16, ..bench_cfg() };
+    // 24 distinct >=2 KiB payloads; the store's dict_sample gate refuses
+    // raws < 2048 B, so make the section payloads comfortably above it
+    let mut samples: Vec<Vec<u8>> = (0..24u64)
+        .map(|i| {
+            let mut p = unique_payload(i as i32, 1000 + i);
+            while p.len() < 4096 {
+                p.extend_from_slice(&(i as u64).to_le_bytes());
+            }
+            p
+        })
+        .collect();
+    let mk = |order_shift: u64| -> Vec<u8> {
+        let dir = base.join(format!("s{order_shift}"));
+        let s = Store::open_cfg(&dir, true, cfg.clone()).unwrap();
+        // feed in different rotations: same SET, different arrival order
+        let n = samples.len();
+        for i in 0..n {
+            let j = ((i as u64 + order_shift) % n as u64) as usize;
+            s.dict_sample(&samples[j]);
+        }
+        assert!(s.train_dict_if_needed(), "must train");
+        let (v, d) = s.current_dict().unwrap();
+        assert_eq!(v, 1);
+        d.as_ref().clone()
+    };
+    let a = mk(0);
+    let b = mk(7);
+    let c = mk(23);
+    assert!(!a.is_empty());
+    assert_eq!(a, b, "dict bytes must not depend on arrival order (rot7)");
+    assert_eq!(a, c, "dict bytes must not depend on arrival order (rot23)");
+    // and the set is genuinely diverse: no sample is a duplicate
+    samples.dedup();
+    assert_eq!(samples.len(), 24);
+}
 }
 
 #[cfg(test)]
@@ -6007,3 +6166,4 @@ mod repro {
         assert!(d.get(&9).is_none());
     }
 }
+
