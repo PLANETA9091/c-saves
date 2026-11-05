@@ -423,6 +423,7 @@ fn main() {
     st_r.sync();
     st_e.sync();
     println!("SPEED pack: {:.2}s", t0.elapsed().as_secs_f64());
+    println!("SPEED pack-census: {}", c_saves::store::pack_census_json());
     let container = st_r.disk_bytes() + st_e.disk_bytes();
     println!(
         "SPEED container: c-saves {:.2} MiB (anvil sector-padded {:.2} MiB, x{:.2} smaller)",
@@ -450,6 +451,54 @@ fn main() {
             anvil as f64 / container.max(1) as f64
         }
     );
+
+    // container identity fingerprint: content hash over every container
+    // file, sorted by path — cross-version byte-identity gate (the drained
+    // container must be byte-identical across hot-level and pack-parallel
+    // variants when form decisions are unchanged)
+    {
+        use c_saves::chunknbt::hash_of;
+        let dir_fp = |dir: &Path| -> String {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            paths.sort();
+            let mut acc: u128 = 0;
+            let mut bytes_total = 0u64;
+            for p in paths {
+                if p.is_dir() {
+                    continue;
+                }
+                if let Ok(b) = std::fs::read(&p) {
+                    bytes_total += b.len() as u64;
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    acc = acc
+                        .wrapping_mul(0x100000001b3_u128)
+                        .wrapping_add(hash_of(name.as_bytes()) as u128)
+                        .wrapping_add(hash_of(&b) as u128);
+                }
+            }
+            format!("{acc:032x}/{bytes_total}")
+        };
+        if std::env::var("CSAVES_FP_FILES").as_deref() == Ok("1") {
+            for d in [&region_dir, &entity_dir] {
+                let mut paths: Vec<PathBuf> = std::fs::read_dir(d)
+                    .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+                    .unwrap_or_default();
+                paths.sort();
+                for p in paths {
+                    if p.is_dir() { continue; }
+                    println!("SPEED fp-file: {} {}", d.file_name().and_then(|s| s.to_str()).unwrap_or("?"), p.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
+                    if let Ok(b) = std::fs::read(&p) { println!("SPEED fp-size: {} {} {}", d.file_name().and_then(|s| s.to_str()).unwrap_or("?"), p.file_name().and_then(|s| s.to_str()).unwrap_or("?"), b.len()); }
+                }
+            }
+        }
+        println!(
+            "SPEED container-fp: region={} entities={}",
+            dir_fp(&region_dir),
+            dir_fp(&entity_dir)
+        );
+    }
 
     // DEBUG early verify (post-import+pack, same handle)
     {
@@ -551,6 +600,8 @@ fn main() {
     {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        c_saves::store::write_stage_reset();
+        c_saves::store::mt_lock_census_reset();
         let mdir = tmp.join("region-mt");
         let _ = std::fs::remove_dir_all(&mdir);
         let st = Store::open_cfg(&mdir, true, Cfg::from_env()).unwrap();
@@ -583,6 +634,8 @@ fn main() {
             "SPEED csaves-import-mt-region: threads={threads} ops={n} MB/s={:.1} wall={:.3}s",
             region_raw as f64 / 1048576.0 / secs, secs
         );
+        println!("SPEED stages-import-mt: {}", c_saves::store::write_stage_json());
+        println!("SPEED mt-lock-census: {}", c_saves::store::mt_lock_census_json());
         st.sync();
         st.seal();
     }

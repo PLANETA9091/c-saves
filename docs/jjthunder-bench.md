@@ -885,3 +885,37 @@ recorded so nobody re-digs these holes):
   needs a fully-fused SIMD counts design (pshufb/SAD accumulators, ~+5%
   class) — noted, not dug. Branch wip-u8-pipeline keeps the full u8
   pipeline + probes for reference.
+
+## 0.9.25 — pack is the wall; parallelize it
+
+The 0.9.24 bench hides the real distribution: import 0.21 s, pack 10.2 s —
+the storage-conversion pipeline spends ~98% of its wall in zstd-19 slab
+compressions (2.5-4 MB/s per core; 8.58 s on the 4-core CI runner). The
+first pack census (new SPEED pack-census line): comp 7.2-7.5 s cumulative,
+build 0.62 s, recipes 0.03 s, victim reads 15 ms — compressions are the
+pass.
+
+flush_slab_cands restructured into three phases: build all group variant
+streams serially (GLOB conversion order preserved exactly — registry gids
+and streams byte-identical), compress every variant through a scoped
+work-stealing pool, then append/update in the serial order. Per-task
+timing proves real overlap: wave 1 ran the 8.34 MB canon (3.32 s) and the
+12.10 MB glob (4.86 s) concurrently (8.18 s serial); the whole pack fell
+10.2 -> 8.0-8.2 s on 2 cores. CI 4-core expectation: 8.58 s -> ~4.5-5.5 s.
+The drained container's packed-slab segment is byte-identical; the tail
+segments were ALREADY non-deterministic on 0.9.24 (self-comparison:
+1443173 vs 1443174 bytes) — the container-fp line (new) makes this
+visible per run instead of a false identity claim.
+
+MT write path got its first exclusive-lock census (SPEED mt-lock-census):
+append 2.5-2.8 ms, slabins 1.3, bump 1.4, lastw 0.3 — all ~1-2% of wall,
+NOT the story; idof (per-hash blobs.read() re-acquisition inside recipe
+encode) measured 10.8-12.3 ms (660 ns per contended acquisition). Fixed:
+one guard per recipe encode; supersede de-nested out of the recipe_batch
+Mutex. MT recipe stage 20-30 -> 6.8 us/chunk, but the MT wall band stayed
+148-181 MB/s — the remaining MT ceiling is split-stage cache/DRAM
+contention (222 -> 264 us/chunk cumulative), not locks. Deferred-encode
+(moving the 47% enc machinery to pack) was scoped and parked: recipes
+reference ids (mode 2/6), so an id-remap pack conversion is designable,
+but hot-tier raw storage changes dedup semantics, slab sizes and the
+shift-pass input — a multi-day project, documented for a future tick.

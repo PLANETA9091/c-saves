@@ -154,6 +154,43 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.25 — parallel pack: slab compressions across all cores
+
+The pack pass is the storage-conversion wall: zstd-19 compresses at
+2.5-4 MB/s per core and was ~98% of the corpus bench's import+pack wall
+(10.2 s pack vs 0.21 s import on 2 cores; 8.58 s on the 4-core CI runner).
+`flush_slab_cands` now runs in three phases: (A) build every group's
+variant streams serially IN GROUP ORDER — the GLOB conversion sequence is
+byte-for-byte the serial one, so registry gids and stream bytes are
+unchanged; (B) compress all variant streams through a scoped
+work-stealing pool (`available_parallelism` threads, one zstd call per
+task — deterministic per (input, level)); (C) append + blob-map updates
+in the exact serial order with the exact serial decision logic. The
+packed-slab segment (seg-00002, all container data) stays byte-identical;
+the small tail segments carry a PRE-EXISTING run-to-run nondeterminism
+(0.9.24 measured against itself: 1443173 vs 1443174 bytes) — not
+introduced here. Local 2-core: pack 10.2 -> 8.0-8.2 s (-21%); the
+per-task census (SPEED pack-census) shows real overlap (8.3 MB canon
+3.32 s + 12.1 MB glob 4.86 s concurrent — 8.2 s serial). On 4-core CI
+the same code is expected to cut the 8.58 s baseline by 40-50%. The
+12.1 MB GLOB stream is the per-wave long pole; zstd-MT inside big
+streams is the documented follow-up (output would differ from
+single-threaded pack, so it is deliberately not taken now).
+
+MT write hygiene from the first exclusive-lock census (new SPEED
+mt-lock-census line): `id_of` hoisted to ONE `blobs.read()` per recipe
+encode (was ~22 acquisitions/chunk; census: 10.8-12.3 ms of a 146 ms
+2-thread import wall, 660 ns per contended acquisition); the supersede
+block de-nested (parse_recipe_body's segment read + decompress and
+drop_recipe_refs' blobs.write used to run INSIDE the recipe_batch
+Mutex). MT recipe-stage inflation 20-30 -> 6.8 us/chunk; the MT wall
+band itself is unchanged (148-181 MB/s on 2 cores) — split-stage
+memory/cache effects dominate what locks no longer do.
+
+Gates: 56/56 tests, enc_fp 6d240d7166cdda99/12130/9971843 EXACT, jj
+verify 946/946 TOTAL x3.36, survival x4.01 ok=1280, bench_size compact
+x0.08 (gate <= 0.15), verify 728+218 bad=0.
+
 ## v0.9.24 — hot tier drops to zstd fast level -3: import +13%
 
 The hot tier is a staging area: the background pack pass decompresses hot

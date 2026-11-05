@@ -970,6 +970,31 @@ impl RecipeBatch {
 pub static ST_RECIPE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static ST_GLOB_CONV_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ST_GLOB_SLABS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// pack-phase census (diagnostic): cumulative ns in each pack sub-stage
+pub static PK_VICTIMS_NS: AtomicU64 = AtomicU64::new(0);
+pub static PK_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+pub static PK_COMP_NS: AtomicU64 = AtomicU64::new(0);
+pub static PK_APPEND_NS: AtomicU64 = AtomicU64::new(0);
+pub static PK_RECIPES_NS: AtomicU64 = AtomicU64::new(0);
+pub static PK_READBLOB_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn pack_census_json() -> String {
+    format!(
+        "{{victims:{},build:{},comp:{},append:{},recipes:{},readblob:{}}}",
+        PK_VICTIMS_NS.load(Ordering::Relaxed),
+        PK_BUILD_NS.load(Ordering::Relaxed),
+        PK_COMP_NS.load(Ordering::Relaxed),
+        PK_APPEND_NS.load(Ordering::Relaxed),
+        PK_RECIPES_NS.load(Ordering::Relaxed),
+        PK_READBLOB_NS.load(Ordering::Relaxed),
+    )
+}
+
+pub fn pack_census_reset() {
+    for st in [&PK_VICTIMS_NS, &PK_BUILD_NS, &PK_COMP_NS, &PK_APPEND_NS, &PK_RECIPES_NS, &PK_READBLOB_NS] {
+        st.store(0, Ordering::Relaxed);
+    }
+}
 /// Unchanged-chunk autosave skips (hash match against the last write).
 pub static ST_WRITE_SKIP: AtomicU64 = AtomicU64::new(0);
 pub static ST_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -988,6 +1013,40 @@ static ST_SHIFT_RES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new
 pub static WST_SPLIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static WST_ENS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static WST_RECIPE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// MT lock census: cumulative ns spent INSIDE each exclusive section across
+// ALL threads. In MT, cumulative-inside ~= serialized wall contributed by
+// that section (threads cannot overlap inside an exclusive guard).
+pub static MT_APPEND_NS: AtomicU64 = AtomicU64::new(0);
+pub static MT_SLABINS_NS: AtomicU64 = AtomicU64::new(0);
+pub static MT_BUMP_NS: AtomicU64 = AtomicU64::new(0);
+pub static MT_DROP_NS: AtomicU64 = AtomicU64::new(0);
+pub static MT_LASTW_NS: AtomicU64 = AtomicU64::new(0);
+pub static MT_BLOBSR_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn mt_lock_census_json() -> String {
+    format!(
+        "{{append:{},slabins:{},bump:{},drop:{},lastw:{},blobsr:{}}}",
+        MT_APPEND_NS.load(Ordering::Relaxed),
+        MT_SLABINS_NS.load(Ordering::Relaxed),
+        MT_BUMP_NS.load(Ordering::Relaxed),
+        MT_DROP_NS.load(Ordering::Relaxed),
+        MT_LASTW_NS.load(Ordering::Relaxed),
+        MT_BLOBSR_NS.load(Ordering::Relaxed),
+    )
+}
+
+pub fn mt_lock_census_reset() {
+    for st in [&MT_APPEND_NS, &MT_SLABINS_NS, &MT_BUMP_NS, &MT_DROP_NS, &MT_LASTW_NS, &MT_BLOBSR_NS] {
+        st.store(0, Ordering::Relaxed);
+    }
+}
+
+pub fn write_stage_reset() {
+    for st in [&WST_SPLIT, &WST_ENS, &WST_RECIPE] {
+        st.0.store(0, Ordering::Relaxed);
+        st.1.store(0, Ordering::Relaxed);
+    }
+}
 
 /// Human/CI-readable stage snapshot: ns/call per stage.
 pub fn read_stage_json() -> String {
@@ -2007,6 +2066,7 @@ impl Store {
     }
 
     fn append(&self, body: &[u8]) -> std::io::Result<(u32, u64, u32)> {
+        let _t = std::time::Instant::now();
         let mut wg = self.writer.lock();
         if wg.is_none() {
             let id = self.next_seg.fetch_add(1, Ordering::SeqCst) as u32;
@@ -2055,6 +2115,7 @@ impl Store {
             s.live.fetch_add(8 + body.len() as u64, Ordering::Relaxed);
         }
         self.disk_written.fetch_add(8 + body.len() as u64, Ordering::Relaxed);
+        MT_APPEND_NS.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok((w.seg_id, body_off, body.len() as u32))
     }
 
@@ -2267,6 +2328,7 @@ impl Store {
         let share = ((8 + blen) / n as u64).min(u32::MAX as u64) as u32;
         let last_share = (8 + blen) - share as u64 * (n as u64 - 1) as u64;
         let cnt = group.len();
+        let _ti = std::time::Instant::now();
         {
             let mut blobs = self.blobs.write();
             // one ids guard for the whole group (was acquired PER MEMBER —
@@ -2302,19 +2364,23 @@ impl Store {
                 cursor += raw.len() as u32;
             }
         }
+        MT_SLABINS_NS.fetch_add(_ti.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(())
     }
 
     fn bump_recipe_refs(&self, rec: &Recipe) {
+        let _t = std::time::Instant::now();
         let mut blobs = self.blobs.write();
         for h in rec.blob_hashes() {
             if let Some(loc) = blobs.get_mut(&h) {
                 loc.refs += 1;
             }
         }
+        MT_BUMP_NS.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn drop_recipe_refs(&self, rec: &Recipe) {
+        let _t = std::time::Instant::now();
         let mut blobs = self.blobs.write();
         for h in rec.blob_hashes() {
             let evict = {
@@ -2331,6 +2397,7 @@ impl Store {
                 }
             }
         }
+        MT_DROP_NS.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// Parse a slab record's compressed stream into (id, raw_len, hash) entries.
@@ -2556,12 +2623,14 @@ impl Store {
             // is unreadable, so a lost/evicted backing blob is repaired
             // from the payload the server just handed us. CSAVES_NO_SKIP=1
             // disables (debug/bisect).
-            if std::env::var("CSAVES_NO_SKIP").as_deref() != Ok("1")
-                && self.last_written.lock().get(&key) == Some(&hash)
-                && self.chunk_intact(key)
-            {
-                ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+            if std::env::var("CSAVES_NO_SKIP").as_deref() != Ok("1") {
+                let _t = std::time::Instant::now();
+                let hit = self.last_written.lock().get(&key) == Some(&hash);
+                MT_LASTW_NS.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if hit && self.chunk_intact(key) {
+                    ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
             }
         }
         let t0w = std::time::Instant::now();
@@ -2638,40 +2707,52 @@ impl Store {
         let t2w = std::time::Instant::now();
         WST_RECIPE.1.fetch_add(1, Ordering::Relaxed);
 
-        let id_of = |h: Hash| -> Option<u32> {
+        // one blobs.read() guard for the WHOLE recipe encode (the closure
+        // used to re-acquire per section hash — ~22 read-lock round-trips
+        // per chunk; the MT lock census measured 10.8-12.3 ms of a 146 ms
+        // 2-thread import wall on that pattern, 660 ns per contended
+        // acquisition vs ~40 ns uncontended)
+        let rec = {
             let blobs = self.blobs.read();
-            let l = blobs.get(&h)?;
-            if l.id == NO_ID { None } else { Some(l.id) }
-        };
-        let rec = if recipe.fields.is_empty() {
-            recipe.encode(id_of)
-        } else {
-            recipe
-                .encode_fields(id_of)
-                .ok_or_else(|| "field recipe too large".to_string())?
+            let id_of = |h: Hash| -> Option<u32> {
+                let l = blobs.get(&h)?;
+                if l.id == NO_ID { None } else { Some(l.id) }
+            };
+            if recipe.fields.is_empty() {
+                recipe.encode(id_of)
+            } else {
+                recipe
+                    .encode_fields(id_of)
+                    .ok_or_else(|| "field recipe too large".to_string())?
+            }
         };
         self.bump_recipe_refs(&recipe);
 
         // supersede refs: a pending batch entry first, then the chunks-map
         // entry (which is only dropped when it was not already superseded by
-        // a pending entry for the same key)
-        {
+        // a pending entry for the same key). The batch Mutex only guards the
+        // map removal — parse_recipe_body (segment read + decompress) and
+        // drop_recipe_refs (blobs.write + ids.write) run OUTSIDE it (they
+        // used to nest inside, serializing MT writers on the batch lock
+        // while holding blobs.write).
+        let pending_old = {
             let mut batch = self.recipe_batch.lock();
-            if let Some(old_body) = batch.remove(key) {
-                if let Some(old_rec) = self.parse_recipe_body(&old_body) {
-                    self.drop_recipe_refs(&old_rec);
-                }
-            } else if let Some((oseg, ooff, olen)) = self.chunks.read().get(&key).copied() {
-                if let Some(old_rec) = self.recipe_at(key, oseg, ooff, olen) {
-                    self.drop_recipe_refs(&old_rec);
-                }
-                let rl = self.batched_len(key, olen);
-                if let Some(s) = self.segs.read().get(&oseg) {
-                    s.live.fetch_sub(8 + rl as u64, Ordering::Relaxed);
-                }
-                if olen == BATCHED {
-                    self.batch_idx.lock().remove(&key);
-                }
+            batch.remove(key)
+        };
+        if let Some(old_body) = pending_old {
+            if let Some(old_rec) = self.parse_recipe_body(&old_body) {
+                self.drop_recipe_refs(&old_rec);
+            }
+        } else if let Some((oseg, ooff, olen)) = self.chunks.read().get(&key).copied() {
+            if let Some(old_rec) = self.recipe_at(key, oseg, ooff, olen) {
+                self.drop_recipe_refs(&old_rec);
+            }
+            let rl = self.batched_len(key, olen);
+            if let Some(s) = self.segs.read().get(&oseg) {
+                s.live.fetch_sub(8 + rl as u64, Ordering::Relaxed);
+            }
+            if olen == BATCHED {
+                self.batch_idx.lock().remove(&key);
             }
         }
 
@@ -2690,7 +2771,9 @@ impl Store {
             }
         }
         WST_RECIPE.0.fetch_add(t2w.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let _tl = std::time::Instant::now();
         self.last_written.lock().insert(key, hash);
+        MT_LASTW_NS.fetch_add(_tl.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -3534,138 +3617,209 @@ impl Store {
         if !cur.is_empty() {
             groups.push(cur);
         }
-        for group in groups {
-            let n = group.len();
-            // SLAB V2 (kind 8): entry table = varint zigzag(id delta) ++
-            // varint(raw len) ++ 16B hash per member, then concatenated raws.
-            // v1 spent 8 fixed bytes/member on id+len; with ids assigned in
-            // walk order the deltas are ~1 byte, lens ~1-2 bytes.
-            let mut tab = Vec::with_capacity(n * 4);
-            let mut rawcat = Vec::with_capacity(group.iter().map(|c| c.3.len()).sum::<usize>());
-            let mut prev_id: i64 = 0;
-            for (h, id, _loc, raw) in &group {
-                put_u64(&mut tab, zigzag(*id as i64 - prev_id));
-                prev_id = *id as i64;
-                put_u64(&mut tab, raw.len() as u64);
-                tab.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
-                tab.extend_from_slice(&(*h as u64).to_le_bytes());
-                rawcat.extend_from_slice(raw);
-            }
-            let build = |lens: &[usize], raws: &[&[u8]]| -> (Vec<u8>, usize) {
-                let mut tab = Vec::with_capacity(n * 4);
-                let mut prev_id: i64 = 0;
-                for (i, (h, id, _loc, _raw)) in group.iter().enumerate() {
-                    let _ = _loc;
-                    let _ = _raw;
-                    put_u64(&mut tab, zigzag(*id as i64 - prev_id));
-                    prev_id = *id as i64;
-                    put_u64(&mut tab, lens[i] as u64);
-                    tab.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
-                    tab.extend_from_slice(&(*h as u64).to_le_bytes());
-                }
-                let tl = tab.len();
-                let mut st = tab;
-                for r in raws {
-                    st.extend_from_slice(r);
-                }
-                (st, tl)
-            };
-            let canon_lens: Vec<usize> = group.iter().map(|c| c.3.len()).collect();
-            let canon_raws: Vec<&[u8]> = group.iter().map(|c| c.3.as_slice()).collect();
-            let (canon_stream, canon_tab_len) = build(&canon_lens, &canon_raws);
-            // GLOB variant (jj_exp5: x2.16 on vanilla-terrain dense content):
-            // the same members with dense CSEC sections converted to the 0xCB
-            // global-id form. The slab stores whichever variant compresses
-            // smaller at the cold tier — the window-level comparison is the
-            // honest gate (raw sizes mislead: the gid stream is wider but
-            // matches cross-section). Non-converting members keep their
-            // canonical bytes; every member is self-describing by magic.
-            let mut glob: Option<(Vec<usize>, Vec<Vec<u8>>)> = None;
-            if self.glob_enabled() && self.glob_reg.lock().len() <= 65536 {
-                let mut reg = self.glob_reg.lock();
-                let before = reg.len();
-                let mut glens = Vec::with_capacity(n);
-                let mut graws: Vec<Vec<u8>> = Vec::with_capacity(n);
-                let mut any = false;
-                for (_h, _id, _loc, raw) in &group {
-                    match chunknbt::section_to_glob(raw, &mut reg) {
-                        Some(g) => {
-                            any = true;
-                            glens.push(g.len());
-                            graws.push(g);
-                        }
-                        None => {
-                            glens.push(raw.len());
-                            graws.push(raw.clone());
+        // ---- Phase A (serial, group order): build BOTH variant streams per
+        // group. The GLOB conversion order is IDENTICAL to the serial flow
+        // (groups in order, members in order, same `len() <= 65536` gate per
+        // group), so registry gids and every stream byte match the old
+        // single-threaded pack — drained containers stay byte-identical.
+        struct GVar {
+            stream: Vec<u8>,
+            tab_len: usize,
+            lens: Vec<usize>,
+        }
+        struct GBuild {
+            group: Vec<(Hash, u32, BlobLoc, Vec<u8>)>,
+            canon: GVar,
+            /// (variant stream, reg_w: 1 = all-u8 gids, 2 = u16 present)
+            glob: Option<(GVar, u8)>,
+        }
+        let _tb = std::time::Instant::now();
+        let builds: Vec<GBuild> = groups
+            .into_iter()
+            .map(|group| {
+                let n = group.len();
+                // SLAB V2 (kind 8): entry table = varint zigzag(id delta) ++
+                // varint(raw len) ++ 16B hash per member, then concatenated
+                // raws. v1 spent 8 fixed bytes/member on id+len; with ids
+                // assigned in walk order the deltas are ~1 byte, lens ~1-2
+                // bytes.
+                let build = |lens: &[usize], raws: &[&[u8]]| -> (Vec<u8>, usize) {
+                    let mut tab = Vec::with_capacity(n * 4);
+                    let mut prev_id: i64 = 0;
+                    for (i, (h, id, _loc, _raw)) in group.iter().enumerate() {
+                        put_u64(&mut tab, zigzag(*id as i64 - prev_id));
+                        prev_id = *id as i64;
+                        put_u64(&mut tab, lens[i] as u64);
+                        tab.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
+                        tab.extend_from_slice(&(*h as u64).to_le_bytes());
+                    }
+                    let tl = tab.len();
+                    let mut st = tab;
+                    for r in raws {
+                        st.extend_from_slice(r);
+                    }
+                    (st, tl)
+                };
+                let canon_lens: Vec<usize> = group.iter().map(|c| c.3.len()).collect();
+                let canon_raws: Vec<&[u8]> = group.iter().map(|c| c.3.as_slice()).collect();
+                let (canon_stream, canon_tab_len) = build(&canon_lens, &canon_raws);
+                // GLOB variant (jj_exp5: x2.16 on vanilla-terrain dense
+                // content): the same members with dense CSEC sections
+                // converted to the 0xCB global-id form. The slab stores
+                // whichever variant compresses smaller at the cold tier —
+                // the window-level comparison is the honest gate (raw sizes
+                // mislead: the gid stream is wider but matches
+                // cross-section). Non-converting members keep their
+                // canonical bytes; every member is self-describing by magic.
+                let mut glob: Option<(GVar, u8)> = None;
+                if self.glob_enabled() && self.glob_reg.lock().len() <= 65536 {
+                    let mut reg = self.glob_reg.lock();
+                    let before = reg.len();
+                    let mut glens = Vec::with_capacity(n);
+                    let mut graws: Vec<Vec<u8>> = Vec::with_capacity(n);
+                    let mut any = false;
+                    for (_h, _id, _loc, raw) in &group {
+                        match chunknbt::section_to_glob(raw, &mut reg) {
+                            Some(g) => {
+                                any = true;
+                                glens.push(g.len());
+                                graws.push(g);
+                            }
+                            None => {
+                                glens.push(raw.len());
+                                graws.push(raw.clone());
+                            }
                         }
                     }
+                    if reg.len() != before {
+                        self.reg_dirty.store(true, Ordering::Relaxed);
+                    }
+                    if any {
+                        let graws_ref: Vec<&[u8]> = graws.iter().map(|v| v.as_slice()).collect();
+                        let (gs, gtab_len) = build(&glens, &graws_ref);
+                        let reg_w = if graws.iter().any(|g| chunknbt::glob_member_wide(g)) {
+                            2u8
+                        } else {
+                            1u8
+                        };
+                        glob = Some((GVar { stream: gs, tab_len: gtab_len, lens: glens }, reg_w));
+                    }
                 }
-                if reg.len() != before {
-                    self.reg_dirty.store(true, Ordering::Relaxed);
+                GBuild {
+                    group,
+                    canon: GVar { stream: canon_stream, tab_len: canon_tab_len, lens: canon_lens },
+                    glob,
                 }
-                if any {
-                    glob = Some((glens, graws));
+            })
+            .collect();
+        PK_BUILD_NS.fetch_add(_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // ---- Phase B (parallel): one zstd cold-tier compression per variant
+        // stream, work-stealing across all cores. Slab windows are
+        // independent and zstd is deterministic per (input, level), so the
+        // outputs are byte-identical to the serial pack. The pack pass is
+        // the storage-conversion wall (zstd-19 ~6-8 MB/s per core; the JJ
+        // corpus bench spent ~98% of its wall here) — this is where the
+        // cores go to work.
+        let flat: Vec<&[u8]> = builds
+            .iter()
+            .flat_map(|b| {
+                let mut v = vec![b.canon.stream.as_slice()];
+                if let Some((g, _)) = &b.glob {
+                    v.push(g.stream.as_slice());
                 }
+                v
+            })
+            .collect();
+        let outs: std::sync::Mutex<Vec<Option<Vec<u8>>>> =
+            std::sync::Mutex::new((0..flat.len()).map(|_| None).collect());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let level = self.cfg.cold_level;
+        let _tc = std::time::Instant::now();
+        if flat.len() > 1 {
+            std::thread::scope(|sc| {
+                let par = std::thread::available_parallelism()
+                    .map(|x| x.get())
+                    .unwrap_or(1)
+                    .min(flat.len());
+                for _ in 0..par {
+                    sc.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= flat.len() {
+                            break;
+                        }
+                        let stream = flat[i];
+                        let (_d, comp) = bulk_compress(stream, level);
+                        outs.lock().unwrap()[i] = Some(comp);
+                    });
+                }
+            });
+        } else {
+            for (i, stream) in flat.iter().enumerate() {
+                let (_d, comp) = bulk_compress(stream, level);
+                outs.lock().unwrap()[i] = Some(comp);
             }
-            let (dict_id, comp, kind_byte, stream, tab_len, lens): (
+        }
+        PK_COMP_NS.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let mut outs = outs.into_inner().unwrap();
+        // ---- Phase C (serial, group order): variant pick + append + blob
+        // map updates, exactly the serial flow's decisions and byte layout.
+        let mut task_at = 0usize;
+        for GBuild { group, canon, glob } in builds {
+            let cc = outs[task_at].take().expect("canon comp missing");
+            task_at += 1;
+            let cg = glob.as_ref().map(|_| {
+                let c = outs[task_at].take().expect("glob comp missing");
+                task_at += 1;
+                c
+            });
+            let n = group.len();
+            let (dict_id, comp, kind_byte, stream, tab_len, lens, gwide): (
                 u8,
                 Vec<u8>,
                 u8,
                 Vec<u8>,
                 usize,
                 Vec<usize>,
-            ) = match &glob {
-                Some((glens, graws)) => {
-                    let graws_ref: Vec<&[u8]> = graws.iter().map(|v| v.as_slice()).collect();
-                    let (gs, gtab_len) = build(glens, &graws_ref);
-                    let (dg, cg) = self.compress_tier_plain(&gs, true);
-                    let (dc, cc) = self.compress_tier_plain(&canon_stream, true);
-                    // CSAVES_FORCE_GLOB=1: debug knob — take the glob variant
-                    // unconditionally so the read/scan paths are testable
-                    // regardless of the size heuristic
-                    let force = std::env::var("CSAVES_FORCE_GLOB").as_deref() == Ok("1");
-                    if force || cg.len() < cc.len() {
-                        // the registry MUST be on disk before the slab that
-                        // references its gids (crash = silent misresolution)
-                        if self.reg_dirty.swap(false, Ordering::Relaxed) {
-                            match self.persist_glob_reg() {
-                                Ok(()) => {
-                                    ST_GLOB_SLABS.fetch_add(1, Ordering::Relaxed);
-                                    (dg, cg, 8u8 | 0x80, gs, gtab_len, glens.clone())
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "[c-saves] states persist failed ({e}) — keeping the canonical slab"
-                                    );
-                                    (dc, cc, 8u8, canon_stream, canon_tab_len, canon_lens)
-                                }
+                u8,
+            ) = if let Some((gv, gwid)) = glob {
+                let cg = cg.expect("glob comp present");
+                // CSAVES_FORCE_GLOB=1: debug knob — take the glob variant
+                // unconditionally so the read/scan paths are testable
+                // regardless of the size heuristic
+                let force = std::env::var("CSAVES_FORCE_GLOB").as_deref() == Ok("1");
+                if force || cg.len() < cc.len() {
+                    // the registry MUST be on disk before the slab that
+                    // references its gids (crash = silent misresolution)
+                    if self.reg_dirty.swap(false, Ordering::Relaxed) {
+                        match self.persist_glob_reg() {
+                            Ok(()) => {
+                                ST_GLOB_SLABS.fetch_add(1, Ordering::Relaxed);
+                                (0u8, cg, 8u8 | 0x80, gv.stream, gv.tab_len, gv.lens, gwid)
                             }
-                        } else {
-                            ST_GLOB_SLABS.fetch_add(1, Ordering::Relaxed);
-                            (dg, cg, 8u8 | 0x80, gs, gtab_len, glens.clone())
+                            Err(e) => {
+                                eprintln!(
+                                    "[c-saves] states persist failed ({e}) — keeping the canonical slab"
+                                );
+                                (0u8, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
+                            }
                         }
                     } else {
-                        (dc, cc, 8u8, canon_stream, canon_tab_len, canon_lens.clone())
+                        ST_GLOB_SLABS.fetch_add(1, Ordering::Relaxed);
+                        (0u8, cg, 8u8 | 0x80, gv.stream, gv.tab_len, gv.lens, gwid)
                     }
+                } else {
+                    (0u8, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
                 }
-                None => {
-                    let (dc, cc) = self.compress_tier_plain(&canon_stream, true);
-                    (dc, cc, 8u8, canon_stream, canon_tab_len, canon_lens)
-                }
+            } else {
+                (0u8, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
             };
             let raw_total = stream.len() as u32;
             // reg_w: the widest gid stream among this slab's GLOB members
-            // (informational on read — members are self-describing by magic)
-            let reg_w = match &glob {
-                Some((_, graws)) => {
-                    if graws.iter().any(|g| chunknbt::glob_member_wide(g)) {
-                        2u8
-                    } else {
-                        1u8
-                    }
-                }
-                None => 1u8,
-            };
+            // (informational on read — members are self-describing by magic);
+            // computed at conversion time in Phase A, stamped only when the
+            // GLOB variant wins.
+            let reg_w = gwide;
+            let _ta = std::time::Instant::now();
             let mut body = Vec::with_capacity(13 + comp.len());
             body.push(kind_byte);
             body.push(dict_id);
@@ -3715,6 +3869,7 @@ impl Store {
                 cursor += lens[i] as u32;
             }
             drop(blobs);
+            PK_APPEND_NS.fetch_add(_ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
 
@@ -4058,10 +4213,12 @@ impl Store {
         let mut cands: Vec<(Hash, u32, BlobLoc, Vec<u8>)> = Vec::new();
         let mut cand_bytes = 0usize;
         let mut did = false;
+        let _tv = std::time::Instant::now();
         for (h, loc) in victims {
             if !drop_seg && loc.cold {
                 continue; // cold-tier material: leave in place
             }
+            let _rb = std::time::Instant::now();
             let Some(data) = self.read_blob(loc, Some(worst_id)) else {
                 eprintln!(
                     "[c-saves] PACK LOSS RISK: blob {h:016x} unreadable in seg-{worst_id:05} — segment will be KEPT"
@@ -4069,6 +4226,7 @@ impl Store {
                 mark_broken();
                 continue;
             };
+            PK_READBLOB_NS.fetch_add(_rb.elapsed().as_nanos() as u64, Ordering::Relaxed);
             did = true;
             let member_cap = if self.whole_mode.load(Ordering::Relaxed) {
                 self.cfg.slab_max_member_whole
@@ -4127,6 +4285,7 @@ impl Store {
                 }
             }
         }
+        PK_VICTIMS_NS.fetch_add(_tv.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.flush_slab_cands(&mut cands, worst_id);
         if !drop_seg {
             // the segment may have emptied out entirely
@@ -4145,6 +4304,7 @@ impl Store {
             return did;
         }
         // move live recipes byte-exact
+        let _tr = std::time::Instant::now();
         let recs: Vec<(u64, u32, u64, u32)> = {
             let chunks = self.chunks.read();
             chunks
@@ -4284,6 +4444,7 @@ impl Store {
         let _ = fs::remove_file(self.seg_path(worst_id));
         self.gc_dicts();
         eprintln!("[c-saves] packed seg-{worst_id:05} (full rewrite, cold-tier recompressed)");
+        PK_RECIPES_NS.fetch_add(_tr.elapsed().as_nanos() as u64, Ordering::Relaxed);
         true
     }
 }
