@@ -1220,6 +1220,9 @@ pub struct Store {
     pub writes: AtomicU64,
     pub reads: AtomicU64,
     pub dedup_hits: AtomicU64,
+    /// per-store write-skip count: the global ST_WRITE_SKIP is shared by
+    /// every Store in the process, so parallel tests cannot assert on it
+    pub write_skips: AtomicU64,
     pub disk_written: AtomicU64,
     pub logical_bytes: AtomicU64,
     /// Whole-mode stores (entities/POI) hold raw NBT payloads whose repeated
@@ -1290,6 +1293,7 @@ impl Store {
             writes: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             dedup_hits: AtomicU64::new(0),
+            write_skips: AtomicU64::new(0),
             disk_written: AtomicU64::new(0),
             logical_bytes: AtomicU64::new(0),
             whole_mode: AtomicBool::new(false),
@@ -2809,6 +2813,7 @@ impl Store {
                 MT_LASTW_NS.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if hit && self.chunk_intact(key) {
                     ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
+                    self.write_skips.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
             }
@@ -4561,7 +4566,20 @@ impl Store {
             return did;
         }
         // move live recipes byte-exact
+        //
+        // v0.9.31 LOSS FIX (CI, concurrent_supersede): the writer thread's
+        // own 192 KiB auto-flush can land a NEW batch recipe INTO the dying
+        // segment AFTER this rewrite's snapshot was taken. The loop below
+        // only iterated the snapshot, so the late-arriving recipe was never
+        // moved and the segment drop deleted its bytes — read_chunk() later
+        // returned None ("chunk 19 lost"). The per-key pointer re-check
+        // cannot see this: the recipe is genuinely NEW, not stale. Fix:
+        // fixpoint — re-snapshot the chunks map until a full pass finds no
+        // recipe still pointing at worst_id. Terminates: after seal() no NEW
+        // appends target this segment, so only the one in-flight flush can
+        // add pointers; each pass moves at least what it sees.
         let _tr = std::time::Instant::now();
+        loop {
         let recs: Vec<(u64, u32, u64, u32)> = {
             let chunks = self.chunks.read();
             chunks
@@ -4570,6 +4588,9 @@ impl Store {
                 .map(|(k, (s, o, l))| (*k, *s, *o, *l))
                 .collect()
         };
+        if recs.is_empty() {
+            break;
+        }
         for (key, _s, off, len) in recs {
             // Re-check the CURRENT chunks-map pointer: a supersede after the
             // snapshot moved this key (pending batch entry or a newer batch)
@@ -4676,6 +4697,19 @@ impl Store {
             }
         }
         self.flush_recipe_batch();
+        // poison escape: a pass that hit mark_broken() leaves its key
+        // pointing at worst_id (the snapshot would never drain) — the
+        // segment is kept below; do not spin
+        if self
+            .segs
+            .read()
+            .get(&worst_id)
+            .map(|s| s.pack_broken.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        }
         // preserve interned keys recorded in this segment (kind-6 records
         // are not referenced by recipes but the key table must survive)
         self.preserve_keys(worst_id);
@@ -5051,11 +5085,15 @@ pub mod tests {
         let s = Store::open_cfg(&dir, false, Cfg::default()).unwrap();
         let p = chunk_payload(7, 42, 1);
         s.write_chunk(1, &p, false).unwrap();
-        let before = ST_WRITE_SKIP.load(Ordering::Relaxed);
+        // v0.9.31: assert on the PER-STORE counter — the global
+        // ST_WRITE_SKIP is shared by every Store in the process, and
+        // cargo runs tests in parallel threads, so other tests' identical
+        // re-saves bumped it mid-window on CI (left: 81, right: 1).
+        let before = s.write_skips.load(Ordering::Relaxed);
         // identical re-save (autosave of an unchanged chunk): skipped
         s.write_chunk(1, &p, false).unwrap();
         assert_eq!(
-            ST_WRITE_SKIP.load(Ordering::Relaxed),
+            s.write_skips.load(Ordering::Relaxed),
             before + 1,
             "identical re-write must hit the skip path"
         );
@@ -5063,13 +5101,13 @@ pub mod tests {
         // changed content: full path again
         let p2 = chunk_payload(7, 43, 2);
         s.write_chunk(1, &p2, false).unwrap();
-        assert_eq!(ST_WRITE_SKIP.load(Ordering::Relaxed), before + 1);
+        assert_eq!(s.write_skips.load(Ordering::Relaxed), before + 1);
         assert!(semantic(&s.read_chunk(1).unwrap(), &p2));
         // delete invalidates the cache: same content re-writes fully
         s.delete_chunk(1).unwrap();
         assert!(s.read_chunk(1).is_none());
         s.write_chunk(1, &p, false).unwrap();
-        assert_eq!(ST_WRITE_SKIP.load(Ordering::Relaxed), before + 1);
+        assert_eq!(s.write_skips.load(Ordering::Relaxed), before + 1);
         assert!(semantic(&s.read_chunk(1).unwrap(), &p));
     }
 

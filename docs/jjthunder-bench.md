@@ -1077,3 +1077,32 @@ drift, NOT dict effects (git-stash A/B today). CI's stable runner remains
 the size judge. Parked follow-up (the real size lever): dictionary into
 pack Phase-B variant streams — wire change, dict_id per stream, decode
 paths; multi-hour project.
+
+## 0.9.31 — CI-caught chunk loss under concurrent supersede+pack (z6 timings)
+
+CI on 0.9.29 (d4a6299) failed `concurrent_supersede_during_pack_keeps_
+newest_state` with "chunk 19 lost" — the FIRST failure of this test ever,
+and only at z6 pack speed on the 2-core runner (locally 30/30 green).
+Log forensics: `LEAK: batch_idx miss` on seg-6 correctly poisoned that
+segment, then seg-1/seg-7 FULL rewrites ran — one of them dropped a
+segment holding a recipe that arrived AFTER the rewrite's snapshot.
+
+Mechanism: the writer thread's 192 KiB recipe-batch auto-flush lands new
+batch recipes into the CURRENT writer segment; when that segment is the
+one being compacted, a flush between the packer's snapshot and the segment
+drop adds pointers the snapshot never saw. The per-key pointer re-check
+only catches STALE pointers, not new ones. The drop then deleted another
+thread's live bytes.
+
+Fix: fixpoint re-snapshot — the move loop repeats until a full pass finds
+no recipe pointing at worst_id (after seal() no new appends target the
+segment, so only the one in-flight flush can add; each pass is bounded
+work). Poison escape: a pass that hits mark_broken() leaves its key
+pointing at worst_id forever — break out and let the PARTIAL/KEPT guard
+handle it (also prevents a spin the old code never had). Second CI failure
+(unchanged_write_skip left:81 right:1) was the process-global
+ST_WRITE_SKIP counter bumped by parallel tests mid-assert — assertions now
+use the new per-store write_skips counter.
+
+Gates: 58/58 x3 suite runs, race test 30/30, jj verify 946/946, survival
+ok=1280, enc_fp EXACT, pack 0.47 s (parity), container x6.42.
