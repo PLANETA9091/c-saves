@@ -255,12 +255,20 @@ impl Default for Cfg {
             // 0.52 s 1.88 MiB (x6.62). z12 = 6.8x pack at +13% container on
             // the noisiest corpus; the size gates did not move (survival
             // x4.01 identical, bench_size compact x0.08 identical, jj
-            // x3.36 at +0.6%), and below 12 the pack wall is the BUILD
-            // phase (variant streams + GLOB conversion), not compression.
-            // Pack is the background drain rate competing with tick
-            // threads for cores — 6.8x less maintenance CPU is the point.
-            // CSAVES_COLD_LEVEL=19 for the size-obsessed.
-            cold_level: 12,
+            // x3.36 at +0.6%). Pack is the background drain rate competing
+            // with tick threads for cores — 6.8x less maintenance CPU is
+            // the point. CSAVES_COLD_LEVEL=19 for the size-obsessed.
+            // v0.9.29 re-sweep AFTER the palette memo cut the build phase
+            // 4x (build no longer hides comp): cold 12 pack 0.79 s comp
+            // 538 ms container 1.88 MiB (x6.61) / cold 8 0.56 s comp
+            // 297 ms 1.89 MiB (x6.59) / cold 6 0.45 s comp 213 ms 1.94 MiB
+            // (x6.42) / cold 4 0.29 s comp 60 ms 2.15 MiB (x5.81). z6 =
+            // -43% pack for +3% container with every size gate byte-flat
+            // (bench_size compact x0.10 unchanged, jj TOTAL unchanged,
+            // verify 946/946); below z6 the wall is the BUILD phase again
+            // (z4: comp 60 ms vs build 158 ms), so the extra -16% pack at
+            // z4 buys +11% storage — wrong trade for a storage engine.
+            cold_level: 6,
             recipe_level: 6,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
@@ -337,7 +345,7 @@ impl Cfg {
     pub fn from_env() -> Cfg {
         Cfg {
             hot_level: env_parse("CSAVES_HOT_LEVEL", -3),
-            cold_level: env_parse("CSAVES_COLD_LEVEL", 12),
+            cold_level: env_parse("CSAVES_COLD_LEVEL", 6),
             recipe_level: env_parse("CSAVES_RECIPE_LEVEL", 6),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 64 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),

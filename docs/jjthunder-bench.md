@@ -1015,3 +1015,37 @@ a degenerate 2239 B trained dict (was ~100 KB) — present with AND without
 the memo (old code measures 1.83 too), so it is an environment-level
 dict-training anomaly to chase separately, not a memo regression. CI
 remains the honest size judge (stable runner image).
+
+## 0.9.29 — cold tier z12 -> z6: the memo moved the knee
+
+With the build phase 4x cheaper (0.9.28 memo), compression is no longer
+hidden behind variant assembly, so the cold-level sweep was RE-RUN
+(JJ corpus, local 2-core, warmup-first `3 2` -> `1 2`, MT off):
+
+| cold | pack | comp | build | container |
+| ---- | ---- | ---- | ----- | --------- |
+| 12   | 0.79 s | 538 ms | 157 ms | 1.88 MiB (x6.61) |
+| 8    | 0.56 s | 297 ms | 185 ms | 1.89 MiB (x6.59) |
+| 6    | 0.45 s | 213 ms | 156 ms | 1.94 MiB (x6.42) |
+| 4    | 0.29 s |  60 ms | 158 ms | 2.15 MiB (x5.81) |
+
+Default 12 -> 6: -43% pack for +3% container. Size gates byte-flat at
+z6: bench_size compact x0.10 (3.58 vs 3.57 MiB, gate 0.15), jj TOTAL
+unchanged (1.83 MiB x2.95 on this env), survival TOTAL x3.12 vs x3.13
+at z12 — level-flat on THIS env; the historical x4.01 vs today's x3.13
+survival spread across sandboxes is the same env-level dict-training
+anomaly documented above (z12 itself no longer reproduces x4.01 here),
+not a level cost. verify 946/946 + survival ok=1280 bad=0; enc_fp
+6d240d7166cdda99/12130/9971843 EXACT.
+
+Below z6 the wall is the BUILD phase again (z4: comp 60 ms vs build
+158 ms), so z4's extra -16% pack buys +11% storage — wrong trade for a
+storage engine. z6 = the knee. CSAVES_COLD_LEVEL=19 opt-out unchanged.
+Auto-MT note: local 2-core default run shows mtjobs:0 (the cores>=4
+gate from 0.9.27 working as designed).
+
+CI verdict v0.9.28 (a9467f5, 2-core runner) received before this push:
+pack 1.43 -> 0.53 s (-63%), pack-census build 803 -> 97.6 ms (8.2x),
+import 174.7 MB/s ST / 335.9 MT (CI best), warm read 1983.9 MB/s,
+cold read 794.9 MB/s, container x6.61 flat, compact x0.10 — the memo
+delivered on CI with zero size movement.

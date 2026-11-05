@@ -154,6 +154,29 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.29 — cold tier z12 → z6: the memo moved the knee
+
+The palette memo (v0.9.28) cut the pack BUILD phase 4x, so compression is
+no longer hidden behind variant assembly — the cold-level sweep had to be
+re-run. Pack wall on the JJ corpus (2-core, warmup-first, MT off): z12
+0.79 s (comp 538 ms, container 1.88 MiB x6.61) / z8 0.56 s (297 ms, 1.89
+x6.59) / **z6 0.45 s (213 ms, 1.94 MiB x6.42)** / z4 0.29 s (60 ms, 2.15
+x5.81). Default moves to z6: **-43% pack for +3% container**, and below
+z6 the wall is the BUILD phase again (z4: comp 60 ms vs build 158 ms), so
+z4's extra -16% pack buys +11% storage — wrong trade for a storage
+engine. Every size gate byte-flat at z6: bench_size compact x0.10 (gate
+0.15), jj TOTAL unchanged, survival x3.12 vs x3.13 at z12 (level-flat on
+this env; the historical x4.01 spread across sandboxes is the documented
+dict-training env anomaly, not a level cost), verify 946/946 + 1280
+ok=0 bad, enc_fp EXACT, 57/57 tests. CSAVES_COLD_LEVEL=19 opt-out
+unchanged.
+
+CI verdict for v0.9.28 (a9467f5) received before this push — the memo
+delivered on the 2-core runner: pack 1.43 → 0.53 s (-63%), build phase
+803 → 97.6 ms (8.2x), import 174.7 MB/s ST / 335.9 MB/s MT (CI best),
+warm read 1983.9 MB/s (+56%), cold read 794.9 MB/s, container x6.61
+flat, compact x0.10.
+
 ## v0.9.27 — cold tier z19 → z12: pack 6.8x; auto-MT gated to 4+ cores
 
 Two verdicts from the same CI run (0.9.26, 42022752248, green 7/7):
