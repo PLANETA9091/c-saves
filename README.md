@@ -154,6 +154,43 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.27 — cold tier z19 → z12: pack 6.8x; auto-MT gated to 4+ cores
+
+Two verdicts from the same CI run (0.9.26, 42022752248, green 7/7):
+
+**Pack verdict NEGATIVE for intra-frame MT on 2-core hosts**: pack 7.45 →
+7.87 s (+5.6%). The private-repo CI runner is 2-core, and there the pack
+is WORK-BOUND (wall ≈ work/cores: comp 6.63 s ≈ 13 core-s of z19 over
+2 cores) — no parallelism can shorten it, intra-frame MT only added job
+overhead + scheduling contention. Fix: the auto-MT budget engages only at
+cores ≥ 4 (where work/4 ≈ 3.3-3.7 s < the 4.86 s pole → pole-bound → MT
+is the right division); 2-core hosts run the pure ST pool (0.9.25
+behavior); explicit CSAVES_PACK_MT_WORKERS overrides on any host.
+
+**The real big pack lever is less WORK, not more cores** — cold-level
+sweep on the JJ corpus (MT off, warmup-first, same machine):
+
+| cold | pack | comp | container | vs anvil |
+|------|------|------|-----------|----------|
+| 19   | 8.39 s | 7.62 s | 1.66 MiB | x7.51 |
+| 15   | 2.53 s | 1.77 s | 1.86 MiB | x6.70 |
+| 12   | **1.23 s** | 0.52 s | 1.88 MiB | x6.62 |
+
+Default cold_level 19 → **12**: pack wall **6.8x smaller** (8.39 →
+1.23 s local 2-core; comp phase 7.62 → 0.52 s — below 12 the wall is the
+BUILD phase: variant streams + GLOB conversion, not compression). The
+container pays +13% on the noisiest corpus only; the size gates did not
+move: survival x4.01 identical, bench_size compact x0.08 identical (gate
+0.15), jj x3.36 at +0.6% (1.60 → 1.61 MiB). Pack is the background drain
+rate competing with tick threads for cores — 6.8x less maintenance CPU
+is the point (the 2 GB hot-tier incident class). CSAVES_COLD_LEVEL=19
+stays for the size-obsessed.
+
+Gates: 57/57 tests, enc_fp 6d240d7166cdda99/12130/9971843 EXACT, jj
+verify 946/946 TOTAL x3.36, survival x4.01 ok=1280, bench_size compact
+x0.08, verify 728+218 bad=0, import 113.7 MB/s / warm read 1577.9 MB/s
+(local, unchanged), container x6.62.
+
 ## v0.9.26 — zstd-MT inside the big pack streams: the pole divides
 
 v0.9.25 parallelized pack ACROSS streams but left the wall = the longest

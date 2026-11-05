@@ -956,3 +956,35 @@ x3.36, survival x4.01 ok=1280, bench_size x0.08, verify 728+218 bad=0.
 Census fields mtjobs/mtns/mtbytes report the intra-frame share; knobs
 CSAVES_PACK_MT_MIN (1 MiB default, 0 = off) and CSAVES_PACK_MT_WORKERS
 (explicit, all bigs — may oversubscribe).
+
+## 0.9.27 — cold tier 19 -> 12: pack 6.8x; auto-MT gated to 4+ cores
+
+The 0.9.26 CI run (42022752248, green 7/7) returned a NEGATIVE pack
+verdict: 7.45 -> 7.87 s (+5.6%). Root truth: the private-repo CI runner
+is 2-core, and a 2-core pack is WORK-BOUND (wall ~= work/cores; comp
+6.63 s ~= 13 core-s of z19 over 2 cores). No parallelism shortens a
+work-bound wall; intra-frame MT only added job overhead + scheduling
+contention. The auto-MT budget now engages only at cores >= 4 (where
+work/4 ~ 3.3-3.7 s < the 4.86 s pole -> pole-bound, MT is the right
+division); 2-core hosts run the pure ST pool (0.9.25 behavior); explicit
+CSAVES_PACK_MT_WORKERS still overrides anywhere.
+
+The big pack lever turned out to be LESS WORK, not more cores. Cold-level
+sweep (JJ corpus, MT off, warmup-first, same machine):
+
+  cold 19: pack 8.39 s (comp 7.62 s), container 1.66 MiB (x7.51)
+  cold 15: pack 2.53 s (comp 1.77 s), container 1.86 MiB (x6.70)
+  cold 12: pack 1.23 s (comp 0.52 s), container 1.88 MiB (x6.62)
+
+Default cold_level 19 -> 12. Pack wall 6.8x smaller; comp phase 7.62 ->
+0.52 s (below 12 the wall is the BUILD phase — variant stream assembly +
+GLOB conversion — so lower levels stop mattering). Size cost +13% on the
+noisiest corpus only; the size gates did not move: survival x4.01
+identical, bench_size compact x0.08 identical (gate 0.15), jj x3.36 at
++0.6% (1.60 -> 1.61 MiB, 946/946 verify). Production frame: pack = the
+background drain rate competing with tick threads for cores; 6.8x less
+maintenance CPU shrinks the 2 GB hot-tier incident class by the same
+factor. CSAVES_COLD_LEVEL=19 remains the size-obsessed opt-out. Gates:
+57/57 tests, enc_fp 6d240d7166cdda99/12130/9971843 EXACT, survival
+x4.01 ok=1280, bench_size x0.08, verify 728+218 bad=0, import 113.7 MB/s
+(warm read 1577.9) — import/read untouched, container x6.62.

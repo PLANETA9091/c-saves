@@ -249,7 +249,18 @@ impl Default for Cfg {
             // longer the term) without further import gains, so -3 keeps the
             // best speed at the smallest transient size of the winners.
             hot_level: -3,
-            cold_level: 19,
+            // v0.9.27 sweep on the JJ corpus (MT off, warmup-first): cold 19
+            // pack 8.39 s comp 7.62 s container 1.66 MiB (x7.51) / cold 15
+            // 2.53 s comp 1.77 s 1.86 MiB (x6.70) / cold 12 1.23 s comp
+            // 0.52 s 1.88 MiB (x6.62). z12 = 6.8x pack at +13% container on
+            // the noisiest corpus; the size gates did not move (survival
+            // x4.01 identical, bench_size compact x0.08 identical, jj
+            // x3.36 at +0.6%), and below 12 the pack wall is the BUILD
+            // phase (variant streams + GLOB conversion), not compression.
+            // Pack is the background drain rate competing with tick
+            // threads for cores — 6.8x less maintenance CPU is the point.
+            // CSAVES_COLD_LEVEL=19 for the size-obsessed.
+            cold_level: 12,
             recipe_level: 6,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
@@ -326,7 +337,7 @@ impl Cfg {
     pub fn from_env() -> Cfg {
         Cfg {
             hot_level: env_parse("CSAVES_HOT_LEVEL", -3),
-            cold_level: env_parse("CSAVES_COLD_LEVEL", 19),
+            cold_level: env_parse("CSAVES_COLD_LEVEL", 12),
             recipe_level: env_parse("CSAVES_RECIPE_LEVEL", 6),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 64 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),
@@ -3802,21 +3813,29 @@ impl Store {
         };
         let mut order: Vec<usize> = (0..flat.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(flat[i].len()));
-        // AUTO policy: concentrate the cores on the poles. Splitting evenly
-        // across every big stream (cores/big) under-workers each pole and
-        // dies when big_cnt > cores; instead the k = cores/2 LONGEST
-        // streams go intra-frame MT with cores/k workers each and the rest
-        // of the bigs stay ST in the pool — the total worker budget stays
-        // == cores. On a work-saturated 2-core box this halves the single
-        // longest stream; on 4+ cores the top poles are exactly what binds
-        // the makespan. Explicit pack_mt_workers overrides the budget (all
-        // bigs get that worker count — an ops lever, may oversubscribe).
+        // AUTO policy: concentrate the cores on the poles — but ONLY on
+        // 4+ core hosts. CI verdict (0.9.26): the 2-core runner is
+        // WORK-BOUND (wall ≈ work/cores; comp 6.63 s = 13 core-s of z19
+        // over 2 cores), so intra-frame MT cannot shorten the makespan —
+        // it only adds job overhead + scheduling contention (7.45 ->
+        // 7.87 s, mtjobs:6 crammed into one wall). On 4+ cores the wall
+        // math flips: work/4 ≈ 3.3-3.7 s < the 4.86 s single-stream pole
+        // → the pole binds and intra-frame MT is exactly the right
+        // division. Splitting evenly across every big stream (cores/big)
+        // under-workers each pole and dies when big_cnt > cores; instead
+        // the k = cores/2 LONGEST streams go intra-frame MT with cores/k
+        // workers each and the rest of the bigs stay ST in the pool — the
+        // total worker budget stays == cores. Explicit pack_mt_workers
+        // overrides everything (all bigs get that worker count — an ops
+        // lever, may oversubscribe on any host).
         let k = if self.cfg.pack_mt_workers > 0 {
             big_cnt
-        } else {
+        } else if cores >= 4 {
             (big_cnt.min(cores / 2)).max(1)
+        } else {
+            0
         };
-        let per_big: u32 = if mt_min > 0 && big_cnt > 0 {
+        let per_big: u32 = if mt_min > 0 && big_cnt > 0 && k > 0 {
             if self.cfg.pack_mt_workers > 0 {
                 (self.cfg.pack_mt_workers as u32).min(16)
             } else {
