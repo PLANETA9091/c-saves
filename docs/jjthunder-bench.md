@@ -919,3 +919,40 @@ contention (222 -> 264 us/chunk cumulative), not locks. Deferred-encode
 reference ids (mode 2/6), so an id-remap pack conversion is designable,
 but hot-tier raw storage changes dedup semantics, slab sizes and the
 shift-pass input — a multi-day project, documented for a future tick.
+
+## 0.9.26 — zstd-MT inside the big pack streams (intra-frame nbWorkers)
+
+The 0.9.25 CI verdict re-measured the wall: pack 7.45 s with comp = 6.63 s
+of it, and the comp wall is the LONGEST single stream (12.1 MB GLOB
+variant, 4.86 s serial z19) — parallel-across-streams cannot divide one
+stream. Phase B now rank-selects the k = cores/2 longest variant streams
+(deterministic: lens are content-determined, ties break by group order)
+and compresses them with zstd nbWorkers = cores/k inside ONE standard
+frame; the rest of the bigs stay ST in the scoped pool and all tasks run
+LONGEST-FIRST. The auto budget is a deliberate fix over the obvious
+cores/big_cnt split: with 6 big streams on 2 cores that formula gives 0
+workers (MT silently dead) and on 4 cores it under-workers every pole;
+concentrating on the poles is what binds the makespan (LPT).
+
+Measurements. Local 2-core sandbox (work-saturated: wall ≈ work/cores,
+so parallelism of any form is ~neutral): baseline MT-off pack 8.39 s
+(comp 7.62 s, mtjobs:0) vs auto-MT 8.36 s (mtjobs:4, 22.2 MB intra-frame)
+vs explicit-2 8.12 s (mtjobs:6, 32.5 MB — oversubscribed, no better).
+Explicit-2 DID prove the pole shrinks: mtns 11.37 s aggregate in a 7.37 s
+wall with the ST streams overlapping. The pack win is expected on
+pole-bound 4+ core hosts: CI 6.63 s comp wall = 4.86 s pole + overlapped
+rest -> pole/1.85 ≈ 2.6 s, work/4 ≈ 3.7 s floor -> pack ~4-5 s expected
+(-35-45%). MT frames decode with the stock single-threaded decoder,
+deterministic per (input, level, workers); drained container fp moves
+(job boundaries) — the 0.9.24/25 tail-segment nondeterminism precedent,
+now also for the packed-slab segment's frame bytes. Sizes: 1.65 vs
+1.66 MiB (x7.53 vs x7.51) — within noise.
+
+libzstd gained ZSTD_MULTITHREAD (zstdmt feature): ST paths (hot tier,
+recipe flush, small streams) byte-identical — enc_fp
+6d240d7166cdda99/12130/9971843 EXACT re-verified. Gates: 57/57 tests
+(new pack_mt_deterministic_and_wire_compatible), jj verify 946/946
+x3.36, survival x4.01 ok=1280, bench_size x0.08, verify 728+218 bad=0.
+Census fields mtjobs/mtns/mtbytes report the intra-frame share; knobs
+CSAVES_PACK_MT_MIN (1 MiB default, 0 = off) and CSAVES_PACK_MT_WORKERS
+(explicit, all bigs — may oversubscribe).

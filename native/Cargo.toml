@@ -16,7 +16,7 @@ cplug-sdk = { path = "../cplug-sdk" }
 jvmti-bindings = "2"
 jni-sys = "0.4"
 fastnbt = "2"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 zstd-safe = "7"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"

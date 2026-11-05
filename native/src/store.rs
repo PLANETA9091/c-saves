@@ -140,6 +140,31 @@ fn bulk_compress(data: &[u8], level: i32) -> (u8, Vec<u8>) {
     })
 }
 
+/// One-shot multi-threaded zstd (pack pass): nbWorkers = workers inside ONE
+/// standard zstd frame. The frame bytes differ from the single-threaded
+/// encoder (job boundaries + per-job overlap) but are deterministic per
+/// (input, level, worker count) and decode with the stock single-threaded
+/// decoder — dedup hashes are content-based (uncompressed) and every
+/// downstream gate is semantic, so the wire stays fully compatible. The
+/// pack wall is the LONGEST single-stream compression (one 12 MB GLOB
+/// variant = 4-5 s of serial zstd-19 that no per-stream pool can touch);
+/// intra-frame workers divide exactly that pole. Returns None on any
+/// error so the caller falls back to the single-threaded bulk path (raw
+/// store on its failure — same safety ladder as bulk_compress).
+fn mt_compress(data: &[u8], level: i32, workers: u32) -> Option<Vec<u8>> {
+    let mut sink = Vec::with_capacity(data.len() / 3 + 1024);
+    let mut enc = zstd::stream::Encoder::new(&mut sink, level).ok()?;
+    enc.multithread(workers).ok()?;
+    // pledged size lets zstd size the job grid up front (deterministic
+    // output, no resync passes); a fresh Encoder per call is fine here —
+    // the MT path only fires on multi-megabyte streams where the frame
+    // itself costs seconds and the pool setup is noise.
+    enc.set_pledged_src_size(Some(data.len() as u64)).ok()?;
+    std::io::Write::write_all(&mut enc, data).ok()?;
+    enc.finish().ok()?;
+    Some(sink)
+}
+
 // ------------------------------------------------------------- config -----
 
 #[derive(Clone, Debug)]
@@ -193,6 +218,16 @@ pub struct Cfg {
     /// to force rolls while the append buffer is guaranteed non-empty (the
     /// exact window of the roll-hole corruption this once caused).
     pub seg_roll: u64,
+    /// Pack-pass zstd-MT admission threshold (bytes). Variant streams at
+    /// least this big compress with nbWorkers inside ONE zstd frame; the
+    /// pack wall is the longest single-stream compression, so this divides
+    /// the pole no per-stream pool can touch. 0 disables.
+    pub pack_mt_min: usize,
+    /// Explicit worker count for pack-MT frames. 0 = auto: the cores
+    /// concentrate on the k = cores/2 longest big streams (cores/k workers
+    /// each, total budget == cores). < 2 keeps the single-threaded bulk
+    /// path.
+    pub pack_mt_workers: usize,
 }
 
 impl Default for Cfg {
@@ -229,6 +264,8 @@ impl Default for Cfg {
             slab_cache: 32 * 1024 * 1024,
             canon_cache: 16 * 1024 * 1024,
             seg_roll: 64 * 1024 * 1024,
+            pack_mt_min: 1024 * 1024,
+            pack_mt_workers: 0,
         }
     }
 }
@@ -304,6 +341,8 @@ impl Cfg {
             slab_cache: env_parse("CSAVES_SLAB_CACHE", 32 * 1024 * 1024),
             canon_cache: env_parse("CSAVES_CANON_CACHE", 16 * 1024 * 1024),
             seg_roll: env_parse("CSAVES_SEG_ROLL", 64 * 1024 * 1024),
+            pack_mt_min: env_parse("CSAVES_PACK_MT_MIN", 1024 * 1024),
+            pack_mt_workers: env_parse("CSAVES_PACK_MT_WORKERS", 0),
         }
     }
 }
@@ -977,21 +1016,29 @@ pub static PK_COMP_NS: AtomicU64 = AtomicU64::new(0);
 pub static PK_APPEND_NS: AtomicU64 = AtomicU64::new(0);
 pub static PK_RECIPES_NS: AtomicU64 = AtomicU64::new(0);
 pub static PK_READBLOB_NS: AtomicU64 = AtomicU64::new(0);
+// zstd-MT sub-census: how many frames went intra-frame multi-threaded,
+// their cumulative compress ns and uncompressed bytes
+pub static PK_MT_JOBS: AtomicU64 = AtomicU64::new(0);
+pub static PK_MT_NS: AtomicU64 = AtomicU64::new(0);
+pub static PK_MT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub fn pack_census_json() -> String {
     format!(
-        "{{victims:{},build:{},comp:{},append:{},recipes:{},readblob:{}}}",
+        "{{victims:{},build:{},comp:{},append:{},recipes:{},readblob:{},mtjobs:{},mtns:{},mtbytes:{}}}",
         PK_VICTIMS_NS.load(Ordering::Relaxed),
         PK_BUILD_NS.load(Ordering::Relaxed),
         PK_COMP_NS.load(Ordering::Relaxed),
         PK_APPEND_NS.load(Ordering::Relaxed),
         PK_RECIPES_NS.load(Ordering::Relaxed),
         PK_READBLOB_NS.load(Ordering::Relaxed),
+        PK_MT_JOBS.load(Ordering::Relaxed),
+        PK_MT_NS.load(Ordering::Relaxed),
+        PK_MT_BYTES.load(Ordering::Relaxed),
     )
 }
 
 pub fn pack_census_reset() {
-    for st in [&PK_VICTIMS_NS, &PK_BUILD_NS, &PK_COMP_NS, &PK_APPEND_NS, &PK_RECIPES_NS, &PK_READBLOB_NS] {
+    for st in [&PK_VICTIMS_NS, &PK_BUILD_NS, &PK_COMP_NS, &PK_APPEND_NS, &PK_RECIPES_NS, &PK_READBLOB_NS, &PK_MT_JOBS, &PK_MT_NS, &PK_MT_BYTES] {
         st.store(0, Ordering::Relaxed);
     }
 }
@@ -3714,12 +3761,23 @@ impl Store {
             .collect();
         PK_BUILD_NS.fetch_add(_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // ---- Phase B (parallel): one zstd cold-tier compression per variant
-        // stream, work-stealing across all cores. Slab windows are
-        // independent and zstd is deterministic per (input, level), so the
-        // outputs are byte-identical to the serial pack. The pack pass is
-        // the storage-conversion wall (zstd-19 ~6-8 MB/s per core; the JJ
-        // corpus bench spent ~98% of its wall here) — this is where the
-        // cores go to work.
+        // stream, work-stealing across all cores, LONGEST-FIRST: the pack
+        // wall is the longest single-stream compression, so the poles must
+        // start while every core is still free (with short tasks first the
+        // tail degenerates into one long stream running alone). Streams
+        // >= cfg.pack_mt_min bytes additionally split INSIDE one zstd frame
+        // (nbWorkers = cfg.pack_mt_workers, or auto = cores split evenly
+        // across the batch's big streams, < 2 = stay on the ST bulk path):
+        // per-stream parallelism cannot touch a single 12 MB GLOB variant
+        // that spends 4-5 s at z19 — intra-frame workers divide exactly
+        // that pole. The worker budget never exceeds the core count (no
+        // oversubscription with the ST streams still running in the pool).
+        // MT frame bytes differ from the ST encoder (job boundaries) but
+        // are deterministic per (input, level, worker count) and decode
+        // with the stock single-threaded decoder; dedup hashes are
+        // content-based and every semantic gate is unaffected. zstd is
+        // deterministic per (input, level) on the ST path, so pooled
+        // outputs there still match the serial pack byte-for-byte.
         let flat: Vec<&[u8]> = builds
             .iter()
             .flat_map(|b| {
@@ -3732,30 +3790,88 @@ impl Store {
             .collect();
         let outs: std::sync::Mutex<Vec<Option<Vec<u8>>>> =
             std::sync::Mutex::new((0..flat.len()).map(|_| None).collect());
-        let next = std::sync::atomic::AtomicUsize::new(0);
         let level = self.cfg.cold_level;
+        let mt_min = self.cfg.pack_mt_min;
+        let cores = std::thread::available_parallelism()
+            .map(|x| x.get())
+            .unwrap_or(1);
+        let big_cnt = if mt_min > 0 {
+            flat.iter().filter(|s| s.len() >= mt_min).count()
+        } else {
+            0
+        };
+        let mut order: Vec<usize> = (0..flat.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(flat[i].len()));
+        // AUTO policy: concentrate the cores on the poles. Splitting evenly
+        // across every big stream (cores/big) under-workers each pole and
+        // dies when big_cnt > cores; instead the k = cores/2 LONGEST
+        // streams go intra-frame MT with cores/k workers each and the rest
+        // of the bigs stay ST in the pool — the total worker budget stays
+        // == cores. On a work-saturated 2-core box this halves the single
+        // longest stream; on 4+ cores the top poles are exactly what binds
+        // the makespan. Explicit pack_mt_workers overrides the budget (all
+        // bigs get that worker count — an ops lever, may oversubscribe).
+        let k = if self.cfg.pack_mt_workers > 0 {
+            big_cnt
+        } else {
+            (big_cnt.min(cores / 2)).max(1)
+        };
+        let per_big: u32 = if mt_min > 0 && big_cnt > 0 {
+            if self.cfg.pack_mt_workers > 0 {
+                (self.cfg.pack_mt_workers as u32).min(16)
+            } else {
+                ((cores / k) as u32).min(16)
+            }
+        } else {
+            0
+        };
+        // rank-select the k longest big streams for MT (deterministic:
+        // stream lens are content-determined, ties break by group order)
+        let mut mt_sel = vec![false; flat.len()];
+        if per_big > 1 {
+            let mut r = 0usize;
+            for &i in &order {
+                if r >= k || flat[i].len() < mt_min {
+                    break;
+                }
+                mt_sel[i] = true;
+                r += 1;
+            }
+        }
         let _tc = std::time::Instant::now();
+        let compress_one = |i: usize| -> Vec<u8> {
+            let stream = flat[i];
+            if mt_sel[i] {
+                PK_MT_JOBS.fetch_add(1, Ordering::Relaxed);
+                PK_MT_BYTES.fetch_add(stream.len() as u64, Ordering::Relaxed);
+                let t = std::time::Instant::now();
+                let r = mt_compress(stream, level, per_big)
+                    .unwrap_or_else(|| bulk_compress(stream, level).1);
+                PK_MT_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                r
+            } else {
+                bulk_compress(stream, level).1
+            }
+        };
         if flat.len() > 1 {
+            let next = std::sync::atomic::AtomicUsize::new(0);
             std::thread::scope(|sc| {
-                let par = std::thread::available_parallelism()
-                    .map(|x| x.get())
-                    .unwrap_or(1)
-                    .min(flat.len());
+                let par = cores.min(flat.len());
                 for _ in 0..par {
                     sc.spawn(|| loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= flat.len() {
+                        let j = next.fetch_add(1, Ordering::Relaxed);
+                        if j >= order.len() {
                             break;
                         }
-                        let stream = flat[i];
-                        let (_d, comp) = bulk_compress(stream, level);
+                        let i = order[j];
+                        let comp = compress_one(i);
                         outs.lock().unwrap()[i] = Some(comp);
                     });
                 }
             });
         } else {
-            for (i, stream) in flat.iter().enumerate() {
-                let (_d, comp) = bulk_compress(stream, level);
+            for i in 0..flat.len() {
+                let comp = compress_one(i);
                 outs.lock().unwrap()[i] = Some(comp);
             }
         }
@@ -5763,6 +5879,72 @@ mod repro {
         let got = s.read_chunk(key(1, 1)).expect("small-chunk read");
         assert!(semantic(&got, &payload));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pack-pass zstd-MT (intra-frame nbWorkers): same input + level +
+    /// worker count compresses deterministically, decodes with the stock
+    /// single-threaded decoder, and worker-count variants stay
+    /// wire-compatible. Container-level: an MT-drained store stays
+    /// semantically clean with clean slab invariants, and the census
+    /// proves the MT path actually fired.
+    #[test]
+    fn pack_mt_deterministic_and_wire_compatible() {
+        // codec level: determinism + decode compatibility across workers
+        let data: Vec<u8> = (0..2_000_000u32)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(i as u8 % 251))
+            .collect();
+        let a = mt_compress(&data, 19, 2).expect("mt compress w2");
+        let b = mt_compress(&data, 19, 2).expect("mt compress w2 again");
+        assert_eq!(a, b, "zstd-MT must be deterministic per (input, level, workers)");
+        let w4 = mt_compress(&data, 19, 4).expect("mt compress w4");
+        for (name, frame) in [("w2", &a), ("w4", &w4)] {
+            let back = zstd::stream::decode_all(std::io::Cursor::new(frame))
+                .expect("stock decoder must read MT frames");
+            assert_eq!(back, data, "{name} frame decoded wrong");
+        }
+        // container level: MT threshold low + explicit 2 workers (host-core
+        // independent), 2 MiB slabs so the canon/glob variant streams clear
+        // the 512 KiB admission threshold
+        let dir = temp_dir("pack-mt-a");
+        let cfg = Cfg {
+            slab_max_raw: 2 * 1024 * 1024,
+            pack_mt_min: 512 * 1024,
+            pack_mt_workers: 2,
+            ..Cfg::default()
+        };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        let n = 70usize;
+        // variant = i: every chunk unique, otherwise content-addressed dedup
+        // collapses the packed candidates below the MT admission threshold
+        let payloads: Vec<Vec<u8>> = (0..n)
+            .map(|i| chunk_payload((i % 10) as i32, (i / 10) as i32, i as u64))
+            .collect();
+        for (i, p) in payloads.iter().enumerate() {
+            s.write_chunk(i as u64, p, false).unwrap();
+        }
+        s.request_pack();
+        let mut steps = 0;
+        while s.compact_step() {
+            steps += 1;
+            assert!(steps < 500, "drain did not converge ({steps} steps)");
+        }
+        let census = pack_census_json();
+        assert!(!census.contains("mtjobs:0"), "MT path never fired: {census}");
+        for (i, p) in payloads.iter().enumerate() {
+            let got = s.read_chunk(i as u64).expect("post-drain read");
+            assert!(semantic(&got, p), "post-drain mismatch chunk {i}");
+        }
+        assert!(
+            s.slab_invariant_scan().is_empty(),
+            "slab invariant violations after MT drain"
+        );
+        drop(s);
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            let got = s.read_chunk(i as u64).expect("reopen read");
+            assert!(semantic(&got, p), "reopen mismatch chunk {i}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -154,6 +154,38 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.26 — zstd-MT inside the big pack streams: the pole divides
+
+v0.9.25 parallelized pack ACROSS streams but left the wall = the longest
+single stream (12.1 MB GLOB variant = 4.86 s of serial zstd-19 — no
+per-stream pool can touch one stream). Phase B now compresses the
+k = cores/2 LONGEST variant streams INTRA-FRAME (zstd nbWorkers = cores/k
+each, total worker budget == cores, the rest of the bigs stay ST in the
+pool; LPT logic — the poles are exactly what binds the makespan on 4+
+cores). MT frames are standard zstd: they decode with the stock
+single-threaded decoder, are deterministic per (input, level, worker
+count), and dedup hashes stay content-based — every semantic gate is
+unaffected; the drained container fp moves (job-boundary bytes differ
+from the ST encoder), which is why the follow-up was parked in 0.9.25.
+Tasks also run LONGEST-FIRST (with short tasks first the tail degenerates
+into one long stream running alone). Physics note: on a work-saturated
+2-core box the pack wall is total-work-bound (wall ≈ work/cores), so MT
+is ~neutral there (measured 8.36 vs 8.39 s baseline — noise); the win
+needs a pole-bound host (4+ cores: CI pack 7.45 s with a 6.63 s
+comp wall dominated by the 4.86 s pole -> expected ~4-5 s). Explicit
+override: CSAVES_PACK_MT_WORKERS (all bigs get that worker count — an
+ops lever that may oversubscribe); CSAVES_PACK_MT_MIN (default 1 MiB, 0
+= off) gates admission per stream; new pack-census fields mtjobs/mtns/
+mtbytes report what went intra-frame. libzstd now builds with
+ZSTD_MULTITHREAD (the ST paths — hot tier, recipe flush, small pack
+streams — are byte-identical; enc_fp re-verified EXACT).
+
+Gates: 57/57 tests (new pack_mt_deterministic_and_wire_compatible:
+determinism + stock-decoder roundtrip + MT-drained invariants), enc_fp
+6d240d7166cdda99/12130/9971843 EXACT, jj verify 946/946 TOTAL x3.36,
+survival x4.01 ok=1280, bench_size compact x0.08, verify 728+218 bad=0,
+container x7.53.
+
 ## v0.9.25 — parallel pack: slab compressions across all cores
 
 The pack pass is the storage-conversion wall: zstd-19 compresses at
