@@ -154,6 +154,32 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.34 — cold back to z6: the CI corpora overrule the local corpus
+
+v0.9.33's cold 6 → 4 was decided on the local dim corpus, where the compact
+gate moved x0.10 → x0.13 (gate 0.15) and everything looked green. The CI
+real-world corpora disagreed, loudly:
+
+| gate | 0.9.32 (z6) | 0.9.33 (z4) | floor |
+|---|---|---|---|
+| jj-bench TOTAL | x2.86 smaller | **x2.59 — FAIL** | 2.6 |
+| survival-bench TOTAL | x3.13 | **x2.50 — FAIL** | 3.0 |
+
+Per-component attribution: entities 3.03 → 2.96 (noise, the GLOB split did
+not touch entity bytes) while region 2.83 → 2.52 — the entire miss is the
+cold level inside the region streams. Survival section data (ore noise) is
+where cold level bites; the GLOB-flat dim corpus cannot see it. z5
+interpolates below the survival floor too — **z6 is the fastest level that
+clears both floors with margin** (survival +4%, jj +10%).
+
+Everything else from 0.9.33 stands: the 3-stage GLOB split, the parallel
+pack build, bounded RLE admission. CI pack wall at z4 was 0.19 s; at z6 it
+is expected ~0.3 s — still ~25x under the 0.9.26 pre-MT wall, and the
+import scan stage (189 µs/chunk, 73% of the split) is now the real wall
+anyway. Lesson recorded in `Cfg`: the cold level is a storage-engine
+parameter owned by the real-world ratio gates, not by the local speed
+corpus.
+
 ## v0.9.33 — pack build goes parallel (3-stage GLOB split) + cold z4
 
 The sub-census found the pack build phase 95% GLOB conversion

@@ -267,14 +267,15 @@ impl Default for Cfg {
             // (bench_size compact x0.10 unchanged, jj TOTAL unchanged,
             // verify 946/946); below z6 the wall is the BUILD phase again
             // (z4: comp 60 ms vs build 158 ms), so the extra -16% pack at
-            // z4 buys +11% storage — wrong trade for a storage engine.
-            // v0.9.33 flips that verdict: the build phase went parallel
-            // (3-stage GLOB conversion), so z4's comp 60 ms no longer
-            // hides behind build 160 ms — z4 pack 0.30 s vs z6 0.44 s
-            // (-32%) for 2.14 vs 1.94 MiB (+10%, compact gate x0.10 ->
-            // x0.11 vs 0.15). With build parallel the storage tax is what
-            // buys speed now; z2 measured pack-flat (0.29 s) — stop at z4.
-            cold_level: 4,
+            // v0.9.33 dropped cold to z4 (pack 0.30 s vs 0.44 s, -32%) on
+            // the strength of the local compact gate (x0.10 -> x0.11 vs
+            // 0.15). CI verdict: the JJThunder corpora disagree — z4 pushed
+            // survival 3.13x -> 2.50x (floor 3.0) and jj 2.86x -> 2.59x
+            // (floor 2.6). z5 interpolates below the survival floor too;
+            // z6 is the fastest level that clears both gates with real
+            // margin. The local dim corpus is GLOB-flat and hides this —
+            // survival/jj section data is where cold level actually bites.
+            cold_level: 6,
             recipe_level: 6,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
@@ -351,7 +352,7 @@ impl Cfg {
     pub fn from_env() -> Cfg {
         Cfg {
             hot_level: env_parse("CSAVES_HOT_LEVEL", -3),
-            cold_level: env_parse("CSAVES_COLD_LEVEL", 4),
+            cold_level: env_parse("CSAVES_COLD_LEVEL", 6),
             recipe_level: env_parse("CSAVES_RECIPE_LEVEL", 6),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 64 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),

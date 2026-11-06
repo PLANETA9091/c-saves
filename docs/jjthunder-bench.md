@@ -1172,3 +1172,23 @@ Next levers by size: import split is now the bigger wall (211 ms vs pack
 (105 us/chunk, AVX2-verdict-negative territory), then stage1 String
 interning on the glob parse path, then z2 (comp 40 ms) only if container
 headroom allows.
+
+## 0.9.34 — cold back to z6 (CI verdict): the real-world corpora own the level
+
+0.9.33's cold 6 -> 4 passed every local gate and broke both real-world ratio
+floors on CI: jj-bench TOTAL x2.59 (floor 2.6), survival-bench TOTAL x2.50
+(floor 3.0). Attribution: entities x3.03 -> x2.96 (noise), region x2.83 ->
+x2.52 — the whole miss is the cold level inside the region streams. Survival
+section data (ore noise) is where cold level bites; the dim corpus is
+GLOB-flat and hides it (its compact gate x0.10 -> x0.13 stayed green).
+z5 interpolates below the survival floor as well, so z6 is the fastest level
+that clears both gates with margin (survival +4%, jj +10%). The 3-stage GLOB
+split and the parallel build stand unchanged. The level decision now carries
+the recorded lesson: it is a storage parameter owned by the survival/jj
+ratio floors, never re-decided on the local speed corpus alone.
+
+CI at z4 measured pack 0.19 s; z6 should land near 0.3 s — still ~25x under
+the 0.9.26 wall, and the import scan stage (189 us/chunk, 73% of the split
+wall) is now the biggest wall in the engine. Next levers by size: the scan
+stage, then shift internals (48-51 us/chunk), then z2 only if both ratio
+floors gain headroom from a codec-side compactness win.
