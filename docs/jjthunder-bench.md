@@ -1209,3 +1209,36 @@ failures were env-race flakes (set_var vs the once-resolved OnceLocks from
 0.9.32/33) — all 14 test env writes are now override statics. Import path
 byte-identical: enc_fp 6d240d7166cdda99 / 12130 / 9971843 unchanged; 58/58
 tests x8 at 8 test threads.
+
+## 0.9.36 — one walk, not two: the root walk owns the section parse
+
+Method note first: the container-fp line is NOT a stable pin on this
+sandbox — four different values across runs of near-identical code
+(member bytes 1728105..1728193), including a run with the change fully
+disabled. The import-level enc_fp is the honest pin (6d240d7166cdda99 /
+12130 / 9971843 re-verified EXACT with the fused path on).
+
+Per-chunk scan budget after the fusion (dim corpus, 2-core, warmup-first,
+measure round 1 2):
+
+| block | µs/chunk | note |
+|---|---|---|
+| enc (misses) | 104.3 | 12146 structurally unique sections x 6.3 µs |
+| shift | 48.8 | build ~20.6 + match ~28 |
+| sections walk (secb) | 22.1 | the fused direct walk (was skip 6 + parse 21) |
+| hash_lite (sh) | 16.9 | 95434 sections x 129 ns |
+| tail + misc | ~20 | build_scan_tail copy + SecBytes pushes |
+| scanp (retry parse) | 0.03 | was 21.1 — the second walk is gone |
+| root hmap / skip | 0.07 / 2.3 | post-memo / generic keys |
+
+The enc-cache verdict: misses are NOT capacity — 12146 per round at both
+32 MiB and 256 MiB caps; they are the unique sections (83288/95434 hit =
+87% within one import; rounds are separate processes). Encode kernel next:
+unp 2.58 + pack 2.20 µs/call = 88 µs/chunk is the biggest single block
+left (documented-negative territory — probe before transplant).
+
+New telemetry: the `"root"` block in split_stage_json
+(secb/hmap/skip ns-n pairs) decomposes scan_root per branch; hdr is the
+remainder. Net measured: scan 222.8 -> 216.8 µs/chunk, import ST 112.5 ->
+114.8 MB/s, import work −2.7% — small but structural, and the walk now
+owns the parse.

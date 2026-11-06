@@ -788,6 +788,11 @@ pub static SPLT_RLE_UNI: AtomicU64 = AtomicU64::new(0);
 /// Last scan_root failure reason: 1=root hdr, 2=sections skip, 3=hmap walk,
 /// 4=light patch, 5=generic key skip, 6=no sections key, 7=root key name.
 static SCAN_FAIL: AtomicU64 = AtomicU64::new(0);
+
+// v0.9.36 probe: scan_root branch decomposition (ns/n). hdr = remainder.
+pub static SPLT_ROOT_SECB: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static SPLT_ROOT_HMAP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static SPLT_ROOT_SKIP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 /// Byte position of the failure (diagnostics only; stored at the failing
 /// sr! site — exact, unlike a deepest-walk beacon, and zero cost on success).
 static SCAN_FAIL_POS: AtomicU64 = AtomicU64::new(0);
@@ -866,6 +871,15 @@ pub fn split_stage_json() -> String {
         DIR_WHYS[5].load(Ordering::Relaxed),
         DIR_WHYS[6].load(Ordering::Relaxed),
         DIR_WHYS[7].load(Ordering::Relaxed)
+    )
+    + &format!(
+        r#","root":{{"secb":[{},{}],"hmap":[{},{}],"skip":[{},{}]}}"#,
+        SPLT_ROOT_SECB.0.swap(0, Ordering::Relaxed),
+        SPLT_ROOT_SECB.1.swap(0, Ordering::Relaxed),
+        SPLT_ROOT_HMAP.0.swap(0, Ordering::Relaxed),
+        SPLT_ROOT_HMAP.1.swap(0, Ordering::Relaxed),
+        SPLT_ROOT_SKIP.0.swap(0, Ordering::Relaxed),
+        SPLT_ROOT_SKIP.1.swap(0, Ordering::Relaxed),
     )
 }
 
@@ -4942,7 +4956,7 @@ fn skip_value(b: &[u8], p: &mut usize, ty: u8, depth: u32) -> Option<()> {
 /// (pos, len, replacement) — disjoint, ascending. Empty replacement = remove.
 type TailEdit = (usize, usize, Vec<u8>);
 
-struct ScanOut {
+struct ScanOut<'a> {
     edits: Vec<TailEdit>,
     /// append TAG_Byte isLightOn=0 before the root END (strip mode only)
     insert_light: bool,
@@ -4950,13 +4964,28 @@ struct ScanOut {
     sections_payload: (usize, usize),
     /// position of the root compound END byte
     end_pos: usize,
+    /// v0.9.36: the sections list parsed IN PLACE by the root walk itself
+    /// (the direct walker doubles as the skipper — scan_split must not
+    /// re-walk the same bytes). None = the walker refused (or lite is
+    /// disabled) and the raw skip_value range stands; scan_split then
+    /// takes its old route (direct retry -> wrap -> Value).
+    direct: Option<Vec<SecLite<'a>>>,
 }
 
 /// Walk the root compound of a chunk payload. Recognizes `sections`
 /// (TAG_List — the removal range), `Heightmaps` (TAG_Compound of LongArrays
 /// — hmap_encode replacements) and `isLightOn` (strip patch). Everything
 /// else is skipped by header arithmetic. None = anything unexpected.
-fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
+///
+/// v0.9.36: at the `sections` key the walker no longer blind-skips the
+/// list — it runs the direct sections parse IN PLACE (the walk covers the
+/// identical bytes: every accepted field type advances by the same spec
+/// extent skip_value would) and returns the parsed list, so the payload's
+/// bulk is walked ONCE instead of skip-here + parse-again in scan_split.
+/// Any refusal falls back to the raw skip and scan_split re-parses the
+/// recorded range exactly as before — one-sided safety, outputs pinned by
+/// enc_fp.
+fn scan_root<'a>(payload: &'a [u8], strip: bool) -> Option<ScanOut<'a>> {
     // NOTE: `p` must be declared BEFORE the macro — macro_rules hygiene
     // resolves the body's `p` at the definition site, and a later local
     // binding is invisible to it (E0425).
@@ -4984,6 +5013,9 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
     let mut sections_payload: Option<(usize, usize)> = None;
     let mut insert_light = false;
     let mut saw_light = false;
+    // v0.9.36: filled by the sections branch when the in-place direct parse
+    // accepts the list (see the branch comment); consumed by scan_split.
+    let mut direct_list: Option<Vec<SecLite>> = None;
     loop {
         let tag_pos = p;
         let ty = *payload.get(p)?;
@@ -5000,6 +5032,7 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
                 insert_light,
                 sections_payload: sr!(sections_payload, 6),
                 end_pos: tag_pos,
+                direct: direct_list,
             });
         }
         let nl = u16::from_be_bytes(sr!(sr!(payload.get(p..p + 2), 7).try_into().ok(), 7)) as usize;
@@ -5007,12 +5040,39 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
         p += 2 + nl;
         match (ty, name) {
             (9, b"sections") => {
+                let t_sec = std::time::Instant::now();
                 let vp = p;
-                sr!(skip_value(payload, &mut p, 9, 24), 2);
+                // v0.9.36: the direct sections walker IS the skipper. The
+                // raw skip_value here walked the whole list (~30-40 us on a
+                // real chunk) only for scan_split to walk the SAME bytes
+                // again in parse_sections_direct; the in-place walk replaces
+                // both — same bytes, same end (every accepted field advances
+                // by the identical spec extent), and the parsed list rides
+                // out in ScanOut::direct. Refusals fall back to the raw
+                // skip + scan_split's own retry chain: identical routes for
+                // every shape the walker does not fully prove.
+                let fused = if no_lite() {
+                    None
+                } else {
+                    parse_sections_direct_from(payload, vp)
+                };
+                match fused {
+                    Some((list, end)) => {
+                        p = end;
+                        direct_list = Some(list);
+                        SPLT_DIRT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        sr!(skip_value(payload, &mut p, 9, 24), 2);
+                    }
+                }
                 sections_payload = Some((vp, p));
                 edits.push((tag_pos, p - tag_pos, Vec::new()));
+                SPLT_ROOT_SECB.0.fetch_add(t_sec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_ROOT_SECB.1.fetch_add(1, Ordering::Relaxed);
             }
             (10, b"Heightmaps") => {
+                let t_hm = std::time::Instant::now();
                 // walk the inner compound manually: each TAG_Long_Array value
                 // that hmap_encode accepts is replaced by the dense
                 // TAG_Byte_Array form tail_encode would produce. The edit
@@ -5067,6 +5127,8 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
                     rep.extend_from_slice(&dense[..]);
                     edits.push((it_pos, p - it_pos, rep));
                 }
+                SPLT_ROOT_HMAP.0.fetch_add(t_hm.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_ROOT_HMAP.1.fetch_add(1, Ordering::Relaxed);
             }
             (_, b"isLightOn") if strip => {
                 saw_light = true;
@@ -5083,7 +5145,10 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
                 }
             }
             _ => {
+                let t_sk = std::time::Instant::now();
                 sr!(skip_value(payload, &mut p, ty, 32), 5);
+                SPLT_ROOT_SKIP.0.fetch_add(t_sk.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_ROOT_SKIP.1.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -5440,6 +5505,25 @@ fn parse_sections_direct<'a>(
     sp0: usize,
     sp1: usize,
 ) -> Option<Vec<SecLite<'a>>> {
+    let (out, end) = parse_sections_direct_from(payload, sp0)?;
+    // the caller's end comes from scan_root's raw skip — the two walks must
+    // agree to the byte (they do by construction on accepted shapes; the
+    // check stays as the standing one-sided safety net)
+    if end != sp1 {
+        return dir_fail(1);
+    }
+    SPLT_DIRT.fetch_add(1, Ordering::Relaxed);
+    Some(out)
+}
+
+/// v0.9.36: the direct sections walk with the end position as an OUTPUT —
+/// the form scan_root uses when the walker doubles as the list skipper
+/// (no sp1 exists yet: the walk defines the extent). The walk is byte-for-
+/// byte the same as parse_sections_direct's; the end-check is the caller's.
+fn parse_sections_direct_from<'a>(
+    payload: &'a [u8],
+    sp0: usize,
+) -> Option<(Vec<SecLite<'a>>, usize)> {
     let mut p = sp0;
     let et = *payload.get(p)?;
     p += 1;
@@ -5459,17 +5543,13 @@ fn parse_sections_direct<'a>(
     for _ in 0..cnt {
         out.push(dir_section(payload, &mut p)?);
     }
-    if p != sp1 {
-        return dir_fail(1);
-    }
-    SPLT_DIRT.fetch_add(1, Ordering::Relaxed);
-    Some(out)
+    Some((out, p))
 }
 
 /// Fast-path split: raw tail + sections-only parse. None = fall back to the
 /// full parse (any structural doubt, non-compound root, missing sections...).
 fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
-    let Some(out) = scan_root(payload, strip) else {
+    let Some(mut out) = scan_root(payload, strip) else {
         if std::env::var("CSAVES_SCAN_DEBUG").as_deref() == Ok("1") {
             eprintln!(
                 "scan_root fail why={} pos={} len={}",
@@ -5490,12 +5570,18 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
     // no wrap buffer, no serde machinery); only when it refuses a shape does
     // the wrap buffer get built for the fastnbt RootList parse. Both produce
     // the identical Vec<SecLite> or fall through to the Value path together.
+    // v0.9.36: the root walk usually parsed the list IN PLACE already (its
+    // walker doubles as the skipper) — the direct retry only runs for
+    // chunks whose list the walker refused (no_lite included), unchanged
+    // from there on.
     let t_sp2 = std::time::Instant::now();
     // the wrap buffer stays a live binding for the whole lite branch: the
     // fastnbt RootList borrows it, and the borrow must outlive litelist's use
     let mut buf: Vec<u8> = Vec::new();
     let lite = if no_lite() {
         None
+    } else if let Some(list) = out.direct.take() {
+        Some(RootList { list })
     } else {
         match parse_sections_direct(payload, sp0, sp1) {
             Some(list) => Some(RootList { list }),

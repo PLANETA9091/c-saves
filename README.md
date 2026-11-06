@@ -154,6 +154,48 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.36 — the root walk parses the section list in place (one walk, not two)
+
+The import split walked every chunk's bulk TWICE: scan_root ran a raw
+`skip_value` over the sections list (~30 KB per real chunk) only to record
+its extent, and then `parse_sections_direct` walked the SAME bytes again to
+parse them. v0.9.36 fuses the two: the direct walker gains an
+end-as-output form (`parse_sections_direct_from`) and scan_root calls it
+AT the sections key — the walk defines the extent, the parsed
+`Vec<SecLite>` rides out in `ScanOut::direct`, and scan_split consumes it
+(the direct retry / wrap / Value chain stays for any list the walker
+refuses, byte-identical routes). Telemetry: scanp 21.1 µs/chunk → 0.03 µs
+(the second walk is gone), scan 222.8 → 216.8 µs/chunk.
+
+Honest sizing: the 0.9.16 note's "~30-40 µs skip" does not hold on this
+corpus/binary — the new root-branch probes (`"root"` block in
+split_stage_json: secb/hmap/skip) decompose scan_root as sections-branch
+22.1 µs (the walk itself), Heightmaps 0.07 µs (post-memo), generic-key
+skips 2.3 µs — the raw skip it replaces measured ~6 µs, so the net scan
+gain is −6 µs/chunk (−2.7%), import ST 112.5 → 114.8 MB/s. The value is
+structural: the chunk bulk is walked once, and the walk now OWNS the parse
+(the next levers build on it). Also measured and settled this session:
+
+- The enc-cache is NOT capacity-limited: 12146 encode misses per round at
+  both 32 MiB and 256 MiB caps — they are the corpus's structurally UNIQUE
+  sections (the other 83288 of 95434 hit at 87% within one import; bench
+  rounds are separate processes, so cross-process retention is out of
+  scope). The misses are mandatory work; the lever is the encode kernel
+  itself (unp 2.58 + pack 2.20 µs/call = 88 µs/chunk — next candidate).
+- container-fp is NOT a stable pin on this sandbox: four different values
+  across runs of near-identical code (member bytes 1728105..1728193),
+  including runs with the change fully disabled — pre-existing environment
+  drift (the 0.9.30 lesson, now visible at fp level). The import-level
+  enc_fp is the honest pin: 6d240d7166cdda99 / 12130 / 9971843 re-verified
+  EXACT with the fused path ON.
+
+Gates: 58/58 tests, enc_fp EXACT (fused on and off), verify 728+218 bad=0,
+pack 0.41 s at z6, container 1.94 MiB x6.42, warm read 1508.9 MB/s. Next
+levers by size: fused unpack→dense-pack kernel inside enc (88 µs/chunk,
+documented-negative territory — probe first), shift-pass fingerprint
+pre-filter (28 µs of matching after builds), hash_lite folded into the
+direct walk (16.9 µs).
+
 ## v0.9.35 — concurrent supersede+pack: the batch_idx window that lost chunks
 
 The CI test job on v0.9.34 failed three tests: the two glob-RLE form pins and
