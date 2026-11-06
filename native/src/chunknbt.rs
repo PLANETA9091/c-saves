@@ -112,7 +112,29 @@ fn no_lite() -> bool {
 // section (getenv + alloc under a process lock, ~36K lookups per bench
 // pack). Process-stable toggles: resolve once.
 static GID_RLE_DIV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+// v0.9.35: tests must NOT set CSAVES_GID_RLE_DIV via std::env::set_var —
+// once-resolved statics race it (OnceLock seals the default before the test's
+// set lands, depending on parallel-test scheduling) and setenv concurrent
+// with getenv is UB. The override below is the test-only knob.
+#[cfg(test)]
+static GID_RLE_DIV_OVR: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
+#[cfg(test)]
+pub(crate) fn set_gid_rle_div_for_tests(v: Option<u64>) {
+    match v {
+        Some(v) => {
+            GID_RLE_DIV_OVR.1.store(v, Ordering::Relaxed);
+            GID_RLE_DIV_OVR.0.store(true, Ordering::Relaxed);
+        }
+        None => GID_RLE_DIV_OVR.0.store(false, Ordering::Relaxed),
+    }
+}
 fn gid_rle_div() -> u64 {
+    #[cfg(test)]
+    {
+        if GID_RLE_DIV_OVR.0.load(Ordering::Relaxed) {
+            return GID_RLE_DIV_OVR.1.load(Ordering::Relaxed);
+        }
+    }
     *GID_RLE_DIV.get_or_init(|| {
         std::env::var("CSAVES_GID_RLE_DIV")
             .ok()
@@ -121,7 +143,25 @@ fn gid_rle_div() -> u64 {
     })
 }
 static GLOB_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(test)]
+static GLOB_DEBUG_OVR: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
+#[cfg(test)]
+pub(crate) fn set_glob_debug_for_tests(v: Option<bool>) {
+    match v {
+        Some(v) => {
+            GLOB_DEBUG_OVR.1.store(v as u64, Ordering::Relaxed);
+            GLOB_DEBUG_OVR.0.store(true, Ordering::Relaxed);
+        }
+        None => GLOB_DEBUG_OVR.0.store(false, Ordering::Relaxed),
+    }
+}
 fn glob_debug() -> bool {
+    #[cfg(test)]
+    {
+        if GLOB_DEBUG_OVR.0.load(Ordering::Relaxed) {
+            return GLOB_DEBUG_OVR.1.load(Ordering::Relaxed) != 0;
+        }
+    }
     *GLOB_DEBUG.get_or_init(|| std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1"))
 }
 
@@ -8820,7 +8860,7 @@ mod glob_tests {
         // pin the admission divisor: this test needs the 4x rule so the
         // ~850-byte strata RLE is admitted (the default 8x would refuse it)
         let _g = crate::store::glob_slab_test::tests_glob_lock();
-        std::env::set_var("CSAVES_GID_RLE_DIV", "4");
+        crate::chunknbt::set_gid_rle_div_for_tests(Some(4));
         let src = strata_section(5, "minecraft:block_a", "minecraft:block_b", 10);
         let canon = section_encode(&src).expect("encode");
         // the canonical stream stays DENSE (runs too short for the packed
@@ -8844,7 +8884,7 @@ mod glob_tests {
         let glob_n = section_to_glob(&canon_n, &mut reg).expect("glob noisy");
         assert_eq!(glob_n[0], GLOB_MAGIC, "noisy gid stream stays 0xCB");
         assert_eq!(glob_any_to_section(&glob_n, &reg).unwrap(), canon_n);
-        std::env::remove_var("CSAVES_GID_RLE_DIV");
+        crate::chunknbt::set_gid_rle_div_for_tests(None);
     }
 
     #[test]
@@ -8852,7 +8892,7 @@ mod glob_tests {
         // push the registry past 256 states, then convert a strata section
         // whose states land at gids > 255: the u16 RLE form (gform 4/5)
         let _g = crate::store::glob_slab_test::tests_glob_lock();
-        std::env::set_var("CSAVES_GID_RLE_DIV", "4");
+        crate::chunknbt::set_gid_rle_div_for_tests(Some(4));
         let pre = glob_section_wide(-2, 0xAAAA, 300);
         let mut reg = StateRegistry::new();
         let pre_canon = section_encode(&pre).expect("encode pre");
@@ -8883,6 +8923,6 @@ mod glob_tests {
         assert_eq!(reg2.len(), reg.len());
         let back2 = glob_any_to_section(&glob, &reg2).expect("decode with reloaded registry");
         assert_eq!(back2, canon);
-        std::env::remove_var("CSAVES_GID_RLE_DIV");
+        crate::chunknbt::set_gid_rle_div_for_tests(None);
     }
 }

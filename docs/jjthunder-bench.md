@@ -1192,3 +1192,20 @@ the 0.9.26 wall, and the import scan stage (189 us/chunk, 73% of the split
 wall) is now the biggest wall in the engine. Next levers by size: the scan
 stage, then shift internals (48-51 us/chunk), then z2 only if both ratio
 floors gain headroom from a codec-side compactness win.
+
+## 0.9.35 — concurrent supersede+pack loss fix (CI verdict)
+
+v0.9.34's CI test job exposed a REAL chunk-loss race the concurrent
+supersede test was built to catch: the supersede path eagerly removed the
+key's batch_idx entry before the new pending recipe was queued, so reads in
+the window resolved to None ("chunk 16 lost") and a concurrent segment
+rewrite poisoned on batch_idx misses (8 in the CI log). Supersede now queues
+the new pending FIRST, resolves the committed version through the captured
+location (load_batched, no batch_idx re-consult), and the batch_idx entry
+lives until the flush overwrites it; the rewrite loop skips keys with a
+newer pending entry (check-and-push is atomic under the batch lock) and
+poisons out when a stuck pending would never drain. The two glob form test
+failures were env-race flakes (set_var vs the once-resolved OnceLocks from
+0.9.32/33) — all 14 test env writes are now override statics. Import path
+byte-identical: enc_fp 6d240d7166cdda99 / 12130 / 9971843 unchanged; 58/58
+tests x8 at 8 test threads.

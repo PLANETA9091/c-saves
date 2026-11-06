@@ -1104,6 +1104,22 @@ pub static MT_DROP_NS: AtomicU64 = AtomicU64::new(0);
 pub static MT_LASTW_NS: AtomicU64 = AtomicU64::new(0);
 pub static MT_BLOBSR_NS: AtomicU64 = AtomicU64::new(0);
 
+// v0.9.35: tests must NOT set CSAVES_FORCE_GLOB via std::env::set_var —
+// the pack path resolves it into a OnceLock (setenv races the resolution
+// and other tests' getenv reads; UB). The override is consulted only under
+// cfg!(test), so release builds pay a single always-false branch.
+pub static FORCE_GLOB_TEST: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
+#[cfg(test)]
+pub(crate) fn set_force_glob_for_tests(v: Option<bool>) {
+    match v {
+        Some(v) => {
+            FORCE_GLOB_TEST.1.store(v as u64, Ordering::Relaxed);
+            FORCE_GLOB_TEST.0.store(true, Ordering::Relaxed);
+        }
+        None => FORCE_GLOB_TEST.0.store(false, Ordering::Relaxed),
+    }
+}
+
 pub fn mt_lock_census_json() -> String {
     format!(
         "{{append:{},slabins:{},bump:{},drop:{},lastw:{},blobsr:{}}}",
@@ -2092,9 +2108,15 @@ impl Store {
         if len != BATCHED {
             return self.load_recipe(seg, off, len);
         }
-        let Some((boff, soff, rl)) = self.batch_idx.lock().get(&key).copied() else {
-            return None;
-        };
+        let (boff, soff, rl) = self.batch_idx.lock().get(&key).copied()?;
+        self.load_batched(seg, boff, soff, rl)
+    }
+
+    /// Load a recipe out of a compressed kind-9 batch at an exact location
+    /// (v0.9.35: split from recipe_at so callers that captured a location —
+    /// supersede ref-retirement — can resolve it WITHOUT re-consulting
+    /// batch_idx, which a concurrent flush may have re-pointed in between).
+    fn load_batched(&self, seg: u32, boff: u64, soff: u32, rl: u32) -> Option<Recipe> {
         if Some(seg) == self.writer_seg_id() {
             self.flush_writer();
         }
@@ -2939,25 +2961,49 @@ impl Store {
             let mut batch = self.recipe_batch.lock();
             batch.remove(key)
         };
-        if let Some(old_body) = pending_old {
-            if let Some(old_rec) = self.parse_recipe_body(&old_body) {
+        if let Some(ref old_body) = pending_old {
+            if let Some(old_rec) = self.parse_recipe_body(old_body) {
                 self.drop_recipe_refs(&old_rec);
-            }
-        } else if let Some((oseg, ooff, olen)) = self.chunks.read().get(&key).copied() {
-            if let Some(old_rec) = self.recipe_at(key, oseg, ooff, olen) {
-                self.drop_recipe_refs(&old_rec);
-            }
-            let rl = self.batched_len(key, olen);
-            if let Some(s) = self.segs.read().get(&oseg) {
-                s.live.fetch_sub(8 + rl as u64, Ordering::Relaxed);
-            }
-            if olen == BATCHED {
-                self.batch_idx.lock().remove(&key);
             }
         }
-
-        // queue the bare recipe into the batch; flushed on sync/seal/compact
-        // or when the batch grows past its size cap
+        // v0.9.35 LOSS FIX (CI, concurrent_supersede): resolve the last
+        // COMMITTED version (recipe + virtual length) BEFORE queuing the new
+        // pending entry — the in-push flush (192 KiB cap) re-points chunks
+        // and overwrites batch_idx together, so any resolution after the
+        // push would see the NEW version and drop its refs instead. The
+        // batched resolution goes through the CAPTURED location (boff must
+        // equal the captured offset): a flush that re-pointed the key in
+        // between has already taken over this version's retirement.
+        let old_committed = if pending_old.is_none() {
+            self.chunks
+                .read()
+                .get(&key)
+                .copied()
+                .and_then(|(oseg, ooff, olen)| {
+                    if olen == BATCHED {
+                        let idx = self.batch_idx.lock().get(&key).copied();
+                        let Some((boff, soff, rl)) = idx.filter(|(b, _, _)| *b == ooff) else {
+                            return None;
+                        };
+                        let rec = self.load_batched(oseg, boff, soff, rl);
+                        Some((oseg, ooff, olen, rec, rl))
+                    } else {
+                        let rec = self.load_recipe(oseg, ooff, olen);
+                        Some((oseg, ooff, olen, rec, olen))
+                    }
+                })
+        } else {
+            None
+        };
+        // v0.9.35: the new pending entry is queued BEFORE the committed
+        // version's refs are dropped, so a concurrent segment rewrite always
+        // sees it (its pending-skip guard) and never re-queues the old bytes
+        // over the newer pending. The old order (drop refs -> eager
+        // batch_idx.remove -> push) left a window where chunks still pointed
+        // BATCHED at the old batch while batch_idx had no entry: every read
+        // of the chunk returned None (CI: "chunk 16 lost"), and the segment
+        // rewrite hit the batch_idx miss -> poisoned the segment (8 misses,
+        // seg-2 KEPT on the CI run).
         {
             let mut bare = Vec::with_capacity(1 + rec.len());
             bare.push(0xFFu8);
@@ -2969,6 +3015,21 @@ impl Store {
             if total >= 192 * 1024 {
                 self.flush_recipe_batch();
             }
+        }
+        if let Some((oseg, ooff, olen, old_rec, rl)) = old_committed {
+            if let Some(old_rec) = old_rec {
+                self.drop_recipe_refs(&old_rec);
+            }
+            if let Some(s) = self.segs.read().get(&oseg) {
+                s.live.fetch_sub(8 + rl as u64, Ordering::Relaxed);
+            }
+            // v0.9.35: the batch_idx entry is KEPT here (the old eager
+            // remove is gone). It resolves reads of the last committed
+            // version inside this window; the flush overwrites it together
+            // with the chunks pointer under one lock pair, and the rewrite's
+            // retire is offset-guarded so a stale entry pointing into a
+            // dying segment is retired exactly once, during the move.
+            let _ = (oseg, ooff, olen);
         }
         WST_RECIPE.0.fetch_add(t2w.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let _tl = std::time::Instant::now();
@@ -4170,10 +4231,17 @@ impl Store {
                 // CSAVES_FORCE_GLOB=1: debug knob — take the glob variant
                 // unconditionally so the read/scan paths are testable
                 // regardless of the size heuristic. v0.9.33: once-resolved
-                // (was a getenv per GROUP on the pack path).
+                // (was a getenv per GROUP on the pack path). v0.9.35: tests
+                // flip the override below, not the env (setenv races the
+                // OnceLock and other tests' getenv — UB).
                 static FORCE_GLOB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                let force =
-                    *FORCE_GLOB.get_or_init(|| std::env::var("CSAVES_FORCE_GLOB").as_deref() == Ok("1"));
+                let force = if cfg!(test) && FORCE_GLOB_TEST.0.load(Ordering::Relaxed) {
+                    FORCE_GLOB_TEST.1.load(Ordering::Relaxed) != 0
+                } else {
+                    *FORCE_GLOB.get_or_init(|| {
+                        std::env::var("CSAVES_FORCE_GLOB").as_deref() == Ok("1")
+                    })
+                };
                 if force || cg.len() < cc.len() {
                     // the registry MUST be on disk before the slab that
                     // references its gids (crash = silent misresolution)
@@ -4716,6 +4784,12 @@ impl Store {
         if recs.is_empty() {
             break;
         }
+        // v0.9.35: keys whose NEWER version is still a PENDING batch entry
+        // must not be moved — re-queueing the old bytes over the pending
+        // would roll the chunk back (RecipeBatch is last-write-wins). The
+        // end-of-pass flush re-points such keys at the writer segment and
+        // the next fixpoint snapshot drains them.
+        let mut pending_skipped: Vec<u64> = Vec::new();
         for (key, _s, off, len) in recs {
             // Re-check the CURRENT chunks-map pointer: a supersede after the
             // snapshot moved this key (pending batch entry or a newer batch)
@@ -4725,6 +4799,10 @@ impl Store {
             // pending one — RecipeBatch is last-write-wins, so the chunk
             // would silently ROLL BACK. The pending/newer state is the truth.
             if self.chunks.read().get(&key).copied() != Some((_s, off, len)) {
+                continue;
+            }
+            if self.recipe_batch.lock().index.contains_key(&key) {
+                pending_skipped.push(key);
                 continue;
             }
             // normalize to a bare batched recipe
@@ -4800,7 +4878,15 @@ impl Store {
             // retire the OLD index entry (pointing into the dying segment).
             let old_rl = self.batched_len(key, len);
             {
+                // v0.9.35: atomic check-and-push — a supersede during the
+                // pull may have queued a NEWER pending entry; last-write-wins
+                // means pushing after it would roll the chunk back.
                 let mut batch = self.recipe_batch.lock();
+                if batch.index.contains_key(&key) {
+                    drop(batch);
+                    pending_skipped.push(key);
+                    continue;
+                }
                 batch.push(key, bare);
                 let total = batch.bytes;
                 drop(batch);
@@ -4822,6 +4908,18 @@ impl Store {
             }
         }
         self.flush_recipe_batch();
+        // v0.9.35 anti-spin: pending-skip keys drain via this flush; if a
+        // persistent append failure left them pending, the snapshot would
+        // never empty — keep the segment (poisoned) instead of spinning.
+        if !pending_skipped.is_empty() {
+            let b = self.recipe_batch.lock();
+            let stuck = pending_skipped.iter().any(|k| b.index.contains_key(k));
+            drop(b);
+            if stuck {
+                mark_broken();
+                break;
+            }
+        }
         // poison escape: a pass that hit mark_broken() leaves its key
         // pointing at worst_id (the snapshot would never drain) — the
         // segment is kept below; do not spin
@@ -5873,11 +5971,11 @@ pub(crate) mod glob_slab_test {
         // size heuristic is gated by the real-corpus CI benches (synthetic
         // payloads cannot reproduce vanilla terrain's palette-diversity
         // statistics where the glob form measured x2.16).
-        // NOTE: set_var is process-global; the flag only flips the pack's
-        // storage-form choice (never semantics — every read converts back),
-        // so parallel-test interference is bounded to the storage form.
-        std::env::set_var("CSAVES_GLOB", "1");
-        std::env::set_var("CSAVES_FORCE_GLOB", "1");
+        // v0.9.35: CSAVES_GLOB defaults to enabled (glob_enabled rejects
+        // only the explicit "0"), so no env write is needed here — the old
+        // set_var("1")/remove_var pair was a semantic no-op AND a
+        // setenv/getenv UB source against parallel tests.
+        set_force_glob_for_tests(Some(true));
         let dir = temp_dir("glob-slab");
         let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
         let n = 120usize;
@@ -5912,8 +6010,7 @@ pub(crate) mod glob_slab_test {
         }
         // the registry must be persisted alongside the glob slabs
         assert!(dir.join("states-1.bin").exists(), "states-1.bin missing");
-        std::env::remove_var("CSAVES_FORCE_GLOB");
-        std::env::remove_var("CSAVES_GLOB");
+        set_force_glob_for_tests(None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5932,8 +6029,7 @@ pub(crate) mod glob_slab_test {
     #[test]
     fn glob_rebuild_keeps_shiftref_target_order() {
         let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CSAVES_GLOB", "1");
-        std::env::set_var("CSAVES_FORCE_GLOB", "1");
+        set_force_glob_for_tests(Some(true));
         let dir = temp_dir("glob-shift");
         let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
 
@@ -6043,8 +6139,7 @@ pub(crate) mod glob_slab_test {
                 "chunk {i} semantically wrong post-reopen"
             );
         }
-        std::env::remove_var("CSAVES_FORCE_GLOB");
-        std::env::remove_var("CSAVES_GLOB");
+        set_force_glob_for_tests(None);
         let _ = fs::remove_dir_all(&dir);
     }
 }

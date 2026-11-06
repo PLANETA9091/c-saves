@@ -154,6 +154,46 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.35 — concurrent supersede+pack: the batch_idx window that lost chunks
+
+The CI test job on v0.9.34 failed three tests: the two glob-RLE form pins and
+`concurrent_supersede_during_pack_keeps_newest_state` ("chunk 16 lost"). The
+LEAK lines in the CI log gave the exact sequence: 8 `batch_idx miss` during
+the seg-2 rewrite, seg-2 and seg-7 kept poisoned, then chunk 16 unreadable.
+
+Root cause — the supersede path eagerly removed the key's `batch_idx` entry
+BEFORE queuing the new pending recipe:
+
+1. while chunks still pointed BATCHED at the old batch, batch_idx had no
+   entry, so every read of the chunk resolved to None (the loss), and
+2. a concurrent segment rewrite hitting the window took the batch_idx-miss
+   branch and poisoned the whole segment (the CI log's 8 misses), and
+3. a flush racing between the chunks read and the eager remove could delete
+   a FRESH index entry the flush had just written (a second, independent
+   loss path).
+
+Fix, three parts: the new pending entry is queued BEFORE the committed
+version's refs are dropped (a concurrent rewrite now always sees it and
+skips instead of re-queueing stale bytes over the newer pending); the old
+version resolves through the CAPTURED location via the new `load_batched`
+helper (immune to a concurrent flush re-pointing batch_idx mid-resolution);
+the batch_idx entry survives until the flush overwrites it. The rewrite loop
+gains a pending-skip (pre-pull check + atomic check-and-push after the pull,
+so last-write-wins can never roll a chunk back) and an anti-spin poison when
+a stuck pending would never drain.
+
+The two glob form failures were a different disease with the same trigger:
+the tests wrote `CSAVES_GID_RLE_DIV` via `std::env::set_var` while the pack
+path resolves that knob into a OnceLock (v0.9.32/33) — the resolution races
+setenv from parallel tests, and setenv concurrent with getenv is UB besides.
+All 14 test env writes are now test-only override statics; the CSAVES_GLOB
+"1"-set/remove pair (a semantic no-op — the default is enabled) is gone.
+
+Gates: 58/58 tests x8 runs at `--test-threads=8`, enc_fp EXACT
+(6d240d7166cdda99 / 12130 / 9971843 — import untouched), pack 0.41 s at z6
+(2-core sandbox), container 1.94 MiB (x6.42 vs sector-padded anvil), verify
+728+218 bad=0.
+
 ## v0.9.34 — cold back to z6: the CI corpora overrule the local corpus
 
 v0.9.33's cold 6 → 4 was decided on the local dim corpus, where the compact
