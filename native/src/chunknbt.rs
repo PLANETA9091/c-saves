@@ -87,6 +87,26 @@ use std::collections::HashMap;
 
 static SEC_EMIT_CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
+// v0.9.32: the per-chunk feature env reads (KEEP_LIGHT / NO_SCAN / NO_SHIFT /
+// NO_LITE) sat on the hot split path — several getenv lookups per chunk on
+// every import thread. They are process-stable toggles: resolve once.
+static KEEP_LIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn keep_light() -> bool {
+    *KEEP_LIGHT.get_or_init(|| std::env::var("CSAVES_KEEP_LIGHT").as_deref() == Ok("1"))
+}
+static NO_SCAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn no_scan() -> bool {
+    *NO_SCAN.get_or_init(|| std::env::var("CSAVES_NO_SCAN").as_deref() == Ok("1"))
+}
+static NO_SHIFT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn no_shift() -> bool {
+    *NO_SHIFT.get_or_init(|| std::env::var("CSAVES_NO_SHIFT").as_deref() == Ok("1"))
+}
+static NO_LITE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn no_lite() -> bool {
+    *NO_LITE.get_or_init(|| std::env::var("CSAVES_NO_LITE").as_deref() == Ok("1"))
+}
+
 fn sec_emit_cap() -> u64 {
     *SEC_EMIT_CAP.get_or_init(|| {
         std::env::var("CSAVES_SEC_CACHE_BYTES")
@@ -4195,6 +4215,34 @@ pub fn section_decode(b: &[u8]) -> Option<Value> {
 /// have similar heights -> tiny skewed deltas that compress extremely well).
 /// Only applies to genuinely vanilla-shaped arrays: the no-straddle unpack
 /// must re-pack to the exact original longs (zero padding bits in long 36).
+// v0.9.32: heightmap memo. The scan-split tail edit re-encodes every
+// Heightmaps LongArray (unpack 9-bit + roundtrip pack + zigzag varint over
+// 256 entries) on EVERY chunk, yet heightmaps repeat massively across
+// chunks — flat regions, ocean floors, shared surface configs. The memo is
+// keyed by the xxh3_128 of the RAW 296 bytes, so it is a pure function
+// cache: identical input bytes => identical dense output bytes (pinned by
+// enc_fp). thread_local => zero lock traffic on the import threads; the
+// capacity clear is a cache reset, not a correctness mechanism.
+thread_local! {
+    static HMAP_MEMO: std::cell::RefCell<std::collections::HashMap<Hash, std::sync::Arc<Vec<u8>>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+const HMAP_MEMO_CAP: usize = 32768;
+
+fn hmap_memo_get(key: Hash) -> Option<std::sync::Arc<Vec<u8>>> {
+    HMAP_MEMO.with(|m| m.borrow().get(&key).cloned())
+}
+
+fn hmap_memo_put(key: Hash, v: std::sync::Arc<Vec<u8>>) {
+    HMAP_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= HMAP_MEMO_CAP {
+            m.clear();
+        }
+        m.insert(key, v);
+    });
+}
+
 fn hmap_encode(la: &[i64]) -> Option<Vec<u8>> {
     if la.len() != 37 {
         return None;
@@ -4491,8 +4539,8 @@ pub fn split(
     if whole_mode {
         return whole_split(payload, pos_hint);
     }
-    let strip = strip && !matches!(std::env::var("CSAVES_KEEP_LIGHT").as_deref(), Ok("1"));
-    if std::env::var("CSAVES_NO_SCAN").as_deref() != Ok("1") {
+    let strip = strip && !keep_light();
+    if !no_scan() {
         let t_scan = std::time::Instant::now();
         let r = scan_split(payload, strip);
         SPLT_SCAN.0.fetch_add(t_scan.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -4634,7 +4682,7 @@ fn shift_stage(
     cache_hit: &[bool],
     facts: &mut [Option<SectionFacts>],
 ) {
-    if std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1") {
+    if !no_shift() {
         let t_sp = std::time::Instant::now();
         shift_ref_pass(sections, src, cache_hit, facts);
         SPLT_SHIFT.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -4822,11 +4870,24 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
                         continue; // hmap_encode rejects; keep raw (same decision)
                     }
                     let raw = sr!(payload.get(vs + 4..vs + 4 + l * 8), 3);
-                    let la: Vec<i64> = raw
-                        .chunks_exact(8)
-                        .map(|c| i64::from_be_bytes(c.try_into().unwrap()))
-                        .collect();
-                    let Some(dense) = hmap_encode(&la) else { continue };
+                    // v0.9.32: memo keyed by the raw bytes — hmap_encode is a
+                    // pure function, so a hit returns identical dense bytes.
+                    let key = hash_of(raw);
+                    let dense_arc = match hmap_memo_get(key) {
+                        Some(d) => Some(d),
+                        None => {
+                            let la: Vec<i64> = raw
+                                .chunks_exact(8)
+                                .map(|c| i64::from_be_bytes(c.try_into().unwrap()))
+                                .collect();
+                            hmap_encode(&la).map(|d| {
+                                let a = std::sync::Arc::new(d);
+                                hmap_memo_put(key, a.clone());
+                                a
+                            })
+                        }
+                    };
+                    let Some(dense) = dense_arc else { continue };
                     let mut rep = Vec::with_capacity(7 + iname.len() + dense.len());
                     rep.push(7u8); // TAG_Byte_Array
                     rep.extend_from_slice(&(iname.len() as u16).to_be_bytes());
@@ -4835,7 +4896,7 @@ fn scan_root(payload: &[u8], strip: bool) -> Option<ScanOut> {
                     // — fastnbt serializes ByteArray the same way, and the
                     // join-side Heightmaps walk reads 4 bytes here)
                     rep.extend_from_slice(&(dense.len() as i32).to_be_bytes());
-                    rep.extend_from_slice(&dense);
+                    rep.extend_from_slice(&dense[..]);
                     edits.push((it_pos, p - it_pos, rep));
                 }
             }
@@ -5252,7 +5313,7 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
         return None;
     };
     let (sp0, sp1) = out.sections_payload;
-    let want_facts = std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1");
+    let want_facts = !no_shift();
     // v0.9.13: typed borrowed parse first (no per-entry HashMap/String
     // allocations; light fields ride as borrows). Any shape doubt fails the
     // parse and the chunk takes the Value path below — outputs identical
@@ -5265,7 +5326,7 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
     // the wrap buffer stays a live binding for the whole lite branch: the
     // fastnbt RootList borrows it, and the borrow must outlive litelist's use
     let mut buf: Vec<u8> = Vec::new();
-    let lite = if std::env::var("CSAVES_NO_LITE").as_deref() == Ok("1") {
+    let lite = if no_lite() {
         None
     } else {
         match parse_sections_direct(payload, sp0, sp1) {
@@ -5418,7 +5479,7 @@ fn split_parsed(
 
     let t_ss = std::time::Instant::now();
     let mut sections;
-    let strip = strip && !matches!(std::env::var("CSAVES_KEEP_LIGHT").as_deref(), Ok("1"));
+    let strip = strip && !keep_light();
     {
         let Value::Compound(map) = &mut root else { unreachable!("checked above") };
         let Some(Value::List(list)) = map.get_mut("sections") else {
@@ -5432,7 +5493,7 @@ fn split_parsed(
                 strip_derived_section(s);
             }
         }
-        let want_facts = std::env::var("CSAVES_NO_SHIFT").as_deref() != Ok("1");
+        let want_facts = !no_shift();
         let (mut secs, cache_hit, mut facts) = encode_section_list(list, want_facts);
         shift_stage(&mut secs, &SecListSrc::Values(list), &cache_hit, &mut facts);
         sections = secs;

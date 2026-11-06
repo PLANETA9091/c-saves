@@ -154,6 +154,42 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.32 — split-path hygiene: heightmap memo, once-resolved env toggles
+
+The import split is now dominated by three measured blocks: section encode
+(~105 µs/chunk), the shift pass (~48-51 µs), and the scan-root walk
+(~48 µs, of which ~40 µs is heightmap work: every Heightmaps LongArray is
+9-bit-unpacked, roundtrip-pack-validated and zigzag-varint re-encoded on
+EVERY chunk import — 4.09 maps per chunk on the corpus). Heightmaps repeat
+massively across chunks (flat regions, ocean floors, shared surface
+configs), so the dense form is now memoized: key = xxh3_128 of the raw 296
+bytes, value = the dense TAG_Byte_Array payload, thread-local (zero lock
+traffic), 32k entries with clear-on-full. It is a pure-function cache —
+identical input bytes must yield identical dense bytes — so the wire is
+untouched: enc_fp 6d240d7166cdda99 / 12130 / 9971843 EXACT.
+
+The per-chunk feature reads (CSAVES_KEEP_LIGHT / NO_SCAN / NO_SHIFT /
+NO_LITE) sat as getenv calls on the hot split path (4-5 per chunk on every
+import thread); they are process-stable toggles and now resolve once into
+statics.
+
+Measured on the dim corpus (stable per-call stage timers, warmup-first):
+scan stage 232.8 -> 222.8 µs/chunk; wall-clock import on this 2-core
+sandbox is too noisy for honest A/B (MT swung 139-177 MB/s across
+identical-code runs). Two documented negatives from the same session: a
+byte-pair nibble unpack rewrite REGRESSED 2572 -> 3228 ns/section (the
+constant-shift loop was already auto-vectorized — reverted), and the
+long-standing split-minus-scan stage delta (~58-68 µs/chunk) turns out to
+be nested Instant::now() overhead on the virtualized host (the outer timer
+absorbs ~70 inner timer sites), not work — future profiling should trust
+per-call stage timers over stage deltas here. Next measured levers, in
+order: shift-pass internals (48-51 µs), hot-slab zstd inside
+ensure_blobs (~60 µs), unpack SWAR histogram.
+
+Gates: 58/58 tests, enc_fp EXACT, verify 728+218 bad=0 (x3 checkpoints),
+bench_size compact x0.11 (gate 0.15), survival TOTAL x3.13 ok=1280 bad=0,
+container 1.94 MiB x6.42, pack 0.47 s.
+
 ## v0.9.30 — dictionary training stops being a lottery
 
 The sample pool behind the shared zstd dictionary was a Vec that froze at

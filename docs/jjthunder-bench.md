@@ -1106,3 +1106,25 @@ use the new per-store write_skips counter.
 
 Gates: 58/58 x3 suite runs, race test 30/30, jj verify 946/946, survival
 ok=1280, enc_fp EXACT, pack 0.47 s (parity), container x6.42.
+
+## v0.9.32: split-path profiling pass (import per-chunk budget)
+
+Warm import-MT run on the dim corpus (728 chunks, 2 threads) decomposes
+per chunk as: split ~225 µs (scan-root walk 48 incl. ~40 heightmap work,
+sections lite-parse 21, encode 105, shift 48-51, tail 3), ensure_blobs
+~60 µs (hot-slab zstd — real work), recipe ~6 µs. The split stage timers
+are stable to ±1 µs across runs; wall clock on this 2-core sandbox swings
+±15% and must not be used for A/B verdicts at this granularity.
+
+Shipped: heightmap dense-form memo (xxh3_128 of the raw 296-byte
+LongArray -> dense bytes, thread-local, pure-function cache; scan stage
+232.8 -> 222.8 µs/chunk) and once-resolved env toggles on the split path.
+enc_fp EXACT (6d240d7166cdda99 / 12130 / 9971843).
+
+Negatives kept on record: byte-pair nibble unpack regression (LLVM already
+vectorizes the constant-shift loop; reverted), and the split-minus-scan
+delta identified as nested-timer overhead (~70 Instant::now() sites inside
+the outer WST_SPLIT wrap on a virtualized host), not work. Next levers by
+size: shift-pass internals (identity/candidate build ~21 µs/chunk of the
+pass), hot-slab zstd inside ensure_blobs, SWAR nibble histogram in
+unpack_counts_vox.
