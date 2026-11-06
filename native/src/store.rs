@@ -268,7 +268,13 @@ impl Default for Cfg {
             // verify 946/946); below z6 the wall is the BUILD phase again
             // (z4: comp 60 ms vs build 158 ms), so the extra -16% pack at
             // z4 buys +11% storage — wrong trade for a storage engine.
-            cold_level: 6,
+            // v0.9.33 flips that verdict: the build phase went parallel
+            // (3-stage GLOB conversion), so z4's comp 60 ms no longer
+            // hides behind build 160 ms — z4 pack 0.30 s vs z6 0.44 s
+            // (-32%) for 2.14 vs 1.94 MiB (+10%, compact gate x0.10 ->
+            // x0.11 vs 0.15). With build parallel the storage tax is what
+            // buys speed now; z2 measured pack-flat (0.29 s) — stop at z4.
+            cold_level: 4,
             recipe_level: 6,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
@@ -345,7 +351,7 @@ impl Cfg {
     pub fn from_env() -> Cfg {
         Cfg {
             hot_level: env_parse("CSAVES_HOT_LEVEL", -3),
-            cold_level: env_parse("CSAVES_COLD_LEVEL", 6),
+            cold_level: env_parse("CSAVES_COLD_LEVEL", 4),
             recipe_level: env_parse("CSAVES_RECIPE_LEVEL", 6),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 64 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),
@@ -1031,6 +1037,12 @@ static ST_GLOB_SLABS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 // pack-phase census (diagnostic): cumulative ns in each pack sub-stage
 pub static PK_VICTIMS_NS: AtomicU64 = AtomicU64::new(0);
 pub static PK_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+// v0.9.33 build sub-census: where the serial Phase A wall goes —
+// bglob = the GLOB variant block (registry lock + section_to_glob +
+// glob stream build), btab = the entry-table + raw-concatenation build()
+// closure calls (canon + glob)
+pub static PK_B_GLOB_NS: AtomicU64 = AtomicU64::new(0);
+pub static PK_B_TAB_NS: AtomicU64 = AtomicU64::new(0);
 pub static PK_COMP_NS: AtomicU64 = AtomicU64::new(0);
 pub static PK_APPEND_NS: AtomicU64 = AtomicU64::new(0);
 pub static PK_RECIPES_NS: AtomicU64 = AtomicU64::new(0);
@@ -1043,7 +1055,7 @@ pub static PK_MT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub fn pack_census_json() -> String {
     format!(
-        "{{victims:{},build:{},comp:{},append:{},recipes:{},readblob:{},mtjobs:{},mtns:{},mtbytes:{}}}",
+        "{{victims:{},build:{},comp:{},append:{},recipes:{},readblob:{},mtjobs:{},mtns:{},mtbytes:{},bglob:{},btab:{}}}",
         PK_VICTIMS_NS.load(Ordering::Relaxed),
         PK_BUILD_NS.load(Ordering::Relaxed),
         PK_COMP_NS.load(Ordering::Relaxed),
@@ -1053,11 +1065,13 @@ pub fn pack_census_json() -> String {
         PK_MT_JOBS.load(Ordering::Relaxed),
         PK_MT_NS.load(Ordering::Relaxed),
         PK_MT_BYTES.load(Ordering::Relaxed),
+        PK_B_GLOB_NS.load(Ordering::Relaxed),
+        PK_B_TAB_NS.load(Ordering::Relaxed),
     )
 }
 
 pub fn pack_census_reset() {
-    for st in [&PK_VICTIMS_NS, &PK_BUILD_NS, &PK_COMP_NS, &PK_APPEND_NS, &PK_RECIPES_NS, &PK_READBLOB_NS, &PK_MT_JOBS, &PK_MT_NS, &PK_MT_BYTES] {
+    for st in [&PK_VICTIMS_NS, &PK_BUILD_NS, &PK_COMP_NS, &PK_APPEND_NS, &PK_RECIPES_NS, &PK_READBLOB_NS, &PK_MT_JOBS, &PK_MT_NS, &PK_MT_BYTES, &PK_B_GLOB_NS, &PK_B_TAB_NS] {
         st.store(0, Ordering::Relaxed);
     }
 }
@@ -3819,9 +3833,115 @@ impl Store {
             glob: Option<(GVar, u8)>,
         }
         let _tb = std::time::Instant::now();
+        let cores = std::thread::available_parallelism()
+            .map(|x| x.get())
+            .unwrap_or(1);
+        // ---- Phase A (v0.9.33: parallel build) ---- The GLOB conversion
+        // used to be ~95% of the build wall and strictly serial, because
+        // registry gid assignment order pins every stream byte. The
+        // conversion is now split (chunknbt): stage 1 (parse + unpack +
+        // bounds + first-reference order) and stage 3 (gid map + RLE scans
+        // + materialize) are PURE functions of the member bytes and run on
+        // all cores; stage 2 — the palette-ref get_or_insert sweep — is the
+        // only registry-touching part and runs serially in the EXACT old
+        // order (group order x member order x first-reference order), so
+        // registry gids, the reg_dirty discipline, every failure decision
+        // and every stream byte match the serial pack.
+        let total: usize = groups.iter().map(|g| g.len()).sum();
+        let flat_raws: Vec<&[u8]> = groups
+            .iter()
+            .flat_map(|g| g.iter().map(|c| c.3.as_slice()))
+            .collect();
+        // stage 1 (parallel, pure)
+        let mut pres: Vec<Option<chunknbt::GlobPre>> = (0..total).map(|_| None).collect();
+        {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let outs: std::sync::Mutex<Vec<Option<Option<chunknbt::GlobPre>>>> =
+                std::sync::Mutex::new((0..total).map(|_| None).collect());
+            std::thread::scope(|sc| {
+                for _ in 0..cores.min(total).max(1) {
+                    sc.spawn(|| loop {
+                        let j = next.fetch_add(1, Ordering::Relaxed);
+                        if j >= total {
+                            break;
+                        }
+                        let pre = chunknbt::section_glob_pre(flat_raws[j]);
+                        outs.lock().unwrap()[j] = Some(pre);
+                    });
+                }
+            });
+            for (d, p) in outs.into_inner().unwrap().into_iter().zip(pres.iter_mut()) {
+                *p = d.flatten();
+            }
+        }
+        // stage 2 (SERIAL, the only registry-touching sweep): the
+        // per-member `len() <= 65536` gate mirrors section_to_glob's
+        // internal check (the registry may cross the line MID-group: later
+        // members then refuse conversion, exactly like the old monolithic
+        // call), and the group-level reg_dirty flag fires on any growth.
+        let mut pgids: Vec<Option<Vec<u32>>> = vec![None; total];
+        if self.glob_enabled() {
+            let mut m = 0usize;
+            for group in &groups {
+                let mut reg = self.glob_reg.lock();
+                let before = reg.len();
+                for _c in group {
+                    if reg.len() <= 65536 {
+                        if let Some(pre) = &pres[m] {
+                            pgids[m] = chunknbt::section_glob_resolve(pre, &mut reg);
+                        }
+                    }
+                    m += 1;
+                }
+                if reg.len() != before {
+                    self.reg_dirty.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        // stage 3 (parallel, pure)
+        let mut globs: Vec<Option<Vec<u8>>> = vec![None; total];
+        {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let outs: std::sync::Mutex<Vec<Option<Option<Vec<u8>>>>> =
+                std::sync::Mutex::new((0..total).map(|_| None).collect());
+            let pres_ref = &pres;
+            let pgids_ref = &pgids;
+            std::thread::scope(|sc| {
+                for _ in 0..cores.min(total).max(1) {
+                    sc.spawn(|| loop {
+                        let j = next.fetch_add(1, Ordering::Relaxed);
+                        if j >= total {
+                            break;
+                        }
+                        let r = match (&pres_ref[j], &pgids_ref[j]) {
+                            (Some(pre), Some(pgid)) => {
+                                chunknbt::section_glob_finish(flat_raws[j], pre, pgid)
+                            }
+                            _ => None,
+                        };
+                        outs.lock().unwrap()[j] = Some(r);
+                    });
+                }
+            });
+            for (d, g) in outs.into_inner().unwrap().into_iter().zip(globs.iter_mut()) {
+                *g = d.flatten();
+            }
+        }
+        drop(flat_raws);
+        drop(pres);
+        drop(pgids);
+        // group offsets into the flat member arrays
+        let mut offs = Vec::with_capacity(groups.len() + 1);
+        let mut acc = 0usize;
+        offs.push(0);
+        for g in &groups {
+            acc += g.len();
+            offs.push(acc);
+        }
         let builds: Vec<GBuild> = groups
             .into_iter()
-            .map(|group| {
+            .enumerate()
+            .map(|(gi, group)| {
                 let n = group.len();
                 // SLAB V2 (kind 8): entry table = varint zigzag(id delta) ++
                 // varint(raw len) ++ 16B hash per member, then concatenated
@@ -3847,7 +3967,9 @@ impl Store {
                 };
                 let canon_lens: Vec<usize> = group.iter().map(|c| c.3.len()).collect();
                 let canon_raws: Vec<&[u8]> = group.iter().map(|c| c.3.as_slice()).collect();
+                let _tbc = std::time::Instant::now();
                 let (canon_stream, canon_tab_len) = build(&canon_lens, &canon_raws);
+                PK_B_TAB_NS.fetch_add(_tbc.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 // GLOB variant (jj_exp5: x2.16 on vanilla-terrain dense
                 // content): the same members with dense CSEC sections
                 // converted to the 0xCB global-id form. The slab stores
@@ -3856,15 +3978,17 @@ impl Store {
                 // mislead: the gid stream is wider but matches
                 // cross-section). Non-converting members keep their
                 // canonical bytes; every member is self-describing by magic.
+                // v0.9.33: converted bytes come from the parallel stage 3;
+                // the registry sweep already happened in stage 2.
                 let mut glob: Option<(GVar, u8)> = None;
-                if self.glob_enabled() && self.glob_reg.lock().len() <= 65536 {
-                    let mut reg = self.glob_reg.lock();
-                    let before = reg.len();
+                let _tg = std::time::Instant::now();
+                {
+                    let base = offs[gi];
                     let mut glens = Vec::with_capacity(n);
                     let mut graws: Vec<Vec<u8>> = Vec::with_capacity(n);
                     let mut any = false;
-                    for (_h, _id, _loc, raw) in &group {
-                        match chunknbt::section_to_glob(raw, &mut reg) {
+                    for (mi, (_h, _id, _loc, raw)) in group.iter().enumerate() {
+                        match globs[base + mi].take() {
                             Some(g) => {
                                 any = true;
                                 glens.push(g.len());
@@ -3876,12 +4000,11 @@ impl Store {
                             }
                         }
                     }
-                    if reg.len() != before {
-                        self.reg_dirty.store(true, Ordering::Relaxed);
-                    }
                     if any {
                         let graws_ref: Vec<&[u8]> = graws.iter().map(|v| v.as_slice()).collect();
+                        let _tbg = std::time::Instant::now();
                         let (gs, gtab_len) = build(&glens, &graws_ref);
+                        PK_B_TAB_NS.fetch_add(_tbg.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let reg_w = if graws.iter().any(|g| chunknbt::glob_member_wide(g)) {
                             2u8
                         } else {
@@ -3890,6 +4013,7 @@ impl Store {
                         glob = Some((GVar { stream: gs, tab_len: gtab_len, lens: glens }, reg_w));
                     }
                 }
+                PK_B_GLOB_NS.fetch_add(_tg.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 GBuild {
                     group,
                     canon: GVar { stream: canon_stream, tab_len: canon_tab_len, lens: canon_lens },
@@ -3930,9 +4054,6 @@ impl Store {
             std::sync::Mutex::new((0..flat.len()).map(|_| None).collect());
         let level = self.cfg.cold_level;
         let mt_min = self.cfg.pack_mt_min;
-        let cores = std::thread::available_parallelism()
-            .map(|x| x.get())
-            .unwrap_or(1);
         let big_cnt = if mt_min > 0 {
             flat.iter().filter(|s| s.len() >= mt_min).count()
         } else {
@@ -4047,8 +4168,11 @@ impl Store {
                 let cg = cg.expect("glob comp present");
                 // CSAVES_FORCE_GLOB=1: debug knob — take the glob variant
                 // unconditionally so the read/scan paths are testable
-                // regardless of the size heuristic
-                let force = std::env::var("CSAVES_FORCE_GLOB").as_deref() == Ok("1");
+                // regardless of the size heuristic. v0.9.33: once-resolved
+                // (was a getenv per GROUP on the pack path).
+                static FORCE_GLOB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let force =
+                    *FORCE_GLOB.get_or_init(|| std::env::var("CSAVES_FORCE_GLOB").as_deref() == Ok("1"));
                 if force || cg.len() < cc.len() {
                     // the registry MUST be on disk before the slab that
                     // references its gids (crash = silent misresolution)

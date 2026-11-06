@@ -154,6 +154,48 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.33 — pack build goes parallel (3-stage GLOB split) + cold z4
+
+The sub-census found the pack build phase 95% GLOB conversion
+(`bglob 145 ms` of `build 152 ms`), and Phase A was strictly serial —
+`groups.into_iter().map()` — while the compress pool waited. The conversion
+could not simply be parallelized: registry gid ASSIGNMENT ORDER pins every
+stream byte. The split that preserves it exactly:
+
+- stage 1 (pure, parallel): header checks + palette parse + dense unpack +
+  bounds + first-reference order (`section_glob_pre`)
+- stage 2 (SERIAL, the only registry-touching part): palette refs resolved
+  in first-reference order — the exact `get_or_insert` sequence of the old
+  per-voxel memo loop, including the >65535 abort semantics and the
+  per-member `len() <= 65536` gate (`section_glob_resolve`)
+- stage 3 (pure, parallel): gid map + RLE admission scans + winner +
+  header + tail (`section_glob_finish`)
+
+`section_to_glob` remains as the composition (tests, serial callers);
+`monolithic == composition` on every glob unit test. Also on the path:
+the two gid-RLE admission scans were full 4096-byte walks — they now
+early-exit once the admission bound is busted (the v0.9.21b lever, ported
+from the encode path; decisions identical by construction) and are skipped
+entirely at `CSAVES_GID_RLE_DIV=0`; the bounds pass and the first-reference
+scan fused into one voxel pass; the per-section getenv reads
+(`CSAVES_GID_RLE_DIV`, `CSAVES_GLOB_DEBUG` x2, `CSAVES_FORCE_GLOB` per
+group) resolved once.
+
+Cold level 6 -> 4. The 0.9.29 verdict ("z4 buys storage, not speed") was
+true only while build was serial: build no longer hides comp, and the
+re-sweep shows z2 pack-flat (0.29 s) while z4 keeps -32% pack vs z6 for
++10% container (compact x0.10 -> x0.13, gate 0.15 still green).
+
+Dim corpus (2-core, warmup-first, same sandbox): pack 0.48 -> 0.24 s
+(-50%), build 152 -> 95 ms, comp 207 -> 57 ms (z4). Conversion bytes are
+IDENTICAL to the serial flow by construction (container x5.81 = the z4
+sweep's own bytes); the container fp moves with the level change only.
+
+Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99 / 12130 / 9971843 —
+import untouched), verify 728+218 bad=0, survival ok=1280 bad=0, bench_size
+compact x0.13 (gate 0.15), container 2.14 MiB (x5.81 vs sector-padded
+anvil), pack 0.24 s.
+
 ## v0.9.32 — split-path hygiene: heightmap memo, once-resolved env toggles
 
 The import split is now dominated by three measured blocks: section encode

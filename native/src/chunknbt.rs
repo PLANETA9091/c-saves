@@ -107,6 +107,24 @@ fn no_lite() -> bool {
     *NO_LITE.get_or_init(|| std::env::var("CSAVES_NO_LITE").as_deref() == Ok("1"))
 }
 
+// v0.9.33: same discipline for the pack build path — section_to_glob read
+// CSAVES_GID_RLE_DIV once per SECTION and CSAVES_GLOB_DEBUG twice per
+// section (getenv + alloc under a process lock, ~36K lookups per bench
+// pack). Process-stable toggles: resolve once.
+static GID_RLE_DIV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+fn gid_rle_div() -> u64 {
+    *GID_RLE_DIV.get_or_init(|| {
+        std::env::var("CSAVES_GID_RLE_DIV")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+static GLOB_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn glob_debug() -> bool {
+    *GLOB_DEBUG.get_or_init(|| std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1"))
+}
+
 fn sec_emit_cap() -> u64 {
     *SEC_EMIT_CAP.get_or_init(|| {
         std::env::var("CSAVES_SEC_CACHE_BYTES")
@@ -1194,6 +1212,32 @@ fn rle_stream_len(v: &[u8]) -> u64 {
     total
 }
 
+/// v0.9.33: early-exit twin — returns the exact length while it stays
+/// <= bound; once the running total EXCEEDS bound the caller's admission
+/// (`total * div <= len`) is already unfixable, so the exact surplus value
+/// is never needed. Noise-heavy gid streams abort after ~len/div bytes
+/// instead of walking all 4096 (the bounded-scan lever that v0.9.21b
+/// applied to the encode path, now on the pack build path). Decisions are
+/// identical: a stream whose exact length exceeds bound fails the same
+/// admission checks either way.
+fn rle_stream_len_bounded(v: &[u8], bound: u64) -> u64 {
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let idx = v[i];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == idx {
+            run += 1;
+        }
+        total += 1 + uvarint_len(run as u64);
+        if total > bound {
+            return total;
+        }
+        i += run;
+    }
+    total
+}
+
 /// RLE size of the y-transposed stream without materializing the
 /// transpose: walks the same (x, z, y) order as transpose_fast_y (x outer,
 /// z middle, y inner stride s2) accumulating the identical run framing.
@@ -1225,6 +1269,39 @@ fn rle_transposed_len(v: &[u8], side: usize) -> u64 {
     total
 }
 
+/// v0.9.33: early-exit twin of rle_transposed_len (same contract as
+/// rle_stream_len_bounded).
+fn rle_transposed_len_bounded(v: &[u8], side: usize, bound: u64) -> u64 {
+    let s2 = side * side;
+    let mut total = 0u64;
+    let mut run_val = 0u8;
+    let mut run_len = 0usize;
+    'outer: for x in 0..side {
+        for z in 0..side {
+            let base = z * side + x;
+            for y in 0..side {
+                let e = v[y * s2 + base];
+                if run_len > 0 && e == run_val {
+                    run_len += 1;
+                } else {
+                    if run_len > 0 {
+                        total += 1 + uvarint_len(run_len as u64);
+                        if total > bound {
+                            break 'outer;
+                        }
+                    }
+                    run_val = e;
+                    run_len = 1;
+                }
+            }
+        }
+    }
+    if run_len > 0 {
+        total += 1 + uvarint_len(run_len as u64);
+    }
+    total
+}
+
 /// u32-input twin of rle_stream_len ([gid u16 LE][varint run] framing).
 fn rle_stream_len_u16(v: &[u32]) -> u64 {
     let mut total = 0u64;
@@ -1236,6 +1313,25 @@ fn rle_stream_len_u16(v: &[u32]) -> u64 {
             run += 1;
         }
         total += 2 + uvarint_len(run as u64);
+        i += run;
+    }
+    total
+}
+
+/// v0.9.33: early-exit twin of rle_stream_len_u16.
+fn rle_stream_len_u16_bounded(v: &[u32], bound: u64) -> u64 {
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let idx = v[i];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == idx {
+            run += 1;
+        }
+        total += 2 + uvarint_len(run as u64);
+        if total > bound {
+            return total;
+        }
         i += run;
     }
     total
@@ -1257,6 +1353,38 @@ fn rle_transposed_len_u16(v: &[u32], side: usize) -> u64 {
                 } else {
                     if run_len > 0 {
                         total += 2 + uvarint_len(run_len as u64);
+                    }
+                    run_val = e;
+                    run_len = 1;
+                }
+            }
+        }
+    }
+    if run_len > 0 {
+        total += 2 + uvarint_len(run_len as u64);
+    }
+    total
+}
+
+/// v0.9.33: early-exit twin of rle_transposed_len_u16.
+fn rle_transposed_len_u16_bounded(v: &[u32], side: usize, bound: u64) -> u64 {
+    let s2 = side * side;
+    let mut total = 0u64;
+    let mut run_val = 0u32;
+    let mut run_len = 0usize;
+    'outer: for x in 0..side {
+        for z in 0..side {
+            let base = z * side + x;
+            for y in 0..side {
+                let e = v[y * s2 + base];
+                if run_len > 0 && e == run_val {
+                    run_len += 1;
+                } else {
+                    if run_len > 0 {
+                        total += 2 + uvarint_len(run_len as u64);
+                        if total > bound {
+                            break 'outer;
+                        }
                     }
                     run_val = e;
                     run_len = 1;
@@ -6719,13 +6847,45 @@ fn glob_parse_entry(b: &[u8], p: &mut usize) -> Option<(GlobState, u8)> {
 /// raw-u8 case keeps the legacy 0xCB layout byte-for-byte; wider/RLE forms
 /// take 0xCC. The gid width follows the section's MAX gid: registries up
 /// to 65536 states are representable (u16 streams).
-pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> {
-    if reg.len() > 65536 {
-        return None;
-    }
+/// v0.9.33: the conversion is split into three stages so the pack build
+/// phase can run on all cores. The ONLY registry-touching part is the
+/// palette resolution (stage 2) — the old per-voxel memo loop's
+/// get_or_insert sequence, reproduced exactly via first-reference order —
+/// everything else is a pure function of the section bytes:
+///   1. section_glob_pre     (pure)  header + palette parse + unpack +
+///                                   bounds + first-reference order
+///   2. section_glob_resolve (serial) palette refs -> gids, exact old order
+///   3. section_glob_finish  (pure)  gid map + RLE scans + materialize
+/// The monolithic section_to_glob is the composition (tests + serial
+/// callers); byte-identical outputs to the pre-split implementation.
+pub struct GlobPre {
+    /// palette states in file order
+    pub states: Vec<GlobState>,
+    /// 4096 canonical voxel indices (bounds-checked < n)
+    pub vox: Vec<u32>,
+    /// distinct palette indices in FIRST-REFERENCE (voxel-scan) order —
+    /// the exact sequence of NEW get_or_insert calls the old per-voxel
+    /// memo loop made; unreferenced entries never appear (never register)
+    pub ref_order: Vec<u32>,
+    pub y: u8,
+    pub f1: u8,
+    /// f2 as written to the 0xCB/0xCC header (narrow/order bits cleared)
+    pub f2c: u8,
+    pub f3: u8,
+    pub out_bits: u32,
+    /// palette size
+    pub n: usize,
+    /// csec offset of the tail after the dense stream
+    pub tail_off: usize,
+}
+
+/// Stage 1 (PURE — no registry): header checks + palette parse + dense
+/// unpack + bounds check + first-reference order. Every failure decision
+/// matches the monolithic implementation.
+pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
     let magic = *csec.first()?;
     if magic != CSEC3_MAGIC && magic != CSEC4_MAGIC {
-        if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+        if glob_debug() {
             eprintln!("glob: magic {magic:#04x} len={} not CSEC", csec.len());
         }
         return None;
@@ -6742,7 +6902,7 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     p += 1;
     // block_states present AND has data; dense form only (f2 order bits 4/5)
     if f1 & 3 != 3 || f2 & 48 != 0 {
-        if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+        if glob_debug() {
             eprintln!("glob: skip f1={f1:02x} f2={f2:02x} (f1&3={}, f2&48={})", f1 & 3, f2 & 48);
         }
         return None;
@@ -6755,7 +6915,7 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     let mut states = Vec::with_capacity(n);
     for i in 0..n {
         let Some((st, _kind)) = glob_parse_entry(csec, &mut p) else {
-            if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+            if glob_debug() {
                 eprintln!("glob: entry parse failed i={i}/{n} p={p} len={}", csec.len());
             }
             return None;
@@ -6767,40 +6927,76 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     let out_bits = if f2 & 4 != 0 { bits_for(n) } else { bits_for(n).max(4) };
     let stream_len = (4096usize * out_bits as usize).div_ceil(8);
     let Some(vox) = dense_unpack_vox(csec.get(p..p + stream_len)?, 4096, out_bits) else {
-        if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+        if glob_debug() {
             eprintln!("glob: dense_unpack failed n={n} out_bits={out_bits} stream_len={stream_len} p={p} len={}", csec.len());
         }
         return None;
     };
-    if vox.iter().any(|&x| (x as usize) >= n) {
-        if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
-            eprintln!("glob: voxel out of range n={n} out_bits={out_bits}");
+    // v0.9.33: the bounds check and the first-reference scan are FUSED
+    // into one pass over the 4096 voxels (was: a separate .any() bounds
+    // pass + a separate refscan pass); the abort decision stays
+    // first-out-of-range-voxel.
+    let mut seen = vec![false; n];
+    let mut ref_order: Vec<u32> = Vec::with_capacity(n.min(4096));
+    for &v in &vox {
+        let vi = v as usize;
+        if vi >= n {
+            if glob_debug() {
+                eprintln!("glob: voxel out of range n={n} out_bits={out_bits}");
+            }
+            return None;
         }
-        return None;
+        if !seen[vi] {
+            seen[vi] = true;
+            ref_order.push(v);
+        }
     }
+    Some(GlobPre {
+        states,
+        vox,
+        ref_order,
+        y,
+        f1,
+        f2c: f2 & !4 & !16 & !32,
+        f3,
+        out_bits,
+        n,
+        tail_off: p + stream_len,
+    })
+}
+
+/// Stage 2 (the ONLY registry-touching stage): resolve the palette refs in
+/// first-reference order — byte-identical registry mutation sequence to
+/// the old per-voxel memo loop, INCLUDING the >65535 abort: the violating
+/// state registers (get_or_insert returned its gid), refs after it do not
+/// — exactly the old voxel-order behavior.
+pub fn section_glob_resolve(pre: &GlobPre, reg: &mut StateRegistry) -> Option<Vec<u32>> {
+    let mut pgid = vec![u32::MAX; pre.n];
+    for &vi in &pre.ref_order {
+        let g = reg.get_or_insert(pre.states[vi as usize].clone());
+        if g > 65535 {
+            return None;
+        }
+        pgid[vi as usize] = g;
+    }
+    Some(pgid)
+}
+
+/// Stage 3 (PURE): gid map + raw materialization + RLE admission scans +
+/// winner + header + tail. Deterministic function of (csec, pre, pgid).
+/// `csec` must be the same bytes `pre` was parsed from (the tail after the
+/// dense stream is copied verbatim).
+pub fn section_glob_finish(csec: &[u8], pre: &GlobPre, pgid: &[u32]) -> Option<Vec<u8>> {
+    let n = pre.n;
     // gid stream: one gid per voxel. The registry may cross the 256-state
     // line MID-CONVERSION (earlier sections in the same pack wave insert
     // new states): gids above 255 switch this section's stream to the u16
     // width instead of refusing the conversion (registries up to 65536
     // states stay representable).
-    // PALETTE-MEMO: the voxel loop used to call reg.get_or_insert per
-    // VOXEL — 4096 full-state hash lookups + 4096 String clones per
-    // section, for a palette that holds at most n distinct states. A lazy
-    // per-palette-index memo keeps the gid ASSIGNMENT ORDER exactly the
-    // old one (states register on first REFERENCING voxel, unreferenced
-    // palette entries never register — registry bytes are unchanged, the
-    // drained container stays identical) while the hash cost drops from
-    // 4096 to n lookups and n clones.
-    let mut pgid: Vec<u32> = vec![u32::MAX; n];
     let mut gids: Vec<u32> = Vec::with_capacity(4096);
     let mut max_gid: u32 = 0;
-    for v in &vox {
-        let vi = *v as usize;
-        let mut g = pgid[vi];
-        if g == u32::MAX {
-            g = reg.get_or_insert(states[vi].clone());
-            pgid[vi] = g;
-        }
+    for v in &pre.vox {
+        let g = pgid[*v as usize];
         if g > 65535 {
             return None;
         }
@@ -6816,12 +7012,9 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
     // 4x rule admits streams whose RLE is small but whose slab compresses
     // WORSE (corpus: x2.99 vs x3.08 at div=4). The divisor is tunable —
     // CSAVES_GID_RLE_DIV, 0 disables gid RLE entirely.
-    let div: u64 = std::env::var("CSAVES_GID_RLE_DIV")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-    if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
-        eprintln!("glob: n={n} vox_max={:?} reg_len={} max_gid={max_gid} wide={wide}", vox.iter().max(), reg.len());
+    let div: u64 = gid_rle_div();
+    if glob_debug() {
+        eprintln!("glob: n={n} vox_max={:?} max_gid={max_gid} wide={wide}", pre.vox.iter().max());
     }
     // The run structure of the gid stream equals the canonical index stream
     // (palette mapping is a bijection), but the RLE admission WINDOW differs:
@@ -6837,10 +7030,19 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
             raw.extend_from_slice(&(*g as u16).to_le_bytes());
         }
         // size-only scans (exact [gid u16][varint] lengths) — materialize
-        // only the winning form; identical decisions and bytes
-        let lv = rle_stream_len_u16(&gids);
+        // only the winning form; identical decisions and bytes. v0.9.33:
+        // bounded scans (early exit once the admission bound is busted) and
+        // skipped entirely when div = 0 (admission can never pass).
+        let (lv, lt) = if div > 0 {
+            let bound = (raw.len() as u64) / div;
+            (
+                rle_stream_len_u16_bounded(&gids, bound),
+                rle_transposed_len_u16_bounded(&gids, 16, bound),
+            )
+        } else {
+            (0, 0)
+        };
         let v_ok = div > 0 && lv * div <= raw.len() as u64 && lv + 32 <= raw.len() as u64;
-        let lt = rle_transposed_len_u16(&gids, 16);
         let t_ok = div > 0 && lt * div <= raw.len() as u64 && lt + 32 <= raw.len() as u64;
         if v_ok {
             if t_ok && lt < lv {
@@ -6858,10 +7060,19 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
         for g in &gids {
             raw.push(*g as u8);
         }
-        // size-only scans (exact lengths) — materialize only the winner
-        let la = rle_stream_len(&raw);
+        // size-only scans (exact lengths) — materialize only the winner.
+        // v0.9.33: bounded scans (early exit once the admission bound is
+        // busted), skipped entirely when div = 0.
+        let (la, lb) = if div > 0 {
+            let bound = (raw.len() as u64) / div;
+            (
+                rle_stream_len_bounded(&raw, bound),
+                rle_transposed_len_bounded(&raw, 16, bound),
+            )
+        } else {
+            (0, 0)
+        };
         let a_ok = div > 0 && la * div <= raw.len() as u64 && la + 32 <= raw.len() as u64;
-        let lb = rle_transposed_len(&raw, 16);
         let b_ok = div > 0 && lb * div <= raw.len() as u64 && lb + 32 <= raw.len() as u64;
         if a_ok {
             if b_ok && lb < la {
@@ -6875,29 +7086,29 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
             (0, raw)
         }
     };
-    let mut out = Vec::with_capacity(p + stream_len + payload.len() + 8);
+    let mut out = Vec::with_capacity(pre.tail_off + payload.len() + 8);
     if gform == 0 {
         // legacy 0xCB: byte-identical to the pre-0xCC wire (raw u8 stream)
         out.push(GLOB_MAGIC);
-        out.push(f1);
-        out.push(f2 & !4 & !16 & !32);
+        out.push(pre.f1);
+        out.push(pre.f2c);
         // 0xCB ALWAYS carries the f3 byte (all f1/f2 bits are taken; the
         // explicit shape removes any v3/v4 header ambiguity)
-        out.push(f3);
-        out.push(y);
+        out.push(pre.f3);
+        out.push(pre.y);
         out.extend_from_slice(&payload);
     } else {
         out.push(GLOB2_MAGIC);
-        out.push(f1);
-        out.push(f2 & !4 & !16 & !32);
-        out.push(f3);
-        out.push(y);
+        out.push(pre.f1);
+        out.push(pre.f2c);
+        out.push(pre.f3);
+        out.push(pre.y);
         out.push(gform);
         out.extend_from_slice(&payload);
     }
-    out.extend_from_slice(&csec[p + stream_len..]);
+    out.extend_from_slice(&csec[pre.tail_off..]);
     ST_GLOB_ENC.fetch_add(1, Ordering::Relaxed);
-    if std::env::var("CSAVES_GLOB_DEBUG").as_deref() == Ok("1") {
+    if glob_debug() {
         eprintln!(
             "glob: converted ok n={n} canon={} glob={} gform={gform}",
             csec.len(),
@@ -6905,6 +7116,15 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
         );
     }
     Some(out)
+}
+
+pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> {
+    if reg.len() > 65536 {
+        return None;
+    }
+    let pre = section_glob_pre(csec)?;
+    let pgid = section_glob_resolve(&pre, reg)?;
+    section_glob_finish(csec, &pre, &pgid)
 }
 
 /// Rebuild canonical CSEC bytes from a GLOB section (0xCB). The rebuilt

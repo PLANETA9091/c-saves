@@ -1128,3 +1128,47 @@ the outer WST_SPLIT wrap on a virtualized host), not work. Next levers by
 size: shift-pass internals (identity/candidate build ~21 µs/chunk of the
 pass), hot-slab zstd inside ensure_blobs, SWAR nibble histogram in
 unpack_counts_vox.
+
+## 0.9.33 — pack build goes parallel: the 3-stage GLOB split + cold z4
+
+Build sub-census (new PK_B_GLOB_NS/PK_B_TAB_NS in pack-census): of the
+serial Phase A wall, `bglob 145.4 ms` = 95% — the GLOB conversion of every
+member — and `btab 12.4 ms` = entry tables + raw concatenation. Phase A was
+`groups.into_iter().map()`: strictly serial while the Phase B compress pool
+waited. The conversion cannot be naively parallelized because the registry
+gid assignment ORDER is the wire format. Split (chunknbt):
+
+- `section_glob_pre` (pure): magic/f1/f2 gates, palette parse, dense
+  unpack, bounds, first-reference order — all parallel
+- `section_glob_resolve` (serial): palette refs -> gids via get_or_insert
+  in first-reference order — the EXACT mutation sequence of the old
+  per-voxel memo loop (including: the violating >65535 state registers,
+  later refs of that member do not; per-member len() <= 65536 gate)
+- `section_glob_finish` (pure): gid map + bounded RLE admission scans +
+  winner materialization + header + tail — all parallel
+
+`section_to_glob` = the composition; all glob unit tests pass unchanged and
+the conversion bytes are identical by construction (container x5.81 on dim
+= the plain z4 sweep's bytes). Ported the v0.9.21b bounded-scan lever to
+the gid admission scans (early exit once `total > len/div` — decisions
+identical because the exact surplus length is only ever used to fail the
+same admission rule) and skipped the scans entirely at div=0. Fused the
+bounds pass into the first-reference scan (one voxel pass instead of two).
+Once-resolved env toggles on the pack path (GID_RLE_DIV was read PER
+SECTION, GLOB_DEBUG twice, FORCE_GLOB per group).
+
+Cold 6 -> 4: with build parallel, z4's comp 60 ms no longer hides behind
+build 160 ms — z4 pack 0.30 s vs z6 0.44 s (-32%) for +10% container
+(compact x0.10 -> x0.13 vs gate 0.15); z2 measured pack-flat (0.29 s, comp
+40 ms) — z4 is the knee.
+
+Dim corpus 2-core (warmup-first): pack 0.48 -> 0.24 s (-50%), build 152 ->
+95 ms, comp 207 -> 57 ms. Import untouched: enc_fp EXACT
+(6d240d7166cdda99 / 12130 / 9971843). Gates: 58/58 tests, verify 728+218
+bad=0, survival ok=1280 bad=0, bench_size compact x0.13.
+
+Next levers by size: import split is now the bigger wall (211 ms vs pack
+240 ms) — shift-pass internals (48-51 us/chunk) and the encode stage
+(105 us/chunk, AVX2-verdict-negative territory), then stage1 String
+interning on the glob parse path, then z2 (comp 40 ms) only if container
+headroom allows.
