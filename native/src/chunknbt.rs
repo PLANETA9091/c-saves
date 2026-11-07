@@ -748,6 +748,13 @@ pub static ST_ENC_RLE_VAN: AtomicU64 = AtomicU64::new(0);
 pub static ST_ENC_RLE_COL: AtomicU64 = AtomicU64::new(0);
 pub static ST_ENC_DENSE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static ST_ENC_RLE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// v0.9.42 form-3 winners (KT-adaptive context modeling) + their byte total
+/// (framing included, as emitted).
+pub static ST_ENC_CM: AtomicU64 = AtomicU64::new(0);
+pub static ST_ENC_CM_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Sections where the order-0 entropy lower bound proved the CM candidate
+/// cannot win (the encode was skipped entirely).
+pub static ST_ENC_CM_SKIP: AtomicU64 = AtomicU64::new(0);
 /// Sections rejected by the encode sanity check (voxel index outside the
 /// palette — malformed source bytes); they fall back to raw NBT storage.
 pub static ST_ENC_FALLBACK: AtomicU64 = AtomicU64::new(0);
@@ -760,9 +767,12 @@ pub fn enc_mode_stats() -> String {
     let db = ST_ENC_DENSE_BYTES.load(Ordering::Relaxed);
     let rb = ST_ENC_RLE_BYTES.load(Ordering::Relaxed);
     let fb = ST_ENC_FALLBACK.load(Ordering::Relaxed);
+    let cm = ST_ENC_CM.load(Ordering::Relaxed);
+    let cmb = ST_ENC_CM_BYTES.load(Ordering::Relaxed);
+    let cms = ST_ENC_CM_SKIP.load(Ordering::Relaxed);
     format!(
-        r#"{{"dense":{},"rle_van":{},"rle_col":{},"dense_bytes":{},"rle_bytes":{},"fallback":{}}}"#,
-        d, rv, rc, db, rb, fb
+        r#"{{"dense":{},"rle_van":{},"rle_col":{},"dense_bytes":{},"rle_bytes":{},"fallback":{},"cm":{},"cm_bytes":{},"cm_skip":{}}}"#,
+        d, rv, rc, db, rb, fb, cm, cmb, cms
     )
 }
 
@@ -1624,8 +1634,18 @@ fn section_decode3(b: &[u8]) -> Option<Value> {
             };
             // RLE form (v0.6): [idx u8][varint run] pairs over the canonical
             // index stream, in vanilla order (1) or y-fast transposed (2).
+            // CM form (v0.9.42, order 3): [uvarint len][KT-adaptive coder
+            // bytes] over the same canonical stream (context = left+above).
             // Legacy v3 streams carry zeros in the order bits -> dense path.
-            let v: Vec<u8> = if order != 0 {
+            let v: Vec<u8> = if order == 3 {
+                if entries != 4096 || n > 16 {
+                    return None; // CM is only minted for 4096-voxel <=16-state sections
+                }
+                let cl = read_uvarint(b, p)? as usize;
+                let cmb = b.get(*p..*p + cl)?;
+                *p += cl;
+                crate::cm::decode_canon(cmb, bits_for(n) as u32, entries)?
+            } else if order != 0 {
                 if n > 256 || side == 0 {
                     return None; // RLE uses byte indices; never emitted for wide palettes
                 }
@@ -2953,6 +2973,41 @@ fn section_encode_view(
                 best = Some((1, bytes));
             }
         }
+        // v0.9.42 CM candidate (form 3): KT-adaptive context modeling over
+        // the canonical index stream (context = left + above, K = 1<<W).
+        // Offline probe (docs/compression-research.md, exact KT closed
+        // form): -11.9% on section bodies vs dense/RLE + LZMA2-6 at W<=4;
+        // W>=5 loses and keeps dense/RLE. Gated by the order-0 entropy
+        // lower bound computed from the already-materialized `counts`: no
+        // coder can beat H0 bytes on this stream, so when
+        // ceil(H0*entries/8) + framing >= the current best body the CM
+        // encode is skipped outright (RLE blowout sections exit here).
+        // Strict-< admission keeps the deterministic tie rule: identical
+        // sections still produce identical bytes (the CM model is a pure
+        // function of the canonical stream).
+        if entries == 4096 && n <= 16 {
+            let mut h0: f64 = 0.0;
+            for &c in counts.iter() {
+                if c > 0 {
+                    let p = c as f64 / entries as f64;
+                    h0 -= p * p.log2();
+                }
+            }
+            let best_len = best.as_ref().map_or(dense_len, |(_, b)| b.len());
+            let lb = (h0 * entries as f64 / 8.0).ceil() as usize + 3;
+            if lb >= best_len {
+                ST_ENC_CM_SKIP.fetch_add(1, Ordering::Relaxed);
+            } else if let Some(cm) = crate::cm::encode_canon(&v, &remap, bits_for(n) as u32) {
+                let mut framed = Vec::with_capacity(cm.len() + 3);
+                push_uvarint(&mut framed, cm.len() as u64);
+                framed.extend_from_slice(&cm);
+                if framed.len() < best_len {
+                    ST_ENC_CM.fetch_add(1, Ordering::Relaxed);
+                    ST_ENC_CM_BYTES.fetch_add(framed.len() as u64, Ordering::Relaxed);
+                    best = Some((3, framed));
+                }
+            }
+        }
         let narrow_flag = match best {
             None => {
                 let dense: Vec<u8> = if identity {
@@ -2976,10 +3031,16 @@ fn section_encode_view(
             }
             Some((ord, bytes)) => {
                 out.extend_from_slice(&bytes);
-                ST_ENC_RLE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 match ord {
-                    1 => ST_ENC_RLE_VAN.fetch_add(1, Ordering::Relaxed),
-                    _ => ST_ENC_RLE_COL.fetch_add(1, Ordering::Relaxed),
+                    1 => {
+                        ST_ENC_RLE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        ST_ENC_RLE_VAN.fetch_add(1, Ordering::Relaxed);
+                    }
+                    3 => { /* CM bytes/counter already fetched at candidate time */ }
+                    _ => {
+                        ST_ENC_RLE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        ST_ENC_RLE_COL.fetch_add(1, Ordering::Relaxed);
+                    }
                 };
                 (ord << order_shift)
             }
@@ -3650,7 +3711,12 @@ fn shift_ref_pass(
     // entirely: their matches can never clear the admission rule (the ref
     // carries at least the header + tail the member already has), and they
     // are the majority of distinct contents, so this cuts most build cost.
-    const MIN_MEMBER: usize = 512;
+    // v0.9.42: CM members shrink well below the old 512 floor (a section
+    // with one noisy plane + 15 uniform planes encodes to ~120 B), and the
+    // CM admission branch (2.5*mbr < 5*full) genuinely rewards refs there,
+    // so the floor tracks the ref's own minimum (~13 B uniform ref) with a
+    // small margin instead of the dense-era 512.
+    const MIN_MEMBER: usize = 64;
     // v0.9.7: LAZY ShiftSec builds. The eager loop built every eligible
     // section up front (~40 µs each: unpack + canonical keys + plane fps),
     // but the fingerprint pre-filter rejects >99.9% of candidate pairs, and
@@ -4029,11 +4095,28 @@ fn shift_ref_pass(
         }
         mbr.extend_from_slice(&csec2[tail_at..]);
         // admission: the ref must clearly beat the full member POST-COMPRESSION.
-        // Slab zstd compresses dense member payloads ~5x (cross-section
+        // Slab zstd compresses dense/RLE member payloads ~5x (cross-section
         // matches) while small ref payloads compress ~2.5x, so the ref wins
         // when 5*mbr < 2*full, i.e. mbr + margin < 0.4*full (the v0.6.1
         // lesson: raw-length comparisons mislead admission).
-        if mbr.len() + 32 < full_len * 2 / 5 {
+        // v0.9.42: CM members (order 3) carry KT-coded near-random bodies —
+        // the slab coder eats no cross-section alignment from them — so the
+        // member keeps only 1x credit and the ref wins at 2.5*mbr < 5*full.
+        let member_cm = {
+            let fb: &[u8] = match &sections[i].1 {
+                SecBytes::Shared(a) => a,
+                SecBytes::Owned(b) => b,
+            };
+            let f2m = *fb.get(2).unwrap_or(&0);
+            (fb.first() == Some(&CSEC3_MAGIC) || fb.first() == Some(&CSEC4_MAGIC))
+                && (f2m >> 4) & 3 == 3
+        };
+        let admit_bound = if member_cm {
+            full_len * 5 / 2
+        } else {
+            full_len * 2 / 5
+        };
+        if mbr.len() + 32 < admit_bound {
             ST_ENC_SHIFT.fetch_add(1, Ordering::Relaxed);
             ST_ENC_SHIFT_BYTES.fetch_add(mbr.len() as u64, Ordering::Relaxed);
             sections[i].0 = hash_of(&mbr);
@@ -4046,9 +4129,10 @@ fn shift_ref_pass(
                 && ST_SHIFT_REJECT.load(Ordering::Relaxed) < 4000
             {
                 eprintln!(
-                    "shift REJECT: k={k} mbr={} full={} n_t={n_t} extras={} tail_len={}",
+                    "shift REJECT: k={k} mbr={} full={} cm={} n_t={n_t} extras={} tail_len={}",
                     mbr.len(),
                     full_len,
+                    member_cm,
                     extras.len(),
                     csec2.len().saturating_sub(3)
                 );
@@ -6244,7 +6328,31 @@ fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
         // "data" sorts before "palette"
         if has_data {
             let out_bits = bits_for(n).max(4);
-            let longs: Vec<i64> = if order != 0 {
+            let longs: Vec<i64> = if order == 3 {
+                // CM form (v0.9.42): decode the KT-adaptive stream to the
+                // canonical voxels, then pack to vanilla no-straddle longs.
+                if entries != 4096 || n > 16 {
+                    fdbg!("fused: CM form on unsupported shape entries={} n={}", entries, n);
+                    return None;
+                }
+                let cl = read_uvarint(b, p)? as usize;
+                let cmb = match b.get(*p..*p + cl) {
+                    Some(d) => d,
+                    None => {
+                        fdbg!("fused: CM payload oob p={} len={} blen={}", p, cl, b.len());
+                        return None;
+                    }
+                };
+                *p += cl;
+                let v = match crate::cm::decode_canon(cmb, bits_for(n) as u32, entries) {
+                    Some(v) => v,
+                    None => {
+                        fdbg!("fused: CM decode failed n={}", n);
+                        return None;
+                    }
+                };
+                pack_nostroddle(&v, out_bits)
+            } else if order != 0 {
                 // RLE form (v0.6): expand (idx, run) pairs to the canonical
                 // voxel stream, transpose back for order 2, then pack to
                 // vanilla no-straddle longs directly.
@@ -7165,10 +7273,14 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
     }
     let y = *csec.get(p)?;
     p += 1;
-    // block_states present AND has data; dense form only (f2 order bits 4/5)
-    if f1 & 3 != 3 || f2 & 48 != 0 {
+    // block_states present AND has data; dense (order 0) or CM (order 3,
+    // v0.9.42 — the CM body decodes to the same canonical voxel stream the
+    // glob form is built from). RLE orders 1/2 never globbed: the gid
+    // stream IS the run-aware form for those sections.
+    let order_bs = (f2 >> 4) & 3;
+    if f1 & 3 != 3 || (order_bs != 0 && order_bs != 3) {
         if glob_debug() {
-            eprintln!("glob: skip f1={f1:02x} f2={f2:02x} (f1&3={}, f2&48={})", f1 & 3, f2 & 48);
+            eprintln!("glob: skip f1={f1:02x} f2={f2:02x} (f1&3={}, order={order_bs})", f1 & 3);
         }
         return None;
     }
@@ -7188,14 +7300,25 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
         states.push(st);
     }
     // dense stream width: narrow (f2 bit2) packs at bits_for(n), else the
-    // vanilla max(4, bits_for(n)) clamp
+    // vanilla max(4, bits_for(n)) clamp. CM sections carry a self-framed
+    // coder payload instead ([uvarint len][KT-adaptive bytes], decoded to
+    // the same canonical voxel stream).
     let out_bits = if f2 & 4 != 0 { bits_for(n) } else { bits_for(n).max(4) };
-    let stream_len = (4096usize * out_bits as usize).div_ceil(8);
-    let Some(vox) = dense_unpack_vox(csec.get(p..p + stream_len)?, 4096, out_bits) else {
-        if glob_debug() {
-            eprintln!("glob: dense_unpack failed n={n} out_bits={out_bits} stream_len={stream_len} p={p} len={}", csec.len());
-        }
-        return None;
+    let (vox, tail_off) = if order_bs == 3 {
+        let cl = read_uvarint(csec, &mut p)? as usize;
+        let cmb = csec.get(p..p + cl)?;
+        p += cl;
+        let v = crate::cm::decode_canon(cmb, bits_for(n) as u32, 4096)?;
+        (v.into_iter().map(|x| x as u32).collect::<Vec<u32>>(), p)
+    } else {
+        let stream_len = (4096usize * out_bits as usize).div_ceil(8);
+        let Some(v) = dense_unpack_vox(csec.get(p..p + stream_len)?, 4096, out_bits) else {
+            if glob_debug() {
+                eprintln!("glob: dense_unpack failed n={n} out_bits={out_bits} stream_len={stream_len} p={p} len={}", csec.len());
+            }
+            return None;
+        };
+        (v, p + stream_len)
     };
     // v0.9.33: the bounds check and the first-reference scan are FUSED
     // into one pass over the 4096 voxels (was: a separate .any() bounds
@@ -7226,7 +7349,7 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
         f3,
         out_bits,
         n,
-        tail_off: p + stream_len,
+        tail_off,
     })
 }
 
