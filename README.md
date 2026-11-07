@@ -154,6 +154,44 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.38 — the encode loop closes: three probe verdicts, one presize
+
+With unp (2593 ns/call) and pack (2199) carrying 44% of the scan wall and
+both SIMD directions already documented-negative, this round probed the last
+unprobed corners of the encode path — in-bench, output-pinned, one shipped:
+
+- **RLE-A fusion — measured NEGATIVE, reverted.** The bounded SIMD
+  transitions scan feeding the RLE-A candidate (305 ns/call) is computable
+  as a register-only cmp+add riding the unpack loop — decision-identical
+  (below cap both counts agree, at/above cap both reject). Measured:
+  unp 2593 -> 3906 ns/call (+50.6%), scan 204.7 -> 231.0 µs/chunk, import
+  119.4 -> 108.1 MB/s. The extract+counts loop is IPC-bound at ~4 µops per
+  voxel: ~3 extra register µops cost +50%, and no saved scan can pay for
+  that. THIRD negative verdict of this class (0.9.24 AVX2 bits4, 0.9.37
+  nibble rewrites) — the encode loop admits no extra µops at any width.
+- **hash_lite fold — sized and parked.** sh is 16.8 µs/chunk (127 ns x
+  95434 sections), but its floor is the data-array hash itself: one xxh3
+  update over the 8 KB LE long stream (~270 ns per block_states section) is
+  mandatory dedup work that a fold cannot remove — folding only saves the
+  dispatch/palette re-walk (~25-30 ns/section), a +2%-class play for a
+  three-implementation hash-scheme rewrite. The numbers stay here.
+- **Pack kernel — near its scalar floor.** packb per-call costs (bits2
+  2091 ns, bits3 4293, bits4 4869 per 4096-voxel call) sit within ~30% of
+  the scalar IPC bound for remap-load + shift + or per voxel; the 0.9.17
+  group-split already broke the accumulator chain. SWAR/pdep rewrites
+  projected at ~1.3x on 14 µs/chunk — parked.
+
+Shipped: `section_encode_view` presizes the output from the known payload
+extents (dense bytes are never larger than the input longs — out_bits <=
+in_bits — plus light arrays and a 1.1 KB palette/framing headroom); the old
+5-byte start grew ~9 times per section inside the enc timer. pack timer
+2199 -> 2078-2167 ns/call across runs; import flat within this shared
+2-core host's noise (ST 117.3-119.4 MB/s band; MT bounces ±25% run-to-run —
+the MT-ensure timer alone measured 54.3M vs 82.3M ns on identical bytes).
+
+Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99/12130/9971843), verify
+728+218 bad=0, pack 0.41 s, container 1.94 MiB x6.42, warm read 1490 MB/s.
+
 ## v0.9.37 — the shift pass stops hashing: fingerprint dedup without SipHash
 
 The 0.9.36 stage decomposition left residues inside scan_split unexplained,

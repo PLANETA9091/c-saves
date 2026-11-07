@@ -1983,6 +1983,12 @@ fn unpack_counts_vox(
     pal_n: usize,
     counts: &mut [u32],
 ) -> Option<Vec<u32>> {
+    // v0.9.38 probe verdict (documented negative, third of its class): a
+    // fused neighbor-transition counter (register-only cmp+add per voxel,
+    // feeding the RLE-A candidate) measured unp 2593 -> 3906 ns/call
+    // (+50.6%) — the extract+counts loop is IPC-bound at ~4 µops/voxel, so
+    // even ~3 extra register µops add ~50%; the saved bounded SIMD walk
+    // (305 ns/call) cannot pay for that. The standalone bounded scan stays.
     let per = (64 / bits) as usize;
     let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let mut out: Vec<u32> = Vec::with_capacity(entries);
@@ -2680,7 +2686,18 @@ fn section_encode_view(
     want_facts: bool,
 ) -> Option<(Vec<u8>, Option<SectionFacts>)> {
     // 5-byte v4 header; patched down to the 4-byte v3 form when f3 stays 0.
-    let mut out = vec![CSEC4_MAGIC, 0u8, 0u8, 0u8, view.y as u8];
+    // v0.9.38: presize from the known payload extents — the dense streams
+    // are never larger than their input longs (out_bits <= in_bits), so one
+    // reserve covers the whole section without growth reallocs (the old
+    // 5-byte start grew ~9 times per section).
+    let presize = 5
+        + view.skylight.as_ref().map_or(0, |b| b.len() + 4)
+        + view.blocklight.as_ref().map_or(0, |b| b.len() + 4)
+        + view.bs.as_ref().and_then(|p| p.data).map_or(0, |d| d.len() * 8)
+        + view.bio.as_ref().and_then(|p| p.data).map_or(0, |d| d.len() * 8)
+        + 1100; // palette entries + per-key framing headroom
+    let mut out = Vec::with_capacity(presize);
+    out.extend_from_slice(&[CSEC4_MAGIC, 0u8, 0u8, 0u8, view.y as u8]);
     let mut f1 = 0u8;
     // shift-facts capture (filled by the block_states encode below)
     let mut block_facts: Option<SectionFacts> = None;

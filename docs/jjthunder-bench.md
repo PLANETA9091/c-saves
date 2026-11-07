@@ -1278,3 +1278,25 @@ New telemetry: the `"root"` block in split_stage_json
 remainder. Net measured: scan 222.8 -> 216.8 µs/chunk, import ST 112.5 ->
 114.8 MB/s, import work −2.7% — small but structural, and the walk now
 owns the parse.
+
+## 0.9.38 — the encode loop closes: three probe verdicts, one presize
+
+In-bench probes on the last unprobed encode corners (all output-pinned,
+enc_fp EXACT throughout; 2-core shared sandbox, warmup `3 2` -> `1 2`):
+
+| probe | result | verdict |
+|---|---|---|
+| RLE-A transitions fused into unpack_counts_vox | unp 2593 -> 3906 ns/call (+50.6%), scan 204.7 -> 231.0 us/chunk, import 119.4 -> 108.1 MB/s | **NEGATIVE, reverted** — the extract+counts loop is IPC-bound (~4 uops/voxel); ~3 register uops (cmp+add+mov prev) cost +50%, the saved bounded SIMD walk is 305 ns/call. Third negative of the class (0.9.24 AVX2 bits4, 0.9.37 nibble). |
+| hash_lite fold into the direct walk (two-level per-key scheme) | floor = the data hash itself: one xxh3 update over the 8 KB LE longs (~270 ns/block_states section) is mandatory dedup work; fold saves only dispatch/palette re-walk ~25-30 ns/section | **PARKED, sized** — +2%-class for a three-implementation hash rewrite (feed / feed_lite / walker must agree; probe_sec pins cross-currency equality). |
+| pack kernel SWAR/pdep headroom | packb: bits2 2091 ns, bits3 4293, bits4 4869 per 4096-voxel call = ~3.1 cycles/voxel vs ~2-2.5 scalar IPC bound | **PARKED** — ~1.3x projected on 14 us/chunk; the 0.9.17 group-split already broke the accumulator chain, remap-gather dominates. |
+
+Shipped: section_encode_view presizes `out` from the known extents (dense <=
+input longs since out_bits <= in_bits; + light arrays + 1.1 KB palette
+headroom) — the old 5-byte Vec grew ~9x per section inside the enc timer.
+pack 2199 -> 2078-2167 ns/call across runs; import flat within host noise
+(ST 117.3-119.4 band; MT bounces +/-25% run-to-run on this co-tenant host —
+the MT-ensure timer measured 54.3M vs 82.3M ns on identical bytes across two
+builds, so MT deltas below that band are not attributable).
+
+Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99/12130/9971843), verify
+728+218 bad=0, pack 0.41 s, container 1.94 MiB x6.42, warm read 1490.2 MB/s.
