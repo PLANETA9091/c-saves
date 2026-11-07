@@ -154,6 +154,48 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.39 — the hot tier stops pretending: raw slab frames + the tail joins the frame
+
+The ensure stage had grown back to 21% of the import wall (58.3 µs/chunk
+of 275). The new `stages-ensure` decomposition (kept as CI telemetry)
+found where: the slab flush burned 139 µs PER FRAME in `slab_comp` — and
+a standalone probe showed bulk zstd costs 155-220 µs on a ~34 KiB frame
+INDEPENDENT of level (-3 through 3), i.e. pure frame machinery, while a
+memcpy of the same bytes costs ~0. The hot tier is transient material the
+pack pass re-stores at the cold level anyway — paying a zstd frame for it
+is work the final container never sees.
+
+- **Raw hot slab frames (change A).** `flush_hot_slab_group` no longer
+  compresses: the SLAB V2 stream is stored verbatim behind a
+  `dict_id=0xFF` sentinel (dict ids are 0..=254 and slabs never carried a
+  dict — unambiguous, and old containers can never contain it). One hook
+  at the top of `decompress()` covers every read path (slab cache,
+  read_blob, batch loads, scan rebuild, pack re-group); the slab header is
+  patched in place in front of the stream, saving a full-frame memcpy per
+  flush. Drained containers are byte-identical (modulo the documented
+  ±19-byte tail-ordering jitter): the cold end state depends only on
+  member raws, which did not change.
+- **The tail joins the frame (change B).** A blob-eligible tail
+  (>= `tail_blob_min`) rides the hot-slab batch as its LAST member —
+  no standalone compress + record + append per tail; the batch map phase
+  dedups it for free. Below the slab threshold the old per-blob path
+  applies, tail included; tiny tails stay recipe-inline.
+
+Same-host measure round (2-core, warmup `3 2` -> `1 2`): import ST
+115.5 -> **130.2 MB/s (+12.7%)**, wall 0.205 -> 0.182 s — now 2.39x the
+Anvil write rate on the same run; import MT 189.8 -> 201.2 MB/s (MT
+bounces ±25% run-to-run on this co-tenant host; ST is the stable metric).
+Ensure stage 58.3 -> 31.1 µs/chunk (-47%): slab flush 158.9 -> 67.7 µs
+(slab_comp 139.3 -> 6.4, tail_blob 10.5 -> 0 per chunk). The transient
+cost is honest disk: undrained containers hold raw member bytes until the
+pack pass drains them — the packed container is unchanged at 1.94 MiB
+(x6.42 vs Anvil sector-padded).
+
+Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99/12130/9971843),
+jj verify 946/946 bad=0, verify 728+218 bad=0, survival TOTAL x3.12
+ok=1280 bad=0 (the documented post-0.9.34 z6 baseline), bench_size
+compact x0.11 (gate 0.15), container x6.42.
+
 ## v0.9.38 — the encode loop closes: three probe verdicts, one presize
 
 With unp (2593 ns/call) and pack (2199) carrying 44% of the scan wall and

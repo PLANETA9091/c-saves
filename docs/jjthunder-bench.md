@@ -1279,6 +1279,63 @@ remainder. Net measured: scan 222.8 -> 216.8 µs/chunk, import ST 112.5 ->
 114.8 MB/s, import work −2.7% — small but structural, and the walk now
 owns the parse.
 
+## 0.9.39 — the hot tier stops pretending: raw slab frames + the tail joins the frame
+
+New `stages-ensure` telemetry (kept in `ensure_stage_json` / SPEED
+`stages-ensure`) decomposed the ensure stage on 0.9.38 (58.3 us/chunk,
+21% of the ST import wall; 2-core shared sandbox, warmup `3 2` -> `1 2`):
+
+| block | us/chunk | note |
+|---|---|---|
+| slab flush | 34.9 | 160 frames; sub-timers: comp 30.7, append 4.4, build 2.6 |
+| tail blob | 10.5 | 728 standalone ensure_blob calls, every chunk |
+| dict_sample | 3.6 | sampling misses at flush time |
+| per-blob fallback | 1.8 | 568 below-threshold batches (mostly map hits) |
+| batch map phase | 1.6 | blobs.read + in-batch seen set |
+
+The smoking gun: `slab_comp` = 139 us PER ~34 KiB frame, and a standalone
+probe (`zstd::bulk::compress` loop) measured **155-220 us for a 34 KiB
+frame at EVERY level from -3 to 3** — the cost is zstd frame machinery
+(window/huffman/literal-table setup), not match-finding; level changes
+moved nothing, a raw memcpy moved ~0. The hot tier is transient material
+the pack pass re-stores at the cold level with a 4-8 MiB window — a
+per-chunk zstd frame is work the drained container never sees.
+
+Shipped (both changes output-pinned, drained containers byte-identical
+modulo the documented ±19-byte tail-order jitter):
+
+1. **Raw hot slab frames** — `flush_hot_slab_group` stores the SLAB V2
+   stream verbatim behind a `dict_id=0xFF` sentinel (dict ids 0..=254;
+   slabs never carried a dict; old containers can never contain it). One
+   hook at the top of `decompress()` covers slab cache, read_blob, batch
+   loads, scan rebuild and pack re-group; the slab header is patched in
+   place in front of the stream (one full-frame memcpy saved). Undrained
+   containers honestly hold raw member bytes until pack drains them.
+2. **Tail joins the frame** — a blob-eligible tail (>= `tail_blob_min`)
+   rides the hot-slab batch as its LAST member: no standalone
+   compress/record/append per tail, the batch map phase dedups it for
+   free. Below the slab threshold it rides the per-blob fallback; tiny
+   tails stay recipe-inline (n=0 on this corpus — every tail >= 512 B).
+
+Measured: import ST 115.5 -> **130.2 MB/s (+12.7%)**, wall 0.205 -> 0.182 s
+(2.39x the same-run Anvil write); import MT 189.8 -> 201.2 MB/s (the MT
+band bounces ±25% on this co-tenant host — ST is the stable metric).
+Ensure 58.3 -> 31.1 us/chunk (-47%): slab flush 158.9 -> 67.7 us
+(comp 139.3 -> 6.4 us = the sentinel copy, tail_blob 10.5 -> 0). Warm
+read 1541 -> 1459 MB/s and cold read 547 -> 557 MB/s — both inside the
+host noise band; warm read of a raw member is a memcpy from the slab
+cache, cold reads move more bytes but skip the decompress.
+
+Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99/12130/9971843), jj
+verify 946/946 bad=0, verify 728+218 bad=0, survival TOTAL x3.12 ok=1280
+bad=0 (documented post-0.9.34 z6 baseline; the historical x4.01 spread
+across sandboxes is documented in the 0.9.29 section), bench_size compact
+x0.11 (gate 0.15), container 1.94 MiB x6.42 unchanged.
+
+Next honest levers after this: cross-chunk slab batching (needs deferred
+recipe encode — the id-window problem), dict_sample gating (+1.3% class,
+ratio-risky), thread-local scratch in the split stage (+1.5-2% class).
+
 ## 0.9.38 — the encode loop closes: three probe verdicts, one presize
 
 In-bench probes on the last unprobed encode corners (all output-pinned,

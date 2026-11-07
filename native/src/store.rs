@@ -1094,6 +1094,16 @@ static ST_SHIFT_RES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new
 pub static WST_SPLIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static WST_ENS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static WST_RECIPE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// ensure decomposition (ensx): where the ensure stage ns actually goes
+pub static ENSX_MAP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ENSX_SLAB: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ENSX_TBLOB: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ENSX_TINL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ENSX_PERB: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ENSX_DSMP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ENSX_SBUILD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ENSX_SCOMP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ENSX_SAPPND: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 // MT lock census: cumulative ns spent INSIDE each exclusive section across
 // ALL threads. In MT, cumulative-inside ~= serialized wall contributed by
 // that section (threads cannot overlap inside an exclusive guard).
@@ -1139,10 +1149,30 @@ pub fn mt_lock_census_reset() {
 }
 
 pub fn write_stage_reset() {
-    for st in [&WST_SPLIT, &WST_ENS, &WST_RECIPE] {
+    for st in [&WST_SPLIT, &WST_ENS, &WST_RECIPE, &ENSX_MAP, &ENSX_SLAB, &ENSX_TBLOB, &ENSX_TINL, &ENSX_PERB, &ENSX_DSMP, &ENSX_SBUILD, &ENSX_SCOMP, &ENSX_SAPPND] {
         st.0.store(0, Ordering::Relaxed);
         st.1.store(0, Ordering::Relaxed);
     }
+}
+
+/// ensx: ensure-stage decomposition (ns/call per block).
+pub fn ensure_stage_json() -> String {
+    let fmt = |name: &str, st: &(AtomicU64, AtomicU64)| {
+        let (ns, n) = (st.0.load(Ordering::Relaxed), st.1.load(Ordering::Relaxed));
+        format!("\"{}\":{{ns:{},n:{},per_call:{}}}", name, ns, n, if n > 0 { ns / n } else { 0 })
+    };
+    format!(
+        "{{{},{},{},{},{},{},{},{},{}}}",
+        fmt("slab", &ENSX_SLAB),
+        fmt("map", &ENSX_MAP),
+        fmt("tail_blob", &ENSX_TBLOB),
+        fmt("tail_inline", &ENSX_TINL),
+        fmt("per_blob", &ENSX_PERB),
+        fmt("dict_sample", &ENSX_DSMP),
+        fmt("slab_build", &ENSX_SBUILD),
+        fmt("slab_comp", &ENSX_SCOMP),
+        fmt("slab_append", &ENSX_SAPPND),
+    )
 }
 
 /// Human/CI-readable stage snapshot: ns/call per stage.
@@ -2333,18 +2363,10 @@ impl Store {
 
     // ---- compression tiers ----
 
-    /// Hot tier: write path. Cold tier: background compaction.
-    /// Compress without a shared dictionary. Slab streams (up to 192 KiB of
-    /// similar section bytes) measure ~4% SMALLER without the dictionary:
-    /// the zstd window already covers the whole slab, so the dict only adds
-    /// header cost and dilutes match search.
-    fn compress_tier_plain(&self, data: &[u8], cold: bool) -> (u8, Vec<u8>) {
-        let level = if cold { self.cfg.cold_level } else { self.cfg.hot_level };
-        bulk_compress(data, level)
-    }
-
-    /// Explicit-level variant (recipe-batch flush): same no-dictionary path,
-    /// caller picks the zstd level.
+    /// Explicit-level variant (recipe-batch flush): bulk_compress, no
+    /// dictionary; caller picks the zstd level. (The hot-slab caller went
+    /// RAW in v0.9.39 — dict_id=0xFF sentinel, see flush_hot_slab_group /
+    /// decompress.)
     fn compress_tier_level(&self, data: &[u8], level: i32) -> (u8, Vec<u8>) {
         bulk_compress(data, level)
     }
@@ -2388,6 +2410,16 @@ impl Store {
     }
 
     fn decompress(&self, dict_id: u8, data: &[u8], raw_len: u32) -> Option<Vec<u8>> {
+        // 0xFF sentinel = RAW slab stream (v0.9.39): hot slab frames skip the
+        // zstd frame entirely — measured 155-220 us per ~34 KiB frame on the
+        // bench host INDEPENDENT of level (-3..3), i.e. pure frame machinery,
+        // while the hot tier is transient material the pack pass re-stores at
+        // the cold level anyway. The drained container is byte-identical; the
+        // sentinel can never collide with a real dict id (dict ids are
+        // assigned 0..=254, and slabs never carried a dict before this).
+        if dict_id == 0xFF {
+            return Some(data.to_vec());
+        }
         DEC_C.with(|c| {
             let mut slot = c.borrow_mut();
             let key = (self.uid, dict_id);
@@ -2459,6 +2491,7 @@ impl Store {
     /// pipeline produced). Dedup stays content-pure: map hits and in-batch
     /// duplicates never enter the frame.
     fn ensure_blobs_batch<'a>(&self, items: &[(Hash, &'a [u8])]) -> Result<(), String> {
+        let _tm = std::time::Instant::now();
         let mut misses: Vec<(Hash, u32, &'a [u8])> = Vec::with_capacity(items.len());
         let mut seen: std::collections::HashSet<Hash, RawBuild> =
             std::collections::HashSet::with_capacity_and_hasher(items.len(), RawBuild);
@@ -2475,20 +2508,31 @@ impl Store {
                 misses.push((*h, 0, raw));
             }
         }
+        ENSX_MAP.0.fetch_add(_tm.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ENSX_MAP.1.fetch_add(1, Ordering::Relaxed);
         let raw_total: usize = misses.iter().map(|m| m.2.len()).sum();
         if misses.len() < HOT_SLAB_MIN_SECS || raw_total < HOT_SLAB_MIN_RAW {
-            // below the frame threshold the per-blob path is cheaper
+            let _t = std::time::Instant::now();
+            let r = (|| -> Result<(), String> {
             for (h, _, raw) in &misses {
                 self.ensure_blob(*h, raw, false)?;
             }
+            Ok(())
+            })();
+            ENSX_PERB.0.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            ENSX_PERB.1.fetch_add(1, Ordering::Relaxed);
+            r?;
             return Ok(());
         }
         for m in &mut misses {
             m.1 = self.next_blob_id.fetch_add(1, Ordering::Relaxed) as u32;
         }
+        let _td = std::time::Instant::now();
         for (_, _, raw) in &misses {
             self.dict_sample(raw);
         }
+        ENSX_DSMP.0.fetch_add(_td.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ENSX_DSMP.1.fetch_add(1, Ordering::Relaxed);
         // split into slab-sized groups (same cap rule as the pack path)
         let slab_cap = if self.whole_mode.load(Ordering::Relaxed) {
             self.cfg.slab_max_raw_whole
@@ -2514,11 +2558,17 @@ impl Store {
 
     /// Write one hot-tier slab frame: SLAB V2 stream (varint zigzag
     /// id-delta + varint len + 16B hash per member, raws concatenated),
-    /// compressed at the hot level WITHOUT the shared dictionary (slab
-    /// streams measure ~4% smaller without it — same rule as the pack
-    /// path) and WITHOUT the GLOB variant. Fresh members: no old-location
-    /// live accounting (their bytes were never on disk before this record).
+    /// stored RAW since v0.9.39 (dict_id=0xFF sentinel, no zstd frame): the
+    /// hot tier is transient material the pack pass re-stores at the cold
+    /// level, and the per-frame zstd machinery measured 155-220 us on a
+    /// ~34 KiB frame independent of level — pure overhead on the write path.
+    /// NO dictionary, NO GLOB variant (the write path stays lean; the cold
+    /// re-pack re-decides the form with a 4-8 MiB window — the drained
+    /// container is byte-identical to the compressed-hot pipeline). Fresh
+    /// members: no old-location live accounting (their bytes were never on
+    /// disk before this record).
     fn flush_hot_slab_group(&self, group: Vec<(Hash, u32, &[u8])>) -> Result<(), String> {
+        let _ts = std::time::Instant::now();
         let n = group.len();
         let mut tab: Vec<u8> = Vec::with_capacity(n * 20);
         let mut prev_id: i64 = 0;
@@ -2535,15 +2585,28 @@ impl Store {
         for (_, _, raw) in &group {
             stream.extend_from_slice(raw);
         }
-        let (dict_id, comp) = self.compress_tier_plain(&stream, false);
-        let raw_total = stream.len() as u32;
-        let mut body = Vec::with_capacity(13 + comp.len());
-        body.push(8u8 | SLAB_KIND_HOT);
-        body.push(dict_id);
-        body.extend_from_slice(&(comp.len() as u32).to_le_bytes());
-        body.extend_from_slice(&raw_total.to_le_bytes());
-        body.extend_from_slice(&(n as u16).to_le_bytes());
-        body.extend_from_slice(&comp);
+        ENSX_SBUILD.0.fetch_add(_ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ENSX_SBUILD.1.fetch_add(1, Ordering::Relaxed);
+        let _tc = std::time::Instant::now();
+        // v0.9.39: RAW stream — no zstd call at all (dict_id=0xFF sentinel;
+        // see decompress()). The slab header is patched IN PLACE in front of
+        // the stream (saves a full-frame memcpy per flush; the only remaining
+        // copy is append's into the segment buffer).
+        const SLAB_HDR: usize = 12; // non-GLOB slab v2 header: kind,dict,cl,raw,n
+        let raws_total: usize = group.iter().map(|g| g.2.len()).sum();
+        let mut body = stream;
+        body.reserve(SLAB_HDR);
+        body.splice(0..0, [0u8; SLAB_HDR]);
+        body[0] = 8u8 | SLAB_KIND_HOT;
+        body[1] = 0xFF; // RAW sentinel
+        body[2..6].copy_from_slice(&((tab_len as usize + raws_total) as u32).to_le_bytes());
+        body[6..10].copy_from_slice(&((tab_len as usize + raws_total) as u32).to_le_bytes());
+        body[10..12].copy_from_slice(&(n as u16).to_le_bytes());
+        ENSX_SCOMP.0.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ENSX_SCOMP.1.fetch_add(1, Ordering::Relaxed);
+        let _ta = std::time::Instant::now();
+        let raw_total = (tab_len as usize + raws_total) as u32;
+        let dict_id: u8 = 0xFF;
         let blen = body.len() as u64;
         let (seg, off, _) = self.append(&body).map_err(|e| e.to_string())?;
         let share = ((8 + blen) / n as u64).min(u32::MAX as u64) as u32;
@@ -2579,13 +2642,17 @@ impl Store {
                     },
                     slab_off: cursor,
                     slab_raw: raw_total,
-                    slab_comp: comp.len() as u32,
+                    slab_comp: raw_total, // RAW frame: stream len == compressed len
                 });
                 ids.insert(*id, *h);
                 cursor += raw.len() as u32;
             }
         }
         MT_SLABINS_NS.fetch_add(_ti.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ENSX_SAPPND.0.fetch_add(_ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ENSX_SAPPND.1.fetch_add(1, Ordering::Relaxed);
+        ENSX_SLAB.0.fetch_add(_ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ENSX_SLAB.1.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2888,14 +2955,34 @@ impl Store {
                     Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
                 } else {
                     let mut hashes = Vec::with_capacity(sections.len());
+                    // v0.9.39: a blob-eligible tail (>= tail_blob_min) rides
+                    // the hot-slab batch as its LAST member — no standalone
+                    // compress/record/append per tail (the batch map phase
+                    // dedups it for free). Below the slab threshold the old
+                    // per-blob loop applies, tail included.
+                    let tail_blob = if tail.len() >= self.cfg.tail_blob_min {
+                        Some((chunknbt::hash_of(&tail), sections.len() >= HOT_SLAB_MIN_SECS))
+                    } else {
+                        None
+                    };
                     if sections.len() >= HOT_SLAB_MIN_SECS {
                         // hot-slab batch: one frame for the chunk's sections
-                        let slices: Vec<(Hash, &[u8])> =
+                        let mut slices: Vec<(Hash, &[u8])> =
                             sections.iter().map(|(h, b)| (*h, b.as_slice())).collect();
+                        if let Some((th, _)) = &tail_blob {
+                            slices.push((*th, tail.as_slice()));
+                        }
                         self.ensure_blobs_batch(&slices)?;
                     } else {
                         for (h, bytes) in &sections {
                             self.ensure_blob(*h, bytes.as_slice(), false)?;
+                        }
+                        if let Some((th, false)) = &tail_blob {
+                            let _tt = std::time::Instant::now();
+                            let r = self.ensure_blob(*th, &tail, false);
+                            ENSX_TBLOB.0.fetch_add(_tt.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            ENSX_TBLOB.1.fetch_add(1, Ordering::Relaxed);
+                            r?;
                         }
                     }
                     for (h, _) in &sections {
@@ -2906,13 +2993,18 @@ impl Store {
                     // its z6 output was thrown away for every tail >= the
                     // blob threshold (the blob path recompresses inside
                     // ensure_blob) — pure wasted CPU on most chunk tails.
-                    let tail_ref = if tail.len() >= self.cfg.tail_blob_min {
-                        let th = chunknbt::hash_of(&tail);
-                        self.ensure_blob(th, &tail, false)?;
-                        Tail::Blob(th)
-                    } else {
-                        let (tdict, tcomp) = self.compress_tier(&tail, false);
-                        Tail::Inline { dict: tdict, comp: tcomp, raw: tail.len() as u32 }
+                    // Since v0.9.39 the blob-eligible tail was ALREADY stored
+                    // above (batch member on the slab path, ensure_blob on
+                    // the per-blob path) — nothing left to do here.
+                    let tail_ref = match &tail_blob {
+                        Some((th, _)) => Tail::Blob(*th),
+                        None => {
+                            let _tt = std::time::Instant::now();
+                            let (tdict, tcomp) = self.compress_tier(&tail, false);
+                            ENSX_TINL.0.fetch_add(_tt.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            ENSX_TINL.1.fetch_add(1, Ordering::Relaxed);
+                            Tail::Inline { dict: tdict, comp: tcomp, raw: tail.len() as u32 }
+                        }
                     };
                     Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false }
                 }
