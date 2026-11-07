@@ -154,6 +154,34 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.40 — the ensure stage stops paying for its own copies
+
+Fresh stage telemetry after 0.9.39 showed the two remaining per-frame costs
+in `flush_hot_slab_group` were not compression but COPIES and HASHING:
+
+- **The splice memmove (change A).** The raw-frame path built
+  `[tab][raws...]` (~150 KiB) and then `splice(0..0, [0u8; 12])` to make
+  room for the slab header — a full-frame memmove per flush hiding behind
+  the "patched in place" comment. The body is now built with the 12-byte
+  header reserved up front and patched after: slab_comp 6.2 -> **0.05
+  us/frame**, byte-identical output.
+- **dict_sample hashed at SipHash speed (change B).** The sample path took
+  up to 16 KiB per member through `DefaultHasher` (~1.5 GB/s) — the whole
+  17.6 us/frame dict_sample timer was THIS hash. `xxh3_64` over the same
+  truncated bytes: 17.6 -> **9.2 us/frame**, now the data movement itself.
+  Bucket keys shift (which samples train the hot dict), but the contract
+  holds — same content set -> same dict; member raws, enc_fp and the
+  drained container are untouched.
+
+Same-host A/B (2-core, warmup `3 2` -> three `1 2` rounds): baseline
+120.8-128.4 MB/s (median 125.7) -> patched **126.8-131.3 (median 131.0)**,
++3-4% import ST; ensure stage 30.4 -> 28.6 us/chunk; MT 195.8 MB/s (in the
+documented +-25% band). The remaining dict_sample cost is the xxh3 over the
+member raws themselves — the honest floor of "hash what you train on".
+
+Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99/12130/9971843), verify
+728+218 bad=0.
+
 ## v0.9.39 — the hot tier stops pretending: raw slab frames + the tail joins the frame
 
 The ensure stage had grown back to 21% of the import wall (58.3 µs/chunk

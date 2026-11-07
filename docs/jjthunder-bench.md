@@ -1357,3 +1357,23 @@ builds, so MT deltas below that band are not attributable).
 
 Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99/12130/9971843), verify
 728+218 bad=0, pack 0.41 s, container 1.94 MiB x6.42, warm read 1490.2 MB/s.
+
+## 0.9.40 - ensure stage: splice memmove + SipHash dict sampling
+
+Fresh per-frame telemetry on flush_hot_slab_group after the 0.9.39 raw-frame
+change (same machine, warmup 3 2 -> measure 1 2, ST):
+
+| timer | 0.9.39 | 0.9.40 | note |
+|---|---|---|---|
+| slab_comp | 6.2 us/frame | 0.05 | splice(0..0) header memmove -> reserved header |
+| dict_sample | 17.6 | 9.2 | SipHash DefaultHasher -> xxh3_64 over the same truncated bytes |
+| ensure total | 30.4 us/chunk | 28.6 | |
+| import ST | 120.8-128.4 (med 125.7) | 126.8-131.3 (med 131.0) | +3-4%, A/B 3 rounds each side |
+
+dict bucket keys shift with the hash change (which samples train the hot
+dict); the determinism contract (same content set -> same dict) holds, and
+member raws / enc_fp / drained container are untouched: enc_fp EXACT
+(6d240d7166cdda99/12130/9971843), 58/58 tests, verify 728+218 bad=0, MT 195.8
+(in the +-25% band). Next honest levers unchanged: cross-chunk slab batching
+(deferred recipe encode), thread-local scratch in the split stage (+1.5-2%
+class), dict_sample is now at its data-hash floor.

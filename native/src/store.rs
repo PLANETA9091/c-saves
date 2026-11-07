@@ -1489,15 +1489,18 @@ impl Store {
         if !self.dict_enabled.load(Ordering::Relaxed) {
             return;
         }
-        use std::hash::{Hash, Hasher};
         let n = raw.len().min(16 * 1024);
         // hash the TRUNCATED bytes (what gets stored/trained): the bucket
         // key then depends only on the trained representation, and the
         // train-time hash-order iteration reproduces the offline-measured
-        // order (83 KB dict vs 49 KB when hashing the untruncated raw)
-        let mut hh = std::collections::hash_map::DefaultHasher::new();
-        raw[..n].hash(&mut hh);
-        let h = hh.finish();
+        // order (83 KB dict vs 49 KB when hashing the untruncated raw).
+        // v0.9.40: xxh3_64 replaces SipHash — DefaultHasher ran ~1.5 GB/s,
+        // which was the entire 17.6 us/frame dict_sample cost; xxh3 covers
+        // the same truncated bytes at an order of magnitude more. Bucket
+        // keys shift (dict content moves within its determinism contract:
+        // same content set -> same dict); member raws, enc_fp and the
+        // drained container are untouched.
+        let h = xxhash_rust::xxh3::xxh3_64(&raw[..n]);
         let mut s = self.dict_samples.lock();
         // memory bound: 16 x dict_train buckets (~13 MB typical, 51 MB
         // worst case at 16 KiB samples). Beyond the cap the set is frozen:
@@ -2570,20 +2573,25 @@ impl Store {
     fn flush_hot_slab_group(&self, group: Vec<(Hash, u32, &[u8])>) -> Result<(), String> {
         let _ts = std::time::Instant::now();
         let n = group.len();
-        let mut tab: Vec<u8> = Vec::with_capacity(n * 20);
+        // v0.9.40: the 12-byte header is RESERVED up front and the body is
+        // built inside it — the old path assembled [tab][raws] and then
+        // splice(0..0) memmove'd the whole ~150 KiB stream to make room for
+        // the header. Byte-identical output, one full-frame memmove gone.
+        const SLAB_HDR: usize = 12; // non-GLOB slab v2 header: kind,dict,cl,raw,n
+        let raws_total: usize = group.iter().map(|g| g.2.len()).sum();
+        let mut body: Vec<u8> = Vec::with_capacity(SLAB_HDR + n * 24 + raws_total);
+        body.resize(SLAB_HDR, 0);
         let mut prev_id: i64 = 0;
         for (h, id, raw) in &group {
-            put_u64(&mut tab, zigzag(*id as i64 - prev_id));
+            put_u64(&mut body, zigzag(*id as i64 - prev_id));
             prev_id = *id as i64;
-            put_u64(&mut tab, raw.len() as u64);
-            tab.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
-            tab.extend_from_slice(&(*h as u64).to_le_bytes());
+            put_u64(&mut body, raw.len() as u64);
+            body.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
+            body.extend_from_slice(&(*h as u64).to_le_bytes());
         }
-        let tab_len = tab.len() as u32;
-        let mut stream = tab;
-        stream.reserve(group.iter().map(|g| g.2.len()).sum::<usize>());
+        let tab_len = (body.len() - SLAB_HDR) as u32;
         for (_, _, raw) in &group {
-            stream.extend_from_slice(raw);
+            body.extend_from_slice(raw);
         }
         ENSX_SBUILD.0.fetch_add(_ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
         ENSX_SBUILD.1.fetch_add(1, Ordering::Relaxed);
@@ -2592,11 +2600,6 @@ impl Store {
         // see decompress()). The slab header is patched IN PLACE in front of
         // the stream (saves a full-frame memcpy per flush; the only remaining
         // copy is append's into the segment buffer).
-        const SLAB_HDR: usize = 12; // non-GLOB slab v2 header: kind,dict,cl,raw,n
-        let raws_total: usize = group.iter().map(|g| g.2.len()).sum();
-        let mut body = stream;
-        body.reserve(SLAB_HDR);
-        body.splice(0..0, [0u8; SLAB_HDR]);
         body[0] = 8u8 | SLAB_KIND_HOT;
         body[1] = 0xFF; // RAW sentinel
         body[2..6].copy_from_slice(&((tab_len as usize + raws_total) as u32).to_le_bytes());
