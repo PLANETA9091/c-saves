@@ -148,3 +148,76 @@ per-stream parallel).
 
 Remaining roadmap items from this research: archive export mode (brotli -11
 measured / ZPAQ-class expected), and the frontier items stay parked.
+
+## 6. Per-section entropy coding: measured NEGATIVE end-to-end (research tick 2)
+
+The natural next question after LZMA2: the canonical voxel streams carry
+order-0..2 redundancy that fixed-width bit-packing wastes — entropy coding
+(rANS / arithmetic with adaptive counts) should harvest it. Probed with
+exact mathematics on the real corpus (1,198 sections, 4.9M voxels,
+`scripts/entropy_probe.py` + `kt_adaptive_probe.py`, sandbox):
+
+**Probe 1 — per-section static rANS (order-0, quantized freqs):** raw
+section bodies drop -55.7% (1,280,355 -> 567,519 B). End-to-end the verdict
+FLIPS: zstd-6 on the CURRENT dense/RLE assembly reaches 355,694 B — the
+rANS output (near-random bits) compresses to nothing further and lands at
+554,429 B (+56% WORSE). LZMA2-6 on the dense assembly: 284,208 B — already
+2x BELOW the per-section order-0 entropy floor (550,467 B).
+
+**Probe 2 — adaptive KT context modeling (context = left + above voxel,
+K = 1<<W symbols, per-section cold start, no transmitted tables):** exact
+sequential code length via the lgamma closed form
+`L_c = log2(Γ(K/2+m)/Γ(K/2)) - Σ log2(Γ(k+1/2)/Γ(1/2))`:
+
+| W | sections | KT-CM b/vox | LZMA2-on-dense b/vox | delta |
+|---|---|---|---|---|
+| 1 | 119 | 0.0499 | 0.0624 | -20% |
+| 2 | 436 | 0.2228 | 0.2684 | -17% |
+| 3 | 375 | 0.4076 | 0.4725 | -13.7% |
+| 4 | 203 | 0.5853 | 0.6517 | -10.2% |
+| 5 | 40 | 0.7612 | 0.7158 | +6.3% (dense keeps) |
+| 6 | 25 | 1.4510 | 1.2735 | +13.9% (dense keeps) |
+
+A -11.9% per-section win under LZMA2 — on paper. A full Rust implementation
+(LZMA-convention carry range coder, KT-adaptive counts, wire form 3 in the
+CSEC frame, decode in all three read paths, glob-conversion support,
+shift-admission recalibration) was built, tested green (64/64), and parked
+on branch `wip-cm-section-form` after the REAL-container A/B:
+
+| corpus / codec | base 0.9.41 | + CM form 3 | verdict |
+|---|---|---|---|
+| JJ bench 64x4, z6 | 1.70 MiB (x0.11) | 1.85 MiB (x0.12) | **+8.8% WORSE** |
+| JJ bench 64x4, LZMA2 | 1.35 MiB (x0.08) | 1.44 MiB (x0.09) | **+6.7% WORSE** |
+| survival 16x12, z6 | x3.12 smaller | x2.80 smaller | **-10%, breaks the 3.0x gate** |
+
+enc_fp raw member bytes DID drop -31.8% (9,971,843 -> 6,798,802; members
+12130 unchanged — structural hashes are content-based; would-be pin
+44b0fbd900bbc67a). **The raw win evaporates post-codec.**
+
+Root cause, now measured three independent ways: the container's dominant
+forms (GLOB gid streams, RLE, dense zero-run streams, shift-refs) win
+through CROSS-SECTION byte alignment that the slab codec harvests at a
+level BELOW any per-section entropy floor. zstd-6's match machinery on
+aligned 1-byte-per-voxel gid streams beats a per-section coder the same
+way LZMA2-on-dense did in probe 1. The offline probe's premise — that the
+alternative to CM was the dense assembly — was wrong for the shipped
+pipeline; the math was right, the baseline was not the real one.
+
+**Anti-retest gates (do not revisit without new evidence):**
+- per-section rANS/tANS/FSE on canonical voxel streams (order-0): dead.
+- per-section adaptive CM (order-1/2, left+above contexts, KT or MAP):
+  dead on both real corpora under both cold codecs.
+- W >= 5 sections: CM loses even on paper (context starvation: 4096
+  samples over up to 4096 contexts).
+- byte-plane transposes, delta filters, BWT family, window growth: dead
+  (section 1).
+
+**What could actually beat glob+LZMA2 (frontier, parked):** a SLAB-LEVEL
+global context model over the gid streams — order-1+ voxel-space contexts
+maintained across the whole slab (the coder both encoder and decoder walk
+the slab's sections in stored order, so the model needs no tables) — i.e.
+replace the general-purpose slab codec with a domain coder. Multi-day
+project, real read-latency cost on the cold path, expected gain bounded by
+the gap between LZMA2-on-glob and the true joint entropy of the aligned
+material (unmeasured; the per-section floors are NOT the bound). Revisit
+only with a corpus where alignment-poor player-built content dominates.
