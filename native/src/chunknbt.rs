@@ -36,6 +36,53 @@ use xxhash_rust::xxh3::{xxh3_128, Xxh3};
 
 pub type Hash = u128;
 
+/// Bucket hasher for Hash-keyed maps in this module (enc cache, emit cache,
+/// shift dedup): the keys are already fingerprints, so one multiply per
+/// 64-bit half replaces SipHash's ~25 ns per probe. Map correctness never
+/// relies on the bucket hash (full-key Eq on every probe).
+#[derive(Default, Clone, Copy)]
+struct RawBuildC;
+impl std::hash::BuildHasher for RawBuildC {
+    type Hasher = RawHasherC;
+    #[inline]
+    fn build_hasher(&self) -> RawHasherC {
+        RawHasherC(0)
+    }
+}
+#[derive(Default, Clone, Copy)]
+struct RawHasherC(u64);
+impl std::hash::Hasher for RawHasherC {
+    #[inline]
+    fn write_u128(&mut self, v: u128) {
+        self.0 = (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ ((v >> 64) as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.0 = (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0 ^ 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h = (h ^ *b as u64).wrapping_mul(0x1000_0000_01B3);
+        }
+        self.0 = h;
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 // ------------------------------------------------- section emit cache -----
 
 /// Bounded FIFO cache of EMITTED section NBT payloads, keyed by the section's
@@ -239,7 +286,7 @@ impl SecBytes {
 }
 
 struct EncCache {
-    map: HashMap<Hash, (Hash, Arc<Vec<u8>>)>, // structural hash -> (encoded hash, csec bytes)
+    map: HashMap<Hash, (Hash, Arc<Vec<u8>>), RawBuildC>, // structural hash -> (encoded hash, csec bytes)
     order: VecDeque<(Hash, u32)>,
     total: u64,
     cap: u64,
@@ -302,7 +349,7 @@ fn enc_cache_with<R>(f: impl FnOnce(&mut Option<EncCache>) -> R) -> R {
             let cap = enc_cache_cap();
             if cap > 0 {
                 *g = Some(EncCache {
-                    map: HashMap::new(),
+                    map: HashMap::with_hasher(RawBuildC),
                     order: VecDeque::new(),
                     total: 0,
                     cap,
@@ -744,6 +791,11 @@ static SPLT_SCANP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0
 /// that fell back to the fastnbt wrap parse (shape the direct parser refuses).
 static SPLT_DIRT: AtomicU64 = AtomicU64::new(0);
 static SPLT_DIRF: AtomicU64 = AtomicU64::new(0);
+/// v0.9.37 probe: scan_split decomposition — scan_root total, the lite
+/// encode list, build_scan_tail. Splits the residual (scan - enc - shift).
+static SPLT_SCANR: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static SPLT_ENCL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+static SPLT_TAILB: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 /// refusal-reason histogram for the direct parser (debug: DIR_WHYS[k] counts)
 /// 1=list shape 2=unknown section field 3=Y 4=bs/bio tag 5=light tag
 /// 6=state dup/int 7=inside block_states/biomes
@@ -811,7 +863,7 @@ pub fn split_stage_json() -> String {
         )
     }
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
         f("parse", &SPLT_PARSE),
         f("sections", &SPLT_SECS),
         f("sh", &SPLT_SH),
@@ -824,7 +876,41 @@ pub fn split_stage_json() -> String {
         f("scan", &SPLT_SCAN),
         f("scan_ok", &SPLT_SCAN_OK),
         f("scanp", &SPLT_SCANP),
-        f("lite", &SPLT_LITE)
+        f("lite", &SPLT_LITE),
+        f("scanr", &SPLT_SCANR),
+        f("encl", &SPLT_ENCL),
+        f("tailb", &SPLT_TAILB)
+    )
+    + &format!(
+        r#","shiftc":{{"cand":{},"plane0":{},"full":{},"reject":{},"resolved":{},"secs_ok":{},"ksum":{},"d1st":{},"dnom":{},"dmatch":{}}}"#,
+        ST_SHIFT_CAND.load(Ordering::Relaxed),
+        ST_SHIFT_PLANE0.load(Ordering::Relaxed),
+        ST_SHIFT_FULL.load(Ordering::Relaxed),
+        ST_SHIFT_REJECT.load(Ordering::Relaxed),
+        ST_SHIFT_RESOLVED.load(Ordering::Relaxed),
+        ST_SHIFT_SECS_OK.load(Ordering::Relaxed),
+        ST_SHIFT_KSUM.load(Ordering::Relaxed),
+        ST_SHIFT_DENSE1ST.load(Ordering::Relaxed),
+        ST_SHIFT_DENSE_NOMATCH.load(Ordering::Relaxed),
+        ST_SHIFT_DENSE_MATCH.load(Ordering::Relaxed),
+    )
+    + &format!(
+        r#","shiftb":{{"id":{},{},"unp":{},{},"key":{},{},"fp":{},{},"builds":{}}}"#,
+        ST_SHIFT_ID_NS.load(Ordering::Relaxed),
+        ST_SHIFT_ID_NS.swap(0, Ordering::Relaxed),
+        ST_SHIFT_UNP_NS.load(Ordering::Relaxed),
+        ST_SHIFT_UNP_NS.swap(0, Ordering::Relaxed),
+        ST_SHIFT_KEY_NS.load(Ordering::Relaxed),
+        ST_SHIFT_KEY_NS.swap(0, Ordering::Relaxed),
+        ST_SHIFT_FP_NS.load(Ordering::Relaxed),
+        ST_SHIFT_FP_NS.swap(0, Ordering::Relaxed),
+        ST_SHIFT_FAST.swap(0, Ordering::Relaxed),
+    )
+    + &format!(
+        r#","shiftt":{{"tail":{},"total":{},"rejects":{}}}"#,
+        ST_SHIFT_TAIL_NS.swap(0, Ordering::Relaxed),
+        ST_SHIFT_TOTAL_NS.swap(0, Ordering::Relaxed),
+        ST_SHIFT_REJECT.swap(0, Ordering::Relaxed),
     )
     + &format!(
         r#","rleabm":{{"a":[{},{}],"b":[{},{}],"m":[{},{}],"uni":{}}}"#,
@@ -3283,7 +3369,7 @@ struct SectionFacts {
 /// both ShiftSec builds.
 fn intern_ids(
     pal: &[PalEntry],
-    tab: &mut HashMap<Box<[u8]>, u32>,
+    tab: &mut HashMap<Box<[u8]>, u32, RawBuildC>,
     idbuf: &mut Vec<u8>,
 ) -> Option<Vec<u32>> {
     let n = pal.len();
@@ -3311,7 +3397,7 @@ fn intern_ids(
 /// light byte copies) for sections that only need interning.
 fn intern_ids_lit(
     pal: &[PalLit],
-    tab: &mut HashMap<Box<[u8]>, u32>,
+    tab: &mut HashMap<Box<[u8]>, u32, RawBuildC>,
     idbuf: &mut Vec<u8>,
 ) -> Vec<u32> {
     let n = pal.len();
@@ -3338,7 +3424,7 @@ fn intern_ids_lit(
 /// comparator (counts desc, then (plain, name, props-sorted)).
 fn shift_sec_of_view(
     v: &SecView,
-    tab: &mut HashMap<Box<[u8]>, u32>,
+    tab: &mut HashMap<Box<[u8]>, u32, RawBuildC>,
     idbuf: &mut Vec<u8>,
 ) -> Option<ShiftSec> {
     let bs = v.bs.as_ref()?;
@@ -3411,7 +3497,7 @@ pub static ST_SHIFT_FAST: AtomicU64 = AtomicU64::new(0);
 
 fn shift_sec_from_facts_view(
     v: &SecView,
-    tab: &mut HashMap<Box<[u8]>, u32>,
+    tab: &mut HashMap<Box<[u8]>, u32, RawBuildC>,
     idbuf: &mut Vec<u8>,
     facts: SectionFacts,
 ) -> Option<ShiftSec> {
@@ -3459,7 +3545,7 @@ fn shift_sec_from_facts_view(
 /// view path could reject.
 fn shift_sec_from_facts_lite(
     s: &SecLite,
-    tab: &mut HashMap<Box<[u8]>, u32>,
+    tab: &mut HashMap<Box<[u8]>, u32, RawBuildC>,
     idbuf: &mut Vec<u8>,
     facts: SectionFacts,
 ) -> Option<ShiftSec> {
@@ -3538,7 +3624,10 @@ fn shift_ref_pass(
     if n_sec < 2 {
         return;
     }
-    let mut tab: HashMap<Box<[u8]>, u32> = HashMap::new();
+    // v0.9.37: RawBuildC bucket hashing over the identity bytes (FNV-style
+    // write) — SipHash's ~25 ns per probe ran ~10k times per import here.
+    // Map correctness rides on full-key Eq over the byte strings.
+    let mut tab: HashMap<Box<[u8]>, u32, RawBuildC> = HashMap::with_hasher(RawBuildC);
     let mut idbuf: Vec<u8> = Vec::with_capacity(64);
     // Sections with tiny members (uniform / RLE-collapsed) are excluded
     // entirely: their matches can never clear the admission rule (the ref
@@ -3694,6 +3783,9 @@ fn shift_ref_pass(
             view_cache[$ix].as_ref()
         }};
     }
+    // v0.9.37: candidate-dedup scratch, reused across the i loop (capacity
+    // == CANDIDATES bound; cleared per i in the matching loop below).
+    let mut seen_ids: Vec<Hash> = Vec::with_capacity(CANDIDATES);
     for i in 0..n_sec {
         if cache_hit.get(i).copied().unwrap_or(false) {
             continue; // cross-chunk-shared content: full member dedups for free
@@ -3713,8 +3805,15 @@ fn shift_ref_pass(
         // uniform target matching at k=1 stores k*256 top-plane entries at
         // the section's palette width, which can dwarf a dense target's ref
         // at larger k with a narrow top palette.
+        // v0.9.37: the per-i HashMap<Hash, ()> (SipHash, ~25 ns/insert,
+        // ~6 growth reallocs) ran ~0.5M inserts per import and dominated
+        // the matching loop. Replacement: one u64 bloom bit + a reused
+        // scratch Vec (capacity == CANDIDATES, cleared per i). A fresh key
+        // costs one AND + bit test; only same-slot collisions fall through
+        // to the exact Vec scan, so dedup semantics are unchanged.
         let mut best: Option<(u64, usize, usize)> = None; // (cost, k, j)
-        let mut seen_ids: HashMap<Hash, ()> = HashMap::new();
+        seen_ids.clear();
+        let mut seen_bf: u64 = 0;
         let mut seen = 0usize;
         for j in (0..i).rev() {
             if seen >= CANDIDATES {
@@ -3726,7 +3825,15 @@ fn shift_ref_pass(
             let Some(ts) = ss_get!(j) else { continue };
             // strict content dedup: identical candidates give identical
             // match results, so only distinct contents consume the budget
-            if seen_ids.insert(sections[j].0, ()).is_some() {
+            let id = sections[j].0;
+            let bit = 1u64 << ((id as u64) & 63);
+            let maybe_new = seen_bf & bit == 0;
+            if maybe_new || !seen_ids.contains(&id) {
+                if maybe_new {
+                    seen_bf |= bit;
+                }
+                seen_ids.push(id);
+            } else {
                 continue;
             }
             seen += 1;
@@ -3776,13 +3883,16 @@ fn shift_ref_pass(
             continue;
         }
         // chunk id -> target ORIGINAL palette index (for ref-space mapping)
-        let mut t_rev: HashMap<u32, usize> = HashMap::with_capacity(n_t);
+        // v0.9.37: RawBuildC bucket hashing (keys are chunk-global ids, map
+        // correctness rides on full-key Eq) — SipHash's ~25 ns per probe
+        // dominated the top-plane remap loop at ~100k lookups per import.
+        let mut t_rev: HashMap<u32, usize, RawBuildC> = HashMap::with_capacity_and_hasher(n_t, RawBuildC);
         for (oi, &id) in tj.id_of_orig.iter().enumerate() {
             t_rev.entry(id).or_insert(oi);
         }
         // ref-space mapping of the section's top planes; extras = identities
         // not present in the target palette, numbered by first appearance
-        let mut extra_of_id: HashMap<u32, u32> = HashMap::new();
+        let mut extra_of_id: HashMap<u32, u32, RawBuildC> = HashMap::with_hasher(RawBuildC);
         let mut extras: Vec<usize> = Vec::new(); // s's ORIGINAL palette positions
         let mut top: Vec<u32> = Vec::with_capacity(kw);
         let mut ok = true;
@@ -5549,6 +5659,7 @@ fn parse_sections_direct_from<'a>(
 /// Fast-path split: raw tail + sections-only parse. None = fall back to the
 /// full parse (any structural doubt, non-compound root, missing sections...).
 fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
+    let t_scanr = std::time::Instant::now();
     let Some(mut out) = scan_root(payload, strip) else {
         if std::env::var("CSAVES_SCAN_DEBUG").as_deref() == Ok("1") {
             eprintln!(
@@ -5560,6 +5671,8 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
         }
         return None;
     };
+    SPLT_SCANR.0.fetch_add(t_scanr.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SPLT_SCANR.1.fetch_add(1, Ordering::Relaxed);
     let (sp0, sp1) = out.sections_payload;
     let want_facts = !no_shift();
     // v0.9.13: typed borrowed parse first (no per-entry HashMap/String
@@ -5601,10 +5714,16 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
         SPLT_SCANP.0.fetch_add(t_sp2.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_SCANP.1.fetch_add(1, Ordering::Relaxed);
         SPLT_LITE.1.fetch_add(1, Ordering::Relaxed);
+        let t_encl = std::time::Instant::now();
         let (mut sections, cache_hit, mut facts) =
             encode_section_list_lite(&litelist, strip, want_facts);
+        SPLT_ENCL.0.fetch_add(t_encl.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLT_ENCL.1.fetch_add(1, Ordering::Relaxed);
         shift_stage(&mut sections, &SecListSrc::Lite(&litelist, strip), &cache_hit, &mut facts);
+        let t_tailb = std::time::Instant::now();
         let tail = build_scan_tail(payload, &out)?;
+        SPLT_TAILB.0.fetch_add(t_tailb.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLT_TAILB.1.fetch_add(1, Ordering::Relaxed);
         return Some(Split::Split { sections, tail });
     }
     let t_sp3 = std::time::Instant::now();
@@ -5624,7 +5743,10 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
     }
     let (mut sections, cache_hit, mut facts) = encode_section_list(&list, want_facts);
     shift_stage(&mut sections, &SecListSrc::Values(&list), &cache_hit, &mut facts);
+    let t_tailb = std::time::Instant::now();
     let tail = build_scan_tail(payload, &out)?;
+    SPLT_TAILB.0.fetch_add(t_tailb.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SPLT_TAILB.1.fetch_add(1, Ordering::Relaxed);
     Some(Split::Split { sections, tail })
 }
 

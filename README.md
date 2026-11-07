@@ -154,6 +154,52 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.37 — the shift pass stops hashing: fingerprint dedup without SipHash
+
+The 0.9.36 stage decomposition left residues inside scan_split unexplained,
+so the split gained three probe timers (scanr / encl / tailb) and the full
+shift-pass counter block (shiftc / shiftb / shiftt in split_stage_json).
+The decomposition (probe-timer-inclusive, same instrumentation on both
+sides): scan 219.6 us/chunk = scanr 24.7 (secb 21.7 = the fused walk) +
+encl 138.4 (enc 105.7 = unp 48.4 + pack 41.5 + canon/pal ~15.8, plus
+sh 17.0 outside the enc timer) + shift 49.2 + tailb 1.1 + residual 6.2.
+The shift pass decomposed further: builds 18.0 (fp 4.9 + id 4.3 + key 0.6;
+its ident fill is counted in unp), tail materialization 16.7, matching
+13.4 — and the matching cost was NOT the 447k plane-fingerprint compares
+(they reject 99.93% at plane0, ~2 us/chunk): it was the per-i
+candidate-dedup `HashMap<Hash, ()>` — ~0.5M SipHash inserts (~25 ns each)
+plus the map growth reallocs — pure hashing, ~14 us/chunk.
+
+Changes, all output-identical (enc_fp pin EXACT):
+
+- Candidate dedup: one u64 bloom bit (AND + bit test for a fresh key)
+  over a reused scratch Vec (capacity == CANDIDATES, cleared per i); only
+  same-slot collisions fall through to the exact Vec scan, so the dedup
+  semantics are unchanged. Matching 13.4 -> 6.7 us/chunk.
+- The identity-intern table (`tab`), the ref-materialization maps
+  (t_rev / extra_of_id) and the per-thread enc cache switch from SipHash
+  to the RawBuildC bucket hasher (keys are already fingerprints or
+  chunk-global ids; correctness rides on full-key Eq). Tail
+  materialization 16.7 -> 9.4 us/chunk.
+
+Verdicts, documented negative: the nibble unpack kernel rewrite
+(byte-plane extraction + 4-way interleaved sub-counters to break the
+counts store-forward chain) measured 2.57 -> 3.78 us/call with branchy
+worst-tracking and 2.57 -> 3.38 with predicted-not-taken checks — both
+reverted; LLVM already schedules the constant-shift loop better than the
+byte-pair form (an independent second confirmation of the 0.9.32
+verdict). The shift-side tail/materialization HashMaps keep their
+allocations; a scratch-vec replacement was considered and parked — the
+remaining 9.4 us/chunk is dominated by the per-ref view clone +
+non-block_states re-encode, not the maps.
+
+Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99/12130/9971843),
+import ST 112.9 -> 117.5 MB/s (p50 60.2 -> 58.4 us), import MT ~180 ->
+~186 MB/s (2-thread, noisy shared host — stage telemetry is the honest
+witness), scan 219.6 -> 207.3 us/chunk, shift 49.2 -> 38.0, pack
+0.42 s at z6, container 1.94 MiB x6.42, bench_size compact x0.11 (gate
+0.15), survival verify ok=1280 bad=0, verify 728+218 bad=0.
+
 ## v0.9.36 — the root walk parses the section list in place (one walk, not two)
 
 The import split walked every chunk's bulk TWICE: scan_root ran a raw

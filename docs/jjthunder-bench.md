@@ -1210,6 +1210,42 @@ failures were env-race flakes (set_var vs the once-resolved OnceLocks from
 byte-identical: enc_fp 6d240d7166cdda99 / 12130 / 9971843 unchanged; 58/58
 tests x8 at 8 test threads.
 
+## 0.9.37 — the shift pass stops hashing: fingerprint dedup without SipHash
+
+New probes first (split_stage_json): scanr = scan_root total, encl =
+encode_section_list_lite total, tailb = build_scan_tail; shiftc =
+candidate-loop counters, shiftb = per-build timers, shiftt = tail
+materialization + pass total. Same-instrumentation before/after on the
+dim corpus (2-core, warmup-first, measure `1 2`):
+
+| block | 0.9.36 | 0.9.37 | note |
+|---|---|---|---|
+| scan | 219.6 | 207.3 µs/chunk | whole scan_split |
+| scanr | 24.7 | 25.0 | root walk (secb 21.7 fused parse) |
+| encl | 138.4 | 137.1 | encode list (enc 105.7 = unp 48.4 + pack 41.5) |
+| shift | 49.2 | 38.0 | builds 18.0 + matching 6.7 + tail 9.4 |
+| import ST | 112.9 | 117.5 MB/s | p50 60.2 -> 58.4 us |
+| import MT | 180.4 | ~186 MB/s | 2 threads, noisy shared host |
+
+The matching-loop cost was the per-i candidate-dedup HashMap<Hash, ()>
+(~0.5M SipHash inserts per import at ~25 ns + growth reallocs), not the
+447k plane-fingerprint compares (99.93% reject at plane0, ~2 us/chunk).
+Fix: u64 bloom bit + reused scratch Vec (capacity == CANDIDATES, exact
+scan only on same-slot collisions). The identity-intern table, the
+ref-materialization maps and the per-thread enc cache switched to the
+RawBuildC bucket hasher (fingerprint/id keys; full-key Eq unchanged).
+
+Documented negative: nibble unpack kernel rewrites (byte-plane extract +
+4-way interleaved sub-counters) measured 2.57 -> 3.78 us/call (branchy
+worst-tracking) and 2.57 -> 3.38 (predicted-not-taken checks) — both
+reverted. Second independent confirmation of the 0.9.32 verdict: LLVM
+already schedules the constant-shift nibble loop better than the
+byte-pair form.
+
+Gates: 58/58 tests, enc_fp EXACT (6d240d7166cdda99/12130/9971843),
+pack 0.42 s at z6, container 1.94 MiB x6.42, bench_size compact x0.11
+(gate 0.15), survival verify ok=1280 bad=0, verify 728+218 bad=0.
+
 ## 0.9.36 — one walk, not two: the root walk owns the section parse
 
 Method note first: the container-fp line is NOT a stable pin on this
