@@ -150,16 +150,23 @@ pub(crate) fn set_cold_codec_for_tests(v: Option<&str>) {
 }
 
 /// Resolved ONCE: cold slab streams go through LZMA2 (preset 6) instead of
-/// zstd when CSAVES_COLD_CODEC=lzma2. The research probe (docs/compression-
-/// research.md) measured -24.8% vs zstd-6 on the real corpus at a bounded
-/// pack-wall cost; opt-in because the default must keep the hot pack-water
-/// behavior untouched.
+/// zstd. v0.9.42: LZMA2 IS THE DEFAULT — the research probe measured -24.8%
+/// vs zstd-6 on the real corpus, the real-container bench -20.5% (1.70 ->
+/// 1.35 MiB, x0.11 -> x0.08 vs anvil), the cold-read verify wall measured
+/// NEUTRAL (25.8 s vs 28.2 s on the 1661-chunk verify — the 20% smaller
+/// container buys back the decode), and the pack wall stays background /
+/// watermark-throttled by design (8.4 s vs 1.0 s on the bench scale, per-
+/// stream parallel). CSAVES_COLD_CODEC=zstd opts back out; the per-record
+/// codec stamp (0xFE vs dict_id) makes both containers readable either way.
 fn cold_codec_lzma2() -> bool {
     static LZ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if cfg!(test) && COLD_CODEC_TEST.0.load(Ordering::Relaxed) {
         return COLD_CODEC_TEST.1.load(Ordering::Relaxed) == 1;
     }
-    *LZ.get_or_init(|| std::env::var("CSAVES_COLD_CODEC").as_deref() == Ok("lzma2"))
+    *LZ.get_or_init(|| match std::env::var("CSAVES_COLD_CODEC").as_deref() {
+        Ok("zstd") => false,
+        _ => true, // default LZMA2 ("lzma2" explicit or unset)
+    })
 }
 
 /// Raw LZMA2 stream (no xz container — the slab record already carries
@@ -5280,6 +5287,40 @@ pub mod tests {
     }
 
     #[test]
+    fn cold_zstd_optout_slab_roundtrip() {
+        // v0.9.42 mirror of the lzma2 roundtrip: CSAVES_COLD_CODEC=zstd opts
+        // back out of the new default — the zstd wire (dict_id stamps) must
+        // stay fully functional for stores that pinned it.
+        set_cold_codec_for_tests(Some("zstd"));
+        let dir = temp_dir("cold-zstd-optout-roundtrip");
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        let n = 40usize;
+        let payloads: Vec<Vec<u8>> = (0..n).map(|i| chunk_payload((i % 8) as i32, (i / 8) as i32, (i % 5) as u64)).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            s.write_chunk(i as u64, p, false).unwrap();
+        }
+        s.sync();
+        s.seal();
+        s.request_pack();
+        for _ in 0..200 {
+            if !s.compact_step() {
+                break;
+            }
+        }
+        assert!(!s.compact_step(), "drain did not converge");
+        s.sync();
+        for (i, p) in payloads.iter().enumerate() {
+            assert!(semantic(&s.read_chunk(i as u64).unwrap(), p), "zstd post-pack chunk {i}");
+        }
+        drop(s);
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            assert!(semantic(&s.read_chunk(i as u64).unwrap(), p), "zstd post-reopen chunk {i}");
+        }
+        set_cold_codec_for_tests(None);
+    }
+
+    #[test]
     fn shared_sections_pack_rewrite_roundtrip() {
         // Regression guard for the ref-loss the unchanged-write fast path
         // exposed on the speed bench: many chunks share section blobs;
@@ -6578,7 +6619,11 @@ mod repro {
         }
         // container level: MT threshold low + explicit 2 workers (host-core
         // independent), 2 MiB slabs so the canon/glob variant streams clear
-        // the 512 KiB admission threshold
+        // the 512 KiB admission threshold. v0.9.42: intra-frame MT stays a
+        // ZSTD-path feature (the lzma2 default compresses serially inside
+        // the frame; its parallelism is the outer per-stream scope) — pin
+        // the zstd codec explicitly for the MT assertion.
+        set_cold_codec_for_tests(Some("zstd"));
         let dir = temp_dir("pack-mt-a");
         let cfg = Cfg {
             slab_max_raw: 2 * 1024 * 1024,
@@ -6619,6 +6664,7 @@ mod repro {
             assert!(semantic(&got, p), "reopen mismatch chunk {i}");
         }
         let _ = fs::remove_dir_all(&dir);
+        set_cold_codec_for_tests(None);
     }
 
     #[test]

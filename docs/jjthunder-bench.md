@@ -1377,3 +1377,35 @@ member raws / enc_fp / drained container are untouched: enc_fp EXACT
 (in the +-25% band). Next honest levers unchanged: cross-chunk slab batching
 (deferred recipe encode), thread-local scratch in the split stage (+1.5-2%
 class), dict_sample is now at its data-hash floor.
+
+## 0.9.42 - LZMA2 cold codec graduates to default; per-section CM measured negative
+
+The 0.9.41 opt-in flipped to the default after the full gate sweep (2-core
+sandbox, same commands as CI):
+
+| gate | 0.9.41 default (z6) | 0.9.42 default (LZMA2-6) | floor |
+|---|---|---|---|
+| bench_size 64x4 compact | 1.70 MiB x0.11 | **1.35 MiB x0.08** | <0.15 |
+| jj_profile container | 1.65 MiB x3.26 | **1.53 MiB x3.53** | >=2.6 |
+| survival 16x12 | 1.36 MiB x3.12 | **1.04 MiB x4.05** | >=3.0 |
+| D verify (cold reads, 1661 chunks) | 28.2 s | **25.8 s** | - |
+| C compaction (pack wall) | 1.0 s | 8.4 s | background/watermark |
+| import ST | 126 MB/s | 132 MB/s | >=25 |
+
+`CSAVES_COLD_CODEC=zstd` opts back out; the per-record 0xFE-vs-dict_id stamp
+makes both containers decode either way. enc_fp EXACT
+(6d240d7166cdda99/12130/9971843). 60/60 tests (new zstd opt-out roundtrip
+mirror; the MT determinism test pins zstd explicitly - intra-frame MT is a
+zstd-path feature, the lzma2 path parallelizes via the outer per-stream
+scope).
+
+Research tick the same day: per-section entropy coding (order-0 rANS;
+KT-adaptive context modeling, context = left+above voxel, exact lgamma
+closed-form code lengths) was implemented to green (64/64 on the wip branch,
+all three decode paths + glob conversion + shift admission) and measured
+NEGATIVE end-to-end: JJ +8.8% (z6) / +6.7% (LZMA2), survival -10% (breaks
+the 3.0x gate) despite -31.8% raw enc_fp member bytes. Root cause measured
+three ways: slab streams win through CROSS-SECTION alignment the codec
+harvests below any per-section entropy floor. Parked on
+`wip-cm-section-form`; full probe tables + anti-retest gates in
+docs/compression-research.md section 6.

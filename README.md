@@ -154,6 +154,37 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.42 — LZMA2 becomes the default cold codec; per-section entropy coding measured negative
+
+The 0.9.41 opt-in graduated to the default after the full gate sweep:
+
+| gate | z6 (old default) | LZMA2 (new default) | floor |
+|---|---|---|---|
+| bench_size compact | 1.70 MiB (x0.11) | **1.35 MiB (x0.08)** | <0.15 |
+| JJ container | x3.26 smaller | **x3.53 smaller** | ≥2.6 |
+| survival container | x3.12 smaller | **x4.05 smaller** | ≥3.0 |
+| cold-read verify (1661 chunks) | 28.2 s | **25.8 s** | — |
+| import ST | 126 MB/s | 132 MB/s | ≥25 |
+| verify | 728+218+946+1280 bad=0 | same | =0 |
+
+The cold-read wall is neutral-to-better: the 20% smaller container buys back
+the slower decode. The pack wall (1.0 -> 8.4 s on the 2-core bench scale)
+stays background, watermark-throttled and per-stream parallel by design.
+`CSAVES_COLD_CODEC=zstd` opts back out; the per-record codec stamp makes
+both containers readable either way. enc_fp pin EXACT — the encode path is
+untouched.
+
+The same research tick took per-section entropy coding all the way to a
+green implementation (order-0 rANS and KT-adaptive context modeling with
+the context = left+above voxel, exact lgamma closed-form code lengths) and
+measured it NEGATIVE end-to-end on both real corpora (+8.8% z6 / +6.7%
+LZMA2 on JJ; -10% survival, breaking the 3.0x gate) despite -31.8% raw
+member bytes: slab streams win through CROSS-SECTION alignment (glob gid
+streams, RLE, dense zero-runs) that the codec harvests below any
+per-section entropy floor. Implementation parked on `wip-cm-section-form`;
+verdicts, probe tables and anti-retest gates in
+`docs/compression-research.md` §6.
+
 ## v0.9.41 — opt-in LZMA2 cold codec: the research probe ships
 
 The compression-research tick (docs/compression-research.md) probed codec
