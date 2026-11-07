@@ -154,6 +154,42 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.41 — opt-in LZMA2 cold codec: the research probe ships
+
+The compression-research tick (docs/compression-research.md) probed codec
+families on the real corpus and found the one lever the zstd family cannot
+reach: **raw LZMA2 -6 compresses the slab streams -24.8% vs zstd-6 — and
+-8.6% below the zstd-19 family ceiling — at the same wall time** (brotli -11
+is 2.5% smaller but 8x slower; delta filters, byte transposes and BWT all
+measured negative on voxel NBT). v0.9.41 ships it as an opt-in cold codec:
+
+- `CSAVES_COLD_CODEC=lzma2` — cold slab streams (canon AND glob variants,
+  the smaller still wins) go through raw LZMA2 preset 6 (liblzma, vendored
+  static build — no system package). FIXED preset on both encode and decode
+  (the raw format does not carry the dict size); CSAVES_COLD_LEVEL stays
+  zstd-only.
+- **The codec rides in the slab record's dict_id byte as the 0xFE
+  sentinel** — the same wire-byte dispatch the 0.9.39 raw sentinel uses, so
+  one hook at the top of decompress() covers slab cache, read_blob, batch
+  loads, scan rebuild, pack re-group and verify with zero call-site
+  changes. Dict-version space is capped at 253 so a store can never mint
+  0xFE as a dict id. Hot frames keep 0xFF (raw); per-blob cold re-stores
+  and recipe batches stay zstd (their dict_id slots carry real dict ids).
+- Errors never mislabel a stream: lzma2_compress returns None -> the
+  per-record stamp falls back to zstd together with the bytes.
+
+Measured on the real container (bench_size, 9216 chunks, 5 edit rounds):
+compact **3.80 -> 3.02 MiB (-20.5%)**, x0.08 vs Anvil (gate 0.15); slab bulk
+3,723,428 -> 2,907,791 (-21.9%); fresh/hot 10.97 MiB unchanged; import
+126 MB/s unchanged. The cost is honest: pack wall rises ~2-5x (LZMA2
+compresses at ~4.6 MB/s single-thread; per-stream parallelism still spreads
+across cores) — that is why it is opt-in, the default pack-water behavior
+stays zstd-6.
+
+Gates: 59/59 tests (new: cold_lzma2_slab_roundtrip — write, pack, drain,
+reopen, read through LZMA2 slabs), enc_fp EXACT
+(6d240d7166cdda99/12130/9971843), verify 728+218 bad=0 in the lzma2 mode.
+
 ## v0.9.40 — the ensure stage stops paying for its own copies
 
 Fresh stage telemetry after 0.9.39 showed the two remaining per-frame costs

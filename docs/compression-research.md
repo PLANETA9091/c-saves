@@ -124,3 +124,27 @@ bellard.org/ts_zip, LLMZip (arXiv/OpenReview), bzip3 project pages,
 Minecraft Bedrock Editor chunk management docs, community terrain-update
 tutorials, PaperMC forums on chunk regeneration, LinearRegionFileFormat
 (Modrinth) as format-level prior art.
+
+## 5. Integration verdict (v0.9.41): LZMA2 shipped as opt-in
+
+Recommendation 1 landed the same tick-series. Real-container numbers
+(bench_size, 9216 chunks, 5 edit rounds; CSAVES_COLD_CODEC=lzma2):
+
+| metric | zstd-6 (default) | LZMA2 preset 6 | delta |
+|---|---|---|---|
+| compact container | 3.80 MiB | **3.02 MiB** | **-20.5%** (x0.08 vs anvil) |
+| slab bulk (records_frame comp) | 3,723,428 B | 2,907,791 B | -21.9% |
+| fresh/hot container | 10.97 MiB | 10.97 MiB | unchanged (raw hot tier) |
+| import ST | 126 MB/s | 126 MB/s | unchanged |
+| verify | 728+218 bad=0 | 728+218 bad=0 | equal |
+
+The offline probe's -24.8% lands as -20.5% on the whole container: recipes,
+per-blob cold re-stores and dict files stay zstd by design (their dict_id
+slots carry real dict ids; slabs carry the bulk). The wire carries the
+codec in the slab record's dict_id byte as the 0xFE sentinel (dict-version
+space capped at 253), so the single decompress() hook dispatches every read
+path. Pack wall is the documented opt-in trade (~2-5x, comp-bound,
+per-stream parallel).
+
+Remaining roadmap items from this research: archive export mode (brotli -11
+measured / ZPAQ-class expected), and the frontier items stay parked.

@@ -59,6 +59,22 @@ const HOT_SLAB_MIN_RAW: usize = 8 * 1024;
 /// bit) rebuild as cold=true and stay in place. Legacy containers written
 /// before the bit never carry it — they rebuild exactly as before.
 const SLAB_KIND_HOT: u8 = 0x40;
+/// v0.9.41: dict_id sentinel marking an LZMA2-compressed slab stream
+/// (CSAVES_COLD_CODEC=lzma2). Rides in the same wire byte as the zstd dict
+/// id, so every read path dispatches through the one decompress() hook with
+/// zero call-site changes (the 0.9.39 raw-sentinel property). 0xFF stays
+/// RAW (hot frames); dict ids for BLOBS are assigned 1..=253 from here on —
+/// training stops at the 254 line, so a fresh store can never mint dict
+/// version 0xFE. A pre-existing store with dict-254 files on disk would
+/// misroute those blobs; reaching 254 retrains in one store lifetime is
+/// already past the documented exhaustion edge, same reasoning class as
+/// the 0xFF reservation.
+const SLAB_CODEC_LZMA2: u8 = 0xFE;
+/// LZMA2 preset for cold slab streams (research probe point: -24.8% vs
+/// zstd-6 on the real corpus). FIXED on both encode and decode so the raw
+/// decoder's window always matches — CSAVES_COLD_LEVEL applies to the zstd
+/// codec only.
+const LZMA2_COLD_PRESET: u32 = 6;
 /// chunks-map len marker: recipe lives inside a compressed kind-9 batch;
 /// the real (rec_off, stream_off, len) is in `batch_idx`.
 const BATCHED: u32 = u32::MAX;
@@ -114,6 +130,66 @@ thread_local! {
     static HOT_COMP: std::cell::RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
         const { std::cell::RefCell::new(None) };
 }
+// v0.9.41: tests must NOT set CSAVES_COLD_CODEC via set_var — same class
+// of race as FORCE_GLOB (0.9.35): the codec resolves into a OnceLock and
+// parallel tests would race it. Consulted only under cfg!(test).
+pub static COLD_CODEC_TEST: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
+#[cfg(test)]
+pub(crate) fn set_cold_codec_for_tests(v: Option<&str>) {
+    match v {
+        Some(v) => {
+            let id = match v {
+                "lzma2" => 1u64,
+                _ => 0u64,
+            };
+            COLD_CODEC_TEST.1.store(id, Ordering::Relaxed);
+            COLD_CODEC_TEST.0.store(true, Ordering::Relaxed);
+        }
+        None => COLD_CODEC_TEST.0.store(false, Ordering::Relaxed),
+    }
+}
+
+/// Resolved ONCE: cold slab streams go through LZMA2 (preset 6) instead of
+/// zstd when CSAVES_COLD_CODEC=lzma2. The research probe (docs/compression-
+/// research.md) measured -24.8% vs zstd-6 on the real corpus at a bounded
+/// pack-wall cost; opt-in because the default must keep the hot pack-water
+/// behavior untouched.
+fn cold_codec_lzma2() -> bool {
+    static LZ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if cfg!(test) && COLD_CODEC_TEST.0.load(Ordering::Relaxed) {
+        return COLD_CODEC_TEST.1.load(Ordering::Relaxed) == 1;
+    }
+    *LZ.get_or_init(|| std::env::var("CSAVES_COLD_CODEC").as_deref() == Ok("lzma2"))
+}
+
+/// Raw LZMA2 stream (no xz container — the slab record already carries
+/// framing + CRC). Returns None on any error so the caller falls back to
+/// the zstd path with the correct per-record codec stamp (never silently
+/// mislabel a stream).
+fn lzma2_compress(data: &[u8]) -> Option<Vec<u8>> {
+    let opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET).ok()?;
+    let mut f = liblzma::stream::Filters::new();
+    f.lzma2(&opts);
+    let mut stream = liblzma::stream::Stream::new_raw_encoder(&f).ok()?;
+    let mut out = Vec::with_capacity(data.len() / 3 + 64);
+    stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
+    stream.process_vec(&[], &mut out, liblzma::stream::Action::Finish).ok()?;
+    Some(out)
+}
+
+/// Decode a raw LZMA2 slab stream. The decoder window is pinned to
+/// LZMA2_COLD_PRESET's dict on both ends (the raw format does not carry the
+/// dict size — see the const docs).
+fn lzma2_decompress(data: &[u8], raw_len: usize) -> Option<Vec<u8>> {
+    let opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET).ok()?;
+    let mut f = liblzma::stream::Filters::new();
+    f.lzma2(&opts);
+    let mut stream = liblzma::stream::Stream::new_raw_decoder(&f).ok()?;
+    let mut out = Vec::with_capacity(raw_len);
+    stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
+    Some(out)
+}
+
 fn bulk_compress(data: &[u8], level: i32) -> (u8, Vec<u8>) {
     HOT_COMP.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -1538,7 +1614,9 @@ impl Store {
         if !self.dict_enabled.load(Ordering::Relaxed) {
             return false;
         }
-        if self.next_dict_ver.load(Ordering::Relaxed) == 255 {
+        // v0.9.41: stop at the 253 line — 0xFE is the LZMA2 slab sentinel
+        // and must never be minted as a dict version (see SLAB_CODEC_LZMA2).
+        if self.next_dict_ver.load(Ordering::Relaxed) >= 254 {
             return false; // version space exhausted
         }
         let refs: Vec<Vec<u8>> = {
@@ -2422,6 +2500,13 @@ impl Store {
         // assigned 0..=254, and slabs never carried a dict before this).
         if dict_id == 0xFF {
             return Some(data.to_vec());
+        }
+        // v0.9.41: LZMA2 cold slab streams (CSAVES_COLD_CODEC=lzma2). Same
+        // wire-byte dispatch as the 0xFF raw sentinel — every read path
+        // (slab cache, read_blob, batch loads, scan rebuild, pack re-group,
+        // verify) is covered by this one hook with zero call-site changes.
+        if dict_id == SLAB_CODEC_LZMA2 {
+            return lzma2_decompress(data, raw_len as usize);
         }
         DEC_C.with(|c| {
             let mut slot = c.borrow_mut();
@@ -4207,9 +4292,10 @@ impl Store {
                 v
             })
             .collect();
-        let outs: std::sync::Mutex<Vec<Option<Vec<u8>>>> =
+        let outs: std::sync::Mutex<Vec<Option<(u8, Vec<u8>)>>> =
             std::sync::Mutex::new((0..flat.len()).map(|_| None).collect());
         let level = self.cfg.cold_level;
+        let lz = cold_codec_lzma2();
         let mt_min = self.cfg.pack_mt_min;
         let big_cnt = if mt_min > 0 {
             flat.iter().filter(|s| s.len() >= mt_min).count()
@@ -4263,18 +4349,32 @@ impl Store {
             }
         }
         let _tc = std::time::Instant::now();
-        let compress_one = |i: usize| -> Vec<u8> {
+        let compress_one = |i: usize| -> (u8, Vec<u8>) {
             let stream = flat[i];
-            if mt_sel[i] {
+            if lz {
+                // v0.9.41: LZMA2 cold slab streams. Per-stream intra-frame
+                // MT stays zstd-specific; the outer per-stream scope already
+                // spreads streams across cores. Any error falls back to the
+                // zstd path WITH the matching codec stamp (a stream is never
+                // mislabeled).
+                match lzma2_compress(stream) {
+                    Some(c) => {
+                        PK_MT_BYTES.fetch_add(stream.len() as u64, Ordering::Relaxed);
+                        (SLAB_CODEC_LZMA2, c)
+                    }
+                    None => (0, bulk_compress(stream, level).1),
+                }
+            } else if mt_sel[i] {
                 PK_MT_JOBS.fetch_add(1, Ordering::Relaxed);
                 PK_MT_BYTES.fetch_add(stream.len() as u64, Ordering::Relaxed);
                 let t = std::time::Instant::now();
                 let r = mt_compress(stream, level, per_big)
                     .unwrap_or_else(|| bulk_compress(stream, level).1);
                 PK_MT_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                r
+                (0, r)
             } else {
-                bulk_compress(stream, level).1
+                let r = bulk_compress(stream, level).1;
+                (0, r)
             }
         };
         if flat.len() > 1 {
@@ -4288,15 +4388,15 @@ impl Store {
                             break;
                         }
                         let i = order[j];
-                        let comp = compress_one(i);
-                        outs.lock().unwrap()[i] = Some(comp);
+                        let r = compress_one(i);
+                        outs.lock().unwrap()[i] = Some(r);
                     });
                 }
             });
         } else {
             for i in 0..flat.len() {
-                let comp = compress_one(i);
-                outs.lock().unwrap()[i] = Some(comp);
+                let r = compress_one(i);
+                outs.lock().unwrap()[i] = Some(r);
             }
         }
         PK_COMP_NS.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -4305,12 +4405,12 @@ impl Store {
         // map updates, exactly the serial flow's decisions and byte layout.
         let mut task_at = 0usize;
         for GBuild { group, canon, glob } in builds {
-            let cc = outs[task_at].take().expect("canon comp missing");
+            let (cc_did, cc) = outs[task_at].take().expect("canon comp missing");
             task_at += 1;
             let cg = glob.as_ref().map(|_| {
-                let c = outs[task_at].take().expect("glob comp missing");
+                let (d, c) = outs[task_at].take().expect("glob comp missing");
                 task_at += 1;
-                c
+                (d, c)
             });
             let n = group.len();
             let (dict_id, comp, kind_byte, stream, tab_len, lens, gwide): (
@@ -4322,7 +4422,7 @@ impl Store {
                 Vec<usize>,
                 u8,
             ) = if let Some((gv, gwid)) = glob {
-                let cg = cg.expect("glob comp present");
+                let (cg_did, cg) = cg.expect("glob comp present");
                 // CSAVES_FORCE_GLOB=1: debug knob — take the glob variant
                 // unconditionally so the read/scan paths are testable
                 // regardless of the size heuristic. v0.9.33: once-resolved
@@ -4344,24 +4444,24 @@ impl Store {
                         match self.persist_glob_reg() {
                             Ok(()) => {
                                 ST_GLOB_SLABS.fetch_add(1, Ordering::Relaxed);
-                                (0u8, cg, 8u8 | 0x80, gv.stream, gv.tab_len, gv.lens, gwid)
+                                (cg_did, cg, 8u8 | 0x80, gv.stream, gv.tab_len, gv.lens, gwid)
                             }
                             Err(e) => {
                                 eprintln!(
                                     "[c-saves] states persist failed ({e}) — keeping the canonical slab"
                                 );
-                                (0u8, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
+                                (cc_did, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
                             }
                         }
                     } else {
                         ST_GLOB_SLABS.fetch_add(1, Ordering::Relaxed);
-                        (0u8, cg, 8u8 | 0x80, gv.stream, gv.tab_len, gv.lens, gwid)
+                        (cg_did, cg, 8u8 | 0x80, gv.stream, gv.tab_len, gv.lens, gwid)
                     }
                 } else {
-                    (0u8, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
+                    (cc_did, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
                 }
             } else {
-                (0u8, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
+                (cc_did, cc, 8u8, canon.stream, canon.tab_len, canon.lens, 1u8)
             };
             let raw_total = stream.len() as u32;
             // reg_w: the widest gid stream among this slab's GLOB members
@@ -5142,6 +5242,41 @@ pub mod tests {
         let va: Value = fastnbt::from_bytes(a).unwrap();
         let vb: Value = fastnbt::from_bytes(b).unwrap();
         va == vb
+    }
+
+    #[test]
+    fn cold_lzma2_slab_roundtrip() {
+        // v0.9.41: the LZMA2 cold codec must produce a fully readable,
+        // drainable, reopenable store — same contract as the zstd default,
+        // different slab codec on the wire (dict_id=0xFE sentinel).
+        set_cold_codec_for_tests(Some("lzma2"));
+        let dir = temp_dir("cold-lzma2-roundtrip");
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        let n = 40usize;
+        let payloads: Vec<Vec<u8>> = (0..n).map(|i| chunk_payload((i % 8) as i32, (i / 8) as i32, (i % 5) as u64)).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            s.write_chunk(i as u64, p, false).unwrap();
+        }
+        s.sync();
+        s.seal();
+        s.request_pack();
+        for _ in 0..200 {
+            if !s.compact_step() {
+                break;
+            }
+        }
+        assert!(!s.compact_step(), "drain did not converge");
+        s.sync();
+        for (i, p) in payloads.iter().enumerate() {
+            assert!(semantic(&s.read_chunk(i as u64).unwrap(), p), "lzma2 post-pack chunk {i}");
+        }
+        // reopen: the raw LZMA2 decoder path rebuilds from disk records
+        drop(s);
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            assert!(semantic(&s.read_chunk(i as u64).unwrap(), p), "lzma2 post-reopen chunk {i}");
+        }
+        set_cold_codec_for_tests(None);
     }
 
     #[test]
