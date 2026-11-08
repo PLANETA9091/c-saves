@@ -93,3 +93,23 @@ JJThunder 262k-chunk container measured x19.88), identical entity NBT
 (x8.47-x11.4 here and in the JJ world), and player-built duplication —
 content-addressed dedup converts all of it into single blobs. Pure fresh
 worldgen has no such redundancy to claim.
+
+## pristine import contracts (0.9.45): the huge-world projection
+
+The x2.21 plateau above is the no-elision number. With
+`CSAVES_PRISTINE=import` the background drain contracts pure-worldgen
+chunks at a measured 26 B/chunk all-in (9,216-recipe measurement, contract
+body + record overhead; see §0.9.45 in jjthunder-bench.md and research §9):
+
+- real JJThunder region import (728 chunks): x0.26 → **x0.002 vs anvil**
+  (-99.8%), pristine=728, stored=0;
+- arithmetic projection for this 512x512 world (labeled, not measured
+  end-to-end): 261,572 chunks × 26 B ≈ 6.8 MB of contracts vs 2,136 MiB
+  region Anvil → region ~x0.003; with the entity corpus (0.86 MiB stored)
+  and the loot-chest spawn edits the total stays two orders of magnitude
+  under Anvil — far past the -90% target.
+
+Safety: the operator asserts the world is pure worldgen under the seed it
+will be restored with; any hash-differing re-save after restore flips that
+chunk to normal storage (visited chunks get real storage, the untouched
+mass stays contracted).

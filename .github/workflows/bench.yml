@@ -39,6 +39,7 @@ jobs:
           path: |
             native/bench_output.txt
             native/bench_stalls.txt
+            native/bench_pristine.txt
       - name: size profile (what weighs the most)
         working-directory: native
         run: |
@@ -50,6 +51,15 @@ jobs:
           RATIO=$(./target/release/examples/bench_size 32 2 2>/dev/null | grep "c-saves compact" | grep -o "x0\.[0-9]* vs anvil" | grep -o "0\.[0-9]*")
           echo "compact/anvil ratio: $RATIO"
           awk -v r="$RATIO" 'BEGIN { if (r+0 > 0.15) { print "FAIL: ratio " r " exceeds 0.15"; exit 1 } print "OK" }'
+      - name: pristine pure-pregen gate — huge-world semantics (v0.9.45)
+        working-directory: native
+        run: |
+          CSAVES_PRISTINE=1 ./target/release/examples/bench_size 96 0 2>&1 | tee bench_pristine.txt
+          PRISTINE_RATIO=$(grep "c-saves compact" bench_pristine.txt | grep -o "x0\.[0-9]* vs anvil" | grep -o "0\.[0-9]*")
+          PRISTINE_N=$(grep "pristine contracts skipped" bench_pristine.txt | grep -o "([0-9]*" | tr -d "(")
+          echo "pure-pregen compact/anvil ratio: $PRISTINE_RATIO, pristine sampled: $PRISTINE_N"
+          awk -v r="$PRISTINE_RATIO" 'BEGIN { if (r+0 > 0.02) { print "FAIL: pristine pure-pregen ratio " r " exceeds 0.02"; exit 1 } print "OK" }'
+          awk -v n="$PRISTINE_N" 'BEGIN { if (n+0 < 100) { print "FAIL: pristine verify sample " n " below 100"; exit 1 } print "OK" }'
 
   jj-bench:
     runs-on: ubuntu-latest

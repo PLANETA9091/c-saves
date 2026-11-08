@@ -1378,6 +1378,30 @@ member raws / enc_fp / drained container are untouched: enc_fp EXACT
 (deferred recipe encode), thread-local scratch in the split stage (+1.5-2%
 class), dict_sample is now at its data-hash floor.
 
+## 0.9.45 - pristine IMPORT contracts; the huge-world lever measured (-99% class)
+
+`CSAVES_PRISTINE=import|2` (or `CSAVES_PRISTINE_IMPORT=1`): the import/strip
+path (background Anvil drain = how huge pregen worlds enter) forms recipe
+mode 7 regeneration contracts too. Whole-mode stores stay exempt.
+
+| gate | 0.9.44 flag OFF | 0.9.45 flag OFF | 0.9.45 pristine pure-pregen / import |
+|---|---|---|---|
+| bench compact (64x4) | 1.24 MiB x0.08 | 1.24 MiB x0.08 (identical) | n/a (edited corpus) |
+| pure-pregen 96x96 (9,216 ch, 0 edits) | not measured | n/a | **0.28 MiB x0.01 vs anvil (-99.2%), 26 B/chunk, blobs=0** |
+| real-corpus import (728 ch, anvil 4.47 MiB) | 1.17 MiB x0.26 (import exempt) | unchanged | **0.01 MiB x0.002 (-99.8%), pristine=728 stored=0** |
+| D verify | 1661 chunks, 0 contracts | 1661 chunks | 152 pristine sampled (0 stored to verify) |
+| tests | 62/62 | **63/63** (+import-contract flip/persist; live-only exemption pinned) | same binaries |
+| enc_fp | 6d240d7166cdda99/12130/9971843 | **EXACT** | pin |
+| jj / survival | x3.71 ok=946 / x4.28 ok=1280 | unchanged (CI flag-off) | n/a |
+
+CI size-bench gains the pristine pure-pregen gate: `CSAVES_PRISTINE=1
+bench_size 96 0`, compact ratio <= 0.02 AND pristine sample >= 100 (measured
+locally: 0.01 / 152). Erosion model documented in README/research §9: flip
+on any hash-differing re-save bounds loss-risk to chunks the server loads;
+operator asserts pure-worldgen import. Probe:
+`native/examples/pristine_import_probe.rs` (imports from a disposable copy —
+import_dir drains its source).
+
 ## 0.9.44 - pristine-chunk elision ships (opt-in); the semantic era begins
 
 CSAVES_PRISTINE=1 (region stores only): first-ever write = recipe mode 7

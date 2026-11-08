@@ -154,6 +154,43 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.45 — pristine IMPORT contracts: the huge-world lever lands
+
+v0.9.44 contracted only the live path. Imported worlds — the exact shape of
+huge pregenerated worlds — were exempt ("imported content is not
+seed-reproducible"), which meant the -90% class was unreachable exactly
+where huge worlds live. That exemption is now an explicit operator mode:
+`CSAVES_PRISTINE=import|2` (or `CSAVES_PRISTINE_IMPORT=1` alongside
+pristine=1) lets the import/strip path (`write_chunk_import`, the background
+Anvil drain) form regeneration contracts too.
+
+- same recipe mode 7 mechanics: 17 B contract, zero blobs, read = absent →
+  Paper regenerates from the seed, flip-on-mismatch, persists across
+  restarts; whole-mode stores (entities/POI) stay exempt;
+- real-corpus import (bench-corpus/dim region, 728 chunks, 4.47 MiB anvil):
+  pristine-off 1.17 MiB compact (x0.26) → **import-contracts 0.01 MiB
+  (x0.002 vs anvil, -99.8%, 0.011x of pristine-off)**, pristine=728
+  stored=0, import wall 0.2 s → 0.0 s (`pristine_import_probe` example,
+  imports from a disposable copy — import_dir drains its source);
+- pure-pregen world (9,216 chunks, live path, no edits): region logical
+  533.8 MiB → **0.28 MiB total (x0.01 vs anvil, -99.2%)** — 26 B/chunk
+  contract cost (9,216 recipes = 239,616 B incl. record overhead), zero
+  blobs; CI gains a pristine pure-pregen gate (`CSAVES_PRISTINE=1
+  bench_size 96 0`: compact ratio ≤ 0.02, pristine verify sample ≥ 100);
+- honest erosion model: the operator ASSERTS the imported world is pure
+  worldgen under the seed it will be restored with. On restore, any re-save
+  that hashes differently (fresh light after relight, serializer/generator
+  drift) flips that chunk to normal storage — SAFE, the regenerated content
+  is stored — so erosion is bounded to chunks the server actually loads;
+  the untouched pristine mass stays contracted;
+- projection (arithmetic, not a measurement): 26 B/chunk × 261,572 chunks ≈
+  6.8 MB of contracts for the 2,136 MiB bigworld-survival region data.
+
+Flag OFF is byte-identical to 0.9.44: 63/63 tests (new: import contracts
+flip/persist; the live-only import exemption stays pinned), enc_fp EXACT
+6d240d7166cdda99/12130/9971843, bench 64x4 compact 1.24 MiB x0.08 verify
+1661, jj x3.71 ok=946, survival x4.28 ok=1280.
+
 ## v0.9.44 — pristine-chunk elision: the order-of-magnitude lever, opt-in
 
 The §2 semantic lever from the compression research ships. With

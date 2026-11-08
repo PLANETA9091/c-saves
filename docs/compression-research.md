@@ -343,3 +343,39 @@ order-of-magnitude lever (§2) shipped opt-in. The codec front is closed;
 the remaining frontier is the domain joint LZ+CM mixer (archival-only,
 parked) and whatever new evidence arrives.
 
+## 9. Research tick 5 — pristine import contracts (v0.9.45): the huge-world lever measured
+
+§8 shipped live-path elision and left one deliberate exemption: imports.
+Huge worlds ARE imports (the background Anvil drain of pregenerated
+worlds), so the -90% class was unreachable exactly there — bigworld-survival
+stood at x2.21 with no codec lever left (§7/§4). v0.9.45 turns the
+exemption into an explicit operator mode: `CSAVES_PRISTINE=import|2` (or
+`CSAVES_PRISTINE_IMPORT=1`): the import/strip write path may form recipe
+mode 7 regeneration contracts like the live path already could.
+
+Measured:
+
+| corpus | pristine-off (0.9.44) | import-contracts (0.9.45) |
+|---|---|---|
+| real JJThunder region import, 728 chunks, anvil 4.47 MiB | 1.17 MiB compact, x0.26, import 0.2 s | **0.01 MiB, x0.002 (-99.8%), pristine=728 stored=0, import 0.0 s** |
+| pure-pregen 9,216-chunk world (live path, 0 edits) | — (flag-off 1.24 MiB at 4096+edits) | **0.28 MiB, x0.01 vs anvil (-99.2%)**, 26 B/chunk, zero blobs |
+
+The 26 B/chunk is the contract's honest all-in cost (17 B mode-7 body +
+record/batch overhead, measured over 9,216 recipes). Arithmetic projection
+(labeled as such): bigworld-survival's 261,572 region chunks ≈ 6.8 MB of
+contracts against 2,136 MiB of Anvil — the -90% target clears by two
+orders of magnitude for pure-worldgen ingests.
+
+Safety model (unchanged mechanics, new operator surface): imported content
+is ASSERTED seed-reproducible; on restore, any re-save that hashes
+differently (fresh light after relight, serializer/generator drift) flips
+that chunk to normal storage — the flip is the safety mechanism, erosion is
+bounded to chunks the server actually loads. Whole-mode stores (entities,
+POI) remain exempt: entity NBT is not worldgen-reproducible.
+
+With this, every exemption that kept huge worlds heavy is gone. The
+"make worlds weigh less" roadmap is fully measured-closed: codecs (§5-§7),
+per-section CM (§6), global CM (§7.2), export framing (§7.3), and now the
+import half of the semantic lever (§2/§8/§9). Remaining bytes on a pure
+worldgen world: contracts (26 B/chunk) + entities/POI (real data, exempt by
+construction) + whatever the server actually edits (stored honestly).

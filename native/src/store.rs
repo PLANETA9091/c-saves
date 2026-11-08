@@ -293,6 +293,22 @@ pub struct Cfg {
     /// the same semantics the Bedrock Editor chunk-reset / community
     /// chunk-regen flows accept. CSAVES_PRISTINE=1 opts in.
     pub pristine: bool,
+    /// v0.9.45 pristine IMPORT contracts (requires `pristine` too): the
+    /// import/strip write path (`write_chunk_import` — the background Anvil
+    /// drain that ingests huge pregenerated worlds) may also form
+    /// regeneration contracts. This is the huge-world lever: a pure-worldgen
+    /// 262k-chunk ingest collapses to ~17 B of contract per chunk instead of
+    /// ~x0.45-anvil slabs. Strictly opt-in because imported content is NOT
+    /// provably seed-reproducible (generator version drift, pre-import
+    /// edits): the operator ASSERTS "this world is pure worldgen under the
+    /// seed it will be restored with". On restore, any re-save that hashes
+    /// differently (fresh light after relight, serializer drift, generator
+    /// version drift) flips that chunk to normal storage — SAFE, the
+    /// regenerated content is stored — so erosion is bounded to the chunks
+    /// the server actually loads; the untouched pristine mass stays
+    /// contracted. CSAVES_PRISTINE=import|2, or CSAVES_PRISTINE_IMPORT=1
+    /// alongside pristine=1.
+    pub pristine_import: bool,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
     /// Slab member cap for whole-mode stores (entity/POI payloads).
@@ -392,6 +408,7 @@ impl Default for Cfg {
             cold_level: 6,
             recipe_level: 6,
             pristine: false,
+            pristine_import: false,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
             auto_pack_bytes: 4 * 1024 * 1024,
@@ -487,6 +504,12 @@ impl Cfg {
             pristine: std::env::var("CSAVES_PRISTINE")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(false),
+            pristine_import: std::env::var("CSAVES_PRISTINE")
+                .map(|v| v == "import" || v == "2")
+                .unwrap_or(false)
+                || std::env::var("CSAVES_PRISTINE_IMPORT")
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(false),
         }
     }
 }
@@ -3027,12 +3050,18 @@ impl Store {
     /// Import-path write: strips derived light (the server relights from
     /// isLightOn=0 — vanilla-standard). Runtime saves MUST use write_chunk:
     /// relit light handed back by Paper is stored, never recomputed again.
+    /// v0.9.45: under cfg.pristine_import the FIRST-EVER import write of a
+    /// region-store key forms a regeneration contract (the huge-world
+    /// lever — a pure-worldgen Anvil drain collapses to ~26 B/chunk of
+    /// contracts); see Cfg::pristine_import for the operator semantics.
     pub fn write_chunk_import(&self, key: u64, payload: &[u8]) -> Result<(), String> {
         self.write_chunk_mode(key, payload, false, true)
     }
 
     /// Bench/import-model write with an explicit strip decision (models
-    /// write_chunk_import while letting benchmarks toggle the mode).
+    /// write_chunk_import while letting benchmarks toggle the mode). Under
+    /// cfg.pristine_import a strip write can form a regeneration contract
+    /// exactly like write_chunk_import.
     pub fn write_chunk_stripped(&self, key: u64, payload: &[u8], strip: bool) -> Result<(), String> {
         self.write_chunk_mode(key, payload, false, strip)
     }
@@ -3095,12 +3124,18 @@ impl Store {
         // through to the normal pipeline and supersedes the contract via the
         // ordinary batch-push/supersede machinery (flip-on-mismatch); an
         // identical re-save was already caught by the pristine fast path
-        // above. Import/strip paths never form contracts (imported content
-        // is not seed-reproducible), and whole-mode stores (entities/POI)
-        // are excluded — their content is not worldgen-reproducible either.
+        // above. Whole-mode stores (entities/POI) are excluded — their
+        // content is not worldgen-reproducible. v0.9.45: import/strip writes
+        // (write_chunk_import — the background Anvil drain of huge pregen
+        // worlds) also form contracts under cfg.pristine_import: the
+        // imported content is then ASSERTED seed-reproducible by the
+        // operator; on restore, any re-save that hashes differently (fresh
+        // light after relight, serializer/generator drift) flips that chunk
+        // to normal storage, so erosion is bounded to the chunks the server
+        // actually loads while the untouched pristine mass stays contracted.
         let pristine_cand = self.cfg.pristine
             && !whole_mode
-            && !strip
+            && (!strip || self.cfg.pristine_import)
             && !self.whole_mode.load(Ordering::Relaxed)
             && !self.chunks.read().contains_key(&key)
             && self.recipe_batch.lock().get(key).is_none();
@@ -6902,7 +6937,8 @@ mod repro {
         assert!(!s.is_pristine(k), "pristine must be OFF by default");
         assert!(s.read_chunk(k).is_some(), "content stored when pristine off");
 
-        // import/strip paths never form contracts even with pristine on
+        // import/strip paths never form contracts even with pristine=1
+        // (live-only mode — the import exemption stays the default pin)
         let dir2 = temp_dir("pristine-import-exempt");
         let cfg = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
         let s2 = Store::open_cfg(&dir2, true, cfg).unwrap();
@@ -6916,5 +6952,71 @@ mod repro {
         assert!(!s2.is_pristine(key(9, 10)), "strip writes must not form contracts");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn pristine_import_contracts_flip_and_persist() {
+        // v0.9.45: pristine_import lets the import/strip path (the background
+        // Anvil drain of huge pregenerated worlds) form regeneration
+        // contracts too — the huge-world lever. Contracts read None BY
+        // DESIGN, flip on any different-content write, persist across reopen.
+        let dir = temp_dir("pristine-import-contract");
+        let cfg = Cfg {
+            pristine: true,
+            pristine_import: true,
+            compact_min: 512 * 1024,
+            ..bench_cfg()
+        };
+        let s = Store::open_cfg(&dir, true, cfg.clone()).unwrap();
+        let k = key(13, 17);
+        let a = chunk_payload(13, 17, 0);
+        s.write_chunk_import(k, &a).unwrap();
+        assert!(
+            s.is_pristine(k),
+            "import write must form a contract under pristine_import"
+        );
+        assert!(s.read_chunk(k).is_none(), "contract reads None BY DESIGN");
+        assert_eq!(s.chunk_count(), 1, "the contract is a live chunk record");
+
+        // identical re-import hits the pristine fast path and stays a contract
+        // (reuse the same payload BYTES: the NBT test model serializes
+        // compounds in HashMap order, so a regenerated payload would be a
+        // different byte string and flip BY DESIGN)
+        let again = a.clone();
+        s.write_chunk_import(k, &again).unwrap();
+        assert!(s.is_pristine(k), "identical re-import must keep the contract");
+
+        // a different-content import write flips to normal storage
+        let b = chunk_payload(13, 17, 1);
+        s.write_chunk_import(k, &b).unwrap();
+        assert!(!s.is_pristine(k), "different import content must flip to normal");
+        let got = s.read_chunk(k).expect("flipped chunk must read back");
+        // the import path strips derived data (isLightOn=0 injected) — compare
+        // against the equally-stripped source, like the real verifiers do
+        let mut want: Value = fastnbt::from_bytes(&b).unwrap();
+        crate::chunknbt::strip_derived_chunk(&mut want);
+        let got_v: Value = fastnbt::from_bytes(&got).unwrap();
+        assert!(got_v == want, "flipped chunk must be the new content");
+
+        // write_chunk_stripped (explicit strip flag) also forms a contract
+        let k2 = key(14, 18);
+        let c = chunk_payload(14, 18, 0);
+        s.write_chunk_stripped(k2, &c, true).unwrap();
+        assert!(s.is_pristine(k2), "strip write must form a contract under pristine_import");
+
+        // sync + reopen: contracts persist and still read None; the flipped
+        // key stays normal and reads back its content
+        s.sync();
+        drop(s);
+        let s2 = Store::open_cfg(&dir, true, cfg).unwrap();
+        assert!(s2.is_pristine(k2), "import contract must persist across reopen");
+        assert!(s2.read_chunk(k2).is_none(), "contract reads None after reopen");
+        assert!(!s2.is_pristine(k), "flipped key stays normal after reopen");
+        let got2 = s2.read_chunk(k).expect("flipped chunk reads after reopen");
+        let mut want2: Value = fastnbt::from_bytes(&b).unwrap();
+        crate::chunknbt::strip_derived_chunk(&mut want2);
+        let got2_v: Value = fastnbt::from_bytes(&got2).unwrap();
+        assert!(got2_v == want2, "flipped chunk content survives reopen");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
