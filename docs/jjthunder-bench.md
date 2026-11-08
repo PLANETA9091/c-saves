@@ -1626,6 +1626,46 @@ bench_size compact x0.08 (gate 0.15). Research §13: the last silent
 None on an operator path is counted, named, and gated — export
 accountable.
 
+## 0.9.52 — harsher arithmetic: the region-assert tier (0.13 B/chunk, x0.00003)
+
+The answer to "is there harsher arithmetic": the per-chunk legend is
+information-theoretically floored at ~32 B/chunk (random 128-bit hashes
+do not compress — measured: raw-only tier x0.0044 = 17.9 B/chunk, canon
+tier x0.0087 = 35.8 B/chunk on the same 262k world). Below the floor:
+stop storing per-chunk information. `CSAVES_PRISTINE_REGION=1` (opt-in
+on top of pristine + pristine_import): one 136 B region assert per
+imported region file — a 1024-bit presence bitmap — instead of 1024
+legends.
+
+- the 262,144-chunk world weighs **34.0 KiB (x0.00003 of Anvil,
+  99.997% saved)**: 256 records x 136 B, the bitmap arithmetic made
+  flesh; after one identical re-save + one real edit (both stored
+  honestly — no legend to verify, the deliberate trade): x0.00006;
+- key-level semantics match the per-chunk contract everywhere:
+  is_pristine/has_chunk/keys/chunk_count include asserted slots,
+  read_chunk = None BY DESIGN, read_fail_reason names the assertion;
+  the write path never re-contracts an asserted key and counts every
+  supersede in `pristine.flips` (§12 telemetry);
+- asserts persist in `pristine-regions.bin` (tmp+rename, outside the
+  segment system — region keys share the u64 space with chunk keys);
+  default-off: every existing path byte-identical without the flag
+  (the 72-test suite pins both tiers, the new
+  `pristine_region_assert_tier` test covers the full semantics);
+- scale probe ladder on the SAME world: Anvil 1026.0 MiB -> raw-only
+  4.5 MiB (x0.0044, 17.9 B/chunk legends, no stored edits) -> canon
+  legends 9.0 MiB (x0.0087, 35.8 B/chunk, with its 256 stored edits)
+  -> region-assert tier 34.0 KiB (x0.00003); CI greps pin the record
+  count (256), the verification-cost semantics (262,142 of 262,144
+  slots still asserted), the export accounting and the region
+  re-import;
+- parked with facts: POI elision (POI files are a derived index —
+  vanilla re-scans block states on load, Moonrise redirects the same
+  call) is the next candidate; entities are NOT regenerable — parked
+  permanently.
+
+Gates: 72/72 tests, enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
+bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS.
+
 ## 0.9.51 — the -90% promise measured at world scale: 262,144 chunks, x0.0087
 
 The claim the whole pristine line was built for is now measured at the

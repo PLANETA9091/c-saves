@@ -154,6 +154,36 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.52 — harsher arithmetic: the region-assert tier, 262,144 chunks in 34 KiB
+
+Yes, there is harsher arithmetic. A per-chunk legend carries two random
+128-bit hashes — random hashes do not compress, so any per-chunk scheme
+is information-theoretically floored at ~32 B/chunk (the scale probe now
+also measures the raw-only 0.9.44/0.9.45 tier: 4.5 MiB, x0.0044). Below
+the floor there is exactly one move: stop storing per-chunk information.
+The new opt-in tier (`CSAVES_PRISTINE_REGION=1`) records ONE 136 B
+region assert per imported region file — a 1024-bit presence bitmap
+asserting "every set slot is seed-reproducible" — instead of 1024
+legends. The 262,144-chunk pregen world now weighs **34.0 KiB = x0.00003
+of vanilla Anvil (99.997% saved, 0.13 B/chunk)** — ~260x harsher than
+the legend tier, ~31,000x smaller than Anvil.
+
+The trade is explicit and pinned by the probe: with no per-chunk legend
+an identical re-save cannot be verified O(1), so ANY write of an
+asserted key (identical included) supersedes the assert for that key and
+stores honestly — erosion bounded to the chunks the server actually
+re-saves, data never lost, the untouched mass stays 136 B per region.
+Asserts persist in `pristine-regions.bin` (outside the segment system —
+region keys share the u64 space with chunk keys, a side file cannot
+collide). `is_pristine`/`has_chunk`/`keys`/`chunk_count`/
+`read_fail_reason` resolve asserted slots present-by-contract; the write
+path never re-contracts an asserted key and counts every supersede in
+the `pristine.flips` telemetry. Default-off — every existing path is
+byte-identical without the flag. Parked with facts: POI-store elision
+(the POI files are a derived index — vanilla re-scans chunk block states
+on load) is the next candidate; the entities store is NOT regenerable
+and is parked permanently.
+
 ## v0.9.51 — the -90% promise measured at world scale: 262,144 chunks weigh x0.0087 of Anvil
 
 The flagship claim ("on huge worlds it must weigh ~-90%") is now a

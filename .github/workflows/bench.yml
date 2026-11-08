@@ -126,6 +126,16 @@ jobs:
           grep -q "scale ratio gate: PASS (< x0.10 = the -90% promise holds at world scale)" bench_scale_probe.txt || { echo "FAIL: -90% weight promise"; exit 1; }
           grep -q "scale export accounting: 256 stored + 261888 pristine_skipped + 0 lost = 262144 keys" bench_scale_probe.txt || { echo "FAIL: export accounting identity"; exit 1; }
           grep -q "scale reimport: 256/256 edits re-contracted" bench_scale_probe.txt || { echo "FAIL: re-import legends"; exit 1; }
+          # v0.9.52: the arithmetic ladder on the same world — raw-only
+          # 17 B/chunk legends, then the region-assert tier (ONE 136 B
+          # record per region, ~0.13 B/chunk): no per-chunk legends at
+          # all, any re-save of an asserted key stores honestly.
+          grep -q "of anvil (17 B/chunk legends, 262144 contracts)" bench_scale_probe.txt || { echo "FAIL: raw-only tier"; exit 1; }
+          grep -q "scale region-assert: 256 region record(s) replace 262144 per-chunk legends" bench_scale_probe.txt || { echo "FAIL: region record count"; exit 1; }
+          grep -q "scale region gate: PASS (< x0.001 — the harsher arithmetic holds)" bench_scale_probe.txt || { echo "FAIL: region-assert arithmetic"; exit 1; }
+          grep -q "scale region verification cost: 2 re-save(s) stored honestly (identical included), 262142 of 262144 slots still asserted" bench_scale_probe.txt || { echo "FAIL: region verification cost semantics"; exit 1; }
+          grep -q "scale region export accounting: 2 stored + 262142 pristine_skipped + 0 lost = 262144 keys" bench_scale_probe.txt || { echo "FAIL: region export accounting"; exit 1; }
+          grep -q "scale region reimport: 2/2 edits re-asserted at region grain" bench_scale_probe.txt || { echo "FAIL: region re-import"; exit 1; }
           grep -q "=== scale probe: PASS ===" bench_scale_probe.txt || { echo "FAIL: scale verdict"; exit 1; }
 
   jj-bench:

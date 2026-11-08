@@ -682,3 +682,62 @@ The pristine story now measures: bytes closed (§8/§9), erosion closed
 (§10), first-write hazard closed (§11), assertion auditable (§12),
 export accountable (§13), operator surface honest (§14), the -90%
 promise PROVEN at the scale it was asked for (§15).
+
+## 16. Research tick 12 — harsher arithmetic (v0.9.52): the legend floor and the region-assert tier
+
+The user asked whether arithmetic harsher than the 33 B/chunk legend
+tier exists. The answer has two halves.
+
+**The floor.** A per-chunk legend carries two random 128-bit hashes
+(raw + strip-canonical); random hashes do not compress, so ANY
+per-chunk legend scheme is information-theoretically floored at
+~32 B/chunk no matter how clever the container gets. Measured ladder on
+the SAME 262,144-chunk world: canonical legends 9.0 MiB (x0.0087,
+35.8 B/chunk), raw-only legends (CSAVES_PRISTINE_CANON=0, the 0.9.44/
+0.9.45 semantics) 4.5 MiB (x0.0044, 17.9 B/chunk) — both now printed by
+the scale probe. Below the floor there is exactly one move: STOP storing
+per-chunk information.
+
+**The region-assert tier (opt-in: `CSAVES_PRISTINE_REGION=1` on top of
+pristine + pristine_import).** The import of a region file records ONE
+136 B assert — a 1024-bit presence bitmap asserting "every set slot is
+seed-reproducible" — instead of 1024 legends: 0.13 B/chunk, ~260x
+harsher than the legend tier. The 262k-chunk world now weighs **34.0
+KiB (x0.00003 of Anvil — 99.997%)**: 256 records x 136 B, exactly the
+bitmap arithmetic. Deliberate trade, accepted by the operator who opts
+in: with no per-chunk raw/canonical legend an identical re-save cannot
+be verified O(1), so ANY write of an asserted key (identical re-save
+included) supersedes the assert for that key and stores honestly — the
+0.9.45 erosion semantics at region grain. The probe pins the cost
+concretely: one identical re-save (spawn chunk) + one real edit -> both
+stored, `pristine.flips` counts both, 262,142 of 262,144 slots stay
+asserted, container x0.00006 after the edits.
+
+Implementation shape: the asserts live OUTSIDE the segment/recipe
+system entirely (`pristine-regions.bin`, tmp+rename — the same scheme
+as the states registry), because region keys share the u64 space with
+chunk keys and a recipe-batch entry could collide with a real chunk
+key. The write path gains one guard (an asserted key never re-contracts
+— the safe side) and one telemetry branch (the flip counter of §12);
+`is_pristine`/`has_chunk`/`keys`/`chunk_count`/`read_fail_reason`
+resolve asserted slots present-by-contract (read = None BY DESIGN,
+forensics name the assertion). Default-off: without the flag every
+existing path is byte-identical (the 72-test suite pins both tiers).
+
+**Next-harsher candidates, parked with facts:** (a) POI-store elision —
+the POI region files are a DERIVED index: vanilla re-scans chunk block
+states on load (`PoiManager.checkConsistencyWithBlocks` / Yarn
+`initForPalette`, called from chunk deserialization; Paper's Moonrise
+redirects the same call), so POI mass is elidable the same way the
+chunk mass is — needs its own measurement + flip story; (b) the
+entities store is NOT regenerable (mob spawn randomness) — parked
+permanently for elision; dedup/dict only.
+
+Gates: 72/72 tests, enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
+bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS
+with the ladder greps (raw-only x0.0044, region-assert < x0.001 —
+measured x0.00003). The full weight story: bytes closed (§8/§9), erosion
+closed (§10), first-write hazard closed (§11), assertion auditable (§12),
+export accountable (§13), operator surface honest (§14), the -90% promise
+proven at scale (§15), and the arithmetic pushed to its information-
+theoretic floor (§16).

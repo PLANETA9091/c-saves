@@ -118,6 +118,11 @@ fn import_file(path: &Path, store: &Arc<Store>, rep: &mut ImportReport) -> std::
     for i in 0..1024 {
         locations[i] = u32::from_be_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]);
     }
+    // v0.9.52: under the region-assert tier, slots whose chunks were
+    // contracted by this import are recorded and collapsed into ONE
+    // region assert (136 B) when the whole file finished — the harsher
+    // huge-world arithmetic (no per-chunk legends at all).
+    let mut asserted_slots: Vec<usize> = Vec::new();
     for (i, loc) in locations.iter().enumerate() {
         if *loc == 0 {
             continue;
@@ -146,12 +151,23 @@ fn import_file(path: &Path, store: &Arc<Store>, rep: &mut ImportReport) -> std::
             continue;
         }
         match store.write_chunk_import(key(cx, cz), &payload) {
-            Ok(_) => rep.chunks += 1,
+            Ok(_) => {
+                rep.chunks += 1;
+                if store.pristine_region_enabled() {
+                    asserted_slots.push(i);
+                }
+            }
             Err(e) => {
                 eprintln!("[c-saves] chunk ({cx},{cz}) import failed: {e}");
                 rep.failed += 1;
                 return Ok(false);
             }
+        }
+    }
+    if store.pristine_region_enabled() && !asserted_slots.is_empty() {
+        if let Err(e) = store.pristine_region_assert(rx, rz, &asserted_slots) {
+            eprintln!("[c-saves] region assert r.{}.{}.mca failed: {e}", rx, rz);
+            return Ok(false);
         }
     }
     Ok(true)

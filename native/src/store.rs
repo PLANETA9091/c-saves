@@ -373,6 +373,22 @@ pub struct Cfg {
     /// (cfg.pristine_import). CSAVES_PRISTINE_FRESH=0 restores the 0.9.44-
     /// 0.9.46 unconditional first-write semantics.
     pub pristine_fresh: bool,
+    /// v0.9.52 REGION-granular pristine asserts (requires `pristine` +
+    /// `pristine_import`). The per-chunk contract legend is information-
+    /// theoretically floored at ~33 B/chunk (two random 128-bit hashes a
+    /// chunk — hashes do not compress). The only way below is to drop the
+    /// per-chunk legend: the import of a region file records ONE region
+    /// assert — "every slot set in this 1024-bit presence bitmap is
+    /// seed-reproducible" (136 B per region, ~0.13 B/chunk — ~260x harsher
+    /// than the legend tier). Trade-off, accepted by the operator who opts
+    /// in: with no per-chunk raw/canonical legend an identical re-save
+    /// CANNOT be verified O(1), so ANY write of an asserted key (identical
+    /// re-save included) supersedes the assert for that key and stores
+    /// honestly — the erosion semantics of the 0.9.45 import-assert tier
+    /// at region grain: bounded to the chunks the server actually re-saves,
+    /// data never lost, the untouched mass stays a 136-byte record.
+    /// CSAVES_PRISTINE_REGION=1 opts in.
+    pub pristine_region: bool,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
     /// Slab member cap for whole-mode stores (entity/POI payloads).
@@ -478,6 +494,7 @@ impl Default for Cfg {
             // when contracts may form; with the evidence channel absent
             // (direct-API callers) freshness is asserted by the caller.
             pristine_fresh: true,
+            pristine_region: false,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
             auto_pack_bytes: 4 * 1024 * 1024,
@@ -585,6 +602,9 @@ impl Cfg {
             pristine_fresh: std::env::var("CSAVES_PRISTINE_FRESH")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
+            pristine_region: std::env::var("CSAVES_PRISTINE_REGION")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false),
         }
     }
 }
@@ -1572,6 +1592,15 @@ pub struct Store {
     /// to risk. Surfaced in stats_json as pristine.flips. Process-lifetime
     /// (RAM) counter, like write_skips.
     pub pristine_flips: AtomicU64,
+    /// v0.9.52: region-granular pristine asserts (one 136 B record per
+    /// region instead of 1024 per-chunk legends). Key = region pair packed
+    /// as ((rx as u64) << 32) | (rz as u32 as u64); value = the 1024-bit
+    /// presence bitmap (bit i = region-file slot i: i>>5 = lz, i&31 = lx).
+    /// Persisted in `pristine-regions.bin` (tmp+rename, same scheme as the
+    /// states registry) — deliberately OUTSIDE the segment/recipe system:
+    /// region keys share the u64 space with chunk keys, so a recipe-batch
+    /// entry could collide with a real chunk key; a side file cannot.
+    pristine_regions: RwLock<HashMap<u64, [u64; 16]>>,
     pub disk_written: AtomicU64,
     pub logical_bytes: AtomicU64,
     /// Whole-mode stores (entities/POI) hold raw NBT payloads whose repeated
@@ -1644,6 +1673,7 @@ impl Store {
             dedup_hits: AtomicU64::new(0),
             write_skips: AtomicU64::new(0),
             pristine_flips: AtomicU64::new(0),
+            pristine_regions: RwLock::new(HashMap::new()),
             disk_written: AtomicU64::new(0),
             logical_bytes: AtomicU64::new(0),
             whole_mode: AtomicBool::new(false),
@@ -1659,6 +1689,7 @@ impl Store {
         st.load_dicts()?;
         st.load_glob_reg();
         st.scan()?;
+        st.load_pristine_regions();
         Ok(st)
     }
 
@@ -1688,6 +1719,131 @@ impl Store {
             f.sync_data()?;
         }
         fs::rename(&tmp, self.states_path())
+    }
+
+    // ---- v0.9.52 region-granular pristine asserts ----
+
+    fn regions_path(&self) -> PathBuf {
+        self.dir.join("pristine-regions.bin")
+    }
+
+    /// Region-pair key: ((rx as u64) << 32) | (rz as u32 as u64). This key
+    /// lives OUTSIDE the per-key recipe maps (where it would collide with
+    /// real chunk keys) — only the side file + this RAM map carry it.
+    fn region_key(rx: i32, rz: i32) -> u64 {
+        ((rx as u64) << 32) | (rz as u64 & 0xffff_ffff)
+    }
+
+    /// The region pair + slot index of a chunk key: slot i = (lz << 5) | lx
+    /// with lx = cx & 31, lz = cz & 31 — exactly the region-file slot order
+    /// the Anvil import walks.
+    fn region_slot_of(key: u64) -> (u64, usize) {
+        let cx = (key >> 32) as i32;
+        let cz = key as u32 as i32;
+        let rk = Self::region_key(cx >> 5, cz >> 5);
+        let slot = (((cz & 31) << 5) | (cx & 31)) as usize;
+        (rk, slot)
+    }
+
+    fn region_enabled(&self) -> bool {
+        self.cfg.pristine && self.cfg.pristine_import && self.cfg.pristine_region
+    }
+
+    /// Is this chunk key covered by a region assert (the slot bit is set)?
+    /// Pure RAM lookup; storage/pending state is the caller's concern.
+    fn region_assert_has(&self, key: u64) -> bool {
+        if !self.cfg.pristine_region || self.pristine_regions.read().is_empty() {
+            return false;
+        }
+        let (rk, slot) = Self::region_slot_of(key);
+        match self.pristine_regions.read().get(&rk) {
+            Some(bits) => bits[slot / 64] >> (slot % 64) & 1 == 1,
+            None => false,
+        }
+    }
+
+    pub fn pristine_region_count(&self) -> usize {
+        self.pristine_regions.read().len()
+    }
+
+    /// v0.9.52: record a region-granular pristine assert after a region
+    /// file import. `slots` = the region-file slot indices whose chunks
+    /// were contracted by this import (first-ever writes of an
+    /// operator-asserted pure-worldgen region). One 136 B record replaces
+    /// the per-chunk legends of the whole slot set; the write path will
+    /// store ANY later write of a covered key honestly (no legend to
+    /// verify against).
+    pub fn pristine_region_assert(&self, rx: i32, rz: i32, slots: &[usize]) -> Result<(), String> {
+        if !self.region_enabled() {
+            return Err("region asserts require pristine + pristine_import + pristine_region".into());
+        }
+        let mut bits = [0u64; 16];
+        for &s in slots {
+            if s >= 1024 {
+                return Err(format!("slot {s} out of region range"));
+            }
+            bits[s / 64] |= 1u64 << (s % 64);
+        }
+        let rk = Self::region_key(rx, rz);
+        self.pristine_regions.write().insert(rk, bits);
+        if let Err(e) = self.persist_pristine_regions() {
+            self.pristine_regions.write().remove(&rk);
+            return Err(format!("persist region assert: {e}"));
+        }
+        Ok(())
+    }
+
+    fn persist_pristine_regions(&self) -> std::io::Result<()> {
+        let map = self.pristine_regions.read();
+        let mut bytes = Vec::with_capacity(map.len() * 136);
+        for (&rk, bits) in map.iter() {
+            bytes.extend_from_slice(&rk.to_le_bytes());
+            for w in bits {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        drop(map);
+        let tmp = self.dir.join("pristine-regions.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_data()?;
+        }
+        fs::rename(&tmp, self.regions_path())
+    }
+
+    fn load_pristine_regions(&self) {
+        let Ok(bytes) = fs::read(self.regions_path()) else { return };
+        const REC: usize = 8 + 128;
+        let mut p = 0usize;
+        {
+            let mut map = self.pristine_regions.write();
+            while p + REC <= bytes.len() {
+                let rk = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
+                let mut bits = [0u64; 16];
+                for (i, w) in bits.iter_mut().enumerate() {
+                    *w = u64::from_le_bytes(bytes[p + 8 + i * 8..p + 16 + i * 8].try_into().unwrap());
+                }
+                map.insert(rk, bits);
+                p += REC;
+            }
+        }
+        if p != bytes.len() {
+            eprintln!(
+                "[c-saves] pristine-regions.bin truncated at {p}/{} — ignoring the torn tail",
+                bytes.len()
+            );
+        }
+        let n = self.pristine_regions.read().len();
+        if n > 0 {
+            eprintln!("[c-saves] loaded {n} pristine region assert(s)");
+        }
+    }
+
+    /// v0.9.52 tooling/anvil hook: is the region-assert tier active?
+    pub fn pristine_region_enabled(&self) -> bool {
+        self.region_enabled()
     }
 
     /// Number of slabs stored in the 0xCB GLOB form (probe/statistic).
@@ -3290,11 +3446,39 @@ impl Store {
                         // "what the elision chose not to risk" surface
                         // §12 promised the operator.
                         self.pristine_flips.fetch_add(1, Ordering::Relaxed);
+                    } else if !strip && self.region_assert_has(key) {
+                        // v0.9.52: a region-asserted key has NO per-chunk
+                        // legend to match, so an identical re-save cannot
+                        // be verified O(1) — ANY live write of a covered
+                        // key supersedes the assert for that key and
+                        // stores honestly (the safe side: an edit can
+                        // never be reverted by a wrong skip). Counted in
+                        // the same pristine.flips telemetry (§12): the
+                        // verification cost of the 0.13 B/chunk tier.
+                        self.pristine_flips.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
         }
         let t0w = std::time::Instant::now();
+        // v0.9.52 region-assert import: under the region tier the import
+        // path (strip=true) forms NO per-chunk legend — that is the whole
+        // point (one 136 B region record instead of 1024 x 33 B legends).
+        // The first-ever import write of a key inside an asserted-pure
+        // region just drops the payload; import_file records the slot in
+        // the region assert when the whole file finished. Crash before
+        // the assert loses only this import pass: the .mca file is
+        // removed only after a fully successful file import, so a
+        // re-import recovers. A repeated import of an already-asserted
+        // key hits the same early return (idempotent). Live writes of
+        // covered keys are handled by the flip branch above.
+        if strip && self.region_enabled()
+            && !self.chunks.read().contains_key(&key)
+            && self.recipe_batch.lock().get(key).is_none()
+            && !self.region_assert_has(key)
+        {
+            return Ok(());
+        }
         // v0.9.44 pristine candidate: FIRST-EVER write of a region-store key
         // under cfg.pristine becomes a regeneration contract instead of
         // stored content. Any later write with different content falls
@@ -3323,6 +3507,7 @@ impl Store {
             && !self.whole_mode.load(Ordering::Relaxed)
             && !self.chunks.read().contains_key(&key)
             && self.recipe_batch.lock().get(key).is_none()
+            && !self.region_assert_has(key)
             && (strip || !self.cfg.pristine_fresh || fresh);
         if self.cfg.pristine && !whole_mode && !strip && self.cfg.pristine_fresh && !fresh {
             // observability for the audit story: a live first write that
@@ -3652,8 +3837,20 @@ impl Store {
 
     /// Verify/tooling hook: does this key resolve to a pristine
     /// regeneration contract (nothing stored, read = None by design)?
+    /// v0.9.52: a region-asserted slot also reads None by design — the
+    /// assertion covers it, nothing is stored, nothing is pending.
     pub fn is_pristine(&self, key: u64) -> bool {
-        self.pristine_hash_of(key).is_some()
+        if self.pristine_hash_of(key).is_some() {
+            return true;
+        }
+        if self.cfg.pristine_region
+            && self.region_assert_has(key)
+            && !self.chunks.read().contains_key(&key)
+            && self.recipe_batch.lock().get(key).is_none()
+        {
+            return true;
+        }
+        false
     }
 
     /// v0.9.48 audit tooling: the pristine contract legend of a key —
@@ -4126,6 +4323,15 @@ impl Store {
             }
         } else {
             let Some((seg, off, len)) = self.chunks.read().get(&key).copied() else {
+                // v0.9.52: a region-asserted slot reads None BY DESIGN —
+                // forensics must name the assertion, not chase a phantom
+                // failure for a chunk the container intentionally does
+                // not hold (same contract-awareness rule as v0.9.50).
+                if self.cfg.pristine_region && self.region_assert_has(key) {
+                    return format!(
+                        "region pristine assert (slot covered, read=None by design — vanilla regenerates from the seed; no per-chunk legend at the 0.13 B/chunk tier)"
+                    );
+                }
                 return "no recipe in chunks map".to_string();
             };
             match self.recipe_at(key, seg, off, len) {
@@ -4203,14 +4409,40 @@ impl Store {
     }
 
     pub fn has_chunk(&self, key: u64) -> bool {
-        self.chunks.read().contains_key(&key)
+        if self.chunks.read().contains_key(&key) {
+            return true;
+        }
+        // v0.9.52: an asserted slot is present-by-contract (read = None,
+        // the shim's vanilla fallback regenerates it) — same semantics as
+        // a per-chunk contract, at region grain.
+        self.cfg.pristine_region
+            && self.region_assert_has(key)
+            && self.recipe_batch.lock().get(key).is_none()
     }
 
     pub fn chunk_count(&self) -> usize {
         let pending = self.recipe_batch.lock();
         let chunks = self.chunks.read();
-        chunks.len()
-            + pending.entries.iter().filter(|(k, _)| !chunks.contains_key(k)).count()
+        let mut n = chunks.len()
+            + pending.entries.iter().filter(|(k, _)| !chunks.contains_key(k)).count();
+        // v0.9.52: asserted slots count as present-by-contract
+        if self.cfg.pristine_region {
+            for (&rk, bits) in self.pristine_regions.read().iter() {
+                let rx = (rk >> 32) as i32;
+                let rz = rk as u32 as i32;
+                for s in 0..1024usize {
+                    if bits[s / 64] >> (s % 64) & 1 == 1 {
+                        let cx = rx * 32 + (s & 31) as i32;
+                        let cz = rz * 32 + (s >> 5) as i32;
+                        let k = ((cx as u64) << 32) | (cz as u64 & 0xffff_ffff);
+                        if !chunks.contains_key(&k) && pending.get(k).is_none() {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        n
     }
 
     pub fn keys(&self) -> Vec<u64> {
@@ -4220,6 +4452,23 @@ impl Store {
         for (k, _) in pending.entries.iter() {
             if !chunks.contains_key(k) {
                 v.push(*k);
+            }
+        }
+        // v0.9.52: synthesize the asserted slots (present-by-contract)
+        if self.cfg.pristine_region {
+            for (&rk, bits) in self.pristine_regions.read().iter() {
+                let rx = (rk >> 32) as i32;
+                let rz = rk as u32 as i32;
+                for s in 0..1024usize {
+                    if bits[s / 64] >> (s % 64) & 1 == 1 {
+                        let cx = rx * 32 + (s & 31) as i32;
+                        let cz = rz * 32 + (s >> 5) as i32;
+                        let k = ((cx as u64) << 32) | (cz as u64 & 0xffff_ffff);
+                        if !chunks.contains_key(&k) && pending.get(k).is_none() {
+                            v.push(k);
+                        }
+                    }
+                }
             }
         }
         v
@@ -7550,6 +7799,105 @@ mod repro {
         let s2 = Store::open_cfg(&dir, true, cfg).unwrap();
         assert!(!s2.is_pristine(k), "flipped key stays normal after reopen");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pristine_region_assert_tier() {
+        // v0.9.52: the region-granular assert tier — ONE 136 B record
+        // replaces the per-chunk legends of a region. Key-level semantics
+        // must match the per-chunk contract everywhere (has_chunk/keys/
+        // chunk_count/read=None/forensics), with ONE deliberate trade:
+        // without a legend an identical re-save cannot be verified, so it
+        // stores honestly (flip). The assert persists across reopen, the
+        // export accounting includes asserted slots, and the default-off
+        // tier keeps forming per-chunk legends exactly as before.
+        let dir = temp_dir("pristine-region");
+        let cfg = Cfg {
+            pristine: true,
+            pristine_import: true,
+            pristine_region: true,
+            compact_min: 512 * 1024,
+            ..bench_cfg()
+        };
+        let s = Store::open_cfg(&dir, true, cfg.clone()).unwrap();
+        // region (2, -1), slots 0, 5 and 999 asserted (partial bitmap)
+        let slots = [0usize, 5, 999];
+        let ks: Vec<u64> = slots
+            .iter()
+            .map(|&i| {
+                let cx = 2 * 32 + (i & 31) as i32;
+                let cz = -1 * 32 + (i >> 5) as i32;
+                key(cx, cz)
+            })
+            .collect();
+        for k in &ks {
+            s.write_chunk_import(*k, &chunk_payload((k >> 32) as i32, *k as u32 as i32, 0))
+                .unwrap();
+        }
+        s.pristine_region_assert(2, -1, &slots).unwrap();
+        assert_eq!(s.pristine_region_count(), 1);
+
+        // present-by-contract at region grain
+        for k in &ks {
+            assert!(s.is_pristine(*k), "asserted slot {k:016x} reads pristine");
+            assert!(s.has_chunk(*k), "asserted slot is present");
+            assert_eq!(s.read_chunk(*k), None, "asserted slot reads None BY DESIGN");
+            assert!(
+                s.read_fail_reason(*k).starts_with("region pristine assert"),
+                "forensics must name the region assert, got: {}",
+                s.read_fail_reason(*k)
+            );
+            assert!(s.pristine_legend(*k).is_none(), "no per-chunk legend at this tier");
+        }
+        assert_eq!(s.chunk_count(), 3);
+        assert_eq!(s.keys().len(), 3);
+        // a key OUTSIDE the bitmap is not covered
+        let outside = key(2 * 32 + 1, -1 * 32 + 2); // slot 1*32... cx&31=1, cz&31=2 -> slot (2<<5)|1=65 — not asserted
+        assert!(!s.is_pristine(outside));
+        assert!(!s.has_chunk(outside));
+
+        // ANY live write of a covered key stores honestly (no legend to
+        // verify against — identical re-save included) and counts a flip
+        let a = chunk_payload((ks[0] >> 32) as i32, ks[0] as u32 as i32, 0);
+        s.write_chunk(ks[0], &a, false).unwrap();
+        assert!(!s.is_pristine(ks[0]), "re-save supersedes the assert for this key");
+        assert!(s.read_chunk(ks[0]).is_some(), "identical re-save stores honestly");
+        assert_eq!(s.pristine_flips.load(Ordering::Relaxed), 1);
+        // the other slots stay asserted
+        assert!(s.is_pristine(ks[1]));
+        assert!(s.is_pristine(ks[2]));
+        assert_eq!(s.chunk_count(), 3, "flip keeps the key count stable");
+
+        // export accounting includes asserted slots
+        let out = dir.parent().unwrap().join("region-export");
+        let rep = crate::anvil::export_dir(&s, &out).unwrap();
+        assert_eq!(rep.chunks, 1, "only the flipped key materializes");
+        assert_eq!(rep.pristine_skipped, 2, "asserted slots are absent by design");
+        assert_eq!(rep.lost, 0);
+        assert_eq!(rep.chunks + rep.pristine_skipped + rep.lost, s.keys().len());
+
+        // persistence: the assert survives reopen, the flip stays stored
+        s.sync();
+        drop(s);
+        let s2 = Store::open_cfg(&dir, true, cfg.clone()).unwrap();
+        assert_eq!(s2.pristine_region_count(), 1);
+        assert!(s2.is_pristine(ks[1]), "asserted slot survives reopen");
+        assert!(!s2.is_pristine(ks[0]), "flipped key stays normal after reopen");
+        assert!(s2.read_chunk(ks[0]).is_some());
+
+        // the 0.13 B/chunk tier is opt-in: without pristine_region the
+        // import path forms per-chunk legends exactly as before
+        let dir3 = temp_dir("pristine-region-off");
+        let cfg3 = Cfg { pristine: true, pristine_import: true, ..bench_cfg() };
+        let s3 = Store::open_cfg(&dir3, true, cfg3).unwrap();
+        s3.write_chunk_import(ks[0], &chunk_payload((ks[0] >> 32) as i32, ks[0] as u32 as i32, 0))
+            .unwrap();
+        assert!(s3.pristine_legend(ks[0]).is_some(), "default tier keeps per-chunk legends");
+        assert!(!s3.region_enabled() || s3.pristine_region_count() == 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir3);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

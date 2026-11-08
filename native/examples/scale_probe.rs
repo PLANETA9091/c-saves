@@ -85,6 +85,18 @@ fn classify(store: &Store) -> (Vec<u64>, Vec<u64>) {
     (stored, contracted)
 }
 
+/// Hard-link every region file into a second directory — zero-cost corpus
+/// copies for the multi-tier phases (the import unlinks the files it
+/// drains; the other directories keep their links to the same inodes).
+fn link_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for e in std::fs::read_dir(src).unwrap().flatten() {
+        if e.metadata().unwrap().is_file() {
+            std::fs::hard_link(e.path(), dst.join(e.file_name())).unwrap();
+        }
+    }
+}
+
 /// One vanilla-format region file, streamed to disk (constant RAM: one
 /// chunk payload + its zlib output at a time). Returns the file size —
 /// the honest baseline bytes Paper would occupy for these 1024 chunks.
@@ -174,12 +186,21 @@ fn main() {
         "[scale] generation done in {t_gen:.1}s: {n_regions} region file(s), {:.1} MiB",
         anvil as f64 / 1048576.0
     );
+    // zero-cost corpus copies: the legend-tier import below unlinks its
+    // files one by one; the raw-only and region-assert tiers drain their
+    // own hard-link sets of the SAME inodes.
+    let gen_b = work.join("gen-legend");
+    let gen_raw = work.join("gen-raw");
+    let gen_region = work.join("gen-region");
+    link_dir(&gen, &gen_b);
+    link_dir(&gen, &gen_raw);
+    link_dir(&gen, &gen_region);
 
     // ---- 2. pristine import: the pregen mass collapses to contracts ----
     let cfg = Cfg { pristine: true, pristine_import: true, ..Cfg::from_env() };
     let store = Store::open_cfg(&work.join("store"), true, cfg).unwrap();
     let t1 = Instant::now();
-    let irep = anvil::import_dir(&gen, &store).expect("import ok");
+    let irep = anvil::import_dir(&gen_b, &store).expect("import ok");
     let t_import = t1.elapsed().as_secs_f64();
     assert_eq!(irep.chunks, total_chunks, "every generated chunk must import");
     assert_eq!(irep.failed, 0, "no import failures");
@@ -267,6 +288,131 @@ fn main() {
         }
     }
     assert_eq!(legend_miss, 0, "every edit must re-contract with a working legend");
+
+    // ---- 6. the raw-only legend tier (v0.9.44/0.9.45 semantics, 17 B/chunk)
+    // Same world, legends without the strip-canonical second hash — the
+    // intermediate point of the arithmetic ladder (relight re-saves erode
+    // this tier; 0.9.46 added the canon legend to absorb that class).
+    let cfgr = Cfg { pristine: true, pristine_import: true, pristine_canon: false, ..Cfg::from_env() };
+    let sraw = Store::open_cfg(&work.join("store-raw"), true, cfgr).unwrap();
+    let irepr = anvil::import_dir(&gen_raw, &sraw).expect("raw-only import ok");
+    assert_eq!(irepr.chunks, total_chunks, "raw-only tier imports the full world");
+    let (stored_r, contracted_r) = classify(&sraw);
+    assert!(stored_r.is_empty() && contracted_r.len() == total_chunks);
+    sraw.sync();
+    let container_r = dir_size(&work.join("store-raw"));
+    let ratio_r = container_r as f64 / anvil.max(1) as f64;
+    println!(
+        "scale raw-only tier: {} bytes ({:.1} MiB) = x{:.4} of anvil (17 B/chunk legends, {} contracts)",
+        container_r,
+        container_r as f64 / 1048576.0,
+        ratio_r,
+        contracted_r.len()
+    );
+    drop(sraw);
+    let _ = std::fs::remove_dir_all(&work.join("store-raw"));
+
+    // ---- 7. the region-assert tier (v0.9.52, ~0.13 B/chunk) — the harsher
+    // arithmetic: NO per-chunk legends at all, ONE 136 B record per region
+    // asserts its slots seed-reproducible. The trade, verified here: ANY
+    // re-save of an asserted key (identical included) stores honestly.
+    let cfgc = Cfg {
+        pristine: true,
+        pristine_import: true,
+        pristine_region: true,
+        ..Cfg::from_env()
+    };
+    let sc = Store::open_cfg(&work.join("store-region"), true, cfgc.clone()).unwrap();
+    let irepc = anvil::import_dir(&gen_region, &sc).expect("region-assert import ok");
+    assert_eq!(irepc.chunks, total_chunks, "region tier imports the full world");
+    assert_eq!(irepc.failed, 0);
+    let (stored_c, contracted_c) = classify(&sc);
+    assert!(stored_c.is_empty(), "region tier stores nothing on a pure pregen import");
+    assert_eq!(contracted_c.len(), total_chunks, "every slot present-by-contract");
+    assert_eq!(
+        sc.pristine_region_count(),
+        n_regions,
+        "one assert record per region file"
+    );
+    assert_eq!(sc.keys().len(), total_chunks, "keys() synthesizes the asserted slots");
+    assert_eq!(sc.chunk_count(), total_chunks);
+    sc.sync();
+    let container_c = dir_size(&work.join("store-region"));
+    let ratio_c = container_c as f64 / anvil.max(1) as f64;
+    println!(
+        "scale region-assert: {} region record(s) replace {} per-chunk legends",
+        sc.pristine_region_count(),
+        total_chunks
+    );
+    println!(
+        "scale region container: {} bytes ({:.1} KiB) = x{:.5} of anvil -> {:.2}% saved",
+        container_c,
+        container_c as f64 / 1024.0,
+        ratio_c,
+        (1.0 - ratio_c) * 100.0
+    );
+    if ratio_c >= 0.001 {
+        panic!(
+            "region-assert tier FAIL: x{ratio_c:.5} of anvil (target < x0.001 — the 0.13 B/chunk arithmetic)"
+        );
+    }
+    println!("scale region gate: PASS (< x0.001 — the harsher arithmetic holds)");
+
+    // the verification cost, made concrete: an IDENTICAL re-save cannot be
+    // verified without a legend — it stores honestly. One identical re-save
+    // (spawn chunk (0,0)) + one real edit (the world's last chunk) — the
+    // untouched rest of the world stays a 136-byte record each.
+    let ka = wgen::key(0, 0);
+    let kb = wgen::key(side as i32 * 32 - 1, side as i32 * 32 - 1);
+    let pa = wgen::chunk_payload(&world, 0, 0, 0); // IDENTICAL to the import
+    let pb = wgen::chunk_payload(&world, side as i32 * 32 - 1, side as i32 * 32 - 1, 1);
+    sc.write_chunk(ka, &pa, false).expect("identical re-save ok");
+    sc.write_chunk(kb, &pb, false).expect("edit ok");
+    assert!(!sc.is_pristine(ka), "identical re-save supersedes the assert (no legend to verify)");
+    assert!(!sc.is_pristine(kb), "edit supersedes the assert");
+    assert!(sc.read_chunk(ka).is_some() && sc.read_chunk(kb).is_some(), "both stored honestly");
+    assert_eq!(
+        sc.pristine_flips.load(Ordering::Relaxed),
+        2,
+        "both re-saves counted as flips (§12 telemetry)"
+    );
+    assert!(sc.is_pristine(wgen::key(0, 1)), "the untouched rest stays asserted");
+    sc.sync();
+    let container_c2 = dir_size(&work.join("store-region"));
+    let ratio_c2 = container_c2 as f64 / anvil.max(1) as f64;
+    println!(
+        "scale region verification cost: 2 re-save(s) stored honestly (identical included), {} of {} slots still asserted -> x{:.5} of anvil after edits",
+        total_chunks - 2,
+        total_chunks,
+        ratio_c2
+    );
+
+    let rege = work.join("export-region");
+    let repc = anvil::export_dir(&sc, &rege).expect("region export ok");
+    assert_eq!(repc.chunks, 2, "export materializes exactly the stored part");
+    assert_eq!(repc.pristine_skipped, total_chunks - 2);
+    assert_eq!(repc.lost, 0);
+    assert_eq!(repc.chunks + repc.pristine_skipped + repc.lost, sc.keys().len());
+    println!(
+        "scale region export accounting: 2 stored + {} pristine_skipped + 0 lost = {} keys",
+        repc.pristine_skipped,
+        sc.keys().len()
+    );
+
+    // re-import the export at region grain: each edited chunk re-asserts
+    // its region slot (the export carries exactly one chunk per region)
+    let sc2 = Store::open_cfg(&work.join("store-region2"), true, cfgc).unwrap();
+    let irep2c = anvil::import_dir(&rege, &sc2).expect("region re-import ok");
+    assert_eq!(irep2c.chunks, 2);
+    let (stored_2c, contracted_2c) = classify(&sc2);
+    assert!(stored_2c.is_empty(), "exported edits re-assert at region grain");
+    assert_eq!(contracted_2c.len(), 2);
+    assert_eq!(sc2.pristine_region_count(), 2, "one assert per exported region file");
+    println!("scale region reimport: 2/2 edits re-asserted at region grain");
+    drop(sc2);
+    let _ = std::fs::remove_dir_all(&work.join("store-region2"));
+    drop(sc);
+    let _ = std::fs::remove_dir_all(&work.join("store-region"));
 
     // ---- verdict ----
     println!(
