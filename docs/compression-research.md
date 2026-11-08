@@ -591,3 +591,40 @@ the last silent None on an operator path is counted, named, and gated.
 The pristine story now measures: bytes closed (§8/§9), erosion closed
 (§10), first-write hazard closed (§11), assertion auditable (§12),
 export accountable (§13).
+
+## 14. Research tick 10 — the operator surface closes (v0.9.50): flips counted, forensics contract-aware
+
+§12 named the remaining surface as "the runtime counters and the flip
+events themselves, visible to the operator" — but the flip event had no
+counter, and two forensics paths still lied about contracts. v0.9.50
+makes the §12 promise literally true:
+
+- **flip telemetry**: `Store::pristine_flips` (per-store, race-free)
+  counts live writes that superseded a contract — the write matched
+  neither the raw nor the strip-canonical legend, i.e. a chunk the
+  server actually changed beyond the absorbed class: exactly what the
+  elision chose not to risk. Surfaced as `pristine.flips` in
+  `profile_json` next to `canon_kept` / `unfresh_stored`;
+- **forensics contract-aware**: `read_fail_reason` used to send the
+  operator after a phantom decompress failure for a contracted key
+  ("map-level checks pass, 0 blob refs — failure is in decompress/join"
+  — nothing failed; the chunk is absent BY DESIGN), and a pending
+  contract was called "unparseable". It now resolves the current truth
+  in read_chunk's order (pending batch wins over the committed map —
+  the test caught a stale committed contract being reported while a
+  superseding pending recipe held the truth) and names the contract at
+  either stage;
+- **sweep test** `pristine_diagnostics_sweep` pins the full contract
+  semantics across every key-resolution diagnostic: has_chunk true,
+  chunk_intact true, keys/chunk_count include, read_chunk None
+  (pending AND flushed), read_fail_reason names the contract at both
+  stages, flip counts exactly once, forensics return to blob checks
+  after the flip, flipped key stays normal after reopen.
+
+No byte-level change: the write path gained one counter increment, the
+read path gained a diagnostics branch. Gates: 71/71 tests, enc_fp EXACT
+6d240d7166cdda99 / 12130 / 9,971,843, bench_size compact x0.08,
+export_roundtrip PASS. The pristine story now measures: bytes closed
+(§8/§9), erosion closed (§10), first-write hazard closed (§11),
+assertion auditable (§12), export accountable (§13), operator surface
+honest (§14).

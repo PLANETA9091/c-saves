@@ -1563,6 +1563,15 @@ pub struct Store {
     /// per-store write-skip count: the global ST_WRITE_SKIP is shared by
     /// every Store in the process, so parallel tests cannot assert on it
     pub write_skips: AtomicU64,
+    /// v0.9.50: live writes that SUPERSEDED a pristine regeneration
+    /// contract on this store (the flip-on-mismatch event — the write's
+    /// content matched neither the raw nor the strip-canonical legend).
+    /// Per-store (race-free) face of the §12 operator surface "the flip
+    /// events themselves": a flip is a chunk the server actually changed
+    /// beyond the absorbed class, i.e. exactly what the elision chose not
+    /// to risk. Surfaced in stats_json as pristine.flips. Process-lifetime
+    /// (RAM) counter, like write_skips.
+    pub pristine_flips: AtomicU64,
     pub disk_written: AtomicU64,
     pub logical_bytes: AtomicU64,
     /// Whole-mode stores (entities/POI) hold raw NBT payloads whose repeated
@@ -1634,6 +1643,7 @@ impl Store {
             reads: AtomicU64::new(0),
             dedup_hits: AtomicU64::new(0),
             write_skips: AtomicU64::new(0),
+            pristine_flips: AtomicU64::new(0),
             disk_written: AtomicU64::new(0),
             logical_bytes: AtomicU64::new(0),
             whole_mode: AtomicBool::new(false),
@@ -3272,6 +3282,14 @@ impl Store {
                                 }
                             }
                         }
+                        // v0.9.50: this write matched neither legend — it
+                        // supersedes the contract through the ordinary
+                        // pipeline below (flip-on-mismatch). Count the
+                        // event: a flip is a chunk the server actually
+                        // changed beyond the absorbed class, the exact
+                        // "what the elision chose not to risk" surface
+                        // §12 promised the operator.
+                        self.pristine_flips.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -4093,17 +4111,31 @@ impl Store {
     /// dictionary version absent in RAM AND on disk / inline-tail dict gone).
     /// Integrity-scan tooling, never on the hot path.
     pub fn read_fail_reason(&self, key: u64) -> String {
-        let ptr = self.chunks.read().get(&key).copied();
-        let Some((seg, off, len)) = ptr else {
-            return if self.recipe_batch.lock().get(key).is_some() {
-                "pending batch recipe unparseable".to_string()
-            } else {
-                "no recipe in chunks map".to_string()
+        // v0.9.50: resolve the CURRENT truth in read_chunk's order (the
+        // pending recipe batch wins over the committed chunks map —
+        // read-your-writes), and name pristine contracts at EITHER stage:
+        // a contract reads None BY DESIGN (nothing stored; the shim's null
+        // read sends Paper to seed regeneration), so forensics must not
+        // chase a phantom decompress failure for a chunk the container
+        // intentionally does not hold — nor report a stale committed
+        // contract while a superseding pending recipe is the truth.
+        let (rec, stage) = if let Some(body) = self.recipe_batch.lock().get(key).cloned() {
+            match self.parse_recipe_body(&body) {
+                Some(r) => (r, "pending batch".to_string()),
+                None => return "pending batch recipe unparseable".to_string(),
+            }
+        } else {
+            let Some((seg, off, len)) = self.chunks.read().get(&key).copied() else {
+                return "no recipe in chunks map".to_string();
             };
+            match self.recipe_at(key, seg, off, len) {
+                Some(r) => (r, format!("recipe seg={seg} off={off} len={len}")),
+                None => return format!("recipe unreadable at seg={seg} off={off} len={len}"),
+            }
         };
-        let Some(rec) = self.recipe_at(key, seg, off, len) else {
-            return format!("recipe unreadable at seg={seg} off={off} len={len}");
-        };
+        if rec.pristine.is_some() {
+            return "pristine regeneration contract (read=None by design — vanilla regenerates from the seed)".to_string();
+        }
         let hashes = rec.blob_hashes();
         for h in &hashes {
             let l = match self.blobs.read().get(h) {
@@ -4146,7 +4178,7 @@ impl Store {
             }
         }
         format!(
-            "map-level checks pass (recipe seg={seg}, {} blob refs) — failure is in decompress/join",
+            "map-level checks pass ({stage}, {} blob refs) — failure is in decompress/join",
             hashes.len()
         )
     }
@@ -4353,9 +4385,10 @@ impl Store {
         s.push_str(&format!(r#""dicts":{dict_bytes},"#));
         s.push_str(&format!(r#""write_skip":{},"#, ST_WRITE_SKIP.load(Ordering::Relaxed)));
         s.push_str(&format!(
-            r#""pristine":{{"canon_kept":{},"unfresh_stored":{}}},"#,
+            r#""pristine":{{"canon_kept":{},"unfresh_stored":{},"flips":{}}},"#,
             ST_PRISTINE_CANON.load(Ordering::Relaxed),
-            ST_PRISTINE_UNFRESH.load(Ordering::Relaxed)
+            ST_PRISTINE_UNFRESH.load(Ordering::Relaxed),
+            self.pristine_flips.load(Ordering::Relaxed)
         ));
         s.push_str(&format!(r#""unattributed":{unattr}"#));
         s.push_str("}");
@@ -7451,6 +7484,71 @@ mod repro {
         let s2 = Store::open_cfg(&dir, true, cfg).unwrap();
         assert!(!s2.is_pristine(k), "unfresh chunk stays normal after reopen");
         assert!(s2.is_pristine(kf), "fresh contract persists across reopen");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pristine_diagnostics_sweep() {
+        // v0.9.50: every key-resolution diagnostic is contract-aware. A
+        // pristine regeneration contract reads None BY DESIGN — forensics
+        // must NAME the contract, not send the operator after a phantom
+        // decompress failure; and the flip event (§12's "what the elision
+        // chose not to risk") is counted per store and surfaced in
+        // stats_json.
+        let dir = temp_dir("pristine-diag");
+        let cfg = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
+        let s = Store::open_cfg(&dir, true, cfg.clone()).unwrap();
+        let k = key(42, 24);
+        let a = chunk_payload(42, 24, 0);
+        s.write_chunk(k, &a, false).unwrap();
+        assert!(s.is_pristine(k));
+
+        // pending state (before the batch flush): already contract-aware
+        assert_eq!(s.read_chunk(k), None, "pending contract reads None BY DESIGN");
+        let reason = s.read_fail_reason(k);
+        assert!(
+            reason.starts_with("pristine regeneration contract"),
+            "pending contract must be named, got: {reason}"
+        );
+        s.sync();
+
+        // the contract is a live key everywhere…
+        assert!(s.has_chunk(k), "contract key is present (has_chunk)");
+        assert!(s.chunk_intact(k), "contract is trivially intact (zero blobs)");
+        assert!(s.keys().contains(&k));
+        assert_eq!(s.read_chunk(k), None, "read=None BY DESIGN");
+        // …and forensics name it instead of a phantom decompress failure
+        let reason = s.read_fail_reason(k);
+        assert!(
+            reason.starts_with("pristine regeneration contract"),
+            "read_fail_reason must name the contract, got: {reason}"
+        );
+        assert!(
+            s.profile_json().contains("\"flips\":0"),
+            "profile_json must surface the flip counter"
+        );
+
+        // the flip: different content supersedes the contract — counted
+        let b = chunk_payload(42, 24, 9);
+        s.write_chunk(k, &b, false).unwrap();
+        assert!(!s.is_pristine(k), "different content flips the contract");
+        assert_eq!(
+            s.pristine_flips.load(Ordering::Relaxed),
+            1,
+            "exactly one flip event"
+        );
+        assert!(
+            !s.read_fail_reason(k).starts_with("pristine regeneration contract"),
+            "a flipped key is normal storage — forensics go back to blob checks"
+        );
+        let got = s.read_chunk(k).expect("flipped chunk reads back");
+        assert!(semantic(&got, &b));
+        assert!(s.profile_json().contains("\"flips\":1"));
+
+        s.sync();
+        drop(s);
+        let s2 = Store::open_cfg(&dir, true, cfg).unwrap();
+        assert!(!s2.is_pristine(k), "flipped key stays normal after reopen");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

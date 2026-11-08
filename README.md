@@ -154,6 +154,27 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.50 — flip telemetry + contract-aware forensics: the §12 operator promise made true
+
+§12 named "the flip events themselves" as the operator-visible surface —
+but no counter existed, and two forensics paths lied about contracts.
+`Store::pristine_flips` (per-store, race-free) now counts live writes
+that superseded a contract (the write matched neither the raw nor the
+strip-canonical legend — a chunk the server actually changed beyond the
+absorbed class, exactly what the elision chose not to risk), surfaced as
+`pristine.flips` in `profile_json` next to `canon_kept` /
+`unfresh_stored`. `read_fail_reason` no longer sends the operator after
+a phantom decompress failure for a contracted key: it resolves the
+current truth in read_chunk's order (pending batch wins over the
+committed map) and names the contract at either stage
+(`pristine regeneration contract (read=None by design — vanilla
+regenerates from the seed)`). The sweep test
+`pristine_diagnostics_sweep` pins the full contract semantics across
+every key-resolution diagnostic — and caught the stale-contract case
+during development: a superseding pending recipe is the truth while the
+committed map still points at the old contract. No byte-level change;
+71/71 tests; research §14.
+
 ## v0.9.49 — pristine-aware export: the round-trip closes, every None gets a name
 
 The one operator-facing path that still had a silent None was the Anvil

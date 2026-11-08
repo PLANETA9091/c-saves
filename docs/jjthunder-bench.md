@@ -1625,3 +1625,31 @@ enc_fp EXACT 6d240d7166cdda99 / 12130 members / 9,971,843 bytes,
 bench_size compact x0.08 (gate 0.15). Research §13: the last silent
 None on an operator path is counted, named, and gated — export
 accountable.
+
+## 0.9.50 — flip telemetry + contract-aware forensics: the §12 operator promise made true
+
+§12 named "the flip events themselves" as the operator-visible surface —
+but no counter existed, and forensics lied about contracts:
+`read_fail_reason` on a contracted key reported "map-level checks pass,
+0 blob refs — failure is in decompress/join" (nothing had failed — the
+chunk is absent BY DESIGN) and a pending contract was called
+"unparseable".
+
+- `Store::pristine_flips` (per-store, race-free) counts live writes that
+  superseded a contract (neither the raw nor the strip-canonical legend
+  matched) — the exact "what the elision chose not to risk" event;
+  surfaced as `pristine.flips` in `profile_json`;
+- `read_fail_reason` resolves the current truth in read_chunk's order
+  (pending batch wins over the committed map) and names pristine
+  contracts at either stage — the sweep test caught the stale-contract
+  case (a superseding pending recipe is the truth while the committed
+  map still points at the old contract);
+- `pristine_diagnostics_sweep` pins the full contract semantics across
+  has_chunk / chunk_intact / keys / chunk_count / read_chunk (pending +
+  flushed) / read_fail_reason (both stages) / flip-once / reopen.
+
+No byte-level change. Gates: 71/71 tests, enc_fp EXACT
+6d240d7166cdda99 / 12130 members / 9,971,843 bytes, bench_size compact
+x0.08 (gate 0.15), export_roundtrip PASS. Research §14: bytes closed,
+erosion closed, first-write hazard closed, assertion auditable, export
+accountable, operator surface honest.
