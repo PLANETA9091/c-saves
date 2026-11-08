@@ -19,6 +19,28 @@ pub struct ImportReport {
     pub failed: usize,
 }
 
+/// v0.9.49: what one export pass produced, classified per key.
+/// `chunks + pristine_skipped + lost == store.keys().len()` — the operator
+/// can always account for every key in the container:
+/// - `chunks`: materialized into the vanilla region files (zlib, type 2);
+/// - `pristine_skipped`: resolves to a pristine regeneration contract
+///   (read = None BY DESIGN — nothing is stored, Paper regenerates the
+///   chunk from the seed on load). The exported Anvil intentionally lacks
+///   these chunks; the count is the proof that a partial export is the
+///   elision working, not data loss. Non-regenerating consumers (mappers,
+///   converters) must treat the count as "absent by contract";
+/// - `lost`: read = None and NOT a pristine contract — a genuinely
+///   unreadable key. Export never fails loudly mid-world for one bad key,
+///   but it refuses to stay silent about it (stderr + the counter, and
+///   the container keeps its per-key forensics via `read_fail_reason`).
+pub struct ExportReport {
+    pub regions: usize,
+    pub chunks: usize,
+    pub bytes: u64,
+    pub pristine_skipped: usize,
+    pub lost: usize,
+}
+
 fn key(cx: i32, cz: i32) -> u64 {
     ((cx as u64) << 32) | (cz as u64 & 0xffff_ffff)
 }
@@ -136,20 +158,41 @@ fn import_file(path: &Path, store: &Arc<Store>, rep: &mut ImportReport) -> std::
 }
 
 /// Export the whole container back into vanilla region files under `out_dir`
-/// (zlib, vanilla layout). `count` returns (chunks_written, bytes_written).
-pub fn export_dir(store: &Arc<Store>, out_dir: &Path) -> std::io::Result<(usize, u64)> {
+/// (zlib, vanilla layout). Returns an `ExportReport`; every key in the
+/// container is accounted for: `chunks + pristine_skipped + lost` equals
+/// `store.keys().len()` (v0.9.49 — the export path became pristine-aware:
+/// a regeneration contract reads None BY DESIGN and is counted, not
+/// silently dropped).
+pub fn export_dir(store: &Arc<Store>, out_dir: &Path) -> std::io::Result<ExportReport> {
     fs::create_dir_all(out_dir)?;
     // group chunk keys by region
     let mut regions: HashMap<(i32, i32), Vec<(i32, i32, Vec<u8>)>> = HashMap::new();
     let mut count = 0usize;
     let mut bytes = 0u64;
+    let mut pristine_skipped = 0usize;
+    let mut lost = 0usize;
     let keys = store.keys();
     for k in keys {
         let cx = (k >> 32) as i32;
         let cz = k as u32 as i32;
-        let Some(payload) = store.read_chunk(k) else { continue };
+        let Some(payload) = store.read_chunk(k) else {
+            // v0.9.49: read = None has exactly two meanings and the export
+            // must not conflate them. A pristine contract is absent BY
+            // DESIGN (regeneration semantics); anything else is a real
+            // read failure and gets counted as lost.
+            if store.is_pristine(k) {
+                pristine_skipped += 1;
+            } else {
+                lost += 1;
+                eprintln!(
+                    "[c-saves] export: key {k:016x} unreadable (not a pristine contract) — see read_fail_reason"
+                );
+            }
+            continue;
+        };
         regions.entry((cx.div_euclid(32), cz.div_euclid(32))).or_default().push((cx, cz, payload));
     }
+    let regions_n = regions.len();
     for ((rx, rz), chunks) in regions {
         let path = out_dir.join(format!("r.{rx}.{rz}.mca"));
         let file = fs::File::create(&path)?;
@@ -191,5 +234,101 @@ pub fn export_dir(store: &Arc<Store>, out_dir: &Path) -> std::io::Result<(usize,
         w.write_all(&body)?;
         w.flush()?;
     }
-    Ok((count, bytes))
+    if pristine_skipped > 0 {
+        eprintln!(
+            "[c-saves] export: {pristine_skipped} chunk(s) absent by pristine contract — vanilla regenerates them from the seed on load (mappers/converters see them as absent by design)"
+        );
+    }
+    Ok(ExportReport {
+        regions: regions_n,
+        chunks: count,
+        bytes,
+        pristine_skipped,
+        lost,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunknbt;
+    use crate::store::Cfg;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "csaves-anvil-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        d
+    }
+
+    /// Minimal `NbtIo.write`-form payload: a root compound holding one Int
+    /// (the byte-form the contract hashes over).
+    fn payload(data_version: i32) -> Vec<u8> {
+        let mut out = vec![10u8, 0, 0]; // TAG_Compound, empty root name
+        out.push(3u8); // TAG_Int
+        out.extend_from_slice(&11u16.to_be_bytes()); // name len
+        out.extend_from_slice(b"DataVersion");
+        out.extend_from_slice(&data_version.to_be_bytes());
+        out.push(0u8); // TAG_End
+        out
+    }
+
+    #[test]
+    fn export_accounts_for_every_key_and_roundtrips() {
+        let dir = temp_dir("exp-rep");
+        let cfg = Cfg { pristine: true, ..Cfg::default() };
+        let s = Store::open_cfg(&dir.join("store"), true, cfg).unwrap();
+        // keys (i, i+7): i=0,1 stay contracts (identical re-save);
+        // i=2 flips to honest storage (different content on the second write)
+        for i in 0..3i32 {
+            let k = ((i as u64) << 32) | ((i + 7) as u64);
+            s.write_chunk(k, &payload(3700 + i), false).unwrap();
+            if i < 2 {
+                s.write_chunk(k, &payload(3700 + i), false).unwrap();
+                assert!(s.is_pristine(k), "identical re-save stays a contract");
+            } else {
+                s.write_chunk(k, &payload(4000 + i), false).unwrap();
+                assert!(!s.is_pristine(k), "different content must flip");
+            }
+        }
+        assert_eq!(s.chunk_count(), 3);
+        let k2 = (2u64 << 32) | 9u64;
+        let stored_hash = chunknbt::hash_of(&s.read_chunk(k2).unwrap());
+        s.sync();
+
+        let rep = export_dir(&s, &dir.join("out")).unwrap();
+        assert_eq!(rep.chunks, 1, "only the honestly-stored chunk materializes");
+        assert_eq!(rep.pristine_skipped, 2, "contracts are counted, not dropped");
+        assert_eq!(rep.lost, 0);
+        assert_eq!(rep.regions, 1);
+        assert_eq!(
+            rep.chunks + rep.pristine_skipped + rep.lost,
+            s.keys().len(),
+            "every key must be accounted for"
+        );
+
+        // roundtrip: re-import the exported Anvil into a fresh store with
+        // pristine_import ON — the import contracts exactly the exported
+        // bytes, so the stored-A key becomes a contract in B whose raw
+        // legend equals the production hash of the stored-A payload; the
+        // contracted-A keys are absent from the export (regeneration
+        // semantics) and therefore absent from B.
+        let cfgb = Cfg { pristine: true, pristine_import: true, ..Cfg::default() };
+        let sb = Store::open_cfg(&dir.join("store-b"), true, cfgb).unwrap();
+        let irep = import_dir(&dir.join("out"), &sb).unwrap();
+        assert_eq!(irep.chunks, 1);
+        assert_eq!(sb.chunk_count(), 1, "contracted keys are absent from the export");
+        assert!(sb.is_pristine(k2));
+        let (raw, _) = sb.pristine_legend(k2).expect("legend present");
+        assert_eq!(raw, stored_hash, "legend must re-derive from the exported bytes");
+
+        drop(s);
+        drop(sb);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

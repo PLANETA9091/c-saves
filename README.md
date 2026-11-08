@@ -154,6 +154,41 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.49 — pristine-aware export: the round-trip closes, every None gets a name
+
+The one operator-facing path that still had a silent None was the Anvil
+exporter: it skipped every key whose `read_chunk` returned None — which
+is exactly what a pristine regeneration contract returns BY DESIGN. A
+pristine pregen world (the -99% class) exported as region files missing
+every contracted chunk, with no counter and no way to tell elision from
+loss; mappers/converters would report holes as corruption. The exporter
+now accounts for every key: `ExportReport { regions, chunks, bytes,
+pristine_skipped, lost }` with the identity `chunks + pristine_skipped +
+lost == store.keys().len()`; contracted chunks are counted as
+`pristine_skipped` (absent BY DESIGN — vanilla regenerates them from the
+seed on load, the same semantic the live read path uses) and announce
+themselves on stderr; genuinely unreadable keys are counted as `lost`
+with per-key stderr (forensics in `read_fail_reason`).
+
+The round-trip is now a measured invariant (`export_roundtrip` probe,
+real 728-chunk corpus):
+
+- **Phase A (flag-off): container → Anvil → container byte-identical
+  728/728** — the exporter is lossless for honest storage;
+- **Phase B (mixed state — pregen + player edits: 720 import contracts
+  + 8 live-path flips): export writes exactly the 8 stored chunks +
+  pristine_skipped=720; re-importing the export re-contracts 8/8 with
+  raw legends byte-equal to the stored-A payload hashes; the 720
+  contracted keys are absent from the export** — the honestly-stored
+  part becomes the new contract set, the regenerated part stays
+  regeneration semantics.
+
+CI gains the roundtrip gate (Phase A + Phase B counts pinned,
+`bench_export_roundtrip.txt` artifact). 70/70 tests (new:
+`export_accounts_for_every_key_and_roundtrips`). Research §13: the last
+silent None on an operator path is counted, named, and gated — export
+accountable.
+
 ## v0.9.48 — pristine contract audit: the wrong assertion is caught at deploy time
 
 The research docs (§10/§11) left one named frontier after the semantic

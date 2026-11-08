@@ -1588,3 +1588,40 @@ None after flip / whole-mode / raw-only containers), enc_fp EXACT
 6d240d7166cdda99 / 12130 members / 9,971,843 bytes, bench_size compact
 x0.08 (gate 0.15). The §12 frontier list is empty: bytes closed, erosion
 closed, first-write hazard closed, assertion auditable.
+
+## 0.9.49 — pristine-aware export: the round-trip closes, every None gets a name
+
+The §12 "operator-facing surface" had one silent None left: the Anvil
+exporter dropped every pristine regeneration contract (read = None BY
+DESIGN → `continue`) — a pristine pregen world exported as region files
+missing every contracted chunk with zero accounting; mappers/converters
+would call it corruption. The exporter now returns
+`ExportReport { regions, chunks, bytes, pristine_skipped, lost }` with
+the accounting identity `chunks + pristine_skipped + lost ==
+store.keys().len()`; `is_pristine` separates absent-by-contract from
+genuinely-unreadable, `lost` keys print per-key stderr, and a partial
+export announces itself (`728 chunk(s) absent by pristine contract —
+vanilla regenerates them from the seed on load`).
+
+Round-trip measured end-to-end on the real 728-chunk corpus (new
+`export_roundtrip` probe):
+
+- **Phase A (flag-off): byte-identical 728/728** — container → Anvil →
+  container keeps every payload (production `hash_of` identity); the
+  exporter is lossless for honest storage;
+- **Phase B (mixed state — the production picture: pregen + player
+  edits): 720 import contracts + 8 live-path flips → export exactly 8
+  chunks + pristine_skipped=720, lost=0; re-importing the export with
+  pristine_import ON re-contracts 8/8 with raw legends byte-equal to
+  the stored-A payload hashes; the 720 contracted keys are absent from
+  the export and from B** — the honestly-stored part becomes the new
+  contract set, the regenerated part stays regeneration semantics.
+
+CI gains the roundtrip gate (size-bench job; Phase A + Phase B counts
+pinned, `bench_export_roundtrip.txt` artifact). Unit test
+`export_accounts_for_every_key_and_roundtrips` pins the accounting
+identity + legend equality on a synthetic store. Gates: 70/70 tests,
+enc_fp EXACT 6d240d7166cdda99 / 12130 members / 9,971,843 bytes,
+bench_size compact x0.08 (gate 0.15). Research §13: the last silent
+None on an operator path is counted, named, and gated — export
+accountable.

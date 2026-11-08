@@ -42,6 +42,7 @@ jobs:
             native/bench_pristine.txt
             native/bench_pristine_fresh.txt
             native/bench_pristine_audit.txt
+            native/bench_export_roundtrip.txt
       - name: size profile (what weighs the most)
         working-directory: native
         run: |
@@ -92,6 +93,21 @@ jobs:
           grep -q "legend check: raw_match=728 canon_match=0 drift=0" bench_pristine_audit.txt || { echo "FAIL: legend drift"; exit 1; }
           grep -q "session check: kept=728 flipped=0" bench_pristine_audit.txt || { echo "FAIL: session prediction"; exit 1; }
           grep -q "verdict: PASS" bench_pristine_audit.txt || { echo "FAIL: audit verdict"; exit 1; }
+      - name: export roundtrip gate — the export path accounts for every key (v0.9.49)
+        working-directory: native
+        run: |
+          cargo build --release --example export_roundtrip
+          # container -> Anvil -> container: Phase A pins flag-off
+          # losslessness (byte-identical payloads), Phase B pins the
+          # mixed-state convergence (export == stored part exactly,
+          # contracted keys absent by design, re-import re-contracts with
+          # exact legends). Exit non-zero on any invariant violation.
+          ./target/release/examples/export_roundtrip 2>&1 | tee bench_export_roundtrip.txt
+          grep -q "A flag-off: 728 chunks imported" bench_export_roundtrip.txt || { echo "FAIL: flag-off losslessness"; exit 1; }
+          grep -q "re-imported byte-identical 728/728" bench_export_roundtrip.txt || { echo "FAIL: byte identity"; exit 1; }
+          grep -q "export 8 chunks + 720 pristine_skipped" bench_export_roundtrip.txt || { echo "FAIL: mixed-state export classification"; exit 1; }
+          grep -q "re-import contracted 8/8 with exact legends" bench_export_roundtrip.txt || { echo "FAIL: legend convergence"; exit 1; }
+          grep -q "=== export roundtrip: PASS ===" bench_export_roundtrip.txt || { echo "FAIL: roundtrip verdict"; exit 1; }
 
   jj-bench:
     runs-on: ubuntu-latest

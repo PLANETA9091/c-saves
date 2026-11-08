@@ -541,3 +541,53 @@ counters (`pristine.unfresh_stored`, `pristine.canon_kept`) and the flip
 events themselves, i.e. what the elision chose not to risk, visible to the
 operator in stats_json. No byte-level lever, no revert-class, no unaudited
 assertion left on the live path.
+
+## 13. Research tick 9 — the export path closes (v0.9.49): every None gets a name
+
+§12 declared the frontier list empty and named the remaining surface as
+operator-facing. One operator-facing path still had a silent None: the
+Anvil exporter. `export_dir` walked `store.keys()` and skipped every key
+whose `read_chunk` returned None — which is exactly what a pristine
+regeneration contract returns BY DESIGN. A pristine pregen world (the
+-99% class, §9) exported as region files missing every contracted chunk,
+with no counter, no log line, no way to tell elision from loss;
+non-regenerating consumers (mappers, converters) would see holes and
+report them as corruption. The export path now classifies every key, and
+the round-trip is a measured invariant.
+
+- `ExportReport { regions, chunks, bytes, pristine_skipped, lost }` —
+  the accounting identity `chunks + pristine_skipped + lost ==
+  store.keys().len()` holds on every export; `is_pristine` separates the
+  two None meanings (absent-by-contract vs genuinely unreadable), and
+  `lost` keys print per-key stderr (per-key forensics stay in
+  `read_fail_reason`);
+- the exported Anvil for a pristine world is INTENTIONALLY partial: a
+  contracted chunk is absent exactly the way a never-generated chunk is
+  absent — vanilla regenerates it from the seed on load (the same
+  semantic the live read path uses); the report + stderr say so, so a
+  partial export is the elision working, not data loss;
+- round-trip invariants (new `export_roundtrip` probe, real 728-chunk
+  corpus): Phase A (flag-off) container → Anvil → container is
+  byte-identical 728/728 (production `hash_of` identity per key) — the
+  exporter is lossless for honest storage; Phase B (mixed state: 720
+  import contracts + 8 live-path flips — the real production picture of
+  pregen + player edits) exports exactly the 8 stored chunks +
+  pristine_skipped=720, and re-importing the export with pristine_import
+  ON re-contracts those 8 keys with raw legends byte-equal to the
+  stored-A payload hashes — the pair converges: the honestly-stored part
+  becomes the new contract set, the regenerated part stays regeneration
+  semantics;
+- unit test pins the accounting identity + legend equality on a
+  synthetic store; CI gains the roundtrip gate (Phase A + Phase B counts
+  pinned, `bench_export_roundtrip.txt` artifact).
+
+Measured (real 728-chunk corpus, mixed state): export regions=2
+chunks=8 pristine_skipped=720 lost=0; re-import contracted 8/8 with
+exact legends; contracted-A keys absent 720/720. Flag-off: 728/728
+byte-identical.
+
+With §13 the export path is closed the way §12 closed the assertion:
+the last silent None on an operator path is counted, named, and gated.
+The pristine story now measures: bytes closed (§8/§9), erosion closed
+(§10), first-write hazard closed (§11), assertion auditable (§12),
+export accountable (§13).
