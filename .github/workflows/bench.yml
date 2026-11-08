@@ -43,6 +43,7 @@ jobs:
             native/bench_pristine_fresh.txt
             native/bench_pristine_audit.txt
             native/bench_export_roundtrip.txt
+            native/bench_scale_probe.txt
       - name: size profile (what weighs the most)
         working-directory: native
         run: |
@@ -108,6 +109,24 @@ jobs:
           grep -q "export 8 chunks + 720 pristine_skipped" bench_export_roundtrip.txt || { echo "FAIL: mixed-state export classification"; exit 1; }
           grep -q "re-import contracted 8/8 with exact legends" bench_export_roundtrip.txt || { echo "FAIL: legend convergence"; exit 1; }
           grep -q "=== export roundtrip: PASS ===" bench_export_roundtrip.txt || { echo "FAIL: roundtrip verdict"; exit 1; }
+      - name: scale probe gate — the -90% promise at 262,144-chunk world scale (v0.9.51)
+        working-directory: native
+        run: |
+          cargo build --release --example scale_probe
+          # A structurally realistic pregen world (the same Tectonic-like
+          # generator the size benchmarks use) at 512x512 chunks = 256
+          # region files = 8192x8192 blocks: vanilla zlib-6 .mca baseline
+          # vs the container after a full pristine import (262,144
+          # contracts) + 256 honest player edits (one per region). The
+          # probe asserts container/anvil < x0.10 itself (panic = red);
+          # the greps pin the exact world size, the export accounting
+          # identity and the re-import legend semantics.
+          ./target/release/examples/scale_probe 16 2>&1 | tee bench_scale_probe.txt
+          grep -q "scale world: 256 regions x 1024 chunks = 262144 chunks" bench_scale_probe.txt || { echo "FAIL: world scale wrong"; exit 1; }
+          grep -q "scale ratio gate: PASS (< x0.10 = the -90% promise holds at world scale)" bench_scale_probe.txt || { echo "FAIL: -90% weight promise"; exit 1; }
+          grep -q "scale export accounting: 256 stored + 261888 pristine_skipped + 0 lost = 262144 keys" bench_scale_probe.txt || { echo "FAIL: export accounting identity"; exit 1; }
+          grep -q "scale reimport: 256/256 edits re-contracted" bench_scale_probe.txt || { echo "FAIL: re-import legends"; exit 1; }
+          grep -q "=== scale probe: PASS ===" bench_scale_probe.txt || { echo "FAIL: scale verdict"; exit 1; }
 
   jj-bench:
     runs-on: ubuntu-latest

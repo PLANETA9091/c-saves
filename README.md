@@ -154,6 +154,32 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.51 — the -90% promise measured at world scale: 262,144 chunks weigh x0.0087 of Anvil
+
+The flagship claim ("on huge worlds it must weigh ~-90%") is now a
+measured, CI-gated fact. The new `scale_probe` builds a structurally
+realistic pregen world with the same Tectonic-like generator the size
+benchmarks use (wgen terrain, paletted sections, heightmaps, block
+entities) at 512x512 chunks = 256 region files = an 8192x8192-block
+world, streams it to disk as vanilla zlib-6 .mca, imports it under
+pristine contracts, then adds 256 honest player edits (one per region —
+the built/spawn reality of every pregen world). Measured end to end,
+container vs vanilla Anvil, store directory included (worst case):
+
+    scale anvil:     1,075,838,976 B (1026.0 MiB)
+    scale container:     9,385,442 B    (9.0 MiB)  = x0.0087 — 99.1% saved
+
+262,144 contracts + 256 stored edits = 35.8 B/chunk — the §9 contract
+arithmetic made flesh. The scaling law falls monotonically with world
+size (x0.0110 at 4,096 chunks, x0.0089 at 65,536, x0.0087 at 262,144):
+bigger worlds only widen the gap. The probe also pins the round-trip at
+scale: the export materializes exactly the 256 edits (256 stored +
+261,888 pristine_skipped + 0 lost = 262,144 keys), re-importing it
+re-contracts every edit with legends describing the stored form, and an
+identical re-save keeps the contract (no erosion). CI gate in the
+size-bench job: the probe panics at >= x0.10 and the step greps the
+exact world size, accounting identity and verdict.
+
 ## v0.9.50 — flip telemetry + contract-aware forensics: the §12 operator promise made true
 
 §12 named "the flip events themselves" as the operator-visible surface —

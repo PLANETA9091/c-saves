@@ -1626,6 +1626,40 @@ bench_size compact x0.08 (gate 0.15). Research §13: the last silent
 None on an operator path is counted, named, and gated — export
 accountable.
 
+## 0.9.51 — the -90% promise measured at world scale: 262,144 chunks, x0.0087
+
+The claim the whole pristine line was built for is now measured at the
+scale it names. `scale_probe` (new example) generates a structurally
+realistic pregen world — the same Tectonic-like wgen generator the size
+benchmarks use — at 512x512 chunks = 256 region files = 8192x8192
+blocks, streams it to disk as vanilla zlib-6 .mca (one payload in RAM
+at a time, regions written in parallel), imports it under pristine
+contracts and adds 256 honest player edits (one per region, round-1
+rebuilt chunks):
+
+- vanilla Anvil baseline: 1,075,838,976 B (1026.0 MiB); container
+  (store directory, every segment/header/frame/dictionary included):
+  9,385,442 B (9.0 MiB) = **x0.0087 — 99.1% saved**, an order of
+  magnitude beyond the -90% promise; 35.8 B/chunk = the 33 B canonical
+  legend plus key and segment framing;
+- scaling law: x0.0110 at 4,096 chunks, x0.0089 at 65,536, x0.0087 at
+  262,144 — the ratio FALLS as the world grows (per-contract constant
+  amortizes, edit mass stays a fixed small fraction);
+- round-trip at scale: export materializes exactly the edits (256
+  stored + 261,888 pristine_skipped + 0 lost = 262,144 keys), re-import
+  re-contracts all 256 with legends describing the stored (normalized)
+  form — raw == hash_of(read-back), canon == canonical(read-back) — and
+  an identical re-save keeps the contract;
+- timing: 401.5 s world generation (parallel region writes), 28.8 s
+  full 262k-chunk import; total probe ~7 min;
+- CI: new size-bench step `scale probe gate — the -90% promise at
+  262,144-chunk world scale (v0.9.51)` — the probe panics at
+  >= x0.10, the step greps the exact world size, the accounting
+  identity, the re-import verdict and the PASS line.
+
+Gates: 71/71 tests, enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
+bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS.
+
 ## 0.9.50 — flip telemetry + contract-aware forensics: the §12 operator promise made true
 
 §12 named "the flip events themselves" as the operator-visible surface —

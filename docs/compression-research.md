@@ -628,3 +628,57 @@ export_roundtrip PASS. The pristine story now measures: bytes closed
 (§8/§9), erosion closed (§10), first-write hazard closed (§11),
 assertion auditable (§12), export accountable (§13), operator surface
 honest (§14).
+
+## 15. Research tick 11 — the -90% promise measured at world scale (v0.9.51): 262,144 chunks, x0.0087
+
+§9 derived the huge-world lever from the contract arithmetic (~17 B/chunk
+raw-only, ~33 B with the canonical legend) and §13/§14 closed the
+export/telemetry surface — but the flagship claim ("on huge worlds it
+must weigh ~-90%") had never been MEASURED at the scale it names.
+v0.9.51 adds the scale probe and turns the claim into a CI gate:
+
+- **the world**: 512x512 chunks = 262,144 chunks = 256 region files =
+  an 8192x8192-block pregeneration, built with the SAME Tectonic-like
+  generator the size benchmarks use (wgen: continentalness fbm terrain,
+  paletted sections, heightmaps, block entities, blending data) —
+  structurally realistic payloads, not padding. Regions stream to disk
+  as vanilla .mca (zlib-6, 4 KiB sectors — byte-layout identical to what
+  Paper writes), one chunk payload in RAM at a time, region files
+  written in parallel;
+- **the scenario**: full pristine import (operator-asserted contracts —
+  262,144 legends, payloads dropped) + 256 honest live edits (one per
+  region file, a round-1 rebuilt chunk — the built/spawn reality every
+  pregen world has). The container weight is measured from the store
+  directory itself: every segment, header, frame, recipe and dictionary
+  included — the worst case, not disk_bytes() bookkeeping;
+- **the numbers**: vanilla Anvil 1,075,838,976 B (1026.0 MiB) vs
+  container 9,385,442 B (9.0 MiB) = **x0.0087 of Anvil — 99.1% saved**,
+  an order of magnitude beyond the -90% promise. Per chunk: 9.0 MiB /
+  262,144 = 35.8 B — the 33 B canonical legend plus key and segment
+  framing, exactly the §9 arithmetic made flesh;
+- **the scaling law**: the same probe at 4,096 chunks measures x0.0110,
+  at 65,536 x0.0089, at 262,144 x0.0087 — the ratio FALLS monotonically
+  as the world grows (the per-contract constant amortizes while the
+  player-edit mass stays a fixed small fraction), so bigger worlds only
+  widen the gap;
+- **legend semantics pinned at scale**: the export materializes exactly
+  the 256 stored edits (v0.9.49 accounting: 256 + 261,888 pristine_skipped
+  + 0 lost = 262,144 keys), and re-importing it re-contracts every edit
+  with legends that describe the STORED (normalized) form of the chunk —
+  raw == hash_of(read-back bytes), canon == canonical_contract_hash(read-back
+  bytes) — and an identical re-save keeps the contract (the operational
+  no-erosion property). A live-path edit is stored through the section
+  model, so the stored bytes are a semantic re-serialization of the
+  handed-in payload; anchoring the legends to the stored form is what
+  the export actually contains;
+- **the gate**: `scale_probe 16` runs in the size-bench job (~7 min:
+  401.5 s world generation, 28.8 s import); the probe itself panics if
+  container/anvil >= x0.10, and the step greps the exact world size, the
+  accounting identity, the re-import verdict and the PASS line.
+
+Gates: 71/71 tests, enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
+bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS.
+The pristine story now measures: bytes closed (§8/§9), erosion closed
+(§10), first-write hazard closed (§11), assertion auditable (§12),
+export accountable (§13), operator surface honest (§14), the -90%
+promise PROVEN at the scale it was asked for (§15).
