@@ -221,3 +221,92 @@ project, real read-latency cost on the cold path, expected gain bounded by
 the gap between LZMA2-on-glob and the true joint entropy of the aligned
 material (unmeasured; the per-section floors are NOT the bound). Revisit
 only with a corpus where alignment-poor player-built content dominates.
+
+## 7. Research tick 3 — the codec front closes: EXTREME ships, PPMd and the export framing die
+
+Three questions were open after 0.9.42: (a) does the LZMA2 encode have any
+left on its own knob, (b) does a GLOBAL context model over the slab material
+(the frontier parked in §6) have a cheap proxy verdict, (c) what is an
+archive-export mode actually worth now that the live cold tier is LZMA2.
+All three got real measurements on the same corpora.
+
+### 7.1 The preset ladder on the REAL member stream (shipped as 0.9.43)
+
+`examples/lzma_preset_probe.rs` collects the canonical members of
+`bench-corpus/dim` in first-occurrence (pack-like) order — 12,130 unique
+members, 6.29 MiB stream raw with 24 B entry rows, one 8 MiB slab group —
+and compresses that exact stream with liblzma presets:
+
+| preset | bytes | vs p6 | wall |
+|---|---|---|---|
+| 6 (shipped through 0.9.42) | 940,873 | — | 2.5 s |
+| 9 (dict 64 MiB) | 940,910 | +0.00% | 3.6 s |
+| 6 + dict 64 MiB (isolate the window) | 940,910 | +0.00% | 3.7 s |
+| **6 \| EXTREME** | **915,488** | **-2.70%** | 4.2 s |
+| 8e / 9e (dict 64 MiB) / 9e + dict 8 MiB | 915,488 | -2.70% | 4.2 s |
+| 1 (sanity floor) | 1,127,521 | +19.84% | 0.4 s |
+
+Reading: the preset-6 dict (8 MiB) already covers the 8 MiB slab cap, so
+the WINDOW lever is empty (+0.00% everywhere); every EXTREME variant lands
+on identical bytes — the entire win is the deeper match search
+(nice_len 273 vs 64). And because EXTREME touches only encoder search
+parameters, the decode side stays `new_preset(6)`: same 8 MiB window, same
+per-decode memory, byte-compatible both directions with every 0xFE stream.
+**0.9.43 = the one-line encoder flag.** End-to-end on the bench corpus
+(4096 chunks, 4 rounds): region slab bulk 1,306,138 -> 1,190,263 B
+(-8.87%), compact container 1.35 -> 1.24 MiB, JJ x3.36 -> x3.71, survival
+x4.01 -> x4.28, verifies 1661+946+1280 bad=0, enc_fp EXACT. The
+synthetic-heavy bench material gains more than the noise-heavy JJ members
+(-2.70%) — repetitive terrain feeds the deeper search superlinearly; the
+pack C-step wall went 8.1 -> 22.5 s on the 2-core sandbox (background,
+watermark-throttled, same accepted trade class as 0.9.41/42).
+
+### 7.2 PPMd solid-window: the global-CM proxy measured NEGATIVE
+
+The §6 frontier — "a slab-level global context model over the gid streams"
+— has a cheap zero-implementation proxy: PPMd (order-N context model with
+transmitted counts) over the whole material as ONE solid stream. Solid
+framing also happens to be what an archive export would do. On the
+24,809,708 B decompressed Anvil corpus (exact re-extraction, 728 chunks):
+
+| coder (solid 24.8 MB) | bytes | vs lzma2-6 solid |
+|---|---|---|
+| lzma2-6 (4 MiB dict) | 1,175,626 | — |
+| lzma2-9e (64 MiB dict) | 1,173,953 | -0.1% |
+| **brotli -11** | **1,137,742** | **-3.2%** |
+| ppmd-I order 16, 192 MiB | 1,247,326 | +6.1% |
+| ppmd-H order 12/16 | 1,280,450 / 1,250,247 | +8.9 / +6.3% |
+| bzip2 -9 | 1,507,514 | +28.2% |
+
+Even at order-16 PPMd LOSES to LZMA2 by +6%: the material is
+LZ-match-dominated (byte-aligned repeated structures, NBT headers, palette
+runs), and LZMA2's literal coder already harvests the order-0/1 context.
+A general-purpose CM cannot see the matches. The slab-CM frontier now has
+TWO independent negatives (per-section CM §6, global CM here); what could
+still beat LZ is a joint LZ+domain-CM mixer (PAQ class) — archival-only,
+still parked, and its prior is now weaker.
+
+### 7.3 The export lever downgraded to ~3%; the zstd residue is speed-pinned
+
+- Archive export (re-drain everything solid through the strongest coder):
+  best measured candidate brotli -11 = -3.2% vs the LZMA2 the live
+  container already uses; solid-vs-grouped framing adds ~1%. NOT a feature
+  on size alone. (ZPAQ's "-15-25% under LZMA2" prior from general-corpus
+  benchmarks is contradicted for this material class by §7.2.)
+- Recipe batches (kind-9, z6): deliberately z6 IN THE WRITE THREAD's
+  critical path — z19 there measured ~49% of fresh-import wall in sync
+  pauses; LZMA2 preset-6 on 192 KiB batches is ~50-100 ms each, worse.
+  The pack pass re-points slabs, not batches, so there is no background
+  moment to re-tier them. Architecture-pinned.
+- Regular cold blobs (>64 KiB members, z6) and dict files: negligible
+  absolute bytes at every measured scale (<2% of container, mostly <0.5%).
+- The 8 MiB slab group cap already realizes the big-window lever (the
+  profile_size S3 "bigger groups" rows are fossils of the 192 KiB era).
+
+**Verdict: the codec era is measured-closed on every stream that matters.**
+The remaining honest lever for "world weighs less" is SEMANTIC:
+pristine-chunk elision (§2) — order-of-magnitude on generated worlds,
+needs the Paper-side generation-write marker + ratio-gate redesign
+decision. Probe artifacts: `scripts/solid_probe.py` +
+`scripts/corpus_extract.py` (sandbox; corpus checksum 24,809,708 B
+matches §1 bit-exact), `native/examples/lzma_preset_probe.rs` (in-repo).

@@ -74,7 +74,19 @@ const SLAB_CODEC_LZMA2: u8 = 0xFE;
 /// zstd-6 on the real corpus). FIXED on both encode and decode so the raw
 /// decoder's window always matches — CSAVES_COLD_LEVEL applies to the zstd
 /// codec only.
+///
+/// v0.9.43: the ENCODER adds PRESET_EXTREME (deeper match search: nice_len
+/// 273 vs 64). Measured on the real post-dedup member stream (12,130
+/// members, one 6.29 MiB group): 940,873 -> 915,488 B = -2.70%, identical
+/// bytes for 6e/8e/9e — the win is the search depth, NOT the window (a
+/// preset-6 dict already covers the 8 MiB slab cap, and dict 64 MiB
+/// measured +0.00%). EXTREME changes only encoder search params, so the
+/// DECODE side stays new_preset(6): same 8 MiB window, same per-decode
+/// memory, byte-compatible with every 0xFE stream ever written.
 const LZMA2_COLD_PRESET: u32 = 6;
+/// Encoder-only search-depth flag (lzma PRESET_EXTREME); never applied on
+/// decode — the decode window comes from LZMA2_COLD_PRESET alone.
+const LZMA2_COLD_EXTREME: u32 = liblzma::stream::PRESET_EXTREME;
 /// chunks-map len marker: recipe lives inside a compressed kind-9 batch;
 /// the real (rec_off, stream_off, len) is in `batch_idx`.
 const BATCHED: u32 = u32::MAX;
@@ -174,7 +186,11 @@ fn cold_codec_lzma2() -> bool {
 /// the zstd path with the correct per-record codec stamp (never silently
 /// mislabel a stream).
 fn lzma2_compress(data: &[u8]) -> Option<Vec<u8>> {
-    let opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET).ok()?;
+    // v0.9.43: 6 | EXTREME — measured -2.70% on the real member stream for
+    // 1.66x encode wall on the (parallel, background) pack path; the decode
+    // side is untouched (see LZMA2_COLD_PRESET docs).
+    let opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
+        .ok()?;
     let mut f = liblzma::stream::Filters::new();
     f.lzma2(&opts);
     let mut stream = liblzma::stream::Stream::new_raw_encoder(&f).ok()?;

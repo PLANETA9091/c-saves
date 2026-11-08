@@ -1378,6 +1378,39 @@ member raws / enc_fp / drained container are untouched: enc_fp EXACT
 (deferred recipe encode), thread-local scratch in the split stage (+1.5-2%
 class), dict_sample is now at its data-hash floor.
 
+## 0.9.43 - the LZMA2 encoder goes EXTREME; PPMd solid + export framing measured dead
+
+One encode-only flag: `lzma2_compress` -> preset 6 | PRESET_EXTREME (deeper
+match search). Decode side untouched (EXTREME = encoder search only, dict
+stays preset-6 8 MiB) - every 0xFE stream ever written decodes as before,
+both directions. Gate sweep (2-core sandbox, CI-equivalent commands):
+
+| gate | 0.9.42 | 0.9.43 (6\|EXTREME) | floor |
+|---|---|---|---|
+| bench_size 64x4 compact | 1.35 MiB x0.08 | **1.24 MiB x0.08 (-8.1%)** | <0.15 |
+| region slab bulk (exact) | 1,306,138 B | **1,190,263 B (-8.87%)** | - |
+| jj_profile container | x3.36 smaller | **x3.71 smaller** | >=2.6 |
+| survival 16x12 | x4.01 smaller | **x4.28 smaller** | >=3.0 |
+| D verify (cold reads, 1661 chunks) | 26.8 s | 27.5 s | - |
+| C compaction (pack wall) | 8.1 s | 22.5 s | background/watermark |
+| enc_fp | 6d240d7166cdda99/12130/9971843 | **EXACT** | pin |
+| tests | 60/60 | **60/60** | all |
+
+Offline ladder on the real member stream (12,130 members, 6.29 MiB group,
+`examples/lzma_preset_probe.rs`): p6 940,873 B; window lever EMPTY (p9/dict
+64 MiB = +0.00% - the preset-6 dict already covers the 8 MiB slab cap); every
+EXTREME variant identical 915,488 B = -2.70% (search depth is the whole win).
+Bench-corpus material gains more (-8.9%) than noise-heavy JJ members (-2.7%):
+repetitive terrain feeds the deeper search superlinearly.
+
+Research tick 3 closures (docs/compression-research.md section 7): PPMd
+solid-window (global-CM proxy) +6.1% WORSE than LZMA2-6 at order-16 on the
+24,809,708 B corpus - second independent negative for the slab-CM frontier;
+brotli -11 solid = -3.2% only, so archive export is ~3%, not a feature;
+recipe batches / cold blobs / dicts are speed-pinned or negligible. The
+codec era is measured-closed; what remains is semantic (pristine-chunk
+elision, product decision pending).
+
 ## 0.9.42 - LZMA2 cold codec graduates to default; per-section CM measured negative
 
 The 0.9.41 opt-in flipped to the default after the full gate sweep (2-core

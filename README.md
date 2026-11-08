@@ -154,6 +154,44 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.43 — the LZMA2 encoder goes EXTREME; PPMd and the solid-window export framing measured dead
+
+One encode-only flag, every read byte untouched: `lzma2_compress` now uses
+**preset 6 | PRESET_EXTREME** (deeper match search, nice_len 273 vs 64). The
+EXTREME bit changes only encoder search parameters — the dict stays preset-6's
+8 MiB, so `lzma2_decompress` and every 0xFE stream ever written stay exactly
+as they are (old containers decode; new containers decode on old code too).
+Measured on the real post-dedup member stream (12,130 members, one 6.29 MiB
+group): 940,873 -> 915,488 B = -2.70%, with 6e/8e/9e producing IDENTICAL
+bytes — the win is search depth, not window (dict 64 MiB measured +0.00%).
+
+| gate | 0.9.42 | 0.9.43 (6 \| EXTREME) | floor |
+|---|---|---|---|
+| bench_size compact (4096 ch) | 1.35 MiB | **1.24 MiB (-8.1%)** | <0.15 |
+| region slab bulk (exact) | 1,306,138 B | **1,190,263 B (-8.87%)** | — |
+| JJ container | x3.36 smaller | **x3.71 smaller** | ≥2.6 |
+| survival container | x4.01 smaller | **x4.28 smaller** | ≥3.0 |
+| verify | 1661+946+1280 bad=0 | same | =0 |
+| enc_fp | 6d240d7166cdda99 / 12130 / 9971843 | **EXACT** | pin |
+| pack wall (C step, 2-core) | 8.1 s | 22.5 s | background |
+
+The pack wall grows 1.66-2.8x depending on material (repetitive synthetic
+terrain feeds the deeper search superlinearly) — background pass, watermark
+throttled, per-stream parallel, same accepted trade class as 0.9.41/42.
+
+The research tick that found it also CLOSED the codec front with three new
+measurements: **PPMd solid-window** (the cheap proxy for a slab-level global
+context model) LOSES to LZMA2-6 by +6.1% at order-16 on the raw corpus —
+general-purpose CM does not bite this material, the slab-CM frontier stays
+parked with a second independent negative; **brotli -11 solid** wins only
+-3.2% over LZMA2-6 (8x slower), so a whole-container archive-export lever is
+worth ~3%, not a feature; and the remaining zstd streams (recipe batches,
+regular cold blobs, dict files) are SPEED-PINNED by architecture — recipe
+flushes run in the write thread's critical path (z19 there measured ~49% of
+fresh-import wall), cold blobs and dicts are negligible absolute bytes.
+What remains for "world weighs less" is SEMANTIC: pristine-chunk elision
+(§2, order-of-magnitude, needs the Paper-side marker product decision).
+
 ## v0.9.42 — LZMA2 becomes the default cold codec; per-section entropy coding measured negative
 
 The 0.9.41 opt-in graduated to the default after the full gate sweep:
