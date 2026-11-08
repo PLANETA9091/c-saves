@@ -32,6 +32,15 @@ import net.minecraft.world.level.chunk.storage.RegionFileStorage;
  * storage engine. Payload contract in BOTH directions: UNCOMPRESSED NBT bytes
  * exactly as NbtIo.write would produce (root tag, empty name).
  *
+ * v0.9.47: nWriteChunk carries a per-write freshness evidence flag — the
+ * chunk tag certifies "Status=minecraft:full && InhabitedTime==0" (fully
+ * generated, never player-inhabited at the moment of its first durable
+ * save). The native side forms pristine regeneration contracts
+ * (CSAVES_PRISTINE=1) only on fresh first writes, so a player edit landing
+ * between worldgen and the first autosave is stored honestly instead of
+ * being hashed into a contract and reverted on regeneration. Re-saves of
+ * already-contracted chunks are unaffected (the native fast paths decide).
+ *
  * This class is defined into the kernel's classloader by the c-saves module
  * (unique name per .so, see module-side renaming) and its natives are bound
  * with RegisterNatives — the class file never hardcodes its own binary name.
@@ -58,7 +67,7 @@ public final class SavesShim {
     public static native boolean nActive();
     public static native int nAttach(String kind, String level, String containerDir);
     public static native byte[] nReadChunk(int handle, int cx, int cz);
-    public static native boolean nWriteChunk(int handle, int cx, int cz, byte[] nbt);
+    public static native boolean nWriteChunk(int handle, int cx, int cz, byte[] nbt, boolean fresh);
     public static native boolean nBeginSave();
     public static native boolean nEndSave();
     public static native void nMarkAutosave();
@@ -229,7 +238,9 @@ public final class SavesShim {
         if (nActive()) {
             ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 14);
             NbtIo.write(tag, new DataOutputStream(bos));
-            boolean ok = nWriteChunk(h, x, z, bos.toByteArray());
+            // v0.9.47: per-write freshness evidence from the tag itself —
+            // pristine contracts may form only on genuinely fresh chunks.
+            boolean ok = nWriteChunk(h, x, z, bos.toByteArray(), isFreshChunk(tag));
             if (!ok || WRITE_LOG) {
                 System.err.println("[c-saves] startWrite(" + x + "," + z + ") status="
                     + tag.getString("Status") + " stored=" + ok);
@@ -238,6 +249,24 @@ public final class SavesShim {
                     new DataOutputStream(new ByteArrayOutputStream(0)), SavesShimNoop.INSTANCE);
         }
         return vanillaStartWrite(st, x, z, tag);
+    }
+
+    /**
+     * v0.9.47 pristine-contract freshness evidence, read from the chunk tag
+     * the server itself handed us: the chunk must be FULLY generated
+     * (Status=minecraft:full — proto-stage saves are stored honestly and
+     * never contracted, so a later full regen cannot flip them) and never
+     * player-inhabited (InhabitedTime==0 — a player standing in/near the
+     * chunk ticks it, so any player-visible interaction leaves evidence).
+     * An absent InhabitedTime key is treated as NOT fresh (conservative:
+     * only a tag that carries the zero is evidence of freshness).
+     */
+    static boolean isFreshChunk(CompoundTag tag) {
+        // Paper 26.3 getters return Optionals; getStringOr collapses them.
+        if (!"minecraft:full".equals(tag.getStringOr("Status", ""))) {
+            return false;
+        }
+        return tag.contains("InhabitedTime") && tag.getLongOr("InhabitedTime", -1L) == 0L;
     }
 
     /** Transcription of the original RegionFileStorage.moonrise$startWrite body. */
@@ -294,7 +323,10 @@ public final class SavesShim {
         if (nActive()) {
             ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 14);
             NbtIo.write(tag, new DataOutputStream(bos));
-            boolean ok = nWriteChunk(h, pos.x(), pos.z(), bos.toByteArray());
+            // v0.9.47: freshness evidence here too — the legacy sync write
+            // path (SimpleRegionStorage / IOWorker) forms contracts under
+            // the same gate as the Moonrise path above.
+            boolean ok = nWriteChunk(h, pos.x(), pos.z(), bos.toByteArray(), isFreshChunk(tag));
             if (!ok || WRITE_LOG) {
                 System.err.println("[c-saves] write(" + pos.x() + "," + pos.z() + ") status="
                     + tag.getString("Status") + " stored=" + ok);

@@ -353,6 +353,26 @@ pub struct Cfg {
     /// raw-only 0.9.44/0.9.45 flip semantics (17 B contracts); contracts
     /// formed before this version behave identically either way.
     pub pristine_canon: bool,
+    /// v0.9.47 shim-evidence gating (requires `pristine`): a LIVE-path
+    /// contract (strip=false) additionally requires the shim's per-write
+    /// freshness evidence — the chunk tag itself certifies
+    /// "Status=minecraft:full && InhabitedTime==0", i.e. fully generated
+    /// and never player-inhabited at the moment of its FIRST durable save.
+    /// This closes the documented 0.9.44 residual risk: a player edit (or
+    /// any pre-first-save mutation that leaves tick evidence) that landed
+    /// between worldgen and the first autosave used to be hashed INTO the
+    /// contract and silently reverted on regeneration. With the gate, such
+    /// a first write stores normally (the edit survives); the pure-pregen
+    /// mass — autosaved untouched chunks — still contracts, so the
+    /// huge-world win is unchanged (the CI pure-pregen gate pins it).
+    /// Direct-API callers without an evidence channel (`write_chunk`)
+    /// assert freshness — the gate is enforced at the JNI boundary where
+    /// Paper's tag is in hand (n_write_chunk -> write_chunk_fresh).
+    /// The import/strip path is unaffected: pregen worlds carry no runtime
+    /// tag evidence, contracts there stay operator-asserted
+    /// (cfg.pristine_import). CSAVES_PRISTINE_FRESH=0 restores the 0.9.44-
+    /// 0.9.46 unconditional first-write semantics.
+    pub pristine_fresh: bool,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
     /// Slab member cap for whole-mode stores (entity/POI payloads).
@@ -454,6 +474,10 @@ impl Default for Cfg {
             pristine: false,
             pristine_import: false,
             pristine_canon: true,
+            // v0.9.47: shim-evidence gate ON by default — it only sharpens
+            // when contracts may form; with the evidence channel absent
+            // (direct-API callers) freshness is asserted by the caller.
+            pristine_fresh: true,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
             auto_pack_bytes: 4 * 1024 * 1024,
@@ -556,6 +580,9 @@ impl Cfg {
                     .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                     .unwrap_or(false),
             pristine_canon: std::env::var("CSAVES_PRISTINE_CANON")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            pristine_fresh: std::env::var("CSAVES_PRISTINE_FRESH")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
         }
@@ -1325,6 +1352,11 @@ pub static ST_WRITE_SKIP: AtomicU64 = AtomicU64::new(0);
 /// the strip-canonical legend (raw hash differed, canonical hash matched —
 /// relit light / timer churn / key-order drift, zero bytes stored).
 pub static ST_PRISTINE_CANON: AtomicU64 = AtomicU64::new(0);
+/// v0.9.47: live first writes stored honestly because the shim's freshness
+/// evidence said not-fresh (would have contracted under 0.9.44-0.9.46).
+/// The audit story number: every count is a mutation class the contract
+/// path can no longer silently revert on regeneration.
+pub static ST_PRISTINE_UNFRESH: AtomicU64 = AtomicU64::new(0);
 pub static ST_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_SECTLOAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_FUSED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -3123,8 +3155,30 @@ impl Store {
 
     /// Store one chunk payload. `whole_mode` is used for entity/poi payloads
     /// and as a fallback when the chunk has no section structure.
+    /// Evidence-less direct callers ASSERT freshness (legacy 0.9.44-0.9.46
+    /// semantics); the shim-evidence gate is enforced through
+    /// `write_chunk_fresh` — the entry the JNI boundary uses, where Paper's
+    /// chunk tag is in hand (v0.9.47).
     pub fn write_chunk(&self, key: u64, payload: &[u8], whole_mode: bool) -> Result<(), String> {
-        self.write_chunk_mode(key, payload, whole_mode, false)
+        self.write_chunk_mode(key, payload, whole_mode, false, true)
+    }
+
+    /// v0.9.47: explicit-evidence live write — the JNI boundary passes the
+    /// shim's per-write freshness evidence (chunk tag certifies
+    /// Status=minecraft:full && InhabitedTime==0 at FIRST durable save).
+    /// Under cfg.pristine_fresh (default) a not-fresh first write stores
+    /// normally instead of forming a regeneration contract, so mutations
+    /// that landed between worldgen and the first autosave can no longer be
+    /// hashed into a contract and reverted on regeneration. Identical
+    /// re-save / relight fast paths and the import path are unaffected.
+    pub fn write_chunk_fresh(
+        &self,
+        key: u64,
+        payload: &[u8],
+        whole_mode: bool,
+        fresh: bool,
+    ) -> Result<(), String> {
+        self.write_chunk_mode(key, payload, whole_mode, false, fresh)
     }
 
     /// Import-path write: strips derived light (the server relights from
@@ -3135,7 +3189,10 @@ impl Store {
     /// lever — a pure-worldgen Anvil drain collapses to ~26 B/chunk of
     /// contracts); see Cfg::pristine_import for the operator semantics.
     pub fn write_chunk_import(&self, key: u64, payload: &[u8]) -> Result<(), String> {
-        self.write_chunk_mode(key, payload, false, true)
+        // fresh=true: pregen worlds carry no runtime tag evidence — import
+        // contracts stay operator-asserted (cfg.pristine_import), the
+        // v0.9.47 shim-evidence gate is a live-path mechanism by design.
+        self.write_chunk_mode(key, payload, false, true, true)
     }
 
     /// Bench/import-model write with an explicit strip decision (models
@@ -3143,7 +3200,7 @@ impl Store {
     /// cfg.pristine_import a strip write can form a regeneration contract
     /// exactly like write_chunk_import.
     pub fn write_chunk_stripped(&self, key: u64, payload: &[u8], strip: bool) -> Result<(), String> {
-        self.write_chunk_mode(key, payload, false, strip)
+        self.write_chunk_mode(key, payload, false, strip, true)
     }
 
     fn write_chunk_mode(
@@ -3152,6 +3209,7 @@ impl Store {
         payload: &[u8],
         whole_mode: bool,
         strip: bool,
+        fresh: bool,
     ) -> Result<(), String> {
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.logical_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -3234,12 +3292,26 @@ impl Store {
         // light after relight, serializer/generator drift) flips that chunk
         // to normal storage, so erosion is bounded to the chunks the server
         // actually loads while the untouched pristine mass stays contracted.
+        // v0.9.47: a LIVE-path contract additionally requires the shim's
+        // per-write freshness evidence (write_chunk_fresh) under
+        // cfg.pristine_fresh — a not-fresh first write (the chunk tag shows
+        // tick evidence / non-full status at first durable save) stores
+        // normally, closing the documented residual risk of reverting
+        // pre-first-save mutations on regeneration. The strip/import path
+        // is exempt (operator-asserted mode, no tag evidence exists).
         let pristine_cand = self.cfg.pristine
             && !whole_mode
             && (!strip || self.cfg.pristine_import)
             && !self.whole_mode.load(Ordering::Relaxed)
             && !self.chunks.read().contains_key(&key)
-            && self.recipe_batch.lock().get(key).is_none();
+            && self.recipe_batch.lock().get(key).is_none()
+            && (strip || !self.cfg.pristine_fresh || fresh);
+        if self.cfg.pristine && !whole_mode && !strip && self.cfg.pristine_fresh && !fresh {
+            // observability for the audit story: a live first write that
+            // WOULD have contracted under 0.9.44-0.9.46 semantics but was
+            // stored honestly because the shim's evidence said not-fresh.
+            ST_PRISTINE_UNFRESH.fetch_add(1, Ordering::Relaxed);
+        }
         let recipe = if pristine_cand {
             // v0.9.46: the strip-canonical legend rides alongside the raw
             // payload hash — [mode 7][raw 16 B][canon 16 B] (33 B) when
@@ -4269,6 +4341,11 @@ impl Store {
         ));
         s.push_str(&format!(r#""dicts":{dict_bytes},"#));
         s.push_str(&format!(r#""write_skip":{},"#, ST_WRITE_SKIP.load(Ordering::Relaxed)));
+        s.push_str(&format!(
+            r#""pristine":{{"canon_kept":{},"unfresh_stored":{}}},"#,
+            ST_PRISTINE_CANON.load(Ordering::Relaxed),
+            ST_PRISTINE_UNFRESH.load(Ordering::Relaxed)
+        ));
         s.push_str(&format!(r#""unattributed":{unattr}"#));
         s.push_str("}");
         s
@@ -7244,6 +7321,84 @@ mod repro {
         crate::chunknbt::strip_derived_chunk(&mut want2);
         let got2_v: Value = fastnbt::from_bytes(&got2).unwrap();
         assert!(got2_v == want2, "flipped chunk content survives reopen");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pristine_fresh_gate_stores_unfresh_first_writes() {
+        // v0.9.47: with the shim-evidence gate ON (default), a LIVE first
+        // write that arrives NOT-fresh (the chunk tag showed tick evidence /
+        // non-full status) stores HONESTLY instead of forming a contract —
+        // a pre-first-save mutation can no longer ride into a contract hash
+        // and be reverted on regeneration. A fresh first write still
+        // contracts (the pure-pregen win is unchanged), and a stored chunk
+        // keeps ordinary flip/edit semantics forever (the contract window
+        // is the first durable save and nothing else).
+        let dir = temp_dir("pristine-fresh-gate");
+        let cfg = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
+        let s = Store::open_cfg(&dir, true, cfg.clone()).unwrap();
+
+        // NOT-fresh first write: stored, readable, never contracted — the
+        // 0.9.44 residual-risk scenario now lands in real storage
+        let k = key(10, 20);
+        let edited = chunk_payload(10, 20, 3);
+        s.write_chunk_fresh(k, &edited, false, false).unwrap();
+        assert!(
+            !s.is_pristine(k),
+            "not-fresh first write must NOT form a contract"
+        );
+        let got = s.read_chunk(k).expect("unfresh content must be stored");
+        assert!(semantic(&got, &edited), "stored content is the edited payload");
+
+        // fresh first write: contract forms exactly as before
+        let kf = key(30, 40);
+        let a = chunk_payload(30, 40, 0);
+        s.write_chunk_fresh(kf, &a, false, true).unwrap();
+        assert!(s.is_pristine(kf), "fresh first write must form a contract");
+        assert!(s.read_chunk(kf).is_none(), "contract reads None BY DESIGN");
+        // identical re-save of the fresh chunk stays contracted
+        s.write_chunk_fresh(kf, &a, false, true).unwrap();
+        assert!(s.is_pristine(kf), "identical fresh re-save stays contracted");
+
+        // the stored (unfresh) chunk keeps ordinary semantics: a later
+        // different-content write goes through the normal pipeline
+        let b = chunk_payload(10, 20, 4);
+        s.write_chunk_fresh(k, &b, false, true).unwrap();
+        assert!(!s.is_pristine(k), "stored chunk never becomes a contract later");
+        let got2 = s.read_chunk(k).expect("edited chunk reads back");
+        assert!(semantic(&got2, &b), "re-edit is the new content");
+
+        s.sync();
+        drop(s);
+        // reopen: the not-fresh chunk stays normal storage, the fresh
+        // contract persists
+        let s2 = Store::open_cfg(&dir, true, cfg).unwrap();
+        assert!(!s2.is_pristine(k), "unfresh chunk stays normal after reopen");
+        assert!(s2.is_pristine(kf), "fresh contract persists across reopen");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pristine_fresh_gate_opt_out_restores_946() {
+        // CSAVES_PRISTINE_FRESH=0 (cfg.pristine_fresh=false): exact 0.9.44-
+        // 0.9.46 semantics — every first-ever live write contracts regardless
+        // of the shim's evidence.
+        let dir = temp_dir("pristine-fresh-off");
+        let cfg = Cfg {
+            pristine: true,
+            pristine_fresh: false,
+            compact_min: 512 * 1024,
+            ..bench_cfg()
+        };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        let k = key(11, 13);
+        let a = chunk_payload(11, 13, 0);
+        s.write_chunk_fresh(k, &a, false, false).unwrap();
+        assert!(
+            s.is_pristine(k),
+            "opt-out must restore unconditional first-write contracts"
+        );
+        assert!(s.read_chunk(k).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -154,7 +154,7 @@ pub fn register_natives_raw(env: &JniEnv, cls: jni::jclass) -> bool {
         ("nActive", "()Z", natives::n_active as *mut _),
         ("nAttach", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I", natives::n_attach as *mut _),
         ("nReadChunk", "(III)[B", natives::n_read_chunk as *mut _),
-        ("nWriteChunk", "(III[B)Z", natives::n_write_chunk as *mut _),
+        ("nWriteChunk", "(III[BZ)Z", natives::n_write_chunk as *mut _),
         ("nBeginSave", "()Z", natives::n_begin_save as *mut _),
         ("nEndSave", "()Z", natives::n_end_save as *mut _),
         ("nMarkAutosave", "()V", natives::n_mark_autosave as *mut _),

@@ -422,3 +422,65 @@ on a pure worldgen world: contracts (42 B/chunk with the legend) +
 entities/POI (exempt by construction) + what the server actually edits.
 Next honest frontiers are tooling (contract/regen-drift audits) and the
 shim-side isNewChunk/InhabitedTime tightening — no byte-level lever left.
+
+## 11. Research tick 7 — shim-evidence pristine gating (v0.9.47): the residual risk closes at the source
+
+§8's contract shipped with one documented, operator-accepted residual risk:
+mutations between worldgen and a chunk's FIRST durable save were hashed INTO
+the contract and silently reverted on regeneration (read=None BY DESIGN).
+§10 named the frontier: "the shim-side isNewChunk/InhabitedTime tightening".
+v0.9.47 ships it — and the design turned out simpler than the §2 sketch
+feared: NO Paper patch, NO generation-write instrumentation. The evidence
+already rides in the chunk tag the server hands the shim on every write.
+
+**Evidence rule** (`SavesShim.isFreshChunk`, applied on BOTH write paths —
+Moonrise `moonrise$startWrite` and the legacy sync `write`):
+
+- `Status == "minecraft:full"` — proto-stage saves never contract. This
+  also kills a latent erosion class: a proto contract could only flip on
+  the later full re-save (proto→full changes blocks/palettes, the canon
+  legend cannot absorb it); now proto content stores honestly instead of
+  forming a doomed contract.
+- `InhabitedTime == 0` — no player has ever inhabited the chunk at the
+  moment of its first durable save. Any player-visible interaction
+  (standing in/near the chunk) ticks it and leaves evidence.
+- ABSENT InhabitedTime key = NOT fresh (conservative: only a tag that
+  carries the zero is evidence).
+
+**Plumbing**: `nWriteChunk(III[BZ)Z` (shim declaration + RegisterNatives in
+lockstep — the module ships both sides), native entry
+`write_chunk_fresh(key, payload, whole_mode, fresh)`; `write_chunk` (direct
+API, no evidence channel) asserts freshness — the gate lives where evidence
+exists. cfg `pristine_fresh` default ON, `CSAVES_PRISTINE_FRESH=0` restores
+the exact 0.9.44-0.9.46 semantics. Import/strip path untouched (pregen
+worlds carry no tag evidence; contracts there stay operator-asserted).
+
+**Measured** (`pristine_fresh_probe`, real 728-chunk corpus, production
+write paths; the session-mutation model = an extra root field — the
+Bukkit.*/Paper.* metadata class — with fresh=false):
+
+| run | first write | outcome |
+|---|---|---|
+| A: gate ON (v0.9.47) | edited payload, fresh=false | **pristine=0 stored=728, edits_surviving=728/728** — every pre-first-save edit survives regeneration (compact 1.37 MiB, x0.31); `unfresh_stored=728` |
+| B: 0.9.44-0.9.46 (`CSAVES_PRISTINE_FRESH=0`) | edited payload, fresh=false | **pristine=728, edits_reverted_on_regen=728/728** — the hazard, measured head-on |
+| C: pure-pregen invariance | raw payload, fresh=true | **pristine=728 stored=0, compact 0.03 MiB (x0.0057 vs anvil)** after a full relight session — the huge-world win is intact |
+
+Probe honesty note: canon-exact read-backs were 524/728; the remaining 204
+are the §10 palette-order drift — the probe therefore verifies surviving
+edits SEMANTICALLY (the jj_profile verifier shape: root by Value, sections
+pairwise through `sections_semantically_equal`), 728/728 pass. The §10
+reasoning holds unchanged: Paper REGENERATES a contracted chunk, so the
+re-save chain never crosses our rebuild form.
+
+**Observability**: `ST_PRISTINE_UNFRESH` (stats_json
+`pristine.unfresh_stored`) counts first writes stored honestly because the
+evidence said not-fresh — every count is a mutation class the contract path
+can no longer revert. The operator audit story: run pristine on, watch the
+counter, know exactly what the elision chose not to risk.
+
+**Where this leaves the semantic line**: contracts now form only on chunks
+the SERVER certifies as pristine (full status + never inhabited), the
+legend absorbs serializer volatility, the import mode stays
+operator-asserted. The remaining frontier from §10 is unchanged but
+smaller: contract/regen-drift audit tooling; no byte-level lever, no
+known revert-class left on the live path.

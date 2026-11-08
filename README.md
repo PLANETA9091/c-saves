@@ -154,6 +154,62 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.47 — shim-evidence pristine gating: the residual risk closes at the source
+
+The 0.9.44-0.9.46 contracts carried one documented, operator-accepted
+residual risk: mutations landing between worldgen and a chunk's FIRST
+durable save (a player walking into a freshly generated chunk before the
+next autosave, Paper session metadata, a mod tag) were hashed INTO the
+contract and silently reverted on regeneration — the contract's read=None
+semantics made the pre-first-save edit disappear. The research docs pinned
+the fix as "shim-side isNewChunk / InhabitedTime==0 passed as a per-write
+flag"; v0.9.47 ships exactly that, with evidence read from the tag the
+server itself hands the shim — no Paper patch, no generation-write
+instrumentation:
+
+- evidence rule (`SavesShim.isFreshChunk`, both write paths — Moonrise
+  `moonrise$startWrite` and the legacy sync `write`): the chunk tag must
+  certify **Status=minecraft:full && InhabitedTime==0** at the moment of
+  its first durable save. Status=full excludes proto-stage saves (a proto
+  contract could only flip on the later full re-save — now proto content
+  stores honestly instead of forming a doomed contract). InhabitedTime==0
+  excludes any player-visible interaction (standing in/near the chunk
+  ticks it). An ABSENT InhabitedTime key is treated as not-fresh
+  (conservative: only a tag that carries the zero is evidence);
+- plumbing: `nWriteChunk(III[BZ)Z` (shim + RegisterNatives in lockstep —
+  the module ships both), native `write_chunk_fresh(key, payload,
+  whole_mode, fresh)` is the evidence channel; `write_chunk` (direct API)
+  asserts freshness — the gate lives where evidence exists;
+- cfg: `pristine_fresh` (default ON; `CSAVES_PRISTINE_FRESH=0` restores
+  the exact 0.9.44-0.9.46 unconditional first-write semantics). The
+  import/strip path is UNCHANGED — pregen worlds carry no runtime tag
+  evidence, import contracts stay operator-asserted (`pristine_import`);
+- measured on the real corpus through production write paths
+  (`pristine_fresh_probe`, first write = payload + a session mutation
+  modeled as an extra root field, fresh=false):
+  **A) gate ON: pristine=0 stored=728, edits_surviving=728/728** — every
+  pre-first-save edit survives regeneration (compact 1.37 MiB, x0.31);
+  **B) pre-0.9.47 semantics: pristine=728, edits_reverted_on_regen
+  =728/728** — the hazard, measured head-on; every contracted edit reads
+  None BY DESIGN; **C) pure-pregen invariance: fresh first writes all
+  contract, one relight session keeps pristine=728 stored=0, compact
+  0.03 MiB (x0.0057 vs anvil)** — the huge-world win is byte-for-byte
+  intact, the CI pure-pregen gate keeps its margin (x0.01, ratio ≤ 0.02);
+- observability: `ST_PRISTINE_UNFRESH` counts first writes stored
+  honestly because the evidence said not-fresh (surfaced in stats_json as
+  `pristine.unfresh_stored` next to `pristine.canon_kept`) — the audit
+  number: every count is a mutation class the contract path can no longer
+  revert;
+- new tests: not-fresh first write stores honestly and never contracts
+  later (flip/edit semantics intact), fresh first write contracts
+  (win unchanged), opt-out restores 0.9.46 semantics; 68/68.
+
+Flag-off is byte-identical to 0.9.46: pristine defaults OFF, enc_fp EXACT
+6d240d7166cdda99/12130/9971843, JJ corpus verify ok=946 bad=0, bench_size
+compact x0.08, pregen gate x0.01 (152 contracts, relight replay 318/318
+kept). The semantic-line frontier from §10 gains its last missing piece:
+contracts now form only on chunks the SERVER certifies as pristine.
+
 ## v0.9.46 — strip-canonical contract legends: relight re-saves stop eroding the huge-world win
 
 0.9.45's import contracts flip on the first **byte**-different re-save. A real

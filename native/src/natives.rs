@@ -128,6 +128,7 @@ pub extern "system" fn n_write_chunk(
     x: i32,
     z: i32,
     data: jni_sys::jbyteArray,
+    fresh: jni_sys::jboolean,
 ) -> jni_sys::jboolean {
     unsafe {
         let Some(entry) = registry().get(handle as usize) else {
@@ -138,7 +139,10 @@ pub extern "system" fn n_write_chunk(
             return false;
         }
         let t0 = Instant::now();
-        let r = entry.0.write_chunk(key(x, z), &bytes, entry.1);
+        // v0.9.47: the shim's per-write freshness evidence (chunk tag:
+        // Status=minecraft:full && InhabitedTime==0) gates live-path
+        // pristine contracts — write_chunk_fresh is the evidence channel.
+        let r = entry.0.write_chunk_fresh(key(x, z), &bytes, entry.1, fresh);
         let us = t0.elapsed().as_micros() as u64;
         engine::note_write_latency(us);
         r.is_ok() as jni_sys::jboolean

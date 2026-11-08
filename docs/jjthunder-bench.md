@@ -1524,3 +1524,32 @@ three ways: slab streams win through CROSS-SECTION alignment the codec
 harvests below any per-section entropy floor. Parked on
 `wip-cm-section-form`; full probe tables + anti-retest gates in
 docs/compression-research.md section 6.
+
+## 0.9.47 — shim-evidence pristine gating (residual risk closes at the source)
+
+Live-path pristine contracts now require the shim's per-write freshness
+evidence (`nWriteChunk(III[BZ)Z`): chunk tag certifies
+`Status=minecraft:full && InhabitedTime==0` at the first durable save
+(`SavesShim.isFreshChunk`, both write paths; `write_chunk_fresh` on the
+native side; `CSAVES_PRISTINE_FRESH=0` restores 0.9.44-0.9.46 semantics;
+import/strip path unchanged). The 0.9.44 residual risk — a mutation between
+worldgen and the first autosave hashed into the contract and reverted on
+regeneration — is closed at the source with zero Paper patches: the
+evidence rides in the tag the server already hands over.
+
+Real-corpus A/B/C (`pristine_fresh_probe`, production write paths, first
+write = payload + session-mutation root field, fresh=false):
+
+- gate ON: pristine=0 stored=728, **edits_surviving=728/728**, compact
+  1.37 MiB (x0.31 vs anvil), `unfresh_stored=728`;
+- pre-0.9.47 semantics: pristine=728, **edits_reverted_on_regen=728/728**
+  (the hazard, measured);
+- pure-pregen invariance: fresh first writes contract 728/728, one relight
+  session keeps pristine=728 stored=0, compact 0.03 MiB (**x0.0057 vs
+  anvil**); CI pure-pregen gate unchanged (x0.01, 152 contracts, relight
+  replay 318/318 kept).
+
+Flag-off byte-identity: enc_fp EXACT 6d240d7166cdda99 / 12130 members /
+9,971,843 bytes; JJ corpus verify ok=946 bad=0; bench_size compact x0.08;
+68/68 tests (new: unfresh-first-write stores honestly + never contracts
+later; fresh-first-write contracts; opt-out restores 0.9.46).

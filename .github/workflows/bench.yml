@@ -40,6 +40,7 @@ jobs:
             native/bench_output.txt
             native/bench_stalls.txt
             native/bench_pristine.txt
+            native/bench_pristine_fresh.txt
       - name: size profile (what weighs the most)
         working-directory: native
         run: |
@@ -60,6 +61,18 @@ jobs:
           echo "pure-pregen compact/anvil ratio: $PRISTINE_RATIO, pristine sampled: $PRISTINE_N"
           awk -v r="$PRISTINE_RATIO" 'BEGIN { if (r+0 > 0.02) { print "FAIL: pristine pure-pregen ratio " r " exceeds 0.02"; exit 1 } print "OK" }'
           awk -v n="$PRISTINE_N" 'BEGIN { if (n+0 < 100) { print "FAIL: pristine verify sample " n " below 100"; exit 1 } print "OK" }'
+      - name: pristine shim-evidence gate — the residual risk stays closed (v0.9.47)
+        working-directory: native
+        run: |
+          cargo build --release --example pristine_fresh_probe
+          CSAVES_PRISTINE=1 ./target/release/examples/pristine_fresh_probe 2>&1 | tee bench_pristine_fresh.txt
+          # A) the gate stores every not-fresh first write honestly (the
+          #    pre-first-save edit survives regeneration)
+          grep -q "edits_surviving=728/728" bench_pristine_fresh.txt || { echo "FAIL: not-fresh edits did not all survive"; exit 1; }
+          # B) the pre-0.9.47 hazard demo still names the reverted class
+          grep -q "edits_reverted_on_regen=728/728" bench_pristine_fresh.txt || { echo "FAIL: hazard demo missing"; exit 1; }
+          # C) pure-pregen invariance: fresh evidence keeps the huge-world win
+          awk -v r="$(grep -o 'x0\.[0-9]* vs anvil' bench_pristine_fresh.txt | tail -1 | grep -o '0\.[0-9]*')" 'BEGIN { if (r+0 > 0.02) { print "FAIL: pure-pregen invariance ratio " r " exceeds 0.02"; exit 1 } print "OK" }'
 
   jj-bench:
     runs-on: ubuntu-latest
