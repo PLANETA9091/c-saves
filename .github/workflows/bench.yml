@@ -41,6 +41,7 @@ jobs:
             native/bench_stalls.txt
             native/bench_pristine.txt
             native/bench_pristine_fresh.txt
+            native/bench_pristine_audit.txt
       - name: size profile (what weighs the most)
         working-directory: native
         run: |
@@ -73,6 +74,24 @@ jobs:
           grep -q "edits_reverted_on_regen=728/728" bench_pristine_fresh.txt || { echo "FAIL: hazard demo missing"; exit 1; }
           # C) pure-pregen invariance: fresh evidence keeps the huge-world win
           awk -v r="$(grep -o 'x0\.[0-9]* vs anvil' bench_pristine_fresh.txt | tail -1 | grep -o '0\.[0-9]*')" 'BEGIN { if (r+0 > 0.02) { print "FAIL: pure-pregen invariance ratio " r " exceeds 0.02"; exit 1 } print "OK" }'
+      - name: pristine audit gate — contract legends re-derive from the corpus (v0.9.48)
+        working-directory: native
+        run: |
+          cargo build --release --example pristine_audit
+          # the end-to-end operator flow: import -> audit -> ship. The tool
+          # stages a copy (the import drains its source), forms contracts
+          # through the production import, then re-derives every legend
+          # from the untouched corpus bytes + replays the relight session.
+          rm -rf /tmp/ci-audit-store
+          CSAVES_PRISTINE=1 CSAVES_PRISTINE_IMPORT=1 \
+            ./target/release/examples/pristine_audit /tmp/ci-audit-store \
+            --corpus ../bench-corpus/dim --import --session 2>&1 | tee bench_pristine_audit.txt
+          # the tool exits non-zero on drift/flips; these pins also catch a
+          # silently degraded legend formation or session model
+          grep -q "contracts 728 (canon legends 728, raw-only 0)" bench_pristine_audit.txt || { echo "FAIL: contract inventory"; exit 1; }
+          grep -q "legend check: raw_match=728 canon_match=0 drift=0" bench_pristine_audit.txt || { echo "FAIL: legend drift"; exit 1; }
+          grep -q "session check: kept=728 flipped=0" bench_pristine_audit.txt || { echo "FAIL: session prediction"; exit 1; }
+          grep -q "verdict: PASS" bench_pristine_audit.txt || { echo "FAIL: audit verdict"; exit 1; }
 
   jj-bench:
     runs-on: ubuntu-latest

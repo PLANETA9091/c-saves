@@ -3638,6 +3638,17 @@ impl Store {
         self.pristine_hash_of(key).is_some()
     }
 
+    /// v0.9.48 audit tooling: the pristine contract legend of a key —
+    /// `(raw payload hash, optional strip-canonical hash)` exactly as the
+    /// write path formed it (both hashes are over the INCOMING payload
+    /// bytes, the same form the corpus parser and Paper's serializer
+    /// family produce). `None` = the key is not a pristine contract.
+    /// Read-only face for the audit tooling; the runtime write path uses
+    /// `pristine_legend_of` internally.
+    pub fn pristine_legend(&self, key: u64) -> Option<(Hash, Option<Hash>)> {
+        self.pristine_legend_of(key).map(|l| (l.raw, l.canon))
+    }
+
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
     pub fn read_chunk(&self, key: u64) -> Option<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -7227,6 +7238,71 @@ mod repro {
         s.sync();
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pristine_audit_legend_accessor() {
+        // v0.9.48 audit tooling: the public legend face returns the exact
+        // hashes the write path formed — raw over the INCOMING payload
+        // bytes (the form the corpus parser and the contract check both
+        // use), canon alongside when pristine_canon is on. None for
+        // whole-mode keys and after a flip to normal storage.
+        let dir = temp_dir("pristine-audit-legend");
+        let cfg = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+
+        let k = key(21, 23);
+        let a = chunk_payload(21, 23, 0);
+        s.write_chunk(k, &a, false).unwrap();
+        let (raw_h, canon_h) =
+            s.pristine_legend(k).expect("contract must expose its legend");
+        assert_eq!(
+            raw_h,
+            chunknbt::hash_of(&a),
+            "raw legend = hash of the incoming payload bytes"
+        );
+        assert_eq!(
+            canon_h,
+            Some(chunknbt::canonical_contract_hash(&a).expect("payload parses canonically")),
+            "canon legend = canonical_contract_hash of the same bytes"
+        );
+
+        // whole-mode keys are exempt from contracts — no legend, stored
+        let ke = key(24, 26);
+        let e = chunk_payload(24, 26, 1);
+        s.write_chunk(ke, &e, true).unwrap();
+        assert!(s.pristine_legend(ke).is_none(), "whole-mode exposes no legend");
+        assert!(s.read_chunk(ke).is_some());
+
+        // a flipped contract exposes no legend (it is normal storage now)
+        let b = chunk_payload(21, 23, 7);
+        s.write_chunk(k, &b, false).unwrap();
+        assert!(!s.is_pristine(k), "different content flips");
+        assert!(s.pristine_legend(k).is_none(), "flipped key exposes no legend");
+        s.sync();
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // raw-only container (0.9.44/45 semantics): the legend is (raw, None)
+        let dir2 = temp_dir("pristine-audit-rawonly");
+        let cfg2 = Cfg {
+            pristine: true,
+            pristine_canon: false,
+            compact_min: 512 * 1024,
+            ..bench_cfg()
+        };
+        let s2 = Store::open_cfg(&dir2, true, cfg2).unwrap();
+        let k2 = key(31, 33);
+        let p = chunk_payload(31, 33, 0);
+        s2.write_chunk(k2, &p, false).unwrap();
+        assert_eq!(
+            s2.pristine_legend(k2),
+            Some((chunknbt::hash_of(&p), None)),
+            "raw-only container: canon half is None"
+        );
+        s2.sync();
+        drop(s2);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

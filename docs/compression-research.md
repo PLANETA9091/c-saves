@@ -484,3 +484,60 @@ legend absorbs serializer volatility, the import mode stays
 operator-asserted. The remaining frontier from §10 is unchanged but
 smaller: contract/regen-drift audit tooling; no byte-level lever, no
 known revert-class left on the live path.
+
+## 12. Research tick 8 — contract/regen-drift audits (v0.9.48): the frontier list is empty
+
+§10/§11 left exactly one named frontier: "contract/regen-drift audit
+tooling". The runtime flip mechanism IS a drift audit at re-save time; the
+missing piece was deploy-time discovery — an operator learns that a
+pure-worldgen assertion is wrong (wrong seed, post-drain edits, generator
+drift) only when players hit the flips. v0.9.48 ships `pristine_audit`:
+a read-only tool that re-derives every contract legend from the ORIGINAL
+Anvil corpus through the production hash chain and predicts, per chunk,
+what restore would do — before the world ships.
+
+Design invariants (measured, not assumed):
+
+- the legend is formed AND compared on the INCOMING payload bytes in the
+  write path (store.rs: contract formation hashes `payload` as handed to
+  `write_chunk_import`; the contract check hashes the re-save's incoming
+  bytes) — the audit therefore hashes the corpus bytes exactly as the
+  import parser produces them: `hash_of` + `canonical_contract_hash`,
+  nothing re-encoded, no rebuild form involved;
+- no writes to the audited store, ever; the audit-side `--import` mode
+  drains a STAGED COPY (the production import consumes its source — the
+  original corpus stays untouched for the legend check);
+- O(1) payload memory: the corpus streams region-file → hash → drop, so
+  the tool scales to the 262k-chunk class;
+- exit code 0 = PASS (no drift, session absorbed), 1 = FAIL — a CI-able
+  predeploy gate.
+
+Measured on the real 728-chunk corpus, end-to-end operator flow
+(`--import --session`: production import forms the contracts, then the
+legend/session checks run against the untouched corpus):
+
+| check | result |
+|---|---|
+| inventory | contracts=728, canon legends=728, raw-only=0, stored=0 |
+| legend check | **raw_match=728, drift=0** (every legend re-derives byte-exact) |
+| session check (§10 relight model) | **kept=728/728**; relight raw-hash differs 728/728 — every raw miss is canon-held |
+| verdict | PASS, exit 0 |
+| negative control: one payload tampered (+17 B root field, a real content change the legend must not absorb) | **drift=1, session_flipped=1, verdict FAIL, exit 1** — the tampered chunk (0,0) is named |
+
+The negative control is the point: a wrong assertion is now a deploy-time
+red light, not a production erosion story. The session check reuses the
+§10 model whose end-to-end write-path validation stands (§10/§11 probes:
+728/728 kept through real scratch stores) — the audit adds the per-key
+prediction against the operator's ACTUAL stored legends.
+
+`Store::pristine_legend(key)` is the new public tooling face (read-only;
+the write path keeps its private accessor). CI gains the audit gate in the
+size-bench job: import → audit → ship with all counts pinned.
+
+With §12 the §10/§11 frontier list is empty. The full pristine story now
+measures: bytes closed (§8/§9), erosion closed (§10), first-write hazard
+closed (§11), assertion auditable (§12) — remaining surface is the runtime
+counters (`pristine.unfresh_stored`, `pristine.canon_kept`) and the flip
+events themselves, i.e. what the elision chose not to risk, visible to the
+operator in stats_json. No byte-level lever, no revert-class, no unaudited
+assertion left on the live path.

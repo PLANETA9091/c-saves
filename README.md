@@ -154,6 +154,48 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.48 — pristine contract audit: the wrong assertion is caught at deploy time
+
+The research docs (§10/§11) left one named frontier after the semantic
+line closed: "contract/regen-drift audit tooling". v0.9.48 ships it as
+`pristine_audit` — a read-only operator tool that re-derives every
+pristine contract legend from the ORIGINAL Anvil corpus and predicts,
+before the world ships, exactly which contracts would flip in production:
+
+- **inventory** — contracts, strip-canonical (v0.9.46) vs raw-only
+  (0.9.44/45) legends, stored keys, container size (read-only recipe
+  walk through the new `Store::pristine_legend(key)` face);
+- **legend check** (`--corpus`) — `hash_of` + `canonical_contract_hash`
+  re-computed from the corpus bytes, the exact hashes the contract check
+  uses (the legend is formed AND compared on the INCOMING payload bytes;
+  verified against the write path). Classification per chunk:
+  `raw_match` (byte-identical — bulletproof) / `canon_match` (the
+  relight/timer/key-order class the legend absorbs) / **DRIFT** (the
+  contract WILL flip — the pure-worldgen assertion is wrong for that
+  chunk: wrong seed, post-drain edit, generator drift);
+- **session check** (`--session`) — the §10 relight model (fresh light,
+  bumped timers, key-order drift) replayed against the stored legends:
+  kept/flipped prediction per chunk;
+- exit code 0/1 = a CI-able predeploy gate; no writes to the audited
+  store, ever; O(1) payload memory (region-file → hash → drop), so it
+  scales to the 262k-chunk class; `--import` mirrors the operator flow
+  (stage a copy — the production import drains its source — import, then
+  audit against the untouched original).
+
+Measured on the real corpus, end-to-end (`--import --session`): import
+728 chunks, **legend check raw_match=728 drift=0**, **session
+kept=728/728** (relight raw-hash differs 728/728 — every raw miss is
+canon-held), verdict PASS. Negative control (one tampered payload, +17 B
+root field — a real content change the legend must not absorb):
+**drift=1, session_flipped=1, verdict FAIL, exit 1**, the tampered chunk
+named. The wrong assertion is now a deploy-time red light, not a
+production erosion story. CI gains the audit gate (import → audit →
+ship, all counts pinned, `bench_pristine_audit.txt` artifact).
+
+With this the §10/§11 frontier list is empty: bytes closed (§8/§9),
+erosion closed (§10), first-write hazard closed (§11), assertion
+auditable (§12). 69/69 tests (new: `pristine_audit_legend_accessor`).
+
 ## v0.9.47 — shim-evidence pristine gating: the residual risk closes at the source
 
 The 0.9.44-0.9.46 contracts carried one documented, operator-accepted

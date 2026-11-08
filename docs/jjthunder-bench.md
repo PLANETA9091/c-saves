@@ -1553,3 +1553,38 @@ Flag-off byte-identity: enc_fp EXACT 6d240d7166cdda99 / 12130 members /
 9,971,843 bytes; JJ corpus verify ok=946 bad=0; bench_size compact x0.08;
 68/68 tests (new: unfresh-first-write stores honestly + never contracts
 later; fresh-first-write contracts; opt-out restores 0.9.46).
+
+## 0.9.48 — pristine contract audit: the wrong assertion is caught at deploy time
+
+The last named frontier (§10/§11 "contract/regen-drift audits") ships as
+`pristine_audit` — read-only, production hash chain, exit-code gate. For
+every pristine contract it re-derives the raw + strip-canonical hashes
+from the ORIGINAL corpus bytes (the exact incoming-payload-bytes form the
+contract check uses — verified against the write path) and predicts
+per-chunk restore behavior: raw_match (bulletproof) / canon_match
+(volatility absorbed) / DRIFT (will flip — assertion wrong for that
+chunk); `--session` replays the §10 relight model against the stored
+legends. `--import` mirrors the operator flow end-to-end: stage a copy
+(the production import drains its source), import, audit the untouched
+original.
+
+Real-corpus measurement (`pristine_audit /tmp/store --corpus
+bench-corpus/dim --import --session`):
+
+- import 728 chunks, contracts=728 (canon legends 728, raw-only 0);
+- legend check: **raw_match=728 drift=0** — every legend re-derives
+  byte-exact from the corpus;
+- session check: **kept=728/728** (relight raw-hash differs 728/728 —
+  all raw misses canon-held, §10 verdict transfers to the live legends);
+- negative control (one tampered payload, +17 B root field): **drift=1,
+  session_flipped=1, verdict FAIL, exit 1** — the tampered chunk is
+  named; deploy-time red light works.
+
+CI gains the audit gate (size-bench job): import → audit → ship, counts
+pinned, `bench_pristine_audit.txt` artifact. `Store::pristine_legend(key)`
+is the public read-only tooling face. Gates: 69/69 tests (new:
+`pristine_audit_legend_accessor` — legend equals the write-path hashes,
+None after flip / whole-mode / raw-only containers), enc_fp EXACT
+6d240d7166cdda99 / 12130 members / 9,971,843 bytes, bench_size compact
+x0.08 (gate 0.15). The §12 frontier list is empty: bytes closed, erosion
+closed, first-write hazard closed, assertion auditable.
