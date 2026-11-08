@@ -32,6 +32,21 @@ impl Registry {
         let whole_mode = kind != "region";
         if whole_mode {
             store.set_whole_mode();
+            // v0.9.53: POI-store elision, opt-in per process. The poi store
+            // is a DERIVED index — vanilla re-derives POIs from the chunk's
+            // block states on load (PoiManager.checkConsistencyWithBlocks /
+            // Yarn initForPalette; Moonrise redirects the same call), so
+            // persisting poi bytes buys nothing across restarts. Entities
+            // are NOT regenerable (mob spawn randomness) and never elide.
+            let poi_elide = std::env::var("CSAVES_POI_ELIDE")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false);
+            if kind == "poi" && poi_elide {
+                store.set_poi_elide();
+                eprintln!(
+                    "[c-saves] poi store: ELIDE mode (bounded session scratchpad, 0 B persisted — vanilla rebuilds from chunk block states: PoiManager.checkConsistencyWithBlocks)"
+                );
+            }
         }
         let chunk_count = store.chunk_count();
         let mut stores = self.stores.write();

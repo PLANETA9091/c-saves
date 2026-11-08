@@ -1607,6 +1607,31 @@ pub struct Store {
     /// strings benefit from the shared dictionary in slab streams; section
     /// stores hold canonical CSEC bytes where the dict only dilutes matches.
     whole_mode: AtomicBool,
+    /// v0.9.53 POI-store elision (opt-in, poi stores only). The points-of-
+    /// interest store is a DERIVED index, not primary world data: on chunk
+    /// load vanilla re-derives POIs from the chunk's block states
+    /// (PoiManager.checkConsistencyWithBlocks / Yarn initForPalette;
+    /// Moonrise redirects the same call), so persisting poi bytes buys
+    /// nothing across restarts. With the flag on, whole-mode writes are
+    /// ACKed and held ONLY in a bounded volatile scratchpad (read-your-
+    /// writes within the session, never on disk); after a reopen the
+    /// payloads are gone and vanilla rebuilds from block states — the
+    /// exact semantics of a missing poi file. Entities are NOT
+    /// regenerable (mob spawn randomness) and never elide.
+    poi_elide: AtomicBool,
+    /// The session scratchpad itself: key -> last written poi payload.
+    /// Bounded by `elide_cap` bytes (LRU by last write); payloads above
+    /// the cap are ACKed and dropped entirely (regenerable either way).
+    elide_map: Mutex<HashMap<u64, Vec<u8>>>,
+    /// Insertion/rewrite order for the LRU eviction.
+    elide_order: Mutex<VecDeque<u64>>,
+    /// Current scratchpad RAM footprint (kept == sum of map values).
+    elide_ram: AtomicU64,
+    /// Scratchpad byte cap (env CSAVES_POI_ELIDE_CAP, default 64 MiB).
+    elide_cap: AtomicU64,
+    /// §12-style telemetry: writes/bytes ACKed by the elision (never stored).
+    pub elide_writes: AtomicU64,
+    pub elide_bytes: AtomicU64,
     /// Set when a pack (slab + cold tier) pass was explicitly requested
     /// (e.g. right after an Anvil import).
     pack_requested: AtomicBool,
@@ -1677,6 +1702,13 @@ impl Store {
             disk_written: AtomicU64::new(0),
             logical_bytes: AtomicU64::new(0),
             whole_mode: AtomicBool::new(false),
+            poi_elide: AtomicBool::new(false),
+            elide_map: Mutex::new(HashMap::new()),
+            elide_order: Mutex::new(VecDeque::new()),
+            elide_ram: AtomicU64::new(0),
+            elide_cap: AtomicU64::new(env_parse("CSAVES_POI_ELIDE_CAP", 64 * 1024 * 1024)),
+            elide_writes: AtomicU64::new(0),
+            elide_bytes: AtomicU64::new(0),
             pack_requested: AtomicBool::new(false),
             pack_watermark: AtomicU64::new(0),
             last_written: Mutex::new(HashMap::new()),
@@ -3377,6 +3409,14 @@ impl Store {
         strip: bool,
         fresh: bool,
     ) -> Result<(), String> {
+        // v0.9.53 POI elision: the write is ACKed, held in the bounded
+        // session scratchpad and NEVER persisted. Short-circuits before any
+        // parse/hash/blob work — there is nothing to dedup or store.
+        if whole_mode && self.poi_elide.load(Ordering::Relaxed) {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.elide_write(key, payload);
+            return Ok(());
+        }
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.logical_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
         let pos_hint = Some(((key >> 32) as i32, (key & 0xffff_ffff) as i32));
@@ -3867,6 +3907,12 @@ impl Store {
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
     pub fn read_chunk(&self, key: u64) -> Option<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
+        // v0.9.53 POI elision: the scratchpad IS the store within the
+        // session; a miss means absent — the exact semantics of a missing
+        // poi file (vanilla rebuilds from chunk block states on load).
+        if self.poi_elide.load(Ordering::Relaxed) {
+            return self.elide_read(key);
+        }
         // located in a segment, or still pending in the recipe batch?
         enum Loc {
             Seg(u32, u64, u32),
@@ -5429,6 +5475,70 @@ impl Store {
         self.dict_enabled.store(false, Ordering::Relaxed);
     }
 
+    /// v0.9.53: mark this (whole-mode) store as a POI store running in
+    /// ELIDE mode. Opt-in per process via CSAVES_POI_ELIDE=1, wired by
+    /// engine::attach for kind=="poi" only — entities never elide.
+    /// Effects: whole-mode writes ACK into a bounded volatile scratchpad
+    /// (read-your-writes within the session); nothing reaches the disk;
+    /// after a reopen every payload reads None and vanilla rebuilds the
+    /// index from chunk block states (PoiManager.checkConsistencyWithBlocks
+    /// / Yarn initForPalette — the same call Moonrise redirects).
+    pub fn set_poi_elide(&self) {
+        self.poi_elide.store(true, Ordering::Relaxed);
+    }
+
+    pub fn poi_elide_enabled(&self) -> bool {
+        self.poi_elide.load(Ordering::Relaxed)
+    }
+
+    /// Scratchpad byte cap (operators may tighten; tests shrink it).
+    pub fn set_elide_cap(&self, bytes: u64) {
+        self.elide_cap.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Current scratchpad RAM footprint (operator/telemetry surface).
+    pub fn elide_ram_bytes(&self) -> u64 {
+        self.elide_ram.load(Ordering::Relaxed)
+    }
+
+    /// ACK a whole-mode poi write: stash in the scratchpad (LRU-bounded),
+    /// count the telemetry. Payloads above the cap are ACKed and dropped
+    /// entirely — regenerable either way.
+    fn elide_write(&self, key: u64, payload: &[u8]) {
+        self.elide_writes.fetch_add(1, Ordering::Relaxed);
+        self.elide_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        let cap = self.elide_cap.load(Ordering::Relaxed);
+        if payload.len() as u64 > cap {
+            return; // too big to even stage — a missing poi file is the semantics
+        }
+        let mut map = self.elide_map.lock();
+        let mut order = self.elide_order.lock();
+        // re-write of a staged key: drop the old copy, move to the back
+        if let Some(old) = map.remove(&key) {
+            self.elide_ram.fetch_sub(old.len() as u64, Ordering::Relaxed);
+            if let Some(i) = order.iter().position(|&k| k == key) {
+                order.remove(i);
+            }
+        }
+        while self.elide_ram.load(Ordering::Relaxed) + payload.len() as u64 > cap {
+            match order.pop_front() {
+                Some(old) => {
+                    if let Some(v) = map.remove(&old) {
+                        self.elide_ram.fetch_sub(v.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                None => break,
+            }
+        }
+        map.insert(key, payload.to_vec());
+        order.push_back(key);
+        self.elide_ram.fetch_add(payload.len() as u64, Ordering::Relaxed);
+    }
+
+    fn elide_read(&self, key: u64) -> Option<Vec<u8>> {
+        self.elide_map.lock().get(&key).cloned()
+    }
+
     /// Request a pack pass (slab-packing + cold-tier recompression) without
     /// waiting for dead bytes. Used after Anvil imports and for fresh data
     /// accumulation (auto-watermark).
@@ -5833,6 +5943,26 @@ pub mod tests {
         ));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    /// Recursive byte size of a directory — the same worst-case accounting
+    /// the scale probe uses for the container weight.
+    pub(crate) fn dir_size_of(p: &Path) -> u64 {
+        let mut n = 0u64;
+        if let Ok(rd) = fs::read_dir(p) {
+            for e in rd.flatten() {
+                let m = match e.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if m.is_dir() {
+                    n += dir_size_of(&e.path());
+                } else {
+                    n += m.len();
+                }
+            }
+        }
+        n
     }
 
     pub(crate) fn bench_cfg() -> Cfg {
@@ -7066,7 +7196,7 @@ pub(crate) mod glob_slab_test {
 #[cfg(test)]
 mod repro {
     use super::*;
-    use super::tests::{bench_cfg, chunk_payload, semantic, temp_dir};
+    use super::tests::{bench_cfg, chunk_payload, dir_size_of, semantic, temp_dir};
     use fastnbt::Value;
     use std::collections::HashMap as Map;
 
@@ -7898,6 +8028,114 @@ mod repro {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir3);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn poi_elide_scratchpad() {
+        // v0.9.53: the poi store is a derived index. With the elide flag on,
+        // whole-mode writes are ACKed into a bounded volatile scratchpad:
+        // session reads return the exact payload (read-your-writes), the
+        // container stays at the fresh-store baseline (0 B persisted), and
+        // after a reopen every payload is gone — vanilla rebuilds the index
+        // from chunk block states on load. Telemetry counts what the
+        // elision ACKed without storing.
+        let dir = temp_dir("poi-elide");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        s.set_whole_mode();
+        s.set_poi_elide();
+        assert!(s.poi_elide_enabled());
+
+        let keys = [key(0, 0), key(31, 31), key(-5, 7)];
+        let payloads: Vec<Vec<u8>> =
+            keys.iter().map(|k| chunk_payload((*k >> 32) as i32, *k as u32 as i32, 0)).collect();
+        for (k, p) in keys.iter().zip(payloads.iter()) {
+            s.write_chunk_fresh(*k, p, true, false).unwrap();
+        }
+        // session read-your-writes: the scratchpad IS the store
+        for (k, p) in keys.iter().zip(payloads.iter()) {
+            assert_eq!(s.read_chunk(*k).as_deref(), Some(p.as_slice()), "session coherence");
+        }
+        // nothing persisted: dir stays at the fresh-store baseline
+        s.sync();
+        let used = dir_size_of(&dir);
+        assert!(
+            used <= 64 * 1024,
+            "elided poi store must persist nothing (dir = {used} B)"
+        );
+        assert_eq!(s.elide_writes.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            s.elide_bytes.load(Ordering::Relaxed),
+            payloads.iter().map(|p| p.len()).sum::<usize>() as u64
+        );
+        // keys()/chunk_count stay empty: elided chunks are not stored data
+        assert_eq!(s.chunk_count(), 0);
+
+        // reopen: the scratchpad is RAM-only — everything reads None
+        let cfg = bench_cfg();
+        drop(s);
+        let s2 = Store::open_cfg(&dir, true, cfg).unwrap();
+        s2.set_whole_mode();
+        s2.set_poi_elide();
+        for k in keys {
+            assert_eq!(s2.read_chunk(k), None, "scratchpad must not survive reopen");
+        }
+        assert_eq!(s2.chunk_count(), 0);
+        assert!(
+            dir_size_of(&dir) <= 64 * 1024,
+            "reopen must not grow the container either"
+        );
+
+        // the default (flag off) keeps today's whole-mode semantics:
+        // the write persists and survives a reopen
+        let dir3 = temp_dir("poi-elide-off");
+        let s3 = Store::open_cfg(&dir3, true, bench_cfg()).unwrap();
+        s3.set_whole_mode();
+        assert!(!s3.poi_elide_enabled());
+        s3.write_chunk_fresh(keys[0], &payloads[0], true, false).unwrap();
+        assert_eq!(s3.read_chunk(keys[0]).as_deref(), Some(payloads[0].as_slice()));
+        s3.sync();
+        drop(s3);
+        let s4 = Store::open_cfg(&dir3, true, bench_cfg()).unwrap();
+        assert!(
+            s4.read_chunk(keys[0]).is_some(),
+            "elide-off whole-mode writes persist exactly as before"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir3);
+    }
+
+    #[test]
+    fn poi_elide_cap_evicts_lru() {
+        // the scratchpad is bounded: staging beyond the cap evicts the
+        // least-recently-written payloads (regenerable either way); payloads
+        // larger than the whole cap are ACKed and dropped entirely.
+        let dir = temp_dir("poi-elide-cap");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        s.set_whole_mode();
+        s.set_poi_elide();
+        let big = chunk_payload(0, 0, 0);
+        let small = chunk_payload(1, 1, 0);
+        s.set_elide_cap(big.len() as u64);
+        s.write_chunk_fresh(key(0, 0), &big, true, false).unwrap();
+        assert!(s.read_chunk(key(0, 0)).is_some(), "first payload stages");
+        // second payload does not fit: the oldest staged payload evicts
+        s.write_chunk_fresh(key(1, 1), &small, true, false).unwrap();
+        assert_eq!(s.read_chunk(key(0, 0)), None, "LRU eviction of the oldest");
+        assert_eq!(s.read_chunk(key(1, 1)).as_deref(), Some(small.as_slice()));
+        // staging the big payload again evicts the current front (the small
+        // one no longer fits beside it), and a following small write evicts
+        // the re-staged big one — the scratchpad never exceeds the cap
+        s.write_chunk_fresh(key(0, 0), &big, true, false).unwrap();
+        assert_eq!(s.read_chunk(key(1, 1)), None, "re-staging evicted the front");
+        assert_eq!(s.read_chunk(key(0, 0)).as_deref(), Some(big.as_slice()));
+        s.write_chunk_fresh(key(2, 2), &small, true, false).unwrap();
+        assert_eq!(s.read_chunk(key(0, 0)), None, "the newest small evicted the big one");
+        assert_eq!(s.read_chunk(key(2, 2)).as_deref(), Some(small.as_slice()));
+        // RAM accounting stays within the cap at every point
+        let ram = s.elide_ram.load(Ordering::Relaxed);
+        assert!(ram <= big.len() as u64, "scratchpad bounded (ram={ram})");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

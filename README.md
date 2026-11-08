@@ -154,6 +154,27 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.53 — the derived index goes extinct: POI-store elision, 0 B persisted
+
+The POI region files (`poi/*.mca`) are not world data — they are a
+derived index: vanilla rebuilds them from chunk block states on load
+(`PoiManager.checkConsistencyWithBlocks` / Yarn `initForPalette`;
+Moonrise redirects the same call). The new opt-in flag
+(`CSAVES_POI_ELIDE=1`, poi stores only) ACKs every poi write into a
+bounded volatile session scratchpad (LRU, cap 64 MiB) and persists
+nothing: session reads return the written payload, after a reopen
+everything reads None — the exact semantics of a missing poi file,
+which vanilla fills by rescanning block states. Measured on the same
+262,144-chunk world (41 poi chunks/region, 10,496 poi chunks): vanilla
+`poi/` = 43.0 MiB, the whole-mode container (today) = 1805.3 KiB, the
+elision = **0 B persisted**. Whole-world arithmetic at the flagship
+tiers: Anvil region+poi 1069.0 MiB vs c-saves **65.0 KiB** =
+**x0.000059 — 99.994%** (the elision alone makes the whole-world ratio
+~29x harsher). The legacy import path names + counts + removes the
+derived index (`CSAVES_KEEP_MCA=1` keeps); entities are NOT
+regenerable (mob spawn randomness) and never elide. CI pins the whole
+ladder; 75/75 tests.
+
 ## v0.9.52 — harsher arithmetic: the region-assert tier, 262,144 chunks in 34 KiB
 
 Yes, there is harsher arithmetic. A per-chunk legend carries two random

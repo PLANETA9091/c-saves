@@ -741,3 +741,59 @@ closed (§10), first-write hazard closed (§11), assertion auditable (§12),
 export accountable (§13), operator surface honest (§14), the -90% promise
 proven at scale (§15), and the arithmetic pushed to its information-
 theoretic floor (§16).
+
+## 17. Research tick 13 — the derived index goes extinct (v0.9.53): POI-store elision, 0 B persisted
+
+§16 parked the next-harsher candidate with facts; this tick cashes it.
+The POI region files (`poi/*.mca`) are NOT primary world data — they are
+a derived index. Vanilla rebuilds them from the chunk block states on
+load: `PoiManager.checkConsistencyWithBlocks` (Yarn `initForPalette`)
+runs from chunk deserialization and re-registers every POI block the
+palette contains; Paper's Moonrise redirects the same call. Persisting
+poi bytes therefore buys nothing across restarts — a missing poi file
+and a written poi file converge to the same rebuilt state.
+
+**The measured ladder at the same 262,144-chunk world** (fabricated
+vanilla `poi/` dir, 41 poi chunks per region — villages, job sites,
+beds; 10,496 poi chunks, vanilla zlib-6 4-KiB-sector layout):
+
+| tier | weight | vs vanilla poi/ |
+|---|---|---|
+| vanilla `poi/` dir | 43.0 MiB | x1.0 (4 KiB sector granularity per poi chunk — padding dominates) |
+| whole-mode container (today, elide off) | 1805.3 KiB | x0.041 (field-split dedup + blobs) |
+| elision (`CSAVES_POI_ELIDE=1`) | **0 B persisted** | x0 — extinct |
+
+**The elision semantics (opt-in, poi stores only).** `engine::attach`
+flags kind=="poi" when `CSAVES_POI_ELIDE=1`; the store then ACKs every
+whole-mode write into a bounded volatile scratchpad (LRU, default cap
+64 MiB, `CSAVES_POI_ELIDE_CAP` to tune) and persists nothing: reads
+within the session return the exact written payload (read-your-writes
+— Paper may evict and re-read a poi region file mid-session), and after
+a reopen every payload reads None — the exact semantics of a missing
+poi file, which vanilla fills by rescanning block states. Payloads
+above the cap are ACKed and dropped entirely (regenerable either way).
+Telemetry counts what the elision ACKed without storing (`poi.elide_writes`
+/ `poi.elide_bytes`, §12-style honesty). The legacy import path gains
+the same switch: `poi/` is named, counted and removed (one line —
+"derived index — vanilla rebuilds from chunk block states on load"),
+`CSAVES_KEEP_MCA=1` keeps the files like the region import. Entities
+are NOT regenerable (mob spawn randomness) and never elide — parked
+permanently (§16).
+
+**The whole-world arithmetic.** At the flagship tiers (region-assert
+region container + elided poi), the 262k-chunk world now weighs:
+Anvil region+poi = 1069.0 MiB vs c-saves = 65.0 KiB = **x0.000059 of
+Anvil — 99.994%** (the elision alone makes the whole-world ratio ~29x
+harsher: the poi whole-mode container would have dwarfed the 34 KiB
+region tier 27:1). CI pins the corpus, the 0.0 KiB persisted line, the
+RAM-only reopen, the elision gate and the whole-world gate (< x0.0001).
+
+Gates: 75/75 tests (poi scratchpad semantics, LRU cap eviction, legacy
+dir elision), enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
+bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS
+with the poi ladder greps. The full weight story: bytes closed (§8/§9),
+erosion closed (§10), first-write hazard closed (§11), assertion
+auditable (§12), export accountable (§13), operator surface honest
+(§14), the -90% promise proven at scale (§15), the per-chunk arithmetic
+at its information-theoretic floor (§16), and the last derived store —
+the POI index — extinct (§17).

@@ -136,6 +136,15 @@ jobs:
           grep -q "scale region verification cost: 2 re-save(s) stored honestly (identical included), 262142 of 262144 slots still asserted" bench_scale_probe.txt || { echo "FAIL: region verification cost semantics"; exit 1; }
           grep -q "scale region export accounting: 2 stored + 262142 pristine_skipped + 0 lost = 262144 keys" bench_scale_probe.txt || { echo "FAIL: region export accounting"; exit 1; }
           grep -q "scale region reimport: 2/2 edits re-asserted at region grain" bench_scale_probe.txt || { echo "FAIL: region re-import"; exit 1; }
+          # v0.9.53: the POI store is a DERIVED index — vanilla rebuilds it
+          # from chunk block states on load (PoiManager.checkConsistency-
+          # WithBlocks). The elision pins 0 B persisted (session scratchpad
+          # only) and the whole-world arithmetic at the flagship tiers.
+          grep -q "poi vanilla weight: 256 file(s), 10496 poi chunks," bench_scale_probe.txt || { echo "FAIL: poi vanilla corpus"; exit 1; }
+          grep -q "poi container elided: 0.0 KiB — 0 B persisted" bench_scale_probe.txt || { echo "FAIL: poi elision weight"; exit 1; }
+          grep -q "poi elide reopen: 0/" bench_scale_probe.txt || { echo "FAIL: scratchpad is not RAM-only"; exit 1; }
+          grep -q "poi elision gate: PASS (vanilla poi/ -> 0 persisted)" bench_scale_probe.txt || { echo "FAIL: poi elision gate"; exit 1; }
+          grep -q "scale total gate: PASS (< x0.0001 — the whole-world arithmetic)" bench_scale_probe.txt || { echo "FAIL: whole-world arithmetic"; exit 1; }
           grep -q "=== scale probe: PASS ===" bench_scale_probe.txt || { echo "FAIL: scale verdict"; exit 1; }
 
   jj-bench:

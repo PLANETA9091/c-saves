@@ -1626,6 +1626,28 @@ bench_size compact x0.08 (gate 0.15). Research §13: the last silent
 None on an operator path is counted, named, and gated — export
 accountable.
 
+## 0.9.53 — the derived index goes extinct: POI-store elision (0 B persisted)
+
+The POI store is the last non-chunk mass in a world dir, and it is a
+DERIVED index: vanilla re-derives POIs from chunk block states on load
+(`PoiManager.checkConsistencyWithBlocks` / Yarn `initForPalette`;
+Moonrise redirects the same call). `CSAVES_POI_ELIDE=1` (opt-in, poi
+stores only) turns the poi container into a bounded volatile session
+scratchpad — LRU cap 64 MiB (`CSAVES_POI_ELIDE_CAP`), read-your-writes
+within the session, 0 B persisted, reopen reads None and vanilla
+rebuilds from block states (the exact semantics of a missing poi
+file). Measured on the 262,144-chunk scale world (41 poi chunks/region
+= 10,496 poi chunks): vanilla `poi/` 43.0 MiB (4 KiB sector padding
+dominates) -> whole-mode container 1805.3 KiB -> elision **0 B**.
+Whole-world arithmetic at the flagship tiers: Anvil region+poi
+1069.0 MiB vs c-saves 65.0 KiB = **x0.000059 (99.994%)** — the elision
+alone makes the whole-world ratio ~29x harsher. Legacy import names +
+counts + removes the derived index (CSAVES_KEEP_MCA=1 keeps);
+entities are NOT regenerable (mob spawn randomness) — parked
+permanently. Gates: 75/75 tests, scale probe poi ladder greps
+(vanilla corpus, 0.0 KiB persisted, RAM-only reopen, elision PASS,
+whole-world < x0.0001).
+
 ## 0.9.52 — harsher arithmetic: the region-assert tier (0.13 B/chunk, x0.00003)
 
 The answer to "is there harsher arithmetic": the per-chunk legend is

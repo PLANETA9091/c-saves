@@ -18,7 +18,11 @@
 //!      every segment, header, frame and dictionary included (worst case);
 //!   5. the v0.9.49 export accounting at scale (chunks + pristine_skipped
 //!      + lost == keys) and the exported Anvil re-imports with exact
-//!      legends for every edit.
+//!      legends for every edit;
+//!   6. the v0.9.53 POI phase: a vanilla poi/ dir is fabricated at a
+//!      documented density and measured; today's whole-mode container is
+//!      compared against the elision (CSAVES_POI_ELIDE semantics — session
+//!      scratchpad, 0 B persisted, vanilla rebuilds from block states).
 //!
 //! Gate: container/anvil < x0.10 — the user-level -90% promise, asserted
 //! at 262k-chunk scale (a panic exits non-zero, CI-able).
@@ -140,6 +144,91 @@ fn write_region(world: &wgen::World, out_dir: &Path, rx: i32, rz: i32) -> std::i
     f.write_all(&hdr)?;
     f.sync_all()?;
     Ok(f.metadata()?.len())
+}
+
+/// One vanilla-format POI region file: per-chunk POI lists in the same
+/// .mca container layout (8 KiB header + 4 KiB sectors, zlib-6). 41 poi
+/// chunks per region — the documented density of a lived-in survival world
+/// (villages, job sites, beds, bee nests). Returns the file size.
+fn write_poi_region(out_dir: &Path, rx: i32, rz: i32) -> std::io::Result<u64> {
+    let path = out_dir.join(format!("r.{rx}.{rz}.mca"));
+    let mut f = std::fs::File::create(&path)?;
+    let mut offsets = [0u32; 1024];
+    {
+        let mut buf = std::io::BufWriter::with_capacity(1 << 18, &mut f);
+        buf.write_all(&[0u8; 8192])?; // location + timestamp header placeholder
+        let mut sector_cursor = 8192u64 / 4096;
+        for i in (0..1024usize).step_by(25) {
+            let lx = (i & 31) as i32;
+            let lz = (i >> 5) as i32;
+            let payload = poi_chunk_nbt(rx * 32 + lx, rz * 32 + lz);
+            let mut z = flate2::write::ZlibEncoder::new(
+                Vec::with_capacity(payload.len()),
+                flate2::Compression::new(6),
+            );
+            z.write_all(&payload)?;
+            let comp = z.finish()?;
+            let entry_len = 5 + comp.len();
+            let sectors = ((entry_len + 4095) / 4096) as u32;
+            offsets[i] = ((sector_cursor as u32) << 8) | sectors;
+            buf.write_all(&(entry_len as u32).to_be_bytes())?;
+            buf.write_all(&[2u8])?; // zlib, vanilla compression type
+            buf.write_all(&comp)?;
+            buf.write_all(&vec![0u8; sectors as usize * 4096 - entry_len])?;
+            sector_cursor += sectors as u64;
+        }
+        buf.flush()?;
+    }
+    f.seek(std::io::SeekFrom::Start(0))?;
+    let mut hdr = Vec::with_capacity(8192);
+    for o in &offsets {
+        hdr.extend_from_slice(&o.to_be_bytes());
+    }
+    hdr.extend_from_slice(&[0u8; 4096]);
+    f.write_all(&hdr)?;
+    f.sync_all()?;
+    Ok(f.metadata()?.len())
+}
+
+/// One poi chunk's NBT in the vanilla PoiManager save form: a root
+/// compound with a `Data` list of {Type, Pos[I;3], FreeTickets} records.
+/// 1-3 POIs per chunk, deterministic in the coordinates.
+fn poi_chunk_nbt(cx: i32, cz: i32) -> Vec<u8> {
+    let n = 1 + ((cx as i64 * 341 + cz as i64 * 173).rem_euclid(3)) as usize;
+    let mut b = Vec::with_capacity(128);
+    b.push(0x0A); // TAG_Compound root
+    b.extend_from_slice(&0u16.to_be_bytes()); // ""
+    b.push(0x09); // TAG_List
+    b.extend_from_slice(&4u16.to_be_bytes());
+    b.extend_from_slice(b"Data");
+    b.push(0x0A); // element type: TAG_Compound
+    b.extend_from_slice(&(n as u32).to_be_bytes());
+    for i in 0..n {
+        b.push(0x0A);
+        b.extend_from_slice(&0u16.to_be_bytes());
+        // Type: "minecraft:bed"
+        b.push(0x08);
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.extend_from_slice(b"Type");
+        b.extend_from_slice(&13u16.to_be_bytes());
+        b.extend_from_slice(b"minecraft:bed");
+        // Pos: [I;3]
+        b.push(0x0B);
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.extend_from_slice(b"Pos");
+        b.extend_from_slice(&3u32.to_be_bytes());
+        b.extend_from_slice(&(cx * 16 + i as i32).to_be_bytes());
+        b.extend_from_slice(&64i32.to_be_bytes());
+        b.extend_from_slice(&(cz * 16 + i as i32).to_be_bytes());
+        // FreeTickets: 2
+        b.push(0x03);
+        b.extend_from_slice(&11u16.to_be_bytes());
+        b.extend_from_slice(b"FreeTickets");
+        b.extend_from_slice(&2i32.to_be_bytes());
+        b.push(0x00); // end element
+    }
+    b.push(0x00); // end root
+    b
 }
 
 fn main() {
@@ -413,6 +502,133 @@ fn main() {
     let _ = std::fs::remove_dir_all(&work.join("store-region2"));
     drop(sc);
     let _ = std::fs::remove_dir_all(&work.join("store-region"));
+
+    // ---- 8. the POI store (v0.9.53): the derived index, elided ----
+    // A lived-in world also carries poi/*.mca — the points-of-interest
+    // index. Vanilla rebuilds it from chunk block states on load
+    // (PoiManager.checkConsistencyWithBlocks / Yarn initForPalette;
+    // Moonrise redirects the same call), so persisting poi bytes buys
+    // nothing across restarts. This phase measures the vanilla poi/ weight
+    // at a documented density (41 poi chunks per region), today's
+    // whole-mode container, and the elision (CSAVES_POI_ELIDE semantics:
+    // bounded session scratchpad, read-your-writes, 0 B persisted).
+    let poi_dir = work.join("gen-poi");
+    std::fs::create_dir_all(&poi_dir).unwrap();
+    let anvil_poi = AtomicU64::new(0);
+    for ri in 0..n_regions {
+        let rx = (ri / side) as i32;
+        let rz = (ri % side) as i32;
+        let n = write_poi_region(&poi_dir, rx, rz).expect("poi gen");
+        anvil_poi.fetch_add(n, Ordering::Relaxed);
+    }
+    let anvil_poi = anvil_poi.load(Ordering::Relaxed);
+    let poi_chunks = 41usize * n_regions;
+    println!(
+        "poi vanilla weight: {n_regions} file(s), {poi_chunks} poi chunks, {:.1} MiB (4 KiB sector granularity per poi chunk)",
+        anvil_poi as f64 / 1048576.0
+    );
+
+    let poi_keys: Vec<u64> = (0..n_regions)
+        .flat_map(|ri| {
+            let rx = (ri / side) as i32;
+            let rz = (ri % side) as i32;
+            (0..1024usize).step_by(25).map(move |i| {
+                wgen::key(rx * 32 + (i & 31) as i32, rz * 32 + (i >> 5) as i32)
+            })
+        })
+        .collect();
+    assert_eq!(poi_keys.len(), poi_chunks);
+    let poi_payloads: BTreeMap<u64, Vec<u8>> = poi_keys
+        .iter()
+        .map(|&k| {
+            let cx = (k >> 32) as i32;
+            let cz = (k & 0xffff_ffff) as u32 as i32;
+            (k, poi_chunk_nbt(cx, cz))
+        })
+        .collect();
+
+    // today's behavior: the whole-mode store persists the poi payloads
+    let s_off = Store::open_cfg(&work.join("store-poi-off"), true, Cfg::from_env()).unwrap();
+    s_off.set_whole_mode();
+    for (k, p) in &poi_payloads {
+        s_off.write_chunk(*k, p, true).expect("poi write ok");
+    }
+    s_off.sync();
+    let container_poi_off = dir_size(&work.join("store-poi-off"));
+    println!(
+        "poi container today (elide off): {:.1} KiB (whole-mode store: field-split + blobs)",
+        container_poi_off as f64 / 1024.0
+    );
+
+    // the elision: the same writes, 0 B persisted, session scratchpad only
+    let s_on = Store::open_cfg(&work.join("store-poi-on"), true, Cfg::from_env()).unwrap();
+    s_on.set_whole_mode();
+    s_on.set_poi_elide();
+    for (k, p) in &poi_payloads {
+        s_on.write_chunk(*k, p, true).expect("poi write ok");
+    }
+    let sample: Vec<u64> = poi_keys.iter().step_by(512).copied().collect();
+    for k in &sample {
+        assert_eq!(
+            s_on.read_chunk(*k).as_deref(),
+            poi_payloads.get(k).map(|v| v.as_slice()),
+            "session read-your-writes"
+        );
+    }
+    s_on.sync();
+    let container_poi_on = dir_size(&work.join("store-poi-on"));
+    assert_eq!(s_on.elide_writes.load(Ordering::Relaxed), poi_chunks as u64);
+    assert_eq!(
+        s_on.elide_bytes.load(Ordering::Relaxed),
+        poi_payloads.values().map(|v| v.len()).sum::<usize>() as u64
+    );
+    println!(
+        "poi container elided: {:.1} KiB — 0 B persisted, session scratchpad only (staged {}, cap 64 MiB)",
+        container_poi_on as f64 / 1024.0,
+        s_on.elide_ram_bytes()
+    );
+    drop(s_on);
+    let s_re = Store::open_cfg(&work.join("store-poi-on"), true, Cfg::from_env()).unwrap();
+    s_re.set_poi_elide();
+    let survived = sample.iter().filter(|k| s_re.read_chunk(**k).is_some()).count();
+    assert_eq!(survived, 0, "the scratchpad is RAM-only — nothing may survive reopen");
+    println!(
+        "poi elide reopen: 0/{} payloads survive (RAM-only — vanilla rebuilds from block states)",
+        sample.len()
+    );
+    if container_poi_on > container_poi_off {
+        panic!(
+            "poi elision FAIL: elided container {container_poi_on} B heavier than today's {container_poi_off} B"
+        );
+    }
+    println!("poi elision gate: PASS (vanilla poi/ -> 0 persisted)");
+
+    // combined arithmetic at the flagship tiers: region-assert region
+    // container + elided poi vs Anvil region + poi — the WHOLE-world weight
+    let total_anvil = anvil + anvil_poi;
+    let total_mod = container_c2 + container_poi_on;
+    let ratio_t = total_mod as f64 / total_anvil.max(1) as f64;
+    println!(
+        "scale total with poi: anvil {} bytes ({:.1} MiB) vs c-saves {} bytes ({:.1} KiB) = x{:.6} -> {:.3}% saved",
+        total_anvil,
+        total_anvil as f64 / 1048576.0,
+        total_mod,
+        total_mod as f64 / 1024.0,
+        ratio_t,
+        (1.0 - ratio_t) * 100.0
+    );
+    if ratio_t >= 0.0001 {
+        panic!(
+            "total gate FAIL: x{ratio_t:.6} of anvil region+poi (target < x0.0001 — the whole-world arithmetic)"
+        );
+    }
+    println!("scale total gate: PASS (< x0.0001 — the whole-world arithmetic)");
+
+    drop(s_off);
+    drop(s_re);
+    let _ = std::fs::remove_dir_all(&work.join("store-poi-off"));
+    let _ = std::fs::remove_dir_all(&work.join("store-poi-on"));
+    let _ = std::fs::remove_dir_all(&poi_dir);
 
     // ---- verdict ----
     println!(
