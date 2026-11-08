@@ -492,3 +492,49 @@ pub fn semantic_eq(a: &[u8], b: &[u8]) -> bool {
     let vb: Value = fastnbt::from_bytes(b).unwrap();
     va == vb
 }
+
+/// v0.9.46: a simulated Paper relight re-save of a pristine chunk. The
+/// seeded content is untouched; every volatile byte moves:
+///   - per-section SkyLight/BlockLight replaced with deterministic junk
+///     (the light engine hands back fresh arrays on every relight);
+///   - lastUpdate bumped, InhabitedTime bumped (a player merely loaded the
+///     chunk), isLightOn set to 1 (relit light is live);
+///   - the payload is re-serialized through fastnbt's HashMap-backed
+///     Value, which shuffles compound key order — the serializer-drift
+///     dimension the strip-canonical contract hash must survive (the raw
+///     payload hash flips by construction).
+pub fn relit_variant(payload: &[u8]) -> Vec<u8> {
+    let v: Value = fastnbt::from_bytes(payload).expect("payload parses");
+    let mut root = match v {
+        Value::Compound(m) => m,
+        _ => panic!("chunk root is a compound"),
+    };
+    if let Some(Value::List(secs)) = root.get_mut("sections") {
+        for s in secs.iter_mut() {
+            if let Value::Compound(sm) = s {
+                sm.insert(
+                    "SkyLight".to_string(),
+                    Value::ByteArray(fastnbt::ByteArray::new(vec![0x7f; 2048])),
+                );
+                sm.insert(
+                    "BlockLight".to_string(),
+                    Value::ByteArray(fastnbt::ByteArray::new(vec![0x03; 2048])),
+                );
+            }
+        }
+    }
+    match root.get_mut("lastUpdate") {
+        Some(Value::Long(l)) => *l = l.wrapping_add(1000),
+        _ => {
+            root.insert("lastUpdate".to_string(), Value::Long(1000));
+        }
+    }
+    match root.get_mut("InhabitedTime") {
+        Some(Value::Long(l)) => *l = l.wrapping_add(123),
+        _ => {
+            root.insert("InhabitedTime".to_string(), Value::Long(123));
+        }
+    }
+    root.insert("isLightOn".to_string(), Value::Byte(1));
+    fastnbt::to_bytes(&Value::Compound(root)).expect("re-serialize")
+}

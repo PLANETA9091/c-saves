@@ -343,6 +343,16 @@ pub struct Cfg {
     /// contracted. CSAVES_PRISTINE=import|2, or CSAVES_PRISTINE_IMPORT=1
     /// alongside pristine=1.
     pub pristine_import: bool,
+    /// v0.9.46: strip-canonical contract legends (requires `pristine`).
+    /// When on (default), mode-7 contracts carry a second hash — the
+    /// order-free structural digest of the payload minus derived light and
+    /// root timers (chunknbt::canonical_contract_hash, 33 B contracts) —
+    /// and the write path keeps the contract when a byte-different
+    /// re-save matches it (Paper relight, InhabitedTime/lastUpdate churn,
+    /// compound-key-order drift). CSAVES_PRISTINE_CANON=0 restores the
+    /// raw-only 0.9.44/0.9.45 flip semantics (17 B contracts); contracts
+    /// formed before this version behave identically either way.
+    pub pristine_canon: bool,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
     /// Slab member cap for whole-mode stores (entity/POI payloads).
@@ -443,6 +453,7 @@ impl Default for Cfg {
             recipe_level: 6,
             pristine: false,
             pristine_import: false,
+            pristine_canon: true,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
             auto_pack_bytes: 4 * 1024 * 1024,
@@ -544,6 +555,9 @@ impl Cfg {
                 || std::env::var("CSAVES_PRISTINE_IMPORT")
                     .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                     .unwrap_or(false),
+            pristine_canon: std::env::var("CSAVES_PRISTINE_CANON")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
         }
     }
 }
@@ -698,6 +712,21 @@ struct Recipe {
     /// pipeline (flip-on-mismatch). Never coexists with whole/sections/tail
     /// by construction.
     pristine: Option<Hash>,
+    /// v0.9.46: strip-canonical contract hash ([mode 7][raw 16B][canon
+    /// 16B] = 33 B). Order-free structural digest minus derived light and
+    /// root timers (chunknbt::canonical_contract_hash): a re-save that
+    /// differs in bytes only through relit light / InhabitedTime /
+    /// lastUpdate / compound key order keeps the contract. None = raw-only
+    /// contract (0.9.44/0.9.45 semantics; canonical form refused to parse).
+    pristine_canon: Option<Hash>,
+}
+
+/// v0.9.46: the contract legend of a pristine key — the raw payload hash
+/// (O(1) fast path) plus the optional strip-canonical hash (the erosion
+/// defense that decides byte-different re-saves).
+struct PristineLegend {
+    raw: Hash,
+    canon: Option<Hash>,
 }
 
 fn crc_of(b: &[u8]) -> u32 {
@@ -721,6 +750,7 @@ impl Recipe {
             fields: Vec::new(),
             pos_from_key: false,
             pristine: None,
+            pristine_canon: None,
         };
         let mut p = 0usize;
         let mode = *b.first()?;
@@ -888,12 +918,19 @@ impl Recipe {
             }
             7 => {
                 // v0.9.44 pristine regeneration contract: [7][hash 16B].
-                // Nothing stored — the seed regenerates the content.
-                if b.len() < 17 {
+                // v0.9.46 strip-canonical legend: [7][raw 16B][canon 16B]
+                // (exact lengths; anything else is malformed). Nothing is
+                // stored — the seed regenerates the content.
+                if b.len() != 17 && b.len() != 33 {
                     return None;
                 }
                 let h = ((rd8(&mut p) as u128) << 64) | rd8(&mut p) as u128;
-                Some(Recipe { pristine: Some(h), ..EMPTY })
+                let canon = if b.len() == 33 {
+                    Some(((rd8(&mut p) as u128) << 64) | rd8(&mut p) as u128)
+                } else {
+                    None
+                };
+                Some(Recipe { pristine: Some(h), pristine_canon: canon, ..EMPTY })
             }
             _ => None,
         }
@@ -920,12 +957,17 @@ impl Recipe {
     /// `id_of` returns the BLOB2 id of a live blob hash (None for legacy).
     fn encode(&self, id_of: impl Fn(Hash) -> Option<u32>) -> Vec<u8> {
         let mut v = Vec::with_capacity(64);
-        // mode 7 first: the contract is always the smallest form (17 B) and
-        // must never silently degrade into content storage.
+        // mode 7 first: the contract is always the smallest form (17 B
+        // raw-only, 33 B with the v0.9.46 canonical legend) and must never
+        // silently degrade into content storage.
         if let Some(h) = self.pristine {
             v.push(7u8);
             v.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
             v.extend_from_slice(&(h as u64).to_le_bytes());
+            if let Some(c) = self.pristine_canon {
+                v.extend_from_slice(&((c >> 64) as u64).to_le_bytes());
+                v.extend_from_slice(&(c as u64).to_le_bytes());
+            }
             return v;
         }
         if let Some(h) = self.whole {
@@ -1279,6 +1321,10 @@ pub fn pack_census_reset() {
 }
 /// Unchanged-chunk autosave skips (hash match against the last write).
 pub static ST_WRITE_SKIP: AtomicU64 = AtomicU64::new(0);
+/// v0.9.46: re-saves of contracted chunks that kept the contract through
+/// the strip-canonical legend (raw hash differed, canonical hash matched —
+/// relit light / timer churn / key-order drift, zero bytes stored).
+pub static ST_PRISTINE_CANON: AtomicU64 = AtomicU64::new(0);
 pub static ST_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_SECTLOAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_FUSED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -3145,9 +3191,30 @@ impl Store {
                 // hash is the recipe itself — O(1) skip, no flip, no
                 // storage: Paper re-serializing the regenerated identical
                 // chunk is exactly the content the seed produces.
-                if !hit && self.cfg.pristine && self.pristine_hash_of(key) == Some(hash) {
-                    ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
+                // v0.9.46: a byte-DIFFERENT re-save of contracted content
+                // (relit light, bumped InhabitedTime/lastUpdate, shuffled
+                // compound key order) also stays a contract when the
+                // strip-canonical legend matches — the raw hash alone
+                // eroded one relight re-save at a time.
+                if !hit && self.cfg.pristine {
+                    if let Some(legend) = self.pristine_legend_of(key) {
+                        if legend.raw == hash {
+                            ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        if self.cfg.pristine_canon {
+                            if let (Some(c), Some(ch)) = (
+                                legend.canon,
+                                chunknbt::canonical_contract_hash(payload),
+                            ) {
+                                if c == ch {
+                                    ST_PRISTINE_CANON.fetch_add(1, Ordering::Relaxed);
+                                    ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3174,6 +3241,16 @@ impl Store {
             && !self.chunks.read().contains_key(&key)
             && self.recipe_batch.lock().get(key).is_none();
         let recipe = if pristine_cand {
+            // v0.9.46: the strip-canonical legend rides alongside the raw
+            // payload hash — [mode 7][raw 16 B][canon 16 B] (33 B) when
+            // pristine_canon is on and the payload parses, else the 0.9.44
+            // 17 B raw-only contract. The legend is what lets a relight
+            // re-save keep the contract instead of eroding it.
+            let canon = if self.cfg.pristine_canon {
+                chunknbt::canonical_contract_hash(payload)
+            } else {
+                None
+            };
             Recipe {
                 whole: None,
                 sections: Vec::new(),
@@ -3181,10 +3258,11 @@ impl Store {
                 fields: Vec::new(),
                 pos_from_key: false,
                 pristine: Some(hash),
+                pristine_canon: canon,
             }
         } else if whole_mode && payload.len() > 1024 {
             self.ensure_blob(hash, payload, false)?;
-            Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None }
+            Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None, pristine_canon: None }
         } else {
             let split = chunknbt::split(payload, whole_mode, pos_hint, strip)?;
             WST_SPLIT.0.fetch_add(t0w.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3193,7 +3271,7 @@ impl Store {
             let r = match split {
             Split::Whole { hash } => {
                 self.ensure_blob(hash, payload, false)?;
-                Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None }
+                Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None, pristine_canon: None }
             }
             Split::Fields { parts, pos_from_key } => {
                 let mut fields = Vec::with_capacity(parts.len());
@@ -3205,13 +3283,13 @@ impl Store {
                         fields.push((self.intern_key(&p.key)?, FieldVal::Hash(p.hash)));
                     }
                 }
-                Recipe { whole: None, sections: Vec::new(), tail: Tail::None, fields, pos_from_key, pristine: None }
+                Recipe { whole: None, sections: Vec::new(), tail: Tail::None, fields, pos_from_key, pristine: None, pristine_canon: None }
             }
             Split::Split { sections, tail } => {
                 if sections.len() > MAX_SECTIONS {
                     let h = chunknbt::hash_of(payload);
                     self.ensure_blob(h, payload, false)?;
-                    Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None }
+                    Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None, pristine_canon: None }
                 } else {
                     let mut hashes = Vec::with_capacity(sections.len());
                     // v0.9.39: a blob-eligible tail (>= tail_blob_min) rides
@@ -3265,7 +3343,7 @@ impl Store {
                             Tail::Inline { dict: tdict, comp: tcomp, raw: tail.len() as u32 }
                         }
                     };
-                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false, pristine: None }
+                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false, pristine: None, pristine_canon: None }
                 }
             }
             };
@@ -3461,14 +3539,25 @@ impl Store {
         hashes.iter().all(|h| blobs.contains_key(h))
     }
 
-    /// v0.9.44: the pristine contract hash of a key, if its live recipe is
-    /// mode 7 (pending batch first — read-your-writes — then committed).
+    /// v0.9.44: the pristine contract of a key, if its live recipe is mode
+    /// 7 (pending batch first — read-your-writes — then committed).
+    /// v0.9.46: returns the full legend — the raw payload hash plus the
+    /// strip-canonical hash when the contract carries one. 0.9.44/0.9.45
+    /// containers store raw-only contracts (canon = None): they behave
+    /// exactly as before, raw fast path + flip on any byte difference.
+    fn pristine_legend_of(&self, key: u64) -> Option<PristineLegend> {
+        let rec = if let Some(p) = self.recipe_batch.lock().get(key).cloned() {
+            self.parse_recipe_body(&p)?
+        } else {
+            let (seg, off, len) = *self.chunks.read().get(&key)?;
+            self.recipe_at(key, seg, off, len)?
+        };
+        rec.pristine.map(|raw| PristineLegend { raw, canon: rec.pristine_canon })
+    }
+
+    /// v0.9.44: the pristine contract raw payload hash of a key.
     fn pristine_hash_of(&self, key: u64) -> Option<Hash> {
-        if let Some(p) = self.recipe_batch.lock().get(key).cloned() {
-            return self.parse_recipe_body(&p).and_then(|r| r.pristine);
-        }
-        let (seg, off, len) = *self.chunks.read().get(&key)?;
-        self.recipe_at(key, seg, off, len).and_then(|r| r.pristine)
+        self.pristine_legend_of(key).map(|l| l.raw)
     }
 
     /// Verify/tooling hook: does this key resolve to a pristine
@@ -4886,6 +4975,7 @@ impl Store {
                 fields: new_fields,
                 pos_from_key: rec.pos_from_key,
                 pristine: None,
+                pristine_canon: None,
             };
             let id_of = |h: Hash| -> Option<u32> {
                 let blobs = self.blobs.read();
@@ -6956,6 +7046,109 @@ mod repro {
         s3.write_chunk(key(11, 21), &a2, false).unwrap();
         assert!(s3.is_pristine(key(11, 21)), "post-restart identical re-save must stay pristine");
         assert!(s3.read_chunk(key(11, 21)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tests-mod relight mutator (chunk_payload shape above has no light
+    /// and no timers): adds junk section light arrays + volatile timers,
+    /// re-serializes through the HashMap-backed Value (compound key order
+    /// shuffles — the serializer-drift dimension).
+    fn relit(cx: i32, cz: i32) -> Vec<u8> {
+        let a = chunk_payload(cx, cz, 0);
+        let v: Value = fastnbt::from_bytes(&a).unwrap();
+        let mut root = match v {
+            Value::Compound(m) => m,
+            _ => unreachable!("chunk root is a compound"),
+        };
+        if let Some(Value::List(secs)) = root.get_mut("sections") {
+            for s in secs.iter_mut() {
+                if let Value::Compound(sm) = s {
+                    sm.insert(
+                        "SkyLight".to_string(),
+                        Value::ByteArray(fastnbt::ByteArray::new(vec![0x7f; 2048])),
+                    );
+                    sm.insert(
+                        "BlockLight".to_string(),
+                        Value::ByteArray(fastnbt::ByteArray::new(vec![0x03; 2048])),
+                    );
+                }
+            }
+        }
+        root.insert("lastUpdate".to_string(), Value::Long(1000));
+        root.insert("InhabitedTime".to_string(), Value::Long(123));
+        root.insert("isLightOn".to_string(), Value::Byte(1));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn pristine_contract_canonical_survives_relight() {
+        // v0.9.46: a relight re-save (fresh light arrays, bumped timers,
+        // re-serialized key order) must NOT flip the contract — the
+        // strip-canonical legend recognizes the same seeded content. A
+        // semantic block change still flips through the ordinary pipeline.
+        let dir = temp_dir("pristine-canon");
+        let cfg = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        let k = key(7, 9);
+        let a = chunk_payload(7, 9, 0);
+        s.write_chunk(k, &a, false).unwrap();
+        assert!(s.is_pristine(k), "first write forms a contract");
+
+        let rel = relit(7, 9);
+        assert_ne!(
+            chunknbt::hash_of(&a),
+            chunknbt::hash_of(&rel),
+            "relight changes raw bytes (the raw-only contract would flip)"
+        );
+        assert_eq!(
+            chunknbt::canonical_contract_hash(&a),
+            chunknbt::canonical_contract_hash(&rel),
+            "canon legend must be relight-stable"
+        );
+        s.write_chunk(k, &rel, false).unwrap();
+        assert!(s.is_pristine(k), "relight re-save must stay contracted");
+        assert!(s.read_chunk(k).is_none(), "still nothing stored");
+
+        // semantic change (different variant = different blocks) flips
+        let b = chunk_payload(7, 9, 5);
+        s.write_chunk(k, &b, false).unwrap();
+        assert!(!s.is_pristine(k), "semantic change must flip");
+        let got = s.read_chunk(k).expect("flipped chunk reads back");
+        assert!(semantic(&got, &b), "flipped chunk is the new content");
+        s.sync();
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pristine_contract_raw_only_falls_back_clean() {
+        // pristine_canon OFF (CSAVES_PRISTINE_CANON=0) = exact 0.9.44/45
+        // semantics: a relight re-save (byte-different) flips; an
+        // identical re-save still hits the O(1) raw fast path.
+        let dir = temp_dir("pristine-rawonly");
+        let cfg = Cfg {
+            pristine: true,
+            pristine_canon: false,
+            compact_min: 512 * 1024,
+            ..bench_cfg()
+        };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        let k = key(11, 13);
+        let a = chunk_payload(11, 13, 0);
+        s.write_chunk(k, &a, false).unwrap();
+        assert!(s.is_pristine(k));
+        s.write_chunk(k, &a, false).unwrap();
+        assert!(s.is_pristine(k), "identical re-save stays (raw fast path)");
+        let rel = relit(11, 13);
+        s.write_chunk(k, &rel, false).unwrap();
+        assert!(
+            !s.is_pristine(k),
+            "raw-only contract flips on relight (old semantics preserved)"
+        );
+        let got = s.read_chunk(k).expect("flipped chunk reads back");
+        assert!(semantic(&got, &rel));
+        s.sync();
+        drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

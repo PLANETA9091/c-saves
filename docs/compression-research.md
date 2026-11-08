@@ -379,3 +379,46 @@ per-section CM (§6), global CM (§7.2), export framing (§7.3), and now the
 import half of the semantic lever (§2/§8/§9). Remaining bytes on a pure
 worldgen world: contracts (26 B/chunk) + entities/POI (real data, exempt by
 construction) + whatever the server actually edits (stored honestly).
+
+## 10. Research tick 6 — strip-canonical contract legends (v0.9.46): erosion measured and closed
+
+§9's raw-only contract flips on the first byte-different re-save. A real
+Paper session relights and re-saves contracted chunks (fresh section light,
+bumped InhabitedTime/lastUpdate, HashMap-key-order drift) the moment a
+player merely walks past — flying over a pregen world erodes every chunk
+the client renders. Measured head-on (pristine_canon_probe, production
+import + write paths, real 728-chunk corpus):
+
+| run (same session) | after one relight session | compact vs anvil 4.47 MiB |
+|---|---|---|
+| canon OFF (0.9.45 raw-only legend) | pristine=0, stored=728 — EVERY contract flipped | 1.45 MiB, x0.32 (-68%) |
+| canon ON (v0.9.46 strip-canonical legend) | **pristine=728, stored=0** | **0.02 MiB, x0.0054 (-99.5%)** |
+
+The legend: `chunknbt::canonical_contract_hash` = order-free structural
+digest (`structural_hash`, sorted-key compounds) after removing
+`lastUpdate`/`LastUpdate`/`InhabitedTime` from the root and
+`strip_derived_chunk`'s set (SkyLight/BlockLight/starlight state bags,
+isLightOn canonicalized to 0) from the sections. Everything else —
+DataVersion, Status, palettes/blocks/biomes, Heightmaps, block_entities —
+stays hashed, so real seeded-content changes still flip. Wire:
+`[mode 7][raw 16B][canon 16B]` = 33 B; 17 B raw-only contracts (0.9.44/45
+containers) parse with canon=None and behave exactly as before; the O(1)
+raw fast path is untouched. `CSAVES_PRISTINE_CANON=0` restores raw-only
+formation.
+
+Honest costs: canonical formation ~2.3 ms/chunk on the corpus (728 chunks,
+23 MB payload: full parse + order-free digest, 2-core sandbox) — rides the
+background import drain, opt-out documented. keys_probe side measurement:
+the import REBUILD form differs from the raw payload under the canonical
+hash for 204/728 corpus chunks — CSEC canonical palette order vs vanilla
+order in rebuilt sections. Irrelevant for contracts: Paper REGENERATES a
+contracted chunk (read = None BY DESIGN), so the re-save comes from Paper's
+own serializer, not from our rebuild; the probe pins this reasoning and
+replays the session against relit(raw).
+
+With §10 the semantic line is again measured-closed: erosion was the last
+way the huge-world win could silently decay in production. Remaining bytes
+on a pure worldgen world: contracts (42 B/chunk with the legend) +
+entities/POI (exempt by construction) + what the server actually edits.
+Next honest frontiers are tooling (contract/regen-drift audits) and the
+shim-side isNewChunk/InhabitedTime tightening — no byte-level lever left.

@@ -208,6 +208,43 @@ fn main() {
         disk_ent_edited as f64 / 1048576.0,
     );
 
+    // ---- Phase B2: relight session (pristine erosion gate, v0.9.46) ----
+    // When pristine contracts + the strip-canonical legend are on, a
+    // simulated Paper relight re-save (fresh section light, bumped
+    // InhabitedTime/lastUpdate, re-serialized key order) must KEEP the
+    // contract — the raw payload hash alone eroded one relight re-save at
+    // a time (every byte of the chunk was re-stored). CI's pristine gate
+    // runs this file with CSAVES_PRISTINE=1, so the session also protects
+    // the canon-skip path in every future change.
+    if cfg.pristine && cfg.pristine_canon {
+        let mut sampled = 0usize;
+        let mut kept = 0usize;
+        for (i, &(cx, cz)) in coords.iter().enumerate() {
+            if i % 29 != 0 {
+                continue;
+            }
+            let k = key(cx, cz);
+            if !region_store.is_pristine(k) {
+                continue; // edited chunks already flipped — not the target
+            }
+            let rel = wgen::relit_variant(&chunk_payload(&w, cx, cz, 0));
+            region_store.write_chunk(k, &rel, false).unwrap();
+            sampled += 1;
+            if region_store.is_pristine(k) {
+                kept += 1;
+            }
+        }
+        if sampled > 0 {
+            assert_eq!(
+                kept, sampled,
+                "every relight re-save of contracted content must keep the contract (canon legend)"
+            );
+            println!(
+                "B2 relight session: {sampled} relit re-saves, {kept} contracts kept (canon skips, zero bytes stored)"
+            );
+        }
+    }
+
     // ---- Phase C: compaction ----
     let t2 = Instant::now();
     let mut steps = 0;

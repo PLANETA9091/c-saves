@@ -1378,6 +1378,42 @@ member raws / enc_fp / drained container are untouched: enc_fp EXACT
 (deferred recipe encode), thread-local scratch in the split stage (+1.5-2%
 class), dict_sample is now at its data-hash floor.
 
+## 0.9.46 - strip-canonical contract legends; the erosion lever (huge-world win survives real sessions)
+
+0.9.45's raw-only contract flips on the first byte-different re-save. A real
+Paper session relights and re-saves contracted chunks (fresh section light,
+bumped InhabitedTime/lastUpdate, HashMap-key-order drift) the moment a player
+merely walks past — one relight session over the 728-chunk real corpus
+eroded 728/728 contracts back to full storage (1.45 MiB, x0.32). The mode-7
+contract now carries a SECOND hash — the strip-canonical legend
+(`chunknbt::canonical_contract_hash`): order-free structural digest minus
+per-section SkyLight/BlockLight/starlight bags, isLightOn and the root
+lastUpdate/LastUpdate/InhabitedTime counters — everything a pristine chunk
+regenerates anyway. Wire: `[mode 7][raw 16B][canon 16B]` = 33 B; 17 B
+raw-only contracts still parse (old containers behave as before); the O(1)
+raw fast path is untouched; canon only arbitrates byte-different re-saves.
+`CSAVES_PRISTINE_CANON=0` restores raw-only formation.
+
+| gate | 0.9.45 flag OFF | 0.9.46 flag OFF | 0.9.46 pristine + canon ON |
+|---|---|---|---|
+| bench compact (64x5) | 1.24 MiB x0.08 (64x4) | **1.24 MiB x0.08 (identical)** | n/a (edited corpus) |
+| erosion A/B (728 ch, one relight session) | n/a | n/a | **pristine=728 stored=0, compact 0.02 MiB x0.0054 vs anvil (-99.5%)** vs raw-only pristine=0 stored=728, 1.45 MiB x0.32 |
+| pure-pregen 96x96 (9,216 ch) | 0.28 MiB x0.01, 26 B/chunk | unchanged | **0.43 MiB x0.01 (42 B/chunk all-in; 33 B legend)** |
+| bench_size B2 relight session | n/a | n/a | **318 relit re-saves -> 318 contracts kept (assert: zero flips allowed)** |
+| D verify | 152 pristine sampled | 1957 chunks semantic-equal | pristine sample 152, gate ratio 0.01 (<= 0.02) |
+| tests | 63/63 | **66/66 x3** (+relight-keeps-contract; +raw-only opt-out fallback; +canon strip-context isolation) | same binaries |
+| enc_fp | EXACT 6d240d7166cdda99/12130/9971843 | **EXACT** | pin |
+
+Honest costs and side measurements: canonical formation ~1.6-1.8 s per 728
+corpus chunks (~2.3 ms/chunk, full parse + order-free structural digest on a
+2-core sandbox) — rides the background import drain; canon re-save check
+costs the same class once per byte-different re-save. keys_probe documents
+that the import REBUILD form differs from the raw payload under the
+canonical hash for 204/728 corpus chunks (CSEC canonical palette order vs
+vanilla order in rebuilt sections) — irrelevant for contracts (Paper
+REGENERATES contracted chunks; the re-save comes from Paper's own
+serializer), pinned in pristine_canon_probe's drift diagnostic.
+
 ## 0.9.45 - pristine IMPORT contracts; the huge-world lever measured (-99% class)
 
 `CSAVES_PRISTINE=import|2` (or `CSAVES_PRISTINE_IMPORT=1`): the import/strip

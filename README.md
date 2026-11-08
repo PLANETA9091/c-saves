@@ -154,6 +154,55 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.46 — strip-canonical contract legends: relight re-saves stop eroding the huge-world win
+
+0.9.45's import contracts flip on the first **byte**-different re-save. A real
+Paper session re-saves contracted chunks with fresh light and bumped
+InhabitedTime/lastUpdate the moment a player merely walks past — every such
+re-save eroded one contract into full storage (measured: ONE relight session
+over the 728-chunk real corpus flipped 728/728 contracts, container back to
+1.45 MiB x0.32). The contract now carries a second, **strip-canonical** hash:
+an order-free structural digest of the payload minus everything a pristine
+chunk regenerates anyway — per-section SkyLight/BlockLight (+ starlight state
+bags), isLightOn, and the root lastUpdate/LastUpdate/InhabitedTime counters.
+DataVersion, Status, palettes/block/biome data, Heightmaps, block_entities —
+all still hashed (sorted-key order), so any seeded-content difference still
+flips; only light-engine and save-tick volatility stops flipping.
+
+- contract format: `[mode 7][raw 16B][canon 16B]` = 33 B (raw-only 17 B
+  contracts from 0.9.44/0.9.45 containers parse and behave exactly as
+  before); the O(1) raw fast path is untouched, the canonical legend only
+  arbitrates byte-different re-saves;
+- erosion A/B on the real corpus (728 chunks, one relight session replayed
+  through the production import + write paths, `pristine_canon_probe`):
+  canon OFF = 0.9.45 semantics, pristine=0 stored=728, compact 1.45 MiB
+  (x0.32 vs anvil); **canon ON = pristine=728 stored=0, compact 0.02 MiB
+  (x0.0054 vs anvil, -99.5%)** — the session no longer costs the huge-world
+  win;
+- pure-pregen demo (9,216 chunks): compact 0.43 MiB, x0.01 vs anvil, 42
+  B/chunk all-in contract cost (the 33 B legend doubles the 17 B recipe;
+  the CI pristine gate ratio ≤ 0.02 keeps real margin at 0.008);
+- the CI pristine gate now also protects the legend: bench_size phase B2
+  replays a relight session over a sample of contracted chunks and FAILS
+  if any of them flips (measured 318 relit re-saves → 318 contracts kept,
+  zero bytes stored);
+- canonical formation cost measured honestly: ~1.6–1.8 s per 728 corpus
+  chunks (~2.3 ms/chunk — full parse + order-free structural digest, 23 MB
+  payload, 2-core sandbox); it rides the background import drain, and
+  `CSAVES_PRISTINE_CANON=0` restores the raw-only 0.9.45 semantics;
+- documented side measurement (`keys_probe`): the import rebuild form
+  differs from the raw payload under the canonical hash for 204/728 corpus
+  chunks (CSEC canonical palette order vs vanilla order in rebuilt
+  sections) — irrelevant for contracts, because Paper REGENERATES a
+  contracted chunk (read = None BY DESIGN) and the re-save comes from
+  Paper's own serializer; the probe pins this reasoning.
+
+Flag OFF is byte-identical to 0.9.45: enc_fp EXACT
+6d240d7166cdda99/12130/9971843, bench 64x5 compact 1.24 MiB x0.08 verify
+1957, 66/66 tests x3 (new: relight re-save keeps the contract, raw-only
+opt-out falls back clean, canonical-hash strip-context isolation incl.
+non-sections "BlockLight" name collisions).
+
 ## v0.9.45 — pristine IMPORT contracts: the huge-world lever lands
 
 v0.9.44 contracted only the live path. Imported worlds — the exact shape of

@@ -435,6 +435,46 @@ pub fn strip_derived_chunk(root: &mut Value) {
     }
 }
 
+/// v0.9.46 strip-canonical regeneration-contract hash (the erosion lever).
+///
+/// Order-free structural digest of a chunk payload with every field that a
+/// pristine chunk regenerates anyway removed:
+///   - per-section SkyLight/BlockLight (+ starlight state bags) — the light
+///     engine recomputes them deterministically from block data;
+///   - isLightOn — a light-engine stamp (canonicalized to 0);
+///   - root lastUpdate / LastUpdate / InhabitedTime — save-tick and
+///     inhabited-time counters that move on EVERY re-save (a player merely
+///     flying over a pregen world bumps InhabitedTime of every loaded
+///     chunk; the raw payload hash therefore erodes one re-save after the
+///     next).
+///
+/// Everything else — DataVersion, Status, sections' palettes/block/biome
+/// data, Heightmaps, block_entities, blending_data — is hashed in
+/// sorted-key order, so any seeded-content difference flips and any
+/// re-serialization (Paper's compound key order is not stable across
+/// sessions) keeps the hash stable.
+///
+/// Two payloads hash equal  <=>  they carry the same worldgen-reproducible
+/// content. This is the flip-discriminator of recipe-mode-7 contracts: the
+/// raw payload hash (hash_of) stays the O(1) fast path, the canonical hash
+/// decides whether a byte-different re-save is still the same seed state.
+/// None = the payload is not parseable NBT (caller falls back to a
+/// raw-only contract, 0.9.44/0.9.45 semantics).
+pub fn canonical_contract_hash(payload: &[u8]) -> Option<Hash> {
+    let v: Value = fastnbt::from_bytes(payload).ok()?;
+    let mut root = match v {
+        Value::Compound(m) => m,
+        _ => return None,
+    };
+    root.remove("lastUpdate");
+    root.remove("LastUpdate");
+    root.remove("InhabitedTime");
+    let mut v = Value::Compound(root);
+    // sets isLightOn=0 (canonical) and drops section light/state bags
+    strip_derived_chunk(&mut v);
+    Some(structural_hash(&v))
+}
+
 fn bits_for(n: usize) -> u32 {
     let mut b = 1u32;
     while (1usize << b) < n {
@@ -7974,6 +8014,57 @@ mod tests {
         be.push(Value::String("x".to_string()));
         root.insert("block_entities".to_string(), Value::List(be));
         to_bytes(&Value::Compound(root))
+    }
+
+    /// v0.9.46: canonical_contract_hash — strip-context isolation, timer
+    /// stripping, relight stability, refusal on malformed input.
+    #[test]
+    fn canonical_contract_hash_strips_only_derived_data() {
+        // non-NBT input must refuse (caller falls back to raw-only)
+        assert!(canonical_contract_hash(b"definitely not nbt").is_none());
+        let mk = |sec_sky: Option<u8>, be_marker: i32, inhabited: i64| -> Vec<u8> {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(0));
+            if let Some(s) = sec_sky {
+                sec.insert(
+                    "SkyLight".to_string(),
+                    Value::ByteArray(fastnbt::ByteArray::new(vec![s as i8; 16])),
+                );
+            }
+            // a same-named field OUTSIDE the sections context: seeded
+            // content, must NOT be stripped
+            let mut be: Map<String, Value> = Map::new();
+            be.insert("BlockLight".to_string(), Value::Int(be_marker));
+            let mut root: Map<String, Value> = Map::new();
+            root.insert("sections".to_string(), Value::List(vec![Value::Compound(sec)]));
+            root.insert(
+                "block_entities".to_string(),
+                Value::List(vec![Value::Compound(be)]),
+            );
+            root.insert("InhabitedTime".to_string(), Value::Long(inhabited));
+            root.insert("lastUpdate".to_string(), Value::Long(inhabited * 2));
+            to_bytes(&Value::Compound(root))
+        };
+        let h_none = canonical_contract_hash(&mk(None, 1, 7)).unwrap();
+        let h_zero = canonical_contract_hash(&mk(Some(0), 1, 7)).unwrap();
+        let h_full = canonical_contract_hash(&mk(Some(15), 1, 7)).unwrap();
+        let h_timers = canonical_contract_hash(&mk(Some(15), 1, 99)).unwrap();
+        assert_eq!(h_none, h_zero, "absent vs all-0 section light: derived");
+        assert_eq!(h_zero, h_full, "section light VALUE is derived");
+        assert_eq!(h_full, h_timers, "root timers are derived");
+        let h_be = canonical_contract_hash(&mk(Some(15), 2, 99)).unwrap();
+        assert_ne!(h_be, h_full, "a BlockLight-named field outside the sections context is seeded content");
+        // a real content change still flips
+        let mut v: Value = fastnbt::from_bytes(&mk(None, 1, 7)).unwrap();
+        if let Value::Compound(m) = &mut v {
+            if let Some(Value::List(secs)) = m.get_mut("sections") {
+                if let Some(Value::Compound(sm)) = secs.first_mut() {
+                    sm.insert("Y".to_string(), Value::Byte(1));
+                }
+            }
+        }
+        let h_block = canonical_contract_hash(&to_bytes(&v)).unwrap();
+        assert_ne!(h_block, h_none, "seeded content changes must flip");
     }
 
     /// Deterministic LCG (xorshift-ish) for reproducible differential inputs.

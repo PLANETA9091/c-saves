@@ -98,18 +98,27 @@ worldgen has no such redundancy to claim.
 
 The x2.21 plateau above is the no-elision number. With
 `CSAVES_PRISTINE=import` the background drain contracts pure-worldgen
-chunks at a measured 26 B/chunk all-in (9,216-recipe measurement, contract
-body + record overhead; see §0.9.45 in jjthunder-bench.md and research §9):
+chunks at a measured 42 B/chunk all-in (9,216-recipe measurement with the
+v0.9.46 33 B strip-canonical legend, contract body + record overhead; the
+17 B raw-only 0.9.45 contract measured 26 B/chunk; see §0.9.45/§0.9.46 in
+jjthunder-bench.md and research §9):
 
 - real JJThunder region import (728 chunks): x0.26 → **x0.002 vs anvil**
   (-99.8%), pristine=728, stored=0;
+- v0.9.46 erosion guard: a full simulated relight session (fresh section
+  light, bumped InhabitedTime/lastUpdate, key-order drift — what Paper
+  does to every chunk a player merely walks past) keeps ALL contracts:
+  pristine=728 stored=0, compact 0.02 MiB (x0.0054 vs anvil); under the
+  raw-only 0.9.45 legend the same session eroded 728/728 contracts back
+  to 1.45 MiB (x0.32);
 - arithmetic projection for this 512x512 world (labeled, not measured
-  end-to-end): 261,572 chunks × 26 B ≈ 6.8 MB of contracts vs 2,136 MiB
-  region Anvil → region ~x0.003; with the entity corpus (0.86 MiB stored)
+  end-to-end): 261,572 chunks × 42 B ≈ 11.0 MB of contracts vs 2,136 MiB
+  region Anvil → region ~x0.005; with the entity corpus (0.86 MiB stored)
   and the loot-chest spawn edits the total stays two orders of magnitude
   under Anvil — far past the -90% target.
 
 Safety: the operator asserts the world is pure worldgen under the seed it
-will be restored with; any hash-differing re-save after restore flips that
-chunk to normal storage (visited chunks get real storage, the untouched
-mass stays contracted).
+will be restored with; a re-save whose strip-canonical hash differs (a real
+seeded-content change) flips that chunk to normal storage (visited-and-built
+chunks get real storage, the untouched mass stays contracted). Light-engine
+and save-tick volatility no longer flips anything.
