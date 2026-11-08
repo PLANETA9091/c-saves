@@ -146,10 +146,37 @@ thread_local! {
 // of race as FORCE_GLOB (0.9.35): the codec resolves into a OnceLock and
 // parallel tests would race it. Consulted only under cfg!(test).
 pub static COLD_CODEC_TEST: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
+// v0.9.45: the override is OWNED by the test thread that set it. Parallel
+// tests serialize on ownership instead of racing: the 0.9.42 default flip
+// (zstd -> lzma2) made foreign set(None) resets VISIBLE — an MT-pack test
+// lost its zstd override to a concurrent lzma2 roundtrip's reset, the pack
+// silently used LZMA2, and intra-frame MT (a zstd-path feature) never fired
+// (CI: "MT path never fired ... mtjobs:0" on 612c4fe, 62/63 passed). Rules:
+// set(Some) blocks while another thread holds the override (60 s cap steals
+// it — the holder is presumed panicked-dead); set(None) releases ONLY the
+// caller's own override, a foreign reset is a no-op.
 #[cfg(test)]
 pub(crate) fn set_cold_codec_for_tests(v: Option<&str>) {
+    use std::sync::{Condvar, Mutex, MutexGuard};
+    use std::thread::ThreadId;
+    use std::time::Duration;
+    static OWNER: Mutex<Option<ThreadId>> = Mutex::new(None);
+    static CV: Condvar = Condvar::new();
+    let me = std::thread::current().id();
+    let mut owner: MutexGuard<'_, Option<ThreadId>> =
+        OWNER.lock().unwrap_or_else(|e| e.into_inner());
     match v {
         Some(v) => {
+            while owner.map(|h| h != me).unwrap_or(false) {
+                let (g, t) = CV
+                    .wait_timeout(owner, Duration::from_secs(60))
+                    .unwrap_or_else(|e| e.into_inner());
+                owner = g;
+                if t.timed_out() {
+                    break; // steal: the holder died without releasing
+                }
+            }
+            *owner = Some(me);
             let id = match v {
                 "lzma2" => 1u64,
                 _ => 0u64,
@@ -157,7 +184,14 @@ pub(crate) fn set_cold_codec_for_tests(v: Option<&str>) {
             COLD_CODEC_TEST.1.store(id, Ordering::Relaxed);
             COLD_CODEC_TEST.0.store(true, Ordering::Relaxed);
         }
-        None => COLD_CODEC_TEST.0.store(false, Ordering::Relaxed),
+        None => {
+            if *owner == Some(me) {
+                *owner = None;
+                COLD_CODEC_TEST.0.store(false, Ordering::Relaxed);
+                CV.notify_all();
+            }
+            // foreign reset: no-op — must not clear a concurrent holder
+        }
     }
 }
 
