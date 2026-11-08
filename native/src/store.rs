@@ -278,6 +278,21 @@ pub struct Cfg {
     /// while z6 costs only a few % more container bytes — the pack pass
     /// re-tiers the underlying section/BE bytes anyway).
     pub recipe_level: i32,
+    /// v0.9.44 pristine-chunk elision (OPT-IN, region stores only): the
+    /// FIRST-EVER write of a key becomes a regeneration CONTRACT instead of
+    /// stored content — recipe mode 7 carries ONLY the payload hash (zero
+    /// blobs, 17 B on disk) and read_chunk returns None, which the shim's
+    /// vanilla fallback turns into ReadResult::NO_DATA → Paper regenerates
+    /// the chunk from the seed (the exact semantics of a missing chunk).
+    /// Safety: any later write of DIFFERENT content flows through the
+    /// normal pipeline and supersedes the contract (flip-on-mismatch);
+    /// an identical-content re-save hits the pristine fast path (O(1)).
+    /// Residual risk (documented, accepted by the operator who opts in):
+    /// mutations between chunk generation and its first-ever durable save
+    /// are captured IN the contract hash and get reverted on regeneration —
+    /// the same semantics the Bedrock Editor chunk-reset / community
+    /// chunk-regen flows accept. CSAVES_PRISTINE=1 opts in.
+    pub pristine: bool,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
     /// Slab member cap for whole-mode stores (entity/POI payloads).
@@ -376,6 +391,7 @@ impl Default for Cfg {
             // survival/jj section data is where cold level actually bites.
             cold_level: 6,
             recipe_level: 6,
+            pristine: false,
             compact_min: 64 * 1024,
             compact_ratio: 0.25,
             auto_pack_bytes: 4 * 1024 * 1024,
@@ -468,6 +484,9 @@ impl Cfg {
             seg_roll: env_parse("CSAVES_SEG_ROLL", 64 * 1024 * 1024),
             pack_mt_min: env_parse("CSAVES_PACK_MT_MIN", 1024 * 1024),
             pack_mt_workers: env_parse("CSAVES_PACK_MT_WORKERS", 0),
+            pristine: std::env::var("CSAVES_PRISTINE")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false),
         }
     }
 }
@@ -614,6 +633,14 @@ struct Recipe {
     fields: Vec<(u16, FieldVal)>,
     /// Mode-5: the Position marker was key-redundant and stripped.
     pos_from_key: bool,
+    /// Mode 7 (v0.9.44): pristine regeneration contract — the payload hash
+    /// of a first-ever write under cfg.pristine. ZERO blobs (blob_hashes
+    /// stays empty, so chunk_intact is trivially true), read_chunk returns
+    /// None (shim → vanilla fallback → NO_DATA → Paper regenerates). Any
+    /// different-content write supersedes the contract through the normal
+    /// pipeline (flip-on-mismatch). Never coexists with whole/sections/tail
+    /// by construction.
+    pristine: Option<Hash>,
 }
 
 fn crc_of(b: &[u8]) -> u32 {
@@ -636,6 +663,7 @@ impl Recipe {
             tail: Tail::None,
             fields: Vec::new(),
             pos_from_key: false,
+            pristine: None,
         };
         let mut p = 0usize;
         let mode = *b.first()?;
@@ -801,6 +829,15 @@ impl Recipe {
                 let tail = parse_tail(&mut p)?;
                 Some(Recipe { whole: None, sections, tail, ..EMPTY })
             }
+            7 => {
+                // v0.9.44 pristine regeneration contract: [7][hash 16B].
+                // Nothing stored — the seed regenerates the content.
+                if b.len() < 17 {
+                    return None;
+                }
+                let h = ((rd8(&mut p) as u128) << 64) | rd8(&mut p) as u128;
+                Some(Recipe { pristine: Some(h), ..EMPTY })
+            }
             _ => None,
         }
     }
@@ -826,6 +863,14 @@ impl Recipe {
     /// `id_of` returns the BLOB2 id of a live blob hash (None for legacy).
     fn encode(&self, id_of: impl Fn(Hash) -> Option<u32>) -> Vec<u8> {
         let mut v = Vec::with_capacity(64);
+        // mode 7 first: the contract is always the smallest form (17 B) and
+        // must never silently degrade into content storage.
+        if let Some(h) = self.pristine {
+            v.push(7u8);
+            v.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
+            v.extend_from_slice(&(h as u64).to_le_bytes());
+            return v;
+        }
         if let Some(h) = self.whole {
             match id_of(h) {
                 Some(id) => {
@@ -3031,12 +3076,46 @@ impl Store {
                     self.write_skips.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
+                // v0.9.44: pristine contracts stay pristine on identical
+                // re-saves even across RESTARTS (last_written is RAM-only,
+                // so the match above misses after reopen). The contract
+                // hash is the recipe itself — O(1) skip, no flip, no
+                // storage: Paper re-serializing the regenerated identical
+                // chunk is exactly the content the seed produces.
+                if !hit && self.cfg.pristine && self.pristine_hash_of(key) == Some(hash) {
+                    ST_WRITE_SKIP.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
             }
         }
         let t0w = std::time::Instant::now();
-        let recipe = if whole_mode && payload.len() > 1024 {
+        // v0.9.44 pristine candidate: FIRST-EVER write of a region-store key
+        // under cfg.pristine becomes a regeneration contract instead of
+        // stored content. Any later write with different content falls
+        // through to the normal pipeline and supersedes the contract via the
+        // ordinary batch-push/supersede machinery (flip-on-mismatch); an
+        // identical re-save was already caught by the pristine fast path
+        // above. Import/strip paths never form contracts (imported content
+        // is not seed-reproducible), and whole-mode stores (entities/POI)
+        // are excluded — their content is not worldgen-reproducible either.
+        let pristine_cand = self.cfg.pristine
+            && !whole_mode
+            && !strip
+            && !self.whole_mode.load(Ordering::Relaxed)
+            && !self.chunks.read().contains_key(&key)
+            && self.recipe_batch.lock().get(key).is_none();
+        let recipe = if pristine_cand {
+            Recipe {
+                whole: None,
+                sections: Vec::new(),
+                tail: Tail::None,
+                fields: Vec::new(),
+                pos_from_key: false,
+                pristine: Some(hash),
+            }
+        } else if whole_mode && payload.len() > 1024 {
             self.ensure_blob(hash, payload, false)?;
-            Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
+            Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None }
         } else {
             let split = chunknbt::split(payload, whole_mode, pos_hint, strip)?;
             WST_SPLIT.0.fetch_add(t0w.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3045,7 +3124,7 @@ impl Store {
             let r = match split {
             Split::Whole { hash } => {
                 self.ensure_blob(hash, payload, false)?;
-                Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
+                Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None }
             }
             Split::Fields { parts, pos_from_key } => {
                 let mut fields = Vec::with_capacity(parts.len());
@@ -3057,13 +3136,13 @@ impl Store {
                         fields.push((self.intern_key(&p.key)?, FieldVal::Hash(p.hash)));
                     }
                 }
-                Recipe { whole: None, sections: Vec::new(), tail: Tail::None, fields, pos_from_key }
+                Recipe { whole: None, sections: Vec::new(), tail: Tail::None, fields, pos_from_key, pristine: None }
             }
             Split::Split { sections, tail } => {
                 if sections.len() > MAX_SECTIONS {
                     let h = chunknbt::hash_of(payload);
                     self.ensure_blob(h, payload, false)?;
-                    Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false }
+                    Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None }
                 } else {
                     let mut hashes = Vec::with_capacity(sections.len());
                     // v0.9.39: a blob-eligible tail (>= tail_blob_min) rides
@@ -3117,7 +3196,7 @@ impl Store {
                             Tail::Inline { dict: tdict, comp: tcomp, raw: tail.len() as u32 }
                         }
                     };
-                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false }
+                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false, pristine: None }
                 }
             }
             };
@@ -3313,6 +3392,22 @@ impl Store {
         hashes.iter().all(|h| blobs.contains_key(h))
     }
 
+    /// v0.9.44: the pristine contract hash of a key, if its live recipe is
+    /// mode 7 (pending batch first — read-your-writes — then committed).
+    fn pristine_hash_of(&self, key: u64) -> Option<Hash> {
+        if let Some(p) = self.recipe_batch.lock().get(key).cloned() {
+            return self.parse_recipe_body(&p).and_then(|r| r.pristine);
+        }
+        let (seg, off, len) = *self.chunks.read().get(&key)?;
+        self.recipe_at(key, seg, off, len).and_then(|r| r.pristine)
+    }
+
+    /// Verify/tooling hook: does this key resolve to a pristine
+    /// regeneration contract (nothing stored, read = None by design)?
+    pub fn is_pristine(&self, key: u64) -> bool {
+        self.pristine_hash_of(key).is_some()
+    }
+
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
     pub fn read_chunk(&self, key: u64) -> Option<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -3358,6 +3453,13 @@ impl Store {
                 return None;
             }
         };
+        // v0.9.44 pristine regeneration contract: nothing is stored. The
+        // shim's nReadChunk → null → vanillaReadData → NO_DATA path makes
+        // Paper regenerate the chunk from the seed (identical semantics to
+        // a missing chunk in the save format).
+        if rec.pristine.is_some() {
+            return None;
+        }
         let writer_id = self.writer_seg_id();
         let t_tail = std::time::Instant::now();
         let tail_bytes: Option<Vec<u8>> = match &rec.tail {
@@ -4714,6 +4816,7 @@ impl Store {
                 tail: Tail::None,
                 fields: new_fields,
                 pos_from_key: rec.pos_from_key,
+                pristine: None,
             };
             let id_of = |h: Hash| -> Option<u32> {
                 let blobs = self.blobs.read();
@@ -6429,12 +6532,12 @@ pub(crate) mod glob_slab_test {
         set_force_glob_for_tests(None);
         let _ = fs::remove_dir_all(&dir);
     }
-}
 
+}
 #[cfg(test)]
 mod repro {
     use super::*;
-    use super::tests::{chunk_payload, semantic, temp_dir};
+    use super::tests::{bench_cfg, chunk_payload, semantic, temp_dir};
     use fastnbt::Value;
     use std::collections::HashMap as Map;
 
@@ -6715,5 +6818,103 @@ mod repro {
         d.put(9, Arc::new(vec![5u8; 8]));
         assert!(d.get(&9).is_none());
     }
-}
+    #[test]
+    fn pristine_contract_roundtrip_and_flip() {
+        // Opt-in per-store cfg (no process-global env race): contracts form
+        // ONLY on this store. Region-kind store (whole_mode off).
+        let dir = temp_dir("pristine-contract");
+        let cfg = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        let k = key(10, 20);
+        let a = chunk_payload(10, 20, 0);
 
+        // first-ever write -> regeneration contract, nothing stored
+        s.write_chunk(k, &a, false).unwrap();
+        assert!(s.is_pristine(k), "first write must form a contract");
+        assert!(s.read_chunk(k).is_none(), "contract reads as absent (regenerate)");
+        assert!(s.chunk_intact(k), "contract is trivially intact (no blobs)");
+        assert_eq!(s.chunk_count(), 1, "the contract is a live chunk record");
+
+        // identical re-save (same session: last_written fast path) -> stays
+        // a contract, O(1), no content storage
+        s.write_chunk(k, &a, false).unwrap();
+        assert!(s.is_pristine(k), "identical re-save must not flip the contract");
+
+        // whole-mode write path (entities/POI) must NEVER form contracts
+        let ke = key(30, 40);
+        let e = chunk_payload(30, 40, 1);
+        s.write_chunk(ke, &e, true).unwrap();
+        assert!(!s.is_pristine(ke), "whole-mode writes must stay normal");
+        assert!(s.read_chunk(ke).is_some(), "whole-mode content is stored");
+
+        // a contract that is never flipped must survive reopen as a contract
+        let kp = key(50, 60);
+        let p = chunk_payload(50, 60, 2);
+        s.write_chunk(kp, &p, false).unwrap();
+        assert!(s.is_pristine(kp));
+
+        // mutation flips the contract to normal storage through the
+        // ordinary supersede pipeline
+        let b = chunk_payload(10, 20, 7);
+        s.write_chunk(k, &b, false).unwrap();
+        assert!(!s.is_pristine(k), "different content must flip to normal");
+        let got = s.read_chunk(k).expect("flipped chunk must read back");
+        assert!(semantic(&got, &b), "flipped chunk must be the new content");
+
+        // sync + reopen: the contract persists (scan parses mode 7)
+        s.sync();
+        drop(s);
+        let cfg2 = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
+        let s2 = Store::open_cfg(&dir, true, cfg2).unwrap();
+        assert_eq!(s2.chunk_count(), 3, "all records survive reopen");
+        // the flipped key is normal forever; the never-touched contract
+        // persists and reads absent; the whole-mode chunk reads back
+        assert!(!s2.is_pristine(k), "flipped key must stay normal after reopen");
+        assert!(s2.is_pristine(kp), "contract must persist across reopen");
+        assert!(s2.read_chunk(kp).is_none(), "contract reads absent after reopen");
+        let got2 = s2.read_chunk(ke).expect("normal chunk reads after reopen");
+        assert!(semantic(&got2, &e), "normal chunk survives reopen");
+
+        // post-restart identical re-save hits the pristine fast path and
+        // STAYS a contract (the restart would otherwise re-store it)
+        let a2 = chunk_payload(10, 20, 99);
+        s2.write_chunk(key(11, 21), &a2, false).unwrap();
+        assert!(s2.is_pristine(key(11, 21)));
+        s2.sync();
+        drop(s2);
+        let cfg3 = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
+        let s3 = Store::open_cfg(&dir, true, cfg3).unwrap();
+        s3.write_chunk(key(11, 21), &a2, false).unwrap();
+        assert!(s3.is_pristine(key(11, 21)), "post-restart identical re-save must stay pristine");
+        assert!(s3.read_chunk(key(11, 21)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pristine_off_by_default_and_import_paths_exempt() {
+        // default cfg: no contracts, everything stored (the CI gates run
+        // with pristine OFF — behavior must be bit-identical to 0.9.43)
+        let dir = temp_dir("pristine-off");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let k = key(5, 6);
+        let a = chunk_payload(5, 6, 0);
+        s.write_chunk(k, &a, false).unwrap();
+        assert!(!s.is_pristine(k), "pristine must be OFF by default");
+        assert!(s.read_chunk(k).is_some(), "content stored when pristine off");
+
+        // import/strip paths never form contracts even with pristine on
+        let dir2 = temp_dir("pristine-import-exempt");
+        let cfg = Cfg { pristine: true, compact_min: 512 * 1024, ..bench_cfg() };
+        let s2 = Store::open_cfg(&dir2, true, cfg).unwrap();
+        let k2 = key(7, 8);
+        let b = chunk_payload(7, 8, 0);
+        s2.write_chunk_import(k2, &b).unwrap();
+        assert!(!s2.is_pristine(k2), "import writes must not form contracts");
+        assert!(s2.read_chunk(k2).is_some(), "import content is stored");
+        let c = chunk_payload(7, 8, 0);
+        s2.write_chunk_stripped(key(9, 10), &c, true).unwrap();
+        assert!(!s2.is_pristine(key(9, 10)), "strip writes must not form contracts");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+}

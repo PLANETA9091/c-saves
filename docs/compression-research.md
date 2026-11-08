@@ -310,3 +310,36 @@ needs the Paper-side generation-write marker + ratio-gate redesign
 decision. Probe artifacts: `scripts/solid_probe.py` +
 `scripts/corpus_extract.py` (sandbox; corpus checksum 24,809,708 B
 matches §1 bit-exact), `native/examples/lzma_preset_probe.rs` (in-repo).
+
+## 8. Research tick 4 — pristine elision ships (v0.9.44): the codec era hands off to the semantic era
+
+The §2 design landed as an OPT-IN feature (`CSAVES_PRISTINE=1`, region
+stores only). Contract semantics (recipe mode 7, 17 B, zero blobs):
+
+- first-ever write of a key -> contract (payload hash only);
+- read -> None -> shim vanilla fallback -> NO_DATA -> Paper regenerates
+  from the seed (identical to a missing chunk in a save format);
+- different-content write -> normal pipeline supersedes the contract
+  (flip-on-mismatch); identical re-save -> pristine fast path, stays a
+  contract across restarts (the hash lives in the recipe, not RAM);
+- import/strip/whole-mode paths exempt; verify gains a pristine=N bucket;
+  two new tests (contract roundtrip/flip/reopen + default-off/import-exempt).
+
+Real-container demo (bench 64x4, CSAVES_PRISTINE=1): fresh 5.08 -> 0.11 MiB
+(x0.01 vs anvil), compact 1.24 -> 0.59 MiB (x0.04 vs anvil), compaction
+22.8 -> 9.5 s. Flag OFF = byte-identical 0.9.43 behavior on every gate.
+
+Residual risk (documented, operator-accepted): mutations between chunk
+generation and the first-ever durable save ride inside the contract hash
+and revert on regeneration — the same semantics as the Bedrock Editor
+chunk-reset flows. The shim-side tightening (isNewChunk marker /
+InhabitedTime==0 passed as a per-write flag) is future work; the Rust
+contract already accepts it.
+
+With this, the "make worlds weigh less" roadmap from §4 is fully resolved:
+LZMA2 family (§5/§7.1) shipped; per-section entropy coding (§6) and global
+CM (§7.2) measured dead; archive export (§7.3) measured not-worth-it; the
+order-of-magnitude lever (§2) shipped opt-in. The codec front is closed;
+the remaining frontier is the domain joint LZ+CM mixer (archival-only,
+parked) and whatever new evidence arrives.
+

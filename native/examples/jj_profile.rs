@@ -640,6 +640,7 @@ fn main() {
     };
     let mut ok = 0usize;
     let mut bad = 0usize;
+    let mut pristine = 0usize;
     // CSAVES_VERIFY_SAMPLE=n: verify every n-th chunk (0 = all). The 512x512
     // CI bench verifies a sample to keep the job under the time cap.
     let sample: usize = std::env::var("CSAVES_VERIFY_SAMPLE")
@@ -662,6 +663,9 @@ fn main() {
                         eprintln!("semantic MISMATCH region chunk ({cx},{cz})");
                     }
                 }
+            }
+            None if rs.is_pristine(key(cx, cz)) => {
+                pristine += 1;
             }
             _ => {
                 bad += 1;
@@ -697,7 +701,7 @@ fn main() {
             }
         }
     }
-    println!("verify: ok={ok} bad={bad} sampled_every={sample}");
+    println!("verify: ok={ok} bad={bad} pristine={pristine} sampled_every={sample}");
     if bad > 0 {
         std::process::exit(1);
     }

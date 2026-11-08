@@ -1378,6 +1378,28 @@ member raws / enc_fp / drained container are untouched: enc_fp EXACT
 (deferred recipe encode), thread-local scratch in the split stage (+1.5-2%
 class), dict_sample is now at its data-hash floor.
 
+## 0.9.44 - pristine-chunk elision ships (opt-in); the semantic era begins
+
+CSAVES_PRISTINE=1 (region stores only): first-ever write = recipe mode 7
+regeneration contract (payload hash, zero blobs, 17 B). Read = absent ->
+Paper regenerates; different-content write supersedes via the normal
+pipeline (flip-on-mismatch); identical re-save stays a contract across
+restarts. Import/strip/whole-mode paths exempt; verify gains pristine=N.
+
+| gate | 0.9.43 | 0.9.44 flag OFF | 0.9.44 flag ON (bench 64x4) |
+|---|---|---|---|
+| bench compact | 1.24 MiB x0.08 | 1.24 MiB x0.08 (identical) | **0.59 MiB x0.04** |
+| bench fresh | 5.08 MiB | 5.08 MiB (identical) | **0.11 MiB x0.01 vs anvil** |
+| D verify | 1661 chunks 25.5 s | 1661 chunks (0 contracts) | 1623 + 38 contracts, 20.5 s |
+| jj_profile | x3.71, ok=946 bad=0 | pristine=0, unchanged | n/a (import path exempt) |
+| survival | x4.28, ok=1280 bad=0 | unchanged | n/a (CI runs flag-off) |
+| tests | 62/62 | **62/62** (2 new pristine tests) | same binaries |
+| enc_fp | 6d240d7166cdda99/12130/9971843 | **EXACT** | pin |
+
+Honest residual risk: pre-first-save mutations ride inside the contract
+hash and revert on regeneration (operator-accepted, documented; shim-side
+isNewChunk/InhabitedTime marker = future tightening).
+
 ## 0.9.43 - the LZMA2 encoder goes EXTREME; PPMd solid + export framing measured dead
 
 One encode-only flag: `lzma2_compress` -> preset 6 | PRESET_EXTREME (deeper

@@ -154,6 +154,52 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.44 — pristine-chunk elision: the order-of-magnitude lever, opt-in
+
+The §2 semantic lever from the compression research ships. With
+`CSAVES_PRISTINE=1` (region stores only; entity/POI stores are exempt by
+construction), the FIRST-EVER write of a chunk becomes a **regeneration
+contract** instead of stored content:
+
+- recipe **mode 7** carries ONLY the payload hash — zero blobs, 17 B on
+  disk (the smallest recipe form; encode always picks it, it can never
+  silently degrade into storage);
+- `read_chunk` returns None → the shim's `nReadChunk → null →
+  vanillaReadData → NO_DATA` chain makes **Paper regenerate the chunk from
+  the seed** — the exact semantics of a missing chunk in a save format;
+- any later write with DIFFERENT content flows through the normal pipeline
+  and supersedes the contract (**flip-on-mismatch**); an identical re-save
+  hits a dedicated pristine fast path and stays a contract — including
+  across RESTARTS (the contract hash lives in the recipe, not in RAM);
+- import/strip writes never form contracts (imported content is not
+  seed-reproducible); the whole-mode write path (entities/POI) never forms
+  contracts;
+- verify/tooling: `is_pristine(key)`, the CI benches gain a
+  `pristine=N` bucket, contracts read as None BY DESIGN.
+
+| gate | 0.9.43 (pristine off) | 0.9.44 pristine ON (bench 64x4) |
+|---|---|---|
+| c-saves fresh | 5.08 MiB | **0.11 MiB (x0.01 vs anvil)** |
+| c-saves compact | 1.24 MiB (x0.08) | **0.59 MiB (x0.04 vs anvil)** |
+| D verify | 1661 chunks, 25.5 s | 1623 + 38 contracts, 20.5 s |
+| C compaction | 22.8 s | 9.5 s (nothing to compress) |
+
+With the flag OFF every gate is byte-identical to 0.9.43 (62/62 tests incl.
+two new pristine contract tests: roundtrip/flip/restart-persistence and
+default-off/import-exempt; enc_fp EXACT
+6d240d7166cdda99/12130/9971843; JJ ok=946 bad=0 pristine=0 x3.71;
+survival ok=1280 bad=0 x4.28; bench compact 1.24 MiB x0.08).
+
+**Honest semantics.** A contract asserts "this chunk equals what the seed
+generator produces". The residual risk an operator accepts with the flag:
+mutations between a chunk's generation and its FIRST-EVER durable save are
+captured in the contract hash and get reverted on regeneration — the same
+semantics the Bedrock Editor chunk-reset and community chunk-regen flows
+accept. Everything AFTER the first save is provably safe (hash flip). A
+future shim-side tightening (isNewChunk marker, InhabitedTime==0 filter at
+the write call) can narrow the window further; the Rust contract already
+accepts a per-write marker.
+
 ## v0.9.43 — the LZMA2 encoder goes EXTREME; PPMd and the solid-window export framing measured dead
 
 One encode-only flag, every read byte untouched: `lzma2_compress` now uses

@@ -474,6 +474,7 @@ fn main() {
     // ---- phase C: streaming semantic verify (every Nth chunk) ----
     let mut ok = 0usize;
     let mut bad = 0usize;
+    let mut pristine = 0usize;
     let mut seen = 0usize;
     for (fidx, f) in region_files.iter().enumerate() {
         if !f.file_name().unwrap().to_string_lossy().ends_with(".mca") {
@@ -497,8 +498,12 @@ fn main() {
                     }
                 }
                 None => {
-                    bad += 1;
-                    eprintln!("region MISSING file={fidx} slot={slot}");
+                    if rs.is_pristine(k) {
+                        pristine += 1;
+                    } else {
+                        bad += 1;
+                        eprintln!("region MISSING file={fidx} slot={slot}");
+                    }
                 }
             }
         }

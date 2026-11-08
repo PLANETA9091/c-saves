@@ -603,9 +603,11 @@ fn main() {
     println!("region profile: {}", rs.profile_json());
     println!("region enc-modes: {}", c_saves::chunknbt::enc_mode_stats());
 
-    // verify every chunk semantically
+    // verify every chunk semantically (pristine contracts count as their
+    // own bucket — nothing is stored, read = None is the contract)
     let mut ok = 0usize;
     let mut bad = 0usize;
+    let mut pristine = 0usize;
     for (cx, cz, p) in &region_chunks {
         match rs.read_chunk(key(*cx, *cz)) {
             Some(d) => {
@@ -619,8 +621,12 @@ fn main() {
                 }
             }
             None => {
-                bad += 1;
-                eprintln!("region MISSING chunk ({cx},{cz})");
+                if rs.is_pristine(key(*cx, *cz)) {
+                    pristine += 1;
+                } else {
+                    bad += 1;
+                    eprintln!("region MISSING chunk ({cx},{cz})");
+                }
             }
         }
     }

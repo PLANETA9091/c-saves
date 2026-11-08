@@ -122,7 +122,10 @@ fn main() {
     println!("=== c-saves size benchmark: {n} chunks, {rounds} edit rounds ===");
 
     // ---- Phase A: fresh world ----
-    let cfg = Cfg { compact_min: 256 * 1024, compact_ratio: 0.10, dict_train: 400, ..Cfg::default() };
+    // from_env base: benches honor the CSAVES_* knobs (the pristine demo
+    // runs with CSAVES_PRISTINE=1; CI sets none, so behavior is identical
+    // to the previous Cfg::default() base)
+    let cfg = Cfg { compact_min: 256 * 1024, compact_ratio: 0.10, dict_train: 400, ..Cfg::from_env() };
     let region_store = Store::open_cfg(&dir.join("region"), true, cfg.clone()).unwrap();
     let entity_store = Store::open_cfg(&dir.join("entities"), true, cfg.clone()).unwrap();
     entity_store.set_whole_mode();
@@ -232,8 +235,15 @@ fn main() {
     // ---- Phase D: verification (semantic) ----
     let t3 = Instant::now();
     let mut verified = 0;
+    let mut pristine_n = 0;
     for (i, &(cx, cz)) in coords.iter().enumerate() {
         if i % 61 != 0 && !edited.contains_key(&key(cx, cz)) {
+            continue;
+        }
+        // v0.9.44: pristine contracts store nothing (read = None BY DESIGN;
+        // Paper regenerates from the seed). Nothing to verify Rust-side.
+        if region_store.is_pristine(key(cx, cz)) {
+            pristine_n += 1;
             continue;
         }
         let round = *edited.get(&key(cx, cz)).unwrap_or(&0);
@@ -252,17 +262,30 @@ fn main() {
         verified += 1;
     }
     let verify_secs = t3.elapsed().as_secs_f64();
-    println!("D verify: {verified} chunks semantic-equal in {verify_secs:.2} s");
+    println!("D verify: {verified} chunks semantic-equal in {verify_secs:.2} s ({pristine_n} pristine contracts skipped)");
 
     // ---- reopen persistence check ----
     let rs2 = Store::open_cfg(&dir.join("region"), true, cfg.clone()).unwrap();
     let es2 = Store::open_cfg(&dir.join("entities"), true, cfg.clone()).unwrap();
     assert_eq!(rs2.chunk_count(), n, "region chunks survive reopen");
     assert_eq!(es2.chunk_count(), n, "entity chunks survive reopen");
-    let sample = coords[n / 2];
-    let got = rs2.read_chunk(key(sample.0, sample.1)).expect("read after reopen");
-    let want = chunk_payload(&w, sample.0, sample.1, 0);
-    assert!(chunk_semantic_eq(&got, &want), "reopen semantic equality");
+    // reopen: a pristine key must stay a contract (read = None); a normal
+    // key must read back semantically equal.
+    let mut reopened_normal = false;
+    for (i, &(cx, cz)) in coords.iter().enumerate() {
+        let k = key(cx, cz);
+        if rs2.is_pristine(k) {
+            assert!(rs2.read_chunk(k).is_none(), "pristine contract must read None after reopen");
+            continue;
+        }
+        if !reopened_normal && i % 97 == 0 {
+            let round = *edited.get(&k).unwrap_or(&0);
+            let want = chunk_payload(&w, cx, cz, round);
+            let got = rs2.read_chunk(k).expect("read after reopen");
+            assert!(chunk_semantic_eq(&got, &want), "reopen semantic equality");
+            reopened_normal = true;
+        }
+    }
 
     // ---- summary ----
     let total_logical = logical_region + logical_ent;
