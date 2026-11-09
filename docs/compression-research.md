@@ -868,3 +868,63 @@ first-write hazard closed (§11), assertion auditable (§12), export
 accountable (§13), operator surface honest (§14), the -90% promise
 proven at scale (§15), the per-chunk arithmetic at its floor (§16), the
 POI index extinct (§17), and the assert itself proven (§18).
+
+## 19. Research tick 15 — the worst case (v0.9.55): every chunk touched, zero pristine help
+
+§16's ladder ended at the region-assert tier's x0.00003 — measured, as
+every pristine number before it, on a world where 261,888 of 262,144
+chunks stay contracted. The honest challenge this tick answers: is the
+huge-world arithmetic just the untouched-chunk elision wearing a
+compression costume? The answer is a second CI probe
+(`worst_case_probe`) that deletes the elision variable entirely: the
+SAME 262,144-chunk wgen world, but every slot carries round-1 content —
+rebuilt terrain, a genuine player edit — and everything is stored
+through the normal pipeline. Two phases, two independent proofs:
+
+**Phase A — pure codec, pristine OFF.** The all-edited world is
+imported with every pristine flag disabled. Zero contracts exist in
+that container; nothing is elided; the only arithmetic at work is the
+content-addressed section dedup + zstd that the codec has always been.
+The measured weight (after the production maintenance pass — sync, seal,
+compaction to completion, exactly what an operator ships): ~235–240 B
+per fully-edited chunk = x0.0575–0.0587 of the Anvil baseline, across
+the 4,096- and 9,216-chunk local validation runs. Vanilla's zlib-6 +
+4 KiB sectors hold the same all-edited world at 4,104 B/chunk.
+
+**Phase B — the pristine lifecycle, fully colonized.** The pure-worldgen
+twin imports pristine (262,144 honest contracts — the operator flow),
+then EVERY contract is superseded by a real live edit: 262,144
+`write_chunk` calls, parallel on all cores, 0 pristine remain. The
+colonized container converges to ~296–301 B/chunk = x0.0723–0.0734 —
+the pristine tier was a lever, not a dependency; a world where the
+players eventually touch every chunk ends up paying the codec's own
+arithmetic, and that arithmetic is −92%…−94%.
+
+**Verification is semantic, and it is total.** Both containers are read
+back chunk by chunk (parallel) and compared against the edited content
+with the JJ verify pattern — per-section expanded state vectors plus
+structural equality of everything else — because canonical section
+re-encoding permutes palette order (semantically neutral) and NBT byte
+order drifts between serializations. bad=0 pinned for all 262,144
+stored chunks in both phases. The fully-colonized export then accounts
+for every key: 262,144 stored + 0 pristine_skipped + 0 lost — nothing
+hides behind a contract anymore, because phase B has none left.
+
+| receipt | value |
+|---|---|
+| phase A (pure codec, 0 contracts) | 235–240 B/chunk = x0.0575–0.0587 of Anvil (local 4,096 / 9,216-chunk runs) |
+| phase B (fully colonized, 0 pristine) | 296–301 B/chunk = x0.0723–0.0734 of Anvil |
+| Anvil baseline, same all-edited world | 4,104 B/chunk (zlib-6, 4 KiB sectors) |
+| verify A / verify B | ok=all, bad=0, semantic (jj verify pattern), both phases |
+| export accounting (phase B) | 262,144 stored + 0 pristine_skipped + 0 lost = all keys |
+| CI gate | in-process assert container/anvil < x0.15 BOTH phases at 262,144 chunks; artifact `bench_worst_case.txt` carries the exact full-scale values |
+
+**What this settles.** The two headline claims now hold separately and
+are separately gated. The codec's own arithmetic — section dedup + zstd,
+no elision anywhere — delivers −92%+ on a world where every chunk was
+touched by a player. The pristine tier's −99% is a VERIFIED content
+delta layered on top of that codec: the untouched mass stores 0.13
+B/chunk of proven-reproducible contract, not an absence, and the moment
+any contract is superseded by real play, the chunk flows through the
+pipeline at the codec's honest weight. Elision never enters the
+equation: the worst case was measured, and it is still −92%.

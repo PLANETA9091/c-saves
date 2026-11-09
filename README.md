@@ -154,6 +154,39 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.55 — the challenge answered: every chunk touched, zero pristine help
+
+The huge-world arithmetic (x0.0087 legends, x0.00003 region-assert) was
+measured on worlds where 261,888 of 262,144 chunks stay contracted. The
+honest challenge: is the -99% just the untouched-chunk elision? This
+tick deletes that excuse with a second CI probe (`worst_case_probe`):
+the SAME 262,144-chunk world, but EVERY chunk carries real
+player-built content (wgen round 1 — rebuilt terrain, a genuine edit)
+and is stored through the normal pipeline. Phase A imports the
+all-edited world with every pristine flag OFF — zero contracts exist in
+that container at all; the only arithmetic at work is the
+content-addressed section dedup + zstd. Phase B imports the pure-worldgen
+twin pristine (262,144 honest contracts) and then supersedes EVERY
+contract with a live edit — 262,144 `write_chunk` calls, parallel, 0
+pristine remain. Both containers are measured after the production
+maintenance pass (sync → seal → compaction to completion) and every one
+of the stored chunks is read back and verified SEMANTICALLY against the
+edited content — the JJ verify pattern (per-section expanded state
+vectors), bad=0 pinned. The export accounts for every key:
+262,144 stored + 0 pristine_skipped + 0 lost — nothing hides behind a
+contract anymore, because there are none.
+
+Measured on 100% player-modified content (local validation runs;
+the CI job pins the same gates at the full 262,144-chunk scale):
+~235–240 B/chunk pure codec (x0.058 of Anvil) and 296–301 B/chunk fully
+colonized (x0.073) — against 4,104 B/chunk of vanilla zlib-6 Anvil for
+the same all-edited world. That is −92%…−94% with every single chunk
+stored. The two claims now hold separately: the codec's own arithmetic
+delivers −92%+ on fully played worlds, and the pristine tier's −99%
+(region-assert, 34 KiB at 262k chunks) is a VERIFIED content delta
+layered on top — every asserted chunk proven seed-reproducible (v0.9.54),
+every contract a true statement about content, never an absence.
+
 ## v0.9.54 — the proven assert: seed verification and the divergent-chunk gate
 
 The pristine tier's one honest residual was that "seed-reproducible"

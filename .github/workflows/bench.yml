@@ -163,6 +163,45 @@ jobs:
           grep -q "scale total gate: PASS (< x0.0001 — the whole-world arithmetic)" bench_scale_probe.txt || { echo "FAIL: whole-world arithmetic"; exit 1; }
           grep -q "=== scale probe: PASS ===" bench_scale_probe.txt || { echo "FAIL: scale verdict"; exit 1; }
 
+  worst-case-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build worst-case probe
+        working-directory: native
+        run: cargo build --release --example worst_case_probe
+      - name: worst-case gate — EVERY chunk player-edited, zero pristine help (v0.9.55)
+        working-directory: native
+        run: |
+          # The challenge answered: the huge-world arithmetic must not rest
+          # on untouched chunks. This probe stores ALL 262,144 chunks
+          # through the normal pipeline — phase A with every pristine flag
+          # OFF (pure codec: section dedup + zstd, zero contracts exist),
+          # phase B as the pristine lifecycle fully colonized (262,144
+          # live edits supersede every contract; 0 pristine remain). Both
+          # containers are measured after the production maintenance pass
+          # and every one of the 262,144 stored chunks is verified
+          # SEMANTICALLY against the edited content (the jj verify
+          # pattern: per-section expanded state vectors). The in-process
+          # gates assert container/anvil < x0.15 on 100% player-modified
+          # content (a panic exits non-zero); the greps pin the counts.
+          ./target/release/examples/worst_case_probe 2>&1 | tee bench_worst_case.txt
+          grep -q "worst-case world: 256 regions x 1024 chunks = 262144 chunks, every chunk player-edited" bench_worst_case.txt || { echo "FAIL: world scale"; exit 1; }
+          grep -q "worst-case import A: 262144 stored, 0 contracted, 0 failed (pristine OFF — pure codec, no elision)" bench_worst_case.txt || { echo "FAIL: phase A all-stored"; exit 1; }
+          grep -q "worst-case verify A: ok=262144 bad=0" bench_worst_case.txt || { echo "FAIL: phase A verification"; exit 1; }
+          grep -q "worst-case ratio gate A: PASS" bench_worst_case.txt || { echo "FAIL: phase A ratio gate"; exit 1; }
+          grep -q "worst-case lifecycle: 262144 edits -> 0 pristine remain (every contract superseded by a real edit)" bench_worst_case.txt || { echo "FAIL: full colonization"; exit 1; }
+          grep -q "worst-case verify B: ok=262144 bad=0" bench_worst_case.txt || { echo "FAIL: phase B verification"; exit 1; }
+          grep -q "worst-case export accounting: 262144 stored + 0 pristine_skipped + 0 lost = 262144 keys" bench_worst_case.txt || { echo "FAIL: export accounting"; exit 1; }
+          grep -q "worst-case ratio gate B: PASS" bench_worst_case.txt || { echo "FAIL: phase B ratio gate"; exit 1; }
+          grep -q "=== worst-case probe: PASS ===" bench_worst_case.txt || { echo "FAIL: verdict"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worst-case-results
+          path: native/bench_worst_case.txt
+
   jj-bench:
     runs-on: ubuntu-latest
     timeout-minutes: 20

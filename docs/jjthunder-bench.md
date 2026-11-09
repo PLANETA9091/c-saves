@@ -1780,3 +1780,35 @@ change; the JJThunder corpus path is untouched. Gates: 75/75 tests,
 enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843, bench_size compact
 x0.08, export_roundtrip PASS, scale_probe 16 PASS with the three new
 greps. Research §18.
+
+## v0.9.55 — the challenge answered: every chunk touched, zero pristine help
+
+The JJThunder gates prove codec correctness on REAL worlds; the scale
+probe proves pristine economics where 261,888 of 262,144 chunks stay
+contracted. What neither proved until now: the worst case — a world
+where EVERY chunk was touched by a player. v0.9.55 adds the
+`worst_case_probe` CI job (8th bench job) that deletes the elision
+variable: the same 262,144-chunk wgen world with round-1 content in
+EVERY slot, stored through the normal pipeline in two phases —
+
+- phase A: every pristine flag OFF, zero contracts exist, pure codec
+  (section dedup + zstd); measured ~235–240 B/chunk = x0.0575–0.0587
+  of the 4,104 B/chunk Anvil baseline;
+- phase B: pristine import of the seed twin, then 262,144 live edits
+  supersede every contract, 0 pristine remain; the colonized container
+  converges to ~296–301 B/chunk = x0.0723–0.0734.
+
+Both containers are measured after the production maintenance pass
+(sync → seal → compaction to completion) and every stored chunk is
+verified SEMANTICALLY against the edited content — the same
+per-section expanded-state-vector equality the JJ gates use — bad=0
+pinned in both phases. The fully-colonized export accounts for every
+key: 262,144 stored + 0 pristine_skipped + 0 lost. The in-process
+gates assert container/anvil < x0.15 on 100% player-modified content
+(a panic exits non-zero); the greps pin the counts, the CI artifact
+(`bench_worst_case.txt`) carries the exact full-scale values.
+
+No byte-level change to the JJThunder corpus path itself. Gates:
+75/75 tests, enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
+bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS,
+worst_case_probe PASS with the nine new greps. Research §19.
