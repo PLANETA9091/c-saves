@@ -1813,6 +1813,29 @@ No byte-level change to the JJThunder corpus path itself. Gates:
 bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS,
 worst_case_probe PASS with the nine new greps. Research §19.
 
+## v0.9.57 — the gate caught the corpus: the three zero-edit chunks, made constructive
+
+The v0.9.56 CI run refused the worst-case phase-B claim — and that
+refusal was the system working: after 262,144 live edits, 3 chunks were
+still pristine contracts (262,141 stored). The `worst_diag` forensic
+replay isolated it in one run: NOT a race — the documented identical-
+re-save canon skip (v0.9.46) fired exactly 3 times, because wgen's
+round-reseeded heights are quantized and in flat zones land on the same
+integer height in all 256 columns. A full-world scan: 188,829 chunks
+differ in every column, ~100 flat-zone chunks differ in a handful, and
+EXACTLY 3 — (158,372), (360,164), (375,463) — differ in ZERO columns;
+their "edit" was canonically identical to the seed. The gate was right,
+the corpus was wrong. The fix makes the edit constructive: every
+round>0 chunk breaks its corner block (lx=15, lz=15) — the change
+flows through sections, heightmaps and blending_data, so round-1 is
+canonically visible in EVERY chunk by construction. Post-fix replay at
+full 262,144-chunk scale: skip branch 0 hits, 262,144 stored, 0
+contracted, no survivors. No byte-level change to the JJThunder corpus
+path itself (wgen is a benchmark-only generator). Gates: 75/75 tests,
+enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843, bench_size compact
+x0.08, export_roundtrip PASS, worst_case_probe PASS with the nine
+greps. Research §21.
+
 ## v0.9.56 — the pack sweep: the JJThunder import pattern generalized to bulk scale
 
 The first CI run of worst_case_probe measured x0.2104 (863 B/chunk) at

@@ -353,6 +353,23 @@ pub fn chunk_payload(w: &World, cx: i32, cz: i32, round: u64) -> Vec<u8> {
             heights[lz * 16 + lx] = w.height(cx, cz, lx, lz, round);
         }
     }
+    // THE GUARANTEED PLAYER EDIT (v0.9.57). Round-reseeded heights are
+    // quantized: in flat zones a reseed lands on the same integer height in
+    // every column. Measured across the side-16 world (262,144 chunks):
+    // 188,829 chunks differ in all 256 columns, ~100 flat-zone chunks differ
+    // in a few columns, and EXACTLY 3 chunks (158,372 / 360,164 / 375,463)
+    // differ in ZERO columns — their round-1 payload was canonically equal
+    // to the round-0 contract, the write path's documented identical-re-save
+    // skip kept those 3 contracts, and the worst-case gate refused the
+    // "every chunk player-edited" claim. The gate was right; the corpus was
+    // wrong. A constructive edit removes the claim's last assumption: every
+    // round>0 chunk has its corner block (lx=15, lz=15) broken — the edit
+    // flows through sections (voxel column + palette), heightmaps and
+    // blending_data, so round-1 is canonically visible in EVERY chunk by
+    // construction, never by statistics.
+    if round > 0 {
+        heights[255] -= 1;
+    }
 
     let mut sections = Vec::with_capacity(NSEC);
     for i in 0..NSEC {

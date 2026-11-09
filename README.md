@@ -154,6 +154,34 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.57 — the gate caught the corpus: the three zero-edit chunks
+
+The v0.9.56 CI run refused the worst-case claim, and it was right to:
+after 262,144 live edits the probe measured 262,141 stored — three
+chunks were still pristine contracts. The `worst_diag` forensic replay
+(the new example, three sandbox-sized phases: pristine import → live
+edits → per-survivor dissection) isolated the mechanism in one run: NOT
+a race. The write path's documented identical-re-save skip fired exactly
+3 times, canon branch (`ST_PRISTINE_CANON`) 3 — because round-reseeded
+wgen heights are QUANTIZED, and in flat zones a reseed lands on the same
+integer height in all 256 columns. A full-world scan measured it: 188,829
+of 262,144 chunks differ in every column, ~100 flat-zone chunks differ in
+a handful, and EXACTLY 3 chunks — (158,372), (360,164), (375,463) —
+differ in ZERO columns: their "player edit" was canonically identical to
+the seed, and the contract legally survived. The gate was right, the
+corpus was wrong: "every chunk player-edited" was a statistical claim,
+not a constructive one.
+
+The fix makes the edit constructive: every round>0 chunk now has its
+corner block (lx=15, lz=15) broken — the change flows through sections
+(voxel column + palette), heightmaps and blending_data, so round-1 is
+canonically visible in EVERY chunk by construction. Post-fix replay at
+full 262,144-chunk scale: skip branch 0 hits, 262,144 stored, 0
+contracted, no survivors (and a repeat edit kills nothing because
+nothing survives). 75/75 tests green. The worst-case headline stands
+unchanged and now airtight: phase A x0.0584 (239 B/chunk) at CI scale —
+−94% on 100% player-modified content with zero pristine help.
+
 ## v0.9.56 — the pack sweep: bulk imports re-tier everything, at every scale
 
 The first CI run of the worst-case probe caught something real: the

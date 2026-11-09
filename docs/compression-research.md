@@ -971,3 +971,77 @@ sweep, not just at bench scale: the shipped container's per-chunk
 weight is scale-invariant. The CI artifact of the re-run carries the
 full 262,144-chunk values; the gates assert < x0.15 in both phases in
 process.
+
+## 21. Research tick 17 — the gate caught the corpus (v0.9.57): the three zero-edit chunks, made constructive
+
+The v0.9.56 CI run of `worst_case_probe` refused the worst-case claim:
+262,141 stored after 262,144 live edits — three keys still resolved to
+pristine contracts (`assert stored_b1.len() == total_chunks` panicked,
+phase B, "every contract superseded by a real edit"). Everything else was
+green: phase A passed with 62,866,302 B = 239 B/chunk = x0.0584 of Anvil
+(−94% on 100% player-modified content, zero pristine help), verify A
+bad=0 across all 262,144 chunks, and the phase-B edits themselves all
+returned `Ok` (262,144/262,144).
+
+**The forensic replay.** The new `worst_diag` example reproduces phase B
+in three sandbox-sized windows (pristine import → parallel live edits →
+per-survivor dissection) and, for every contracted survivor, prints the
+full evidence: `read_chunk` Some/None, the legend's raw and canonical
+hashes against the round-0 AND round-1 payload hashes, a column-by-column
+height diff, then repeats the SAME edit (a transient race survivor dies
+on the second write; a deterministic one survives again). One run pinned
+the mechanism:
+
+```
+SURVIVOR k=0000009e00000174 cx=158 cz=372 read_chunk=None
+  legend.raw==h(r1)?  false   legend.canon==c(r1)?  true
+  legend.raw==h(r0)?  false   legend.canon==c(r0)?  true
+  height-diff cols 0/256
+SURVIVOR k=00000168000000a4 cx=360 cz=164  ... (identical shape)
+SURVIVOR k=00000177000001cf cx=375 cz=463  ... (identical shape)
+after repeat edits: survivors killed: 0
+```
+
+NOT a race. The skip counters (`ST_WRITE_SKIP`, `ST_PRISTINE_CANON`)
+moved by exactly 3 during the edits: the write path's documented
+identical-re-save behavior — "a byte-different re-save of contracted
+content also stays a contract when the strip-canonical legend matches"
+(v0.9.46) — fired legitimately 3 times. The three round-1 payloads were
+canonically EQUAL to their round-0 contracts: same sections, same
+heightmaps, same blending_data (the `LootTable ..._r{round}` chest edit
+does not apply: `(cx ^ cz) % 3 != 0` for all three).
+
+**Why the corpus was wrong.** wgen re-seeds every round (round-1 is the
+"player-edited" world), but the reseeded heights are QUANTIZED —
+`h.round() as i32` — and in flat zones the reseeded noise lands on the
+same integer height in every column. A full-world scan (262,144 chunks ×
+256 columns × 2 rounds) measured the distribution:
+
+| height-diff columns (round-0 vs round-1) | chunks |
+|---|---|
+| 256/256 (every column differs) | 188,829 |
+| small tail (2 … ~30 columns — flat zones) | ~73,312 |
+| **0/256 (the edit is canonically invisible)** | **exactly 3** |
+
+For those 3 chunks the "player edit" changed nothing the contract
+protects — and the pristine tier, doing exactly what §10 documented,
+kept the contract instead of paying 296 B/chunk to store a duplicate of
+the seed. The gate refused the claim. **The gate was right; the corpus
+was wrong**: "every chunk player-edited" was statistical, not
+constructive.
+
+**The constructive fix.** The guaranteed edit: every `round > 0` chunk
+now breaks its corner block (`heights[255] -= 1`, lx=15/lz=15). The
+change flows through the section model (the column's voxel entry + the
+palette it joins), both heightmaps (`WORLD_SURFACE`, `MOTION_BLOCKING`),
+and `blending_data.section_pos_heights` — so round-1 is canonically
+visible in EVERY chunk by construction, never by statistics.
+
+**Post-fix replay at full scale** (`worst_diag`, side=16, 262,144
+chunks, 4 threads, sync stride 16,384 — probe parity): the skip branch
+fired **0** times; classify after the edits: **262,144 stored, 0
+contracted, no survivors**; a repeat edit has nothing to kill. 75/75
+tests green. The worst-case answer is now airtight end to end: the
+−92%…−94% holds on 100% player-modified content where every edit is
+canonically visible BY CONSTRUCTION, and the pristine tier's −99% is the
+verified content delta on top of it.
