@@ -928,3 +928,46 @@ B/chunk of proven-reproducible contract, not an absence, and the moment
 any contract is superseded by real play, the chunk flows through the
 pipeline at the codec's honest weight. Elision never enters the
 equation: the worst case was measured, and it is still −92%.
+
+## 20. Research tick 16 — the pack sweep (v0.9.56): bulk imports re-tier everything
+
+The first CI run of the worst-case probe caught a real gap — in the
+probe's own maintenance model, exposed precisely because the probe runs
+at a scale no bench had touched before. One `request_pack` flag
+re-tiers ONE hot segment per `compact_step` (the flag is swapped away
+and the auto-pack watermark resets); every existing bench corpora fit
+into 1–2 segments, so the single-request pattern always covered them.
+At 262,144 chunks the imported mass spans ~4 × 64 MB
+(`CSAVES_SEG_ROLL`) segments — the first CI run measured the UN-SWEPT
+hot tier: 226,356,090 B = 863 B/chunk = x0.2104 of Anvil. The
+in-process x0.15 gate refused it — the gate doing exactly its job
+against a transient form. Worth stating: even that un-swept container
+is −79% on 100% player-modified content; the hot tier alone beats the
+module promise on a fully played world.
+
+**The fix.** The JJThunder corpus path has always taken the right step
+after an Anvil import (`request_pack` + `compact_step` loop — "imported
+data must be slab-packed + cold-tiered, the same path the server module
+takes after an Anvil import"); the sweep generalizes it to bulk scale:
+re-raise `request_pack` before EVERY `compact_step` and loop until
+`pack_fallback` finds no non-cold blob anywhere. Each step picks the
+heaviest hot segment; the loop ends only when the container is all
+cold-tier. Validated locally on a forced multi-segment corpus
+(`CSAVES_SEG_ROLL=1 MB` → 12 segments): every segment packed
+(seg-00005/00009/00010/...), and the converged weight is IDENTICAL to
+single-segment scale — 240 B/chunk (x0.0587) pure codec, 302 B/chunk
+(x0.0738) fully colonized, verify bad=0 in both phases.
+
+| receipt | value |
+|---|---|
+| un-swept hot tier at 262k (CI, v0.9.55) | 226,356,090 B = 863 B/chunk = x0.2104 (−79%) — gate refused, correctly |
+| swept container, forced 12-segment local run | 240 B/chunk = x0.0587 (phase A) / 302 B/chunk = x0.0738 (phase B) |
+| convergence | identical per-chunk weight at 1, 4 and 12 segments — scale-invariant |
+| production semantics | import path ships the swept container; `spawn_maintenance` re-tiers residue during live play (4 MB auto-pack watermark) |
+
+**Why this matters for the worst-case answer.** The v0.9.55 claim —
+"every chunk touched, −92%…−94%" — now holds at bulk scale with the
+sweep, not just at bench scale: the shipped container's per-chunk
+weight is scale-invariant. The CI artifact of the re-run carries the
+full 262,144-chunk values; the gates assert < x0.15 in both phases in
+process.

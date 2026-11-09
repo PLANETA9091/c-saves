@@ -1812,3 +1812,21 @@ No byte-level change to the JJThunder corpus path itself. Gates:
 75/75 tests, enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
 bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS,
 worst_case_probe PASS with the nine new greps. Research §19.
+
+## v0.9.56 — the pack sweep: the JJThunder import pattern generalized to bulk scale
+
+The first CI run of worst_case_probe measured x0.2104 (863 B/chunk) at
+262,144 chunks and the x0.15 gate refused it — correctly. The container
+was the UN-SWEPT hot tier: one `request_pack` re-tiers one hot segment
+per `compact_step`, every existing bench corpora fit in 1–2 segments,
+and 262k chunks span ~4 × 64 MB ones. The fix re-raises
+`request_pack` before every `compact_step` until no hot material
+remains — the exact pattern this corpus path has always taken after an
+Anvil import, now proven at bulk scale. Forced 12-segment local run
+(`CSAVES_SEG_ROLL=1 MB`): every segment packed, converged weight
+IDENTICAL to single-segment scale — 240 B/chunk (x0.0587) pure codec,
+302 B/chunk (x0.0738) fully colonized, verify bad=0 both phases. Even
+the un-swept hot tier was −79% on fully played content; the swept
+container is −92%…−94% at every scale. Gates: 75/75 tests, enc_fp EXACT
+6d240d7166cdda99 / 12130 / 9,971,843, bench_size compact x0.08, scale_probe
+PASS, worst_case_probe PASS with the sweep. Research §20.

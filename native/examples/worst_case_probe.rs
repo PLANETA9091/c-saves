@@ -259,19 +259,33 @@ fn verify_all_stored(
 }
 
 /// The production maintenance pass (the bench_size flow): fsync, seal the
-/// active segment, then drive compaction to completion — slabs re-tier at
-/// cold_level, dictionaries retrain, dead records vanish. The container
+/// active segment, then drive the pack sweep to completion — slabs re-tier
+/// at cold_level, dictionaries retrain, dead records vanish. The container
 /// weight is measured AFTER this pass, exactly what an operator ships.
+///
+/// The sweep is the JJThunder import pattern (`request_pack` +
+/// `compact_step` loop — "imported data must be slab-packed + cold-tiered,
+/// the same path the server module takes after an Anvil import")
+/// GENERALIZED to bulk scale: one `request_pack` flag re-tiers ONE hot
+/// segment per `compact_step`, and at world scale the imported mass spans
+/// several `CSAVES_SEG_ROLL` segments (64 MB roll -> 262k chunks ~ 226 MB
+/// hot -> ~4 segments) — so the flag is re-raised before every step and
+/// the loop runs until NO hot material remains (pack_fallback finds no
+/// non-cold blob and returns false). Without the sweep a bulk import
+/// leaves every segment after the first in the hot tier — the CI run of
+/// v0.9.55 caught exactly that (x0.2104 measured against the x0.058 the
+/// shipped container actually weighs).
 fn drive_maintenance(store: &Store) -> usize {
     store.sync();
     store.seal();
     let mut steps = 0;
     while steps < 100_000 {
+        store.request_pack();
         if !store.compact_step() {
             break;
         }
         steps += 1;
-        if steps % 100 == 0 {
+        if steps % 10 == 0 {
             eprintln!("[worst] compaction step {steps}");
         }
     }

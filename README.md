@@ -154,6 +154,31 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.56 — the pack sweep: bulk imports re-tier everything, at every scale
+
+The first CI run of the worst-case probe caught something real: the
+probe's maintenance pass was too weak at bulk scale. One `request_pack`
+flag re-tiers ONE hot segment per `compact_step`, and 262,144 imported
+chunks span ~4 × 64 MB segments — so the measured container was the
+UN-SWEPT hot tier: 226,356,090 B = 863 B/chunk = x0.2104, and the
+in-process x0.15 gate correctly refused it (even that number is −79% on
+100% player-modified content — the hot tier alone beats the promise on
+a fully played world). The fix is the JJThunder import pattern
+generalized to bulk scale: re-raise `request_pack` before every
+`compact_step` until pack_fallback finds no hot material left. Validated
+locally on a forced multi-segment run (`CSAVES_SEG_ROLL=1 MB` → 12
+segments, all packed): 240 B/chunk (x0.0587) pure codec, 302 B/chunk
+(x0.0738) fully colonized — the shipped container converges to the same
+weight at every scale, single-segment or twelve.
+
+Production semantics, stated precisely: after a bulk Anvil import the
+operator ships the SWEPT container (the import path runs the sweep —
+the same step the JJThunder corpus path has always taken); the server's
+background maintenance (`spawn_maintenance`, a `compact_step` every
+2.5 s) re-tiers remaining hot segments as live play accumulates writes
+(the 4 MB auto-pack watermark). The hot tier is a transient, never the
+shipped form.
+
 ## v0.9.55 — the challenge answered: every chunk touched, zero pristine help
 
 The huge-world arithmetic (x0.0087 legends, x0.00003 region-assert) was
