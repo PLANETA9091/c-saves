@@ -2,6 +2,14 @@
 #![allow(dead_code)]
 
 use fastnbt::Value;
+// std HashMap, deliberately: fastnbt's Value::Compound is HashMap-backed,
+// so NBT byte order is randomized per compound INSTANCE — chunk_payload can
+// never be byte-reproducible across invocations (real vanilla cannot either:
+// JVM map order). The v0.9.54 seed-verification gate therefore verifies at
+// the CANONICAL level (canonical_contract_hash — order-free, strip-
+// invariant), which is exactly the restoration semantics the pristine tier
+// guarantees: read=None -> vanilla regenerates -> Paper re-serializes with
+// its own map order -> the canon legend absorbs the byte drift.
 use std::collections::HashMap as Map;
 
 // ---------------------------------------------------------------- noise ----

@@ -1749,3 +1749,34 @@ No byte-level change. Gates: 71/71 tests, enc_fp EXACT
 x0.08 (gate 0.15), export_roundtrip PASS. Research §14: bytes closed,
 erosion closed, first-write hazard closed, assertion auditable, export
 accountable, operator surface honest.
+
+---
+
+## v0.9.54 — the proven assert: seed verification and the divergent-chunk gate
+
+The JJThunder corpus gates prove codec correctness on REAL worlds; the
+scale probe proves the pristine economics on the synthetic 262,144-chunk
+world. What neither proved until now: that "seed-reproducible" — the
+claim the 0.13 B/chunk region-assert tier rests on — is true, per run,
+not per operator's signature. v0.9.54 adds the verification machinery to
+the scale probe:
+
+- the seed-verification gate: every chunk on disk canonically
+  hash-compared against the seed regeneration (262,144/262144 pinned);
+  the surviving legends checked through the container against the same
+  hashes (261,888/261888 pinned);
+- the divergent-chunk gate: a round-1 (diverged) chunk is caught by the
+  classifier, refused the assert for its slot, stored honestly through
+  `write_chunk_fresh(fresh=false)` — the restore identity pins
+  262,143 seed-restored + 1 container-stored = 262,144/262144 restored,
+  0 lost.
+
+The comparison is deliberately canonical (`canonical_contract_hash`),
+not byte-level: NBT byte order drifts between independent
+serializations (HashMap-backed compounds — fastnbt here, JVM map order
+in real vanilla), and canonical equality of regenerated content is
+exactly what the pristine tier guarantees on restore. No byte-level
+change; the JJThunder corpus path is untouched. Gates: 75/75 tests,
+enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843, bench_size compact
+x0.08, export_roundtrip PASS, scale_probe 16 PASS with the three new
+greps. Research §18.

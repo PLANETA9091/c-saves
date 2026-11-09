@@ -18,7 +18,7 @@ jobs:
 
   size-bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -136,6 +136,22 @@ jobs:
           grep -q "scale region verification cost: 2 re-save(s) stored honestly (identical included), 262142 of 262144 slots still asserted" bench_scale_probe.txt || { echo "FAIL: region verification cost semantics"; exit 1; }
           grep -q "scale region export accounting: 2 stored + 262142 pristine_skipped + 0 lost = 262144 keys" bench_scale_probe.txt || { echo "FAIL: region export accounting"; exit 1; }
           grep -q "scale region reimport: 2/2 edits re-asserted at region grain" bench_scale_probe.txt || { echo "FAIL: region re-import"; exit 1; }
+          # v0.9.54: the PROVEN assert — before any tier may claim a chunk
+          # is seed-reproducible, every chunk on disk is canonically
+          # hash-compared against the seed regeneration (canonical_
+          # contract_hash: order-free, strip-invariant — NBT byte order is
+          # NOT stable across serializations, content is), and the
+          # surviving legends are checked through the container against
+          # the same seed hashes. The divergent-chunk gate proves the
+          # negative: a chunk whose content diverged from the seed is
+          # caught at the gate, refused the assert, and stored honestly
+          # through the not-fresh evidence path — nothing lost, nothing
+          # silently reverted to seed content.
+          grep -q "scale seed verify: 262144/262144 chunks on disk match seed regeneration" bench_scale_probe.txt || { echo "FAIL: seed verification gate"; exit 1; }
+          grep -q "scale legend truth: 261888/261888 surviving legends equal the seed hash" bench_scale_probe.txt || { echo "FAIL: legend truth"; exit 1; }
+          grep -q "scale divergence gate: chunk (259,272) rejected — disk hash != seed hash" bench_scale_probe.txt || { echo "FAIL: divergent chunk not caught"; exit 1; }
+          grep -q "scale divergence protocol: 262143 slots asserted (verified against the seed), 1 divergent chunk stored honestly" bench_scale_probe.txt || { echo "FAIL: divergence protocol"; exit 1; }
+          grep -q "scale restore identity: 262143 seed-restored + 1 container-stored = 262144/262144 restored, 0 lost" bench_scale_probe.txt || { echo "FAIL: restore identity"; exit 1; }
           # v0.9.53: the POI store is a DERIVED index — vanilla rebuilds it
           # from chunk block states on load (PoiManager.checkConsistency-
           # WithBlocks). The elision pins 0 B persisted (session scratchpad

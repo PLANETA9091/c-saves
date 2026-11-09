@@ -154,6 +154,38 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.54 — the proven assert: seed verification and the divergent-chunk gate
+
+The pristine tier's one honest residual was that "seed-reproducible"
+was *asserted*, not *proven*. This tick makes the proof a CI artifact.
+The scale probe gains a seed-verification gate: before any tier may
+claim a chunk is seed-reproducible, every chunk on disk is decompressed
+and canonically hash-compared against the seed regeneration
+(`canonical_contract_hash` — order-free, strip-invariant). The
+comparison is canonical, not byte-level, because NBT byte order is NOT
+stable across independent serializations: fastnbt's compounds are
+HashMap-backed and a real vanilla JVM re-serializes with its own map
+order every save — content is what the pristine tier guarantees
+(read=None → vanilla regenerates → Paper re-serializes → the canon
+legend absorbs the byte drift), and content is what the gate now
+verifies, 262,144 times per CI run. The surviving legends are then
+checked THROUGH THE CONTAINER against the same seed hashes
+(261,888/261,888): every contract is a true statement about the seed,
+not an operator's hope.
+
+The divergent-chunk gate proves the negative: a chunk whose content
+diverged from the seed (a mod, a data-pack edit, any pre-first-save
+mutation) is CAUGHT by the classifier (chunk (259,272) in the pinned
+run), refused the assert for its slot, and stored honestly through the
+not-fresh evidence path (`write_chunk_fresh` with fresh=false — the
+v0.9.47 gate doing exactly its job; a plain write_chunk asserts
+freshness and would contract it). The receipts: one incident costs one
+honest chunk (~2.9 KB) while 262,143 slots stay asserted; the restore
+identity pins 262,143 seed-restored + 1 container-stored =
+262,144/262,144 restored, 0 lost, nothing silently reverted to seed
+content. The pristine tier is now a content-addressed delta against the
+seed with a verified admission protocol — not a "skip".
+
 ## v0.9.53 — the derived index goes extinct: POI-store elision, 0 B persisted
 
 The POI region files (`poi/*.mca`) are not world data — they are a

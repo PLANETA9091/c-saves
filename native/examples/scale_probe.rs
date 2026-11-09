@@ -22,7 +22,17 @@
 //!   6. the v0.9.53 POI phase: a vanilla poi/ dir is fabricated at a
 //!      documented density and measured; today's whole-mode container is
 //!      compared against the elision (CSAVES_POI_ELIDE semantics — session
-//!      scratchpad, 0 B persisted, vanilla rebuilds from block states).
+//!      scratchpad, 0 B persisted, vanilla rebuilds from block states);
+//!   7. the v0.9.54 seed-verification gate: BEFORE any tier may claim a
+//!      chunk is seed-reproducible, every chunk on disk is decompressed and
+//!      hash-compared against the seed regeneration (wgen round 0 — the
+//!      exact content a missing chunk restores to at runtime), and the
+//!      surviving legends are checked THROUGH THE CONTAINER against the
+//!      same seed hashes — the assert is proven, not assumed;
+//!   8. the v0.9.54 divergent-chunk gate: a chunk whose content diverged
+//!      from the seed (a mod, a data-pack edit, any pre-first-save
+//!      mutation) is CAUGHT by the classifier, refused the assert and
+//!      stored honestly — nothing lost, nothing silently reverted.
 //!
 //! Gate: container/anvil < x0.10 — the user-level -90% promise, asserted
 //! at 262k-chunk scale (a panic exits non-zero, CI-able).
@@ -34,9 +44,10 @@ use c_saves::anvil;
 use c_saves::chunknbt::{canonical_contract_hash, hash_of};
 use c_saves::store::{Cfg, Store};
 use std::collections::BTreeMap;
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 #[path = "wgen/mod.rs"]
@@ -104,7 +115,13 @@ fn link_dir(src: &Path, dst: &Path) {
 /// One vanilla-format region file, streamed to disk (constant RAM: one
 /// chunk payload + its zlib output at a time). Returns the file size —
 /// the honest baseline bytes Paper would occupy for these 1024 chunks.
-fn write_region(world: &wgen::World, out_dir: &Path, rx: i32, rz: i32) -> std::io::Result<u64> {
+fn write_region(
+    world: &wgen::World,
+    out_dir: &Path,
+    rx: i32,
+    rz: i32,
+    slot_override: Option<(usize, Option<Vec<u8>>)>,
+) -> std::io::Result<u64> {
     let path = out_dir.join(format!("r.{rx}.{rz}.mca"));
     let mut f = std::fs::File::create(&path)?;
     let mut offsets = [0u32; 1024];
@@ -117,7 +134,15 @@ fn write_region(world: &wgen::World, out_dir: &Path, rx: i32, rz: i32) -> std::i
             let lz = (i >> 5) as i32;
             let cx = rx * 32 + lx;
             let cz = rz * 32 + lz;
-            let payload = wgen::chunk_payload(world, cx, cz, 0);
+            if let Some((s, None)) = slot_override {
+                if s == i {
+                    continue; // absent slot: the offsets entry stays 0, no sectors
+                }
+            }
+            let payload = match &slot_override {
+                Some((s, Some(p))) if *s == i => p.clone(),
+                _ => wgen::chunk_payload(world, cx, cz, 0),
+            };
             let mut z = flate2::write::ZlibEncoder::new(
                 Vec::with_capacity(payload.len() / 3),
                 flate2::Compression::new(6),
@@ -231,6 +256,69 @@ fn poi_chunk_nbt(cx: i32, cz: i32) -> Vec<u8> {
     b
 }
 
+/// The v0.9.54 seed-verification gate, one region file: every present
+/// slot's on-disk payload is decompressed and CANONICALLY compared against
+/// the seed regeneration (wgen round 0). The comparison is
+/// `canonical_contract_hash` — order-free, strip-invariant — because NBT
+/// byte order is NOT stable across independent serializations (fastnbt's
+/// compounds are HashMap-backed; a real JVM behaves the same), and the
+/// thing the pristine tier guarantees is canonical equality of the
+/// restored content: read=None -> vanilla regenerates -> Paper re-serializes
+/// -> the canon legend absorbs the byte drift. When `seed_hashes` is
+/// given, the canonical seed hash of every verified key is recorded for
+/// the through-the-container legend truth check.
+struct RegionVerdict {
+    present: usize,
+    ok: usize,
+    divergent: Option<(usize, u128, u128)>, // (slot, disk canon, seed canon)
+}
+
+fn verify_region_against_seed(
+    world: &wgen::World,
+    path: &Path,
+    rx: i32,
+    rz: i32,
+    seed_hashes: Option<&Mutex<BTreeMap<u64, u128>>>,
+) -> RegionVerdict {
+    let data = std::fs::read(path).expect("region file readable");
+    let mut v = RegionVerdict { present: 0, ok: 0, divergent: None };
+    for i in 0..1024usize {
+        let loc = u32::from_be_bytes([
+            data[i * 4],
+            data[i * 4 + 1],
+            data[i * 4 + 2],
+            data[i * 4 + 3],
+        ]);
+        if loc == 0 {
+            continue;
+        }
+        let off = (loc >> 8) as usize * 4096;
+        let len =
+            u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+        let comp_type = data[off + 4];
+        assert_eq!(comp_type, 2, "probe corpus is zlib (vanilla type 2)");
+        let mut disk_payload = Vec::with_capacity(len * 4);
+        flate2::read::ZlibDecoder::new(&data[off + 5..off + 4 + len])
+            .read_to_end(&mut disk_payload)
+            .expect("slot decompresses");
+        let cx = rx * 32 + (i as i32 & 31);
+        let cz = rz * 32 + (i as i32 >> 5);
+        let seed_payload = wgen::chunk_payload(world, cx, cz, 0);
+        v.present += 1;
+        let dh = canonical_contract_hash(&disk_payload).expect("disk slot parses as NBT");
+        let sh = canonical_contract_hash(&seed_payload).expect("seed regen parses as NBT");
+        if dh == sh {
+            v.ok += 1;
+        } else if v.divergent.is_none() {
+            v.divergent = Some((i, dh, sh));
+        }
+        if let Some(m) = seed_hashes {
+            m.lock().unwrap().insert(wgen::key(cx, cz), sh);
+        }
+    }
+    v
+}
+
 fn main() {
     let side: usize = std::env::args()
         .nth(1)
@@ -256,7 +344,7 @@ fn main() {
                 for ri in (w..n_regions).step_by(nproc) {
                     let rx = (ri / side) as i32;
                     let rz = (ri % side) as i32;
-                    let n = write_region(world, &gen, rx, rz).expect("region gen");
+                    let n = write_region(world, &gen, rx, rz, None).expect("region gen");
                     ab.fetch_add(n, Ordering::Relaxed);
                     let d = dn.fetch_add(1, Ordering::Relaxed) + 1;
                     if d % 32 == 0 || d == n_regions {
@@ -286,7 +374,12 @@ fn main() {
     link_dir(&gen, &gen_region);
 
     // ---- 2. pristine import: the pregen mass collapses to contracts ----
-    let cfg = Cfg { pristine: true, pristine_import: true, ..Cfg::from_env() };
+    let cfg = Cfg {
+        pristine: true,
+        pristine_import: true,
+        pristine_canon: true,
+        ..Cfg::from_env()
+    };
     let store = Store::open_cfg(&work.join("store"), true, cfg).unwrap();
     let t1 = Instant::now();
     let irep = anvil::import_dir(&gen_b, &store).expect("import ok");
@@ -401,6 +494,79 @@ fn main() {
     drop(sraw);
     let _ = std::fs::remove_dir_all(&work.join("store-raw"));
 
+    // ---- 6b. the seed-verification gate (v0.9.54): the assert is PROVEN,
+    // not assumed. Before any tier may claim a chunk is seed-reproducible,
+    // every chunk on disk is decompressed and hash-compared against the
+    // seed regeneration (wgen round 0) — the exact content a missing chunk
+    // restores to at runtime (read=None -> vanilla regenerates from the
+    // seed). This is what makes the pristine tier a content-addressed
+    // delta against the seed rather than a "skip": the classification is
+    // verified, 262,144 times, on every CI run. The surviving legends are
+    // then checked THROUGH THE CONTAINER against the same seed hashes.
+    let seed_map = Mutex::new(BTreeMap::<u64, u128>::new());
+    let v_ok = AtomicUsize::new(0);
+    let v_present = AtomicUsize::new(0);
+    let v_div = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for w in 0..nproc {
+            let (world, gr, sm, ok, pr, dv) =
+                (&world, &gen_region, &seed_map, &v_ok, &v_present, &v_div);
+            s.spawn(move || {
+                for ri in (w..n_regions).step_by(nproc) {
+                    let rx = (ri / side) as i32;
+                    let rz = (ri % side) as i32;
+                    let v = verify_region_against_seed(
+                        world,
+                        &gr.join(format!("r.{rx}.{rz}.mca")),
+                        rx,
+                        rz,
+                        Some(sm),
+                    );
+                    pr.fetch_add(v.present, Ordering::Relaxed);
+                    ok.fetch_add(v.ok, Ordering::Relaxed);
+                    if v.divergent.is_some() {
+                        dv.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let (v_ok, v_present, v_div) = (
+        v_ok.load(Ordering::Relaxed),
+        v_present.load(Ordering::Relaxed),
+        v_div.load(Ordering::Relaxed),
+    );
+    assert_eq!(v_present, total_chunks, "every generated slot present on disk");
+    assert_eq!(v_ok, total_chunks, "every disk chunk equals the seed regeneration");
+    assert_eq!(v_div, 0, "no divergent chunk in the verified corpus");
+    println!(
+        "scale seed verify: {v_ok}/{v_present} chunks on disk match seed regeneration (asserts and legends are proven, not assumed)"
+    );
+    // the legend truth: every contract still in the container must be a
+    // TRUE statement about the seed — the canonical legend equals the
+    // canonical hash of the seed regeneration (the exact semantic the
+    // canon legend exists to carry: byte order drifts between
+    // serializations, content does not)
+    let seed_map = seed_map.into_inner().unwrap();
+    let (stored_v, contracted_v) = classify(&store);
+    assert_eq!(stored_v.len(), flips, "the flipped set is stored, not contracted");
+    let mut legend_truth_miss = 0usize;
+    for k in &contracted_v {
+        match (store.pristine_legend(*k), seed_map.get(k)) {
+            (Some((_, Some(canon))), Some(sh)) if canon == *sh => {}
+            _ => legend_truth_miss += 1,
+        }
+    }
+    assert_eq!(
+        legend_truth_miss, 0,
+        "every surviving legend is a true statement about the seed"
+    );
+    println!(
+        "scale legend truth: {}/{} surviving legends equal the seed hash (checked through the container)",
+        contracted_v.len(),
+        contracted_v.len()
+    );
+
     // ---- 7. the region-assert tier (v0.9.52, ~0.13 B/chunk) — the harsher
     // arithmetic: NO per-chunk legends at all, ONE 136 B record per region
     // asserts its slots seed-reproducible. The trade, verified here: ANY
@@ -502,6 +668,110 @@ fn main() {
     let _ = std::fs::remove_dir_all(&work.join("store-region2"));
     drop(sc);
     let _ = std::fs::remove_dir_all(&work.join("store-region"));
+
+    // ---- 7b. the divergent-chunk gate (v0.9.54): the negative proof.
+    // A chunk whose content DIVERGED from the seed (a mod, a data-pack
+    // edit, any pre-first-save mutation) must never take the assert: the
+    // seed-verification classifier catches it, the protocol refuses the
+    // assert for that slot and the chunk is stored HONESTLY — nothing
+    // lost, nothing silently reverted to seed content (the 0.9.44 hazard
+    // class, demonstrated end to end at scale).
+    let drx = (side / 2) as i32;
+    let drz = (side / 2) as i32;
+    const DSLOT: usize = 515; // lx=3, lz=16 — deterministic probe coordinates
+    let dcx = drx * 32 + (DSLOT as i32 & 31);
+    let dcz = drz * 32 + (DSLOT as i32 >> 5);
+    let div_payload = wgen::chunk_payload(&world, dcx, dcz, 1); // round 1: real different content
+    let rname = format!("r.{drx}.{drz}.mca");
+    let tmpdir = work.join("tmp-region");
+    std::fs::create_dir_all(&tmpdir).unwrap();
+    // the divergent corpus file: full 1024 slots, slot DSLOT divergent
+    write_region(&world, &tmpdir, drx, drz, Some((DSLOT, Some(div_payload.clone()))))
+        .expect("divergent region ok");
+    let gen_div = work.join("gen-div");
+    std::fs::create_dir_all(&gen_div).unwrap();
+    std::fs::rename(tmpdir.join(&rname), gen_div.join(&rname)).expect("rename ok");
+    // the classifier catches it — the gate receipt
+    let vd = verify_region_against_seed(&world, &gen_div.join(&rname), drx, drz, None);
+    assert_eq!(vd.present, 1024, "the divergent file is a full region");
+    assert_eq!(vd.ok, 1023, "1023 slots still match the seed");
+    let (dslot, _dh, sh_div) = vd.divergent.expect("the divergent slot is caught");
+    assert_eq!(dslot, DSLOT);
+    println!(
+        "scale divergence gate: chunk ({dcx},{dcz}) rejected — disk hash != seed hash (content is not seed-reproducible)"
+    );
+    // the protocol: the operator asserts ONLY the verified corpus — the
+    // divergent region is rewritten with the slot absent (gen-div-verified,
+    // rename over the hard link leaves `gen`'s inode intact), and the
+    // divergent chunk itself goes through the honest store path.
+    let gen_dv = work.join("gen-div-verified");
+    link_dir(&gen, &gen_dv);
+    write_region(&world, &tmpdir, drx, drz, Some((DSLOT, None))).expect("verified region ok");
+    std::fs::rename(tmpdir.join(&rname), gen_dv.join(&rname))
+        .expect("rename over the hard link ok");
+    let cfgd = Cfg {
+        pristine: true,
+        pristine_import: true,
+        pristine_region: true,
+        ..Cfg::from_env()
+    };
+    let sd = Store::open_cfg(&work.join("store-div"), true, cfgd).unwrap();
+    let irepd = anvil::import_dir(&gen_dv, &sd).expect("verified import ok");
+    assert_eq!(irepd.chunks, total_chunks - 1, "every verified chunk imports");
+    assert_eq!(irepd.failed, 0);
+    let (stored_d, contracted_d) = classify(&sd);
+    assert!(stored_d.is_empty() && contracted_d.len() == total_chunks - 1);
+    assert_eq!(
+        sd.pristine_region_count(),
+        n_regions,
+        "256 assert records — the divergent region's bitmap holds 1023 slots"
+    );
+    assert!(
+        !sd.is_pristine(wgen::key(dcx, dcz)),
+        "the divergent slot is not asserted"
+    );
+    // the divergent chunk goes through the honest store path — modeled
+    // exactly as production: the chunk carries tick evidence, so the
+    // JNI boundary hands fresh=false to write_chunk_fresh and the
+    // v0.9.47 gate STORES it normally instead of forming a contract
+    // (a plain write_chunk asserts freshness and would contract it —
+    // the wrong model for a chunk the engine knows was modified)
+    sd.write_chunk_fresh(wgen::key(dcx, dcz), &div_payload, false, false)
+        .expect("divergent chunk stored honestly");
+    let q_d = sd.read_chunk(wgen::key(dcx, dcz)).expect("divergent chunk reads back");
+    assert_ne!(
+        canonical_contract_hash(&q_d).expect("stored divergent chunk parses"),
+        sh_div,
+        "the stored form is still NOT the seed content (nothing silently reverted)"
+    );
+    sd.sync();
+    let container_d = dir_size(&work.join("store-div"));
+    let repd = anvil::export_dir(&sd, &work.join("export-div")).expect("divergent export ok");
+    assert_eq!(repd.chunks, 1, "exactly the divergent chunk materializes");
+    assert_eq!(repd.pristine_skipped, total_chunks - 1);
+    assert_eq!(repd.lost, 0, "nothing lost");
+    assert_eq!(repd.chunks + repd.pristine_skipped + repd.lost, sd.keys().len());
+    println!(
+        "scale divergence protocol: {} slots asserted (verified against the seed), 1 divergent chunk stored honestly",
+        total_chunks - 1
+    );
+    println!(
+        "scale divergence container: {} B — one incident costs one honest chunk, {} stay asserted",
+        container_d,
+        total_chunks - 1
+    );
+    println!(
+        "scale restore identity: {} seed-restored + 1 container-stored = {}/{} restored, 0 lost",
+        total_chunks - 1,
+        sd.keys().len(),
+        sd.keys().len()
+    );
+    drop(sd);
+    let _ = std::fs::remove_dir_all(&gen_div);
+    let _ = std::fs::remove_dir_all(&gen_dv);
+    let _ = std::fs::remove_dir_all(&work.join("store-div"));
+    let _ = std::fs::remove_dir_all(&work.join("export-div"));
+    let _ = std::fs::remove_dir_all(&tmpdir);
 
     // ---- 8. the POI store (v0.9.53): the derived index, elided ----
     // A lived-in world also carries poi/*.mca — the points-of-interest

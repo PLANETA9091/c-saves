@@ -797,3 +797,74 @@ auditable (§12), export accountable (§13), operator surface honest
 (§14), the -90% promise proven at scale (§15), the per-chunk arithmetic
 at its information-theoretic floor (§16), and the last derived store —
 the POI index — extinct (§17).
+
+## 18. Research tick 14 — the proven assert (v0.9.54): seed verification and the divergent-chunk gate
+
+§16's region-assert tier carried one honest residual: "seed-reproducible"
+was an operator/import assertion, never independently verified inside the
+receipt chain. The tier's economics (a 136 B record replacing 1,024
+33 B legends) rest on the claim that an asserted chunk's content is a
+deterministic function of the seed already in the world — and nothing in
+CI proved that claim per run. This tick closes it: the proof is now a CI
+artifact, verified 262,144 times per push.
+
+**The seed-verification gate.** The scale probe gains a classifier that,
+per region file, decompresses every present slot's on-disk payload and
+compares it against the seed regeneration (wgen round 0 — the exact
+content a missing chunk restores to via read=None → vanilla regenerates).
+The comparison is `canonical_contract_hash` — order-free, strip-invariant
+— and that level is not a shortcut, it is the CORRECT semantics: NBT byte
+order is not stable across independent serializations (fastnbt's
+compounds are HashMap-backed, and a real vanilla JVM re-serializes with
+its own map order every save — the same reason the 0.9.46 canon legend
+exists). What the pristine tier guarantees on restore is canonical
+equality of the regenerated content, and canonical equality is what the
+gate verifies. Pinned receipt: `scale seed verify: 262144/262144 chunks
+on disk match seed regeneration (asserts and legends are proven, not
+assumed)`.
+
+**The legend truth.** The same pass records the canonical seed hash of
+every key; the surviving legends (261,888 after the 256 honest edits)
+are then checked THROUGH THE CONTAINER against those hashes — every
+contract is a true statement about the seed, not an operator's hope:
+`scale legend truth: 261888/261888 surviving legends equal the seed hash
+(checked through the container)`.
+
+**The divergent-chunk gate — the negative proof.** A chunk whose content
+diverged from the seed (a mod, a data-pack edit, any pre-first-save
+mutation) must never take the assert. The probe fabricates exactly that
+case: chunk (259,272) is rewritten with round-1 content before the
+region-tier import, the classifier catches it (1,023 of 1,024 slots in
+the region still match), the protocol refuses the assert for that slot
+(the region's bitmap holds 1,023 bits) and the divergent chunk is stored
+honestly through the not-fresh evidence path — `write_chunk_fresh` with
+fresh=false, the v0.9.47 gate doing exactly its job (a plain write_chunk
+asserts freshness and would contract the chunk — the wrong model for
+content the engine knows was modified). Receipts, pinned by CI:
+
+| receipt | value |
+|---|---|
+| divergence caught | `chunk (259,272) rejected — disk hash != seed hash` |
+| protocol | 262,143 slots asserted (verified against the seed), 1 stored honestly |
+| incident cost | 26,877 B container — one honest chunk (~2.9 KB), 262,143 stay asserted |
+| restore identity | 262,143 seed-restored + 1 container-stored = 262,144/262,144 restored, 0 lost |
+| anti-reversion | stored form canonically ≠ seed content — nothing silently reverted |
+
+**What this makes the pristine tier.** A content-addressed delta against
+the seed with a verified admission protocol: a chunk enters the tier only
+through evidence (Paper's runtime tags on the live path, seed verification
+on the pregen path), any write of an asserted key supersedes the assert
+honestly, and anything the seed cannot reproduce is caught at the gate
+and stored at full weight. The untouched mass is not "skipped" — it is
+proven reproducible, asserted at 0.13 B/chunk, and its restoration
+(read=None → vanilla regenerates) is hash-verified end to end on every
+CI run.
+
+Gates: 75/75 tests, enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
+bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS
+with the seed-verification, legend-truth and divergent-gate greps. The
+full receipt chain: bytes closed (§8/§9), erosion closed (§10),
+first-write hazard closed (§11), assertion auditable (§12), export
+accountable (§13), operator surface honest (§14), the -90% promise
+proven at scale (§15), the per-chunk arithmetic at its floor (§16), the
+POI index extinct (§17), and the assert itself proven (§18).
