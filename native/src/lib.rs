@@ -16,6 +16,7 @@ pub mod anvil;
 mod anvil_import;
 pub mod chunknbt;
 pub mod engine;
+pub mod jvmgate;
 pub mod natives;
 mod shim;
 pub mod store;

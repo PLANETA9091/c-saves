@@ -1192,3 +1192,69 @@ proved (~250 B on 100% content).
 
 **77/77 tests green.** The CI matrix is now 10 jobs; play-bench runs
 the full session on every push.
+
+## 25. Research tick 21 — the JVM gate (v0.9.61): a real JVM drives the production natives
+
+**The unproven half.** v0.9.60 gated the live path from the Rust side:
+play_probe calls `Registry::attach` / `write_chunk_fresh` / `read_chunk`
+in-process. But the actual integration is JAVA calling Rust over JNI —
+`byte[]` → `GetPrimitiveArrayCritical` → zstd tiers and back through
+`NewByteArray`/`SetByteArrayRegion`, `null` meaning NO_DATA — and none
+of that marshalling had ever run under a gate. The CRUSSTY kernel was
+also the only way to bind: `cplugin_init` needs the kernel ABI, so a
+plain `java` process could not reach the natives at all.
+
+**The bridge.** `native/src/jvmgate.rs` adds standard-JNI exports
+(`Java_dev_crussty_saves_jvmgate_JvmGate_nActive/nAttach/nReadChunk/
+nWriteChunk/nBeginSave/nEndSave/nMarkAutosave`). Each is a one-line
+pass-through into the corresponding `natives::n_*` function — the same
+registry the shim binds via RegisterNatives, zero duplicated logic.
+The JVM resolves the symbols itself; no kernel, no JVM TI, no shim
+needed. The product binding path is untouched.
+
+**The harness** (`java/dev/crussty/saves/jvmgate/JvmGate.java`) builds
+chunk NBT on the Java side — a minimal NBT writer emits sections
+`{Y, block_states{palette: strings, data: longs}, biomes{palette}}`
+with 4-bit LSB-first packed indices (16 per long, the vanilla
+`pack_nostroddle` layout), deterministic xorshift content, ~18 KiB per
+chunk — and verifies reloads with a minimal NBT parser: it re-walks the
+read-back chunk and asserts every block of every section sits on its
+exact position, plus the root tags (Status, xPos).
+
+**Byte equality is deliberately NOT the gate.** The store re-encodes
+sections canonically on the write path; the experiment on the microtest
+corpus shows the canonical form REVERSES the incoming palette order
+(input `[a,b,c]` → stored `[c,b,a]` with data rebuilt to match —
+semantically neutral, exactly the "palette order permutes" note the
+semantic-equality helpers have carried since v0.9.44). A byte gate
+would either fail on every chunk or force the harness to mirror the
+canonicalizer; block-position equality asserts the property the player
+actually cares about and stays correct under any future canonical
+form. The harness still counts what it can: the NBT parse itself
+rejects structural damage, the grid walk rejects positional damage.
+
+**The session, CI-gated (jvm-bench, two JVM processes, 16,384 chunks,
+8 threads):**
+
+- write: 16,384 competitive parallel JNI writes in 6.65 s
+  (mean 406 µs/write) — pure `byte[]` marshalling into the real tiers;
+- the `nBeginSave`/`nEndSave` barrier (fsync) passes, `nMarkAutosave`
+  is a no-op, then `System.exit` — server death;
+- verify: a FRESH JVM process reopens the SAME container dir —
+  semantic verify 16,384/16,384 (NBT parse + block-position equality,
+  17.4 s including the parse);
+- read burst: 32,768 concurrent JNI reads over the reopened container —
+  p50 ≈ 127 µs, mean chunk ~18 KiB;
+- the whole gate runs in ~30 s of CI time.
+
+**What the gate caught while being built** (the reason it exists):
+(1) the first harness payload was not valid NBT and every write
+correctly returned false — the natives' error channel works end to
+end; (2) `read_chunk` after reopen returns canonical re-encodings, not
+the written bytes — the byte-equality assumption died in the first
+local run, and the semantic gate is what remains honest; (3) a Java
+side without the kernel now has a first-class, CI-gated path to the
+engine, which is exactly the surface any future mod-side integration
+(Fabric/Paper plugin) will reuse.
+
+**77/77 tests green.** The CI matrix is now 11 jobs.

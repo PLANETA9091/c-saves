@@ -199,6 +199,50 @@ jobs:
           name: play-results
           path: native/bench_play.txt
 
+  jvm-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: build the engine + compile the Java harness
+        working-directory: native
+        run: |
+          cargo build --release
+          javac -d ../build/java ../java/dev/crussty/saves/jvmgate/JvmGate.java
+      - name: JVM gate — a REAL JVM drives the production natives, restart included (v0.9.61)
+        working-directory: native
+        run: |
+          # The bridge is standard JNI: the JVM resolves Java_dev_crussty_...
+          # exports which pass through into natives::n_* — the SAME registry
+          # the Paper shim binds. Two separate JVM processes (the new server):
+          #   write  — 16,384 chunks, 8 threads, pure JNI byte[] marshalling,
+          #            begin/end save barrier (fsync), exit = server death;
+          #   verify — fresh JVM reopens the container: every chunk SEMANTIC
+          #            through a real NBT parse (every block of every section
+          #            on its exact position — the store re-encodes sections
+          #            canonically, palette order is semantically neutral),
+          #            then a concurrent read burst with latency percentiles.
+          H=$(pwd)/target/release/libc_saves.so
+          CP=../build/java
+          rm -rf /tmp/jvmgate-ci
+          java -cp $CP -Dcsaves.lib=$H dev.crussty.saves.jvmgate.JvmGate write /tmp/jvmgate-ci 128 8 2>&1 | tee ../bench_jvm.txt
+          java -cp $CP -Dcsaves.lib=$H dev.crussty.saves.jvmgate.JvmGate verify /tmp/jvmgate-ci 128 8 2 2>&1 | tee -a ../bench_jvm.txt
+          grep -q "jvm gate: wrote 16384 chunks (8 threads) in" ../bench_jvm.txt || { echo "FAIL: JNI write burst"; exit 1; }
+          grep -q "jvm gate: save barrier (begin/end fsync) ok — JVM exits (server death)" ../bench_jvm.txt || { echo "FAIL: save barrier"; exit 1; }
+          grep -q "jvm gate: semantic verify 16384/16384 chunks across the restart" ../bench_jvm.txt || { echo "FAIL: semantic reload"; exit 1; }
+          grep -q "jvm gate: read burst 32768 JNI reads (8 threads, 2 rounds)" ../bench_jvm.txt || { echo "FAIL: read burst"; exit 1; }
+          grep -q "=== jvm gate: write phase PASS ===" ../bench_jvm.txt || { echo "FAIL: write verdict"; exit 1; }
+          grep -q "=== jvm gate: PASS ===" ../bench_jvm.txt || { echo "FAIL: verdict"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jvm-results
+          path: bench_jvm.txt
+
   serve-bench:
     runs-on: ubuntu-latest
     timeout-minutes: 60

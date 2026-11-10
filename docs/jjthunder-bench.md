@@ -1899,3 +1899,20 @@ same dir), reload (edits byte-exact, contract legends regenerate the
 worldgen form) — and counts the .mca files on disk: ZERO. 16,384 chunks,
 358 B/chunk (stored ~250 B, contracts ~35 B), 77/77 tests, enc_fp
 untouched. Research §24.
+
+## v0.9.61 — the JVM gate: a real JVM over standard JNI (job 3 of 11)
+
+The Java half of the integration got its own gate: `jvm-bench` boots
+two REAL JVM processes against the same container — write phase drives
+16,384 chunks x 8 threads through pure JNI byte[] marshalling into
+`natives::n_*` (the standard-JNI `Java_dev_crussty_saves_jvmgate_*`
+exports are one-line pass-throughs; the shim's RegisterNatives path is
+untouched), takes the begin/end fsync barrier and dies; verify phase is
+a FRESH JVM reopening the container and proving every chunk SEMANTIC
+through a real NBT parse — every block of every section on its exact
+position (the store canonically re-encodes sections, palette order is
+semantically neutral, so block-position equality is the honest gate) —
+then a 32,768-read concurrent burst. p50 ~127 µs, mean chunk ~18 KiB,
+whole gate ~30 s of CI time. 77/77 tests, enc_fp needle
+(6d240d7166cdda99 / members=12130 / bytes=9971843) untouched.
+Research §25.

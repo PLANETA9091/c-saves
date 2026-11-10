@@ -189,6 +189,33 @@ server's only world copy is the container, 358 B/chunk (stored ~250 B,
 contracts ~35 B). 77/77 tests green. The new CI `play-bench` job runs
 this whole session on every push.
 
+## v0.9.61 — the JVM gate: a real JVM drives the production natives
+
+v0.9.60 gated the live path from the Rust side of the natives. The
+unproven half was the JAVA side: real `byte[]` marshalling through JNI,
+real `null` = NO_DATA, and a restart into a genuinely new JVM process.
+This tick closes it. `native/src/jvmgate.rs` adds standard-JNI exports
+(`Java_dev_crussty_saves_jvmgate_JvmGate_*`) that are one-line
+pass-throughs into `natives::n_*` — the same registry the Paper shim
+binds, zero duplicated logic — so a plain `java` process can drive the
+production surface without the CRUSSTY kernel. The Java harness
+(`java/dev/crussty/saves/jvmgate/JvmGate.java`) builds real chunk NBT
+itself (sections with 4-bit packed block indices, the vanilla layout)
+through a minimal NBT writer, and verifies reloads through a minimal NBT
+parser: after the restart every chunk must place EVERY block of EVERY
+section on its exact position. The gate is block-position equality, not
+byte equality — the store re-encodes sections canonically (palette order
+is semantically neutral), and the harness asserts semantics precisely
+because of that.
+
+The CI session (two JVM processes, 16,384 chunks, 8 threads): write —
+competitive parallel JNI writes (mean ~406 µs/write), the begin/end
+save barrier (fsync), exit = server death; verify — a fresh JVM reopens
+the container, semantic verify 16,384/16,384 (NBT parse + block-position
+equality), then a concurrent read burst (32,768 JNI reads: p50 ~127 µs,
+mean chunk ~18 KiB). The whole gate runs in ~30 s. The CI matrix is now
+11 jobs (`jvm-bench`). 77/77 tests green.
+
 ## v0.9.59 — the container IS the world: Anvil becomes a view, never a file
 
 Every tick so far lived inside the round-trip story: vanilla saves Anvil,
