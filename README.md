@@ -154,6 +154,32 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.58 — the streaming export: the runner wasn't flaky, the export was
+
+The v0.9.57 CI run looked like infrastructure flakiness: both attempts of
+the worst-case job died with "runner shutdown signal, exit 143" — but
+BOTH times at the same place, ~2 minutes after phase B's verify passed.
+That place is `export_dir`, and 262,144 chunks was the first corpus to
+ever reach it: the export used to materialize EVERY chunk payload into a
+RAM map (~5 GB resident at world scale) before writing a single region
+byte. The runner was not flaky — the export was OOM-killed, and the
+kernel kill surfaces as a runner shutdown. Everything real had already
+passed inside both attempts: phase A 63,258,876 B = 241 B/chunk = x0.0588
+of Anvil, verify A ok=262,144 bad=0, the lifecycle gate
+"262,144 edits → 0 pristine remain", verify B ok=262,144 bad=0, ratio B
+x0.0739 (303 B/chunk) — the −92%…−94% worst-case answer held on 100%
+player-modified content in CI, twice.
+
+The fix is a streaming export: pass 1 groups KEYS only (~8 B each), pass
+2 streams one region at a time — the payload of 1024 chunks (~20 MB) is
+the only chunk content resident, same key order, same region layout,
+same report semantics (`chunks + pristine_skipped + lost` still accounts
+for every key). Local replay under the 3 GB sandbox — RAM that kills the
+old export — materializes the whole world: 256 regions, 262,144 chunks,
+1,073,741,824 B, 0 pristine_skipped, 0 lost, 146 s. 75/75 tests green.
+The export path is now scale-proven: what it holds in memory is one
+region, not the world.
+
 ## v0.9.57 — the gate caught the corpus: the three zero-edit chunks
 
 The v0.9.56 CI run refused the worst-case claim, and it was right to:

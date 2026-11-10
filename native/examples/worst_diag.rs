@@ -173,6 +173,41 @@ fn main() {
         store.sync();
         store.seal();
         eprintln!("[diag] phase 2 sealed");
+    } else if phase == "4" {
+        // ---- export stress: reopen the fully-colonized container and run
+        // export_dir at full 262,144-chunk scale under the sandbox's 3 GB
+        // RAM. The pre-0.9.58 export materialized every payload (~5 GB
+        // resident) before writing a byte — the CI runner died (exit 143,
+        // OOM) twice, both times ~2 min into this phase. The streaming
+        // export holds one region's payload at a time (~20 MB). Prints the
+        // report; bad counts are asserted by worst_case_probe in CI.
+        let store = Store::open_cfg(&work, true, cfg_pristine()).unwrap();
+        let keys = store.keys();
+        let (stored, contracted) = classify(&store);
+        eprintln!(
+            "[diag] reopen: keys={} stored={} contracted={}",
+            keys.len(),
+            stored.len(),
+            contracted.len()
+        );
+        let out = std::env::var("DIAG_EXPORT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| work.join("export-b"));
+        let t0 = Instant::now();
+        let rep = c_saves::anvil::export_dir(&store, &out).expect("export ok");
+        eprintln!(
+            "[diag] export done in {:.1}s: regions={} chunks={} bytes={} pristine_skipped={} lost={}",
+            t0.elapsed().as_secs_f64(),
+            rep.regions,
+            rep.chunks,
+            rep.bytes,
+            rep.pristine_skipped,
+            rep.lost
+        );
+        assert_eq!(rep.chunks, total, "export materializes the whole world");
+        assert_eq!(rep.pristine_skipped, 0, "no pristine contracts remain");
+        assert_eq!(rep.lost, 0, "nothing lost");
+        eprintln!("[diag] phase 4 done");
     } else {
         // ---- dissect: reopen, classify, forensics on every survivor,
         // repeat the SAME edit for survivors, classify again.

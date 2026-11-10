@@ -1813,6 +1813,26 @@ No byte-level change to the JJThunder corpus path itself. Gates:
 bench_size compact x0.08, export_roundtrip PASS, scale_probe 16 PASS,
 worst_case_probe PASS with the nine new greps. Research §19.
 
+## v0.9.58 — the streaming export: the runner wasn't flaky, the export was
+
+Both v0.9.57 CI attempts died the same way: every gate green (phase A
+x0.0588, lifecycle 262,144 edits → 0 pristine remain, verify bad=0 in
+both phases, ratio B x0.0739 = 303 B/chunk), then a runner shutdown
+(exit 143) ~2 minutes into `export_dir`. The export used to materialize
+EVERY chunk payload (~5 GB at 262k chunks) before writing a region byte
+— 262,144 chunks was the first corpus ever to reach the export path, and
+it was OOM-killed there, twice. The fix is a streaming export: keys-only
+grouping (~8 B each), then one region at a time — 1024 chunks (~20 MB)
+is the only chunk content resident; same key order, same region layout,
+same report semantics (`chunks + pristine_skipped + lost` still accounts
+for every key). Local replay under a 3 GB sandbox (RAM that kills the
+old export): 256 regions, 262,144 chunks, 1,073,741,824 B, 0
+pristine_skipped, 0 lost, 146 s. worst_diag gained the export-stress
+phase 4. No byte-level change to the JJThunder corpus path itself.
+Gates: 75/75 tests, enc_fp EXACT 6d240d7166cdda99 / 12130 / 9,971,843,
+bench_size compact x0.08, export_roundtrip PASS, worst_case_probe PASS
+with the nine greps. Research §22.
+
 ## v0.9.57 — the gate caught the corpus: the three zero-edit chunks, made constructive
 
 The v0.9.56 CI run refused the worst-case phase-B claim — and that

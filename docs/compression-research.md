@@ -1045,3 +1045,50 @@ tests green. The worst-case answer is now airtight end to end: the
 −92%…−94% holds on 100% player-modified content where every edit is
 canonically visible BY CONSTRUCTION, and the pristine tier's −99% is the
 verified content delta on top of it.
+
+## 22. Research tick 18 — the streaming export (v0.9.58): the runner wasn't flaky, the export was
+
+The v0.9.57 CI run of the worst-case gate failed twice in a row with the
+same shape: every real gate GREEN, then "The runner has received a
+shutdown signal … exit code 143" ~2 minutes after phase B's verify
+passed. The failure profile:
+
+| gate | attempt 1 (147) | attempt 2 (rerun) |
+|---|---|---|
+| phase A container | 62,866,302 B = 239 B/chunk | 63,258,876 B = 241 B/chunk |
+| phase A ratio | x0.0584 PASS | x0.0588 PASS |
+| verify A | ok=262,144 bad=0 | ok=262,144 bad=0 |
+| lifecycle (262,144 edits → 0 pristine) | PASS (first time in CI) | PASS |
+| container B | 79,409,187 B = 302 B/chunk | 79,469,571 B = 303 B/chunk |
+| ratio B | x0.0738 | x0.0739 |
+| verify B | ok=262,144 bad=0 | ok=262,144 bad=0 |
+| export accounting | killed ~99 s in | killed ~118 s in |
+
+The kill landed at the same statement both times: `export_dir`. The
+export used to build a `HashMap<(i32,i32), Vec<(cx,cz,payload)>>` holding
+EVERY chunk payload before writing a single region byte — harmless at
+every corpus that ever reached it (bench sizes, ≤20k chunks ≈ 400 MB),
+lethal at world scale: 262,144 payloads ≈ 5 GB resident, the runner's
+OOM kill surfaces as a runner shutdown. The probe had never run the
+export before: v0.9.55 died at the ratio gate, v0.9.56 at the lifecycle
+assert — 262,144 chunks was the first corpus to get this far.
+
+**The fix (streaming export).** Pass 1 groups KEYS only (~8 B each —
+2 MB total); pass 2 streams region by region: the payload of one
+region's 1024 chunks (~20 MB) is the only chunk content resident; each
+chunk is read (`read_chunk`), zlib-encoded, placed, and dropped. Same
+key order, same region layout, same report semantics — `chunks +
+pristine_skipped + lost` still accounts for every key, and the v0.9.49
+"read = None has exactly two meanings" rule is preserved per chunk.
+
+**Validation.** The `worst_diag` forensic example gained a phase 4
+(export stress): reopen the fully-colonized 262,144-chunk container and
+run `export_dir` under the sandbox's 3 GB RAM — memory that kills the
+old export outright. Streaming: 256 regions, 262,144 chunks,
+1,073,741,824 B (exactly one full vanilla .mca world), 0
+pristine_skipped, 0 lost, 146 s. 75/75 tests green.
+
+**Why this matters.** The worst-case answer is no longer hostage to an
+export that could not survive its own probe: the CI gate now exercises
+the full operator surface — store, verify, EXPORT — at world scale, and
+every path it touches holds one region in memory, not the world.

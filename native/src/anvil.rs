@@ -181,35 +181,33 @@ fn import_file(path: &Path, store: &Arc<Store>, rep: &mut ImportReport) -> std::
 /// silently dropped).
 pub fn export_dir(store: &Arc<Store>, out_dir: &Path) -> std::io::Result<ExportReport> {
     fs::create_dir_all(out_dir)?;
-    // group chunk keys by region
-    let mut regions: HashMap<(i32, i32), Vec<(i32, i32, Vec<u8>)>> = HashMap::new();
+    // v0.9.58 STREAMING EXPORT. The export used to materialize EVERY chunk
+    // payload into RAM before writing the first region byte — fine at bench
+    // corpora (<=20k chunks ~ 400 MB), fatal at world scale: the 262,144-
+    // chunk worst-case CI gate got both attempts killed by OOM right after
+    // phase B's verify passed (262,144 payloads ~ 5 GB resident; the runner
+    // reports the OOM kill as a runner shutdown, exit 143). Now the payload
+    // of a chunk lives in memory exactly while its region file is being
+    // written: pass 1 groups KEYS only (~8 B each), pass 2 streams region
+    // by region (1024 chunks ~ 20 MB peak). Same key order, same region
+    // layout, same report semantics.
+    let mut regions: HashMap<(i32, i32), Vec<(i32, i32, u64)>> = HashMap::new();
     let mut count = 0usize;
     let mut bytes = 0u64;
     let mut pristine_skipped = 0usize;
     let mut lost = 0usize;
     let keys = store.keys();
-    for k in keys {
+    for k in &keys {
+        let k = *k;
         let cx = (k >> 32) as i32;
         let cz = k as u32 as i32;
-        let Some(payload) = store.read_chunk(k) else {
-            // v0.9.49: read = None has exactly two meanings and the export
-            // must not conflate them. A pristine contract is absent BY
-            // DESIGN (regeneration semantics); anything else is a real
-            // read failure and gets counted as lost.
-            if store.is_pristine(k) {
-                pristine_skipped += 1;
-            } else {
-                lost += 1;
-                eprintln!(
-                    "[c-saves] export: key {k:016x} unreadable (not a pristine contract) — see read_fail_reason"
-                );
-            }
-            continue;
-        };
-        regions.entry((cx.div_euclid(32), cz.div_euclid(32))).or_default().push((cx, cz, payload));
+        regions
+            .entry((cx.div_euclid(32), cz.div_euclid(32)))
+            .or_default()
+            .push((cx, cz, k));
     }
     let regions_n = regions.len();
-    for ((rx, rz), chunks) in regions {
+    for ((rx, rz), keys) in regions {
         let path = out_dir.join(format!("r.{rx}.{rz}.mca"));
         let file = fs::File::create(&path)?;
         let mut w = std::io::BufWriter::new(file);
@@ -218,9 +216,26 @@ pub fn export_dir(store: &Arc<Store>, out_dir: &Path) -> std::io::Result<ExportR
         let mut body: Vec<u8> = Vec::new();
         let mut sector_off = 2u32; // 2 header sectors
         let mut placed: Vec<(usize, u32, u32)> = Vec::new(); // idx, sector_off, sector_count
-        for (cx, cz, payload) in &chunks {
+        for (cx, cz, k) in &keys {
+            // STREAMED READ: the payload of this one chunk is the only
+            // chunk content resident; read = None has exactly two meanings
+            // and the export must not conflate them (v0.9.49). A pristine
+            // contract is absent BY DESIGN (regeneration semantics);
+            // anything else is a real read failure and gets counted as
+            // lost.
+            let Some(payload) = store.read_chunk(*k) else {
+                if store.is_pristine(*k) {
+                    pristine_skipped += 1;
+                } else {
+                    lost += 1;
+                    eprintln!(
+                        "[c-saves] export: key {k:016x} unreadable (not a pristine contract) — see read_fail_reason"
+                    );
+                }
+                continue;
+            };
             let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            z.write_all(payload)?;
+            z.write_all(&payload)?;
             let comp = z.finish()?;
             let entry_len = 5 + comp.len(); // len field(4) + type(1) + data
             let sector_count = ((entry_len + 4095) / 4096) as u32;
