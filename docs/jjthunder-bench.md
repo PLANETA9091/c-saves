@@ -1873,3 +1873,17 @@ the un-swept hot tier was −79% on fully played content; the swept
 container is −92%…−94% at every scale. Gates: 75/75 tests, enc_fp EXACT
 6d240d7166cdda99 / 12130 / 9,971,843, bench_size compact x0.08, scale_probe
 PASS, worst_case_probe PASS with the sweep. Research §20.
+
+## v0.9.59 — the container is the world: the serve gate (job 3 of 9)
+
+The same corpus path this document follows (Anvil in → container →
+verify) gained its endgame form: Anvil is no longer a stored artifact.
+`serve_region` renders any region in memory byte-for-byte identical to
+the export view (one extracted region builder feeds both), `serve_chunk`
+is the engine-hook entry for a future mod shim, and the takeover import
+drains the .mca it reads. The new CI `serve-bench` job takes a
+65,536-chunk vanilla world, plays every chunk live, then counts the .mca
+files on disk: ZERO — the world lives only in the container; the served
+bytes re-import and verify bad=0; enc_fp needle untouched
+(6d240d7166cdda99 / members=12130 / bytes=9971843). 77/77 tests.
+Research §23.

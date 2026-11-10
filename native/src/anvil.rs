@@ -173,6 +173,122 @@ fn import_file(path: &Path, store: &Arc<Store>, rep: &mut ImportReport) -> std::
     Ok(true)
 }
 
+/// One region's vanilla-form body, built from the container — the shared
+/// core of the bulk export (v0.9.49/0.9.58 semantics) and the on-demand
+/// serve (v0.9.59). STREAMED: only ONE chunk payload is resident at a
+/// time (the 262,144-chunk OOM lesson). `read = None` has exactly two
+/// meanings and must never be conflated (v0.9.49): a pristine contract is
+/// absent BY DESIGN (regeneration semantics, counted as pristine_skipped);
+/// anything else is a real read failure (counted as lost, never silent).
+struct RegionBody {
+    /// zlib entries + sector padding, ready to append after the 8 KiB header
+    body: Vec<u8>,
+    /// (slot index, sector offset, sector count) — the caller renders the
+    /// location header from these
+    placed: Vec<(usize, u32, u32)>,
+    count: usize,
+    bytes: u64,
+    pristine_skipped: usize,
+    lost: usize,
+}
+
+fn build_region_body(store: &Arc<Store>, keys: &[(i32, i32, u64)]) -> std::io::Result<RegionBody> {
+    let mut body: Vec<u8> = Vec::new();
+    let mut placed: Vec<(usize, u32, u32)> = Vec::new();
+    let mut sector_off = 2u32; // 2 header sectors
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    let mut pristine_skipped = 0usize;
+    let mut lost = 0usize;
+    for (cx, cz, k) in keys {
+        let Some(payload) = store.read_chunk(*k) else {
+            if store.is_pristine(*k) {
+                pristine_skipped += 1;
+            } else {
+                lost += 1;
+                eprintln!(
+                    "[c-saves] export: key {k:016x} unreadable (not a pristine contract) — see read_fail_reason"
+                );
+            }
+            continue;
+        };
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&payload)?;
+        let comp = z.finish()?;
+        let entry_len = 5 + comp.len(); // len field(4) + type(1) + data
+        let sector_count = ((entry_len + 4095) / 4096) as u32;
+        let idx = ((cx.rem_euclid(32)) + (cz.rem_euclid(32)) * 32) as usize;
+        placed.push((idx, sector_off, sector_count));
+        let mut entry = Vec::with_capacity(entry_len);
+        entry.extend_from_slice(&((1 + comp.len()) as u32).to_be_bytes());
+        entry.push(2u8); // zlib
+        entry.extend_from_slice(&comp);
+        body.extend_from_slice(&entry);
+        let pad = sector_count as usize * 4096 - entry_len;
+        body.extend(std::iter::repeat(0u8).take(pad));
+        sector_off += sector_count;
+        count += 1;
+        bytes += sector_count as u64 * 4096;
+    }
+    Ok(RegionBody { body, placed, count, bytes, pristine_skipped, lost })
+}
+
+/// v0.9.59 — THE CONTAINER IS THE WORLD. Serve the exact vanilla bytes of
+/// `r.{rx}.{rz}.mca` from the container, in memory, on demand. Nothing is
+/// written to disk: Anvil stops being a stored artifact and becomes a
+/// VIEW the engine (or any vanilla-compatible tool) asks for. Byte-for-
+/// byte identical to what `export_dir` would write for the same region
+/// (both render through `build_region_body` — one code path, one truth).
+/// Returns `Ok(None)` for a region with no keys at all.
+pub fn serve_region(store: &Arc<Store>, rx: i32, rz: i32) -> std::io::Result<Option<Vec<u8>>> {
+    let mut keys: Vec<(i32, i32, u64)> = Vec::new();
+    for k in store.keys() {
+        let cx = (k >> 32) as i32;
+        let cz = k as u32 as i32;
+        if cx.div_euclid(32) == rx && cz.div_euclid(32) == rz {
+            keys.push((cx, cz, k));
+        }
+    }
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let rb = build_region_body(store, &keys)?;
+    let mut out = Vec::with_capacity(8192 + rb.body.len());
+    let mut offsets = [0u32; 1024];
+    for (idx, so, sc) in &rb.placed {
+        offsets[*idx] = (so << 8) | (sc & 0xff);
+    }
+    for v in offsets {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    for _ in 0..1024 {
+        out.extend_from_slice(&0u32.to_be_bytes()); // zero timestamps, as export
+    }
+    out.extend_from_slice(&rb.body);
+    Ok(Some(out))
+}
+
+/// The engine-hook entry point (v0.9.59): the vanilla region ENTRY for one
+/// chunk — len(4 BE) + compression type(1) + zlib payload — exactly the
+/// bytes one sector holds, i.e. what a RegionFile shim (a mod that points
+/// the game's chunk IO at this container) serves on a chunk read. `None`
+/// means "absent by contract": a pristine contract stores nothing and the
+/// caller regenerates from the seed (vanilla semantics), an unknown chunk
+/// simply does not exist yet. Decompressing the entry yields the stored
+/// payload bit-exactly (the same bytes `read_chunk` returns).
+pub fn serve_chunk(store: &Arc<Store>, cx: i32, cz: i32) -> Option<Vec<u8>> {
+    let k = key(cx, cz);
+    let payload = store.read_chunk(k)?;
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(&payload).ok()?;
+    let comp = z.finish().ok()?;
+    let mut entry = Vec::with_capacity(5 + comp.len());
+    entry.extend_from_slice(&((1 + comp.len()) as u32).to_be_bytes());
+    entry.push(2u8); // zlib
+    entry.extend_from_slice(&comp);
+    Some(entry)
+}
+
 /// Export the whole container back into vanilla region files under `out_dir`
 /// (zlib, vanilla layout). Returns an `ExportReport`; every key in the
 /// container is accounted for: `chunks + pristine_skipped + lost` equals
@@ -211,49 +327,14 @@ pub fn export_dir(store: &Arc<Store>, out_dir: &Path) -> std::io::Result<ExportR
         let path = out_dir.join(format!("r.{rx}.{rz}.mca"));
         let file = fs::File::create(&path)?;
         let mut w = std::io::BufWriter::new(file);
-        // layout: collect entries
+        let rb = build_region_body(store, &keys)?;
+        count += rb.count;
+        bytes += rb.bytes;
+        pristine_skipped += rb.pristine_skipped;
+        lost += rb.lost;
         let mut offsets = [0u32; 1024];
-        let mut body: Vec<u8> = Vec::new();
-        let mut sector_off = 2u32; // 2 header sectors
-        let mut placed: Vec<(usize, u32, u32)> = Vec::new(); // idx, sector_off, sector_count
-        for (cx, cz, k) in &keys {
-            // STREAMED READ: the payload of this one chunk is the only
-            // chunk content resident; read = None has exactly two meanings
-            // and the export must not conflate them (v0.9.49). A pristine
-            // contract is absent BY DESIGN (regeneration semantics);
-            // anything else is a real read failure and gets counted as
-            // lost.
-            let Some(payload) = store.read_chunk(*k) else {
-                if store.is_pristine(*k) {
-                    pristine_skipped += 1;
-                } else {
-                    lost += 1;
-                    eprintln!(
-                        "[c-saves] export: key {k:016x} unreadable (not a pristine contract) — see read_fail_reason"
-                    );
-                }
-                continue;
-            };
-            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            z.write_all(&payload)?;
-            let comp = z.finish()?;
-            let entry_len = 5 + comp.len(); // len field(4) + type(1) + data
-            let sector_count = ((entry_len + 4095) / 4096) as u32;
-            let idx = ((cx.rem_euclid(32)) + (cz.rem_euclid(32)) * 32) as usize;
-            placed.push((idx, sector_off, sector_count));
-            let mut entry = Vec::with_capacity(entry_len);
-            entry.extend_from_slice(&((1 + comp.len()) as u32).to_be_bytes());
-            entry.push(2u8); // zlib
-            entry.extend_from_slice(&comp);
-            body.extend_from_slice(&entry);
-            let pad = sector_count as usize * 4096 - entry_len;
-            body.extend(std::iter::repeat(0u8).take(pad));
-            sector_off += sector_count;
-            count += 1;
-            bytes += sector_count as u64 * 4096;
-        }
-        for (idx, so, sc) in placed {
-            offsets[idx] = (so << 8) | (sc & 0xff);
+        for (idx, so, sc) in &rb.placed {
+            offsets[*idx] = (so << 8) | (sc & 0xff);
         }
         for v in offsets {
             w.write_all(&v.to_be_bytes())?;
@@ -262,7 +343,7 @@ pub fn export_dir(store: &Arc<Store>, out_dir: &Path) -> std::io::Result<ExportR
         for i in 0..1024 {
             w.write_all(&0u32.to_be_bytes())?;
         }
-        w.write_all(&body)?;
+        w.write_all(&rb.body)?;
         w.flush()?;
     }
     if pristine_skipped > 0 {
@@ -360,6 +441,124 @@ mod tests {
 
         drop(s);
         drop(sb);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.59: the serve view is byte-for-byte what the export writes —
+    /// one region builder feeds both, and the test pins it: for every
+    /// region the container touches, `serve_region` bytes == the .mca file
+    /// bytes; a region with no keys serves None (and export never created
+    /// a file for it).
+    #[test]
+    fn serve_region_matches_export_byte_for_byte() {
+        let dir = temp_dir("serve-identity");
+        let cfg = Cfg { pristine: true, ..Cfg::default() };
+        let s = Store::open_cfg(&dir.join("store"), true, cfg).unwrap();
+        // region (0,0): keys (0..4, 7) — i=0 stays a contract (identical
+        // re-save), i=1..3 store honestly; region (1,0): one stored chunk;
+        // region (5,5): untouched (serves None).
+        for i in 0..4i32 {
+            let k = ((i as u64) << 32) | 7u64;
+            s.write_chunk(k, &payload(3700 + i), false).unwrap();
+            if i == 0 {
+                s.write_chunk(k, &payload(3700 + i), false).unwrap(); // identical re-save
+            } else {
+                s.write_chunk(k, &payload(4000 + i), false).unwrap();
+            }
+        }
+        let k = (32u64 << 32) | 3u64; // region (1,0)
+        s.write_chunk(k, &payload(4100), false).unwrap();
+        s.sync();
+
+        let out = dir.join("ref");
+        let rep = export_dir(&s, &out).unwrap();
+        assert_eq!(rep.regions, 2);
+
+        for (rx, rz) in [(0i32, 0i32), (1, 0)] {
+            let served = serve_region(&s, rx, rz).unwrap().expect("region has keys");
+            let on_disk = fs::read(out.join(format!("r.{rx}.{rz}.mca"))).unwrap();
+            assert_eq!(served, on_disk, "serve must equal export byte-for-byte");
+        }
+        assert!(serve_region(&s, 5, 5).unwrap().is_none(), "empty region serves None");
+
+        // the header the serve view renders must locate every entry: walk
+        // the location table of region (0,0) and check each claimed entry
+        // begins with a plausible len+type=2 framing
+        let served = serve_region(&s, 0, 0).unwrap().unwrap();
+        let mut located = 0usize;
+        for i in 0..1024usize {
+            let raw = u32::from_be_bytes(served[i * 4..i * 4 + 4].try_into().unwrap());
+            if raw == 0 {
+                continue;
+            }
+            let off = (raw >> 8) as usize * 4096;
+            let cnt = (raw & 0xff) as usize;
+            let len = u32::from_be_bytes(served[off..off + 4].try_into().unwrap()) as usize;
+            assert_eq!(served[off + 4], 2, "zlib type byte");
+            assert!(len >= 6 && len <= cnt * 4096 - 4, "len {len} fits {cnt} sectors");
+            located += 1;
+        }
+        assert_eq!(located, 3, "three stored chunks located in region (0,0)");
+
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.59: serve_chunk is the engine-hook entry — the entry bytes it
+    /// returns are exactly the bytes at the region slot the serve view's
+    /// header claims, and they decompress to the stored payload
+    /// bit-exactly. A pristine contract serves None (regeneration
+    /// semantics) while its stored sibling serves Some.
+    #[test]
+    fn serve_chunk_framing_and_pristine_none() {
+        let dir = temp_dir("serve-chunk");
+        let cfg = Cfg { pristine: true, ..Cfg::default() };
+        let s = Store::open_cfg(&dir.join("store"), true, cfg).unwrap();
+        let k_stored = (1u64 << 32) | 1u64;
+        let k_pristine = (2u64 << 32) | 2u64;
+        // with pristine ON the FIRST write of a chunk is its worldgen form
+        // (a contract candidate); a live edit with different content is
+        // what flips it to honest storage
+        let p = payload(4243);
+        s.write_chunk(k_stored, &payload(4242), false).unwrap();
+        s.write_chunk(k_stored, &p, false).unwrap();
+        s.write_chunk(k_pristine, &payload(777), false).unwrap();
+        s.write_chunk(k_pristine, &payload(777), false).unwrap(); // identical re-save
+        s.sync();
+        assert!(!s.is_pristine(k_stored), "a live edit flips to honest storage");
+        assert!(s.is_pristine(k_pristine));
+
+        // pristine -> None, by design
+        assert!(serve_chunk(&s, 2, 2).is_none(), "contract regenerates, nothing to serve");
+        // unknown -> None
+        assert!(serve_chunk(&s, 9, 9).is_none());
+
+        // stored -> Some, and the framing is the region slot's framing
+        let entry = serve_chunk(&s, 1, 1).expect("stored chunk serves");
+        let len = u32::from_be_bytes(entry[0..4].try_into().unwrap()) as usize;
+        assert_eq!(len, entry.len() - 4, "len field covers type+data");
+        assert_eq!(entry[4], 2, "zlib");
+        let mut d = flate2::read::ZlibDecoder::new(&entry[5..]);
+        let mut round = Vec::new();
+        d.read_to_end(&mut round).unwrap();
+        assert_eq!(round, p, "decompresses bit-exactly to the stored payload");
+
+        // and the same bytes sit at the slot the serve view's header claims
+        let served = serve_region(&s, 0, 0).unwrap().unwrap();
+        let raw = u32::from_be_bytes(served[0..4].try_into().unwrap()); // slot (1,1) -> idx 33
+        let idx33 = u32::from_be_bytes(served[33 * 4..33 * 4 + 4].try_into().unwrap());
+        assert!(idx33 != 0, "slot (1,1) located");
+        let off = (idx33 >> 8) as usize * 4096;
+        let cnt = (idx33 & 0xff) as usize;
+        assert_eq!(
+            &served[off..off + len + 4],
+            &entry[..],
+            "serve_chunk bytes == region-slot bytes"
+        );
+        assert!(cnt * 4096 >= len + 4);
+        let _ = raw;
+
+        drop(s);
         let _ = fs::remove_dir_all(&dir);
     }
 }

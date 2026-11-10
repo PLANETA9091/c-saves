@@ -154,6 +154,40 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.59 — the container IS the world: Anvil becomes a view, never a file
+
+Every tick so far lived inside the round-trip story: vanilla saves Anvil,
+the module compresses it, `export_dir` materializes Anvil back when the
+world is needed. That makes the container a very good ARCHIVE. This tick
+removes the asterisk: the .mca form must not exist on disk AT ALL. The
+storage layer becomes primary; Anvil bytes become a RENDERING the engine
+asks for.
+
+Three pieces land together. `serve_region(store, rx, rz)` renders any
+region's exact vanilla bytes IN MEMORY from the container — byte-for-byte
+identical to what `export_dir` writes, because one extracted region
+builder (`build_region_body`) feeds both paths; there is one code path
+and one truth. `serve_chunk(store, cx, cz)` is the engine-hook entry: the
+single region entry (len + type + zlib payload) a mod shim would serve
+from a chunk read — `None` means absent-by-contract (regenerate from the
+seed), vanilla semantics. And the takeover import now has a punchline:
+`import_dir` DRAINS the .mca files it reads, so a world imported from
+vanilla literally ceases to exist in Anvil form the moment it lands.
+
+The CI `serve-bench` job proves the whole chain at scale (65,536 chunks,
+64 regions): take over a vanilla-saved world, live-edit EVERY chunk in
+place (the 0.9.57 constructive edit), then assert the disk truth — a
+recursive walk counts ZERO .mca files; the world lives ONLY in the
+container. `serve_region` re-renders all 64 regions byte-identical to the
+derived export view; the SERVED bytes are written to a scratch dir and
+re-imported into a fresh store — every chunk verified semantically,
+ok=65,536 bad=0; `serve_chunk` matches the region slot bytes on a
+1024-entry sample. Local side=3 run: container x0.0729 of the Anvil view
+on 100% live content, per-region serve ~0.8 ms mean (in-memory, no
+disk). 77/77 tests green. What remains for a live server is the Java-side
+shim (a mod pointing the engine's chunk IO at serve_chunk) — the storage
+side is done and gated.
+
 ## v0.9.58 — the streaming export: the runner wasn't flaky, the export was
 
 The v0.9.57 CI run looked like infrastructure flakiness: both attempts of

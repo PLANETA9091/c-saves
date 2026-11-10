@@ -163,6 +163,38 @@ jobs:
           grep -q "scale total gate: PASS (< x0.0001 — the whole-world arithmetic)" bench_scale_probe.txt || { echo "FAIL: whole-world arithmetic"; exit 1; }
           grep -q "=== scale probe: PASS ===" bench_scale_probe.txt || { echo "FAIL: scale verdict"; exit 1; }
 
+  serve-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build serve probe
+        working-directory: native
+        run: cargo build --release --example serve_probe
+      - name: serve gate — the container IS the world, zero .mca on disk (v0.9.59)
+        working-directory: native
+        run: |
+          # The endgame: Anvil stops being a stored artifact. A vanilla-
+          # saved 65,536-chunk world is imported (the import DRAINS the
+          # .mca it reads), every chunk is live-edited in place, and the
+          # disk must hold ONLY the container from then on. serve_region
+          # re-renders every region in memory byte-for-byte identical to
+          # the export view; the SERVED bytes re-import into a fresh store
+          # and verify chunk-for-chunk (bad=0); serve_chunk — the engine-
+          # hook entry — must return exactly the region-slot bytes.
+          ./target/release/examples/serve_probe 2>&1 | tee bench_serve.txt
+          grep -q "serve world: 64 regions x 1024 chunks = 65536 chunks taken over from vanilla Anvil" bench_serve.txt || { echo "FAIL: world scale"; exit 1; }
+          grep -q "serve disk truth: 0 .mca files on disk after takeover + play — the world lives ONLY in the container" bench_serve.txt || { echo "FAIL: disk truth"; exit 1; }
+          grep -q "serve identity: 64/64 regions byte-identical to the derived export view" bench_serve.txt || { echo "FAIL: byte identity"; exit 1; }
+          grep -q "serve world replay: re-import of the SERVED bytes: 65536 chunks, ok=65536 bad=0" bench_serve.txt || { echo "FAIL: served-world replay"; exit 1; }
+          grep -q "serve chunk hook: 1024/1024 sampled entries match the region view byte-for-byte" bench_serve.txt || { echo "FAIL: engine hook framing"; exit 1; }
+          grep -q "=== serve probe: PASS ===" bench_serve.txt || { echo "FAIL: verdict"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: serve-results
+          path: native/bench_serve.txt
+
   worst-case-bench:
     runs-on: ubuntu-latest
     timeout-minutes: 180

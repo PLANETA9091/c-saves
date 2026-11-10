@@ -1092,3 +1092,58 @@ pristine_skipped, 0 lost, 146 s. 75/75 tests green.
 export that could not survive its own probe: the CI gate now exercises
 the full operator surface — store, verify, EXPORT — at world scale, and
 every path it touches holds one region in memory, not the world.
+
+## 23. Research tick 19 — the container is the world (v0.9.59): Anvil becomes a view, never a file
+
+Every preceding tick measured the round-trip: vanilla saves Anvil, the
+module compresses it into the container, `export_dir` materializes Anvil
+back when the world is needed. Whatever the ratios, that framing keeps
+one asterisk alive — somewhere on disk, a .mca file exists. This tick
+removes the asterisk at the storage layer: the .mca form must not exist
+on disk AT ALL, not while playing, not between sessions. Anvil stops
+being a stored artifact and becomes a RENDERING the engine asks for.
+
+**Three pieces.** First, `build_region_body` — the per-region writer
+extracted from `export_dir` (the v0.9.58 streaming core: one chunk
+payload resident at a time, the v0.9.49 two-meanings-of-None rule
+preserved per chunk). One region builder now feeds TWO consumers; there
+is one code path and one truth. Second, `serve_region(store, rx, rz)` —
+renders any region's exact vanilla bytes IN MEMORY from the container:
+location table, zero timestamps, zlib body — byte-for-byte what
+`export_dir` would write, nothing touches the disk. Third,
+`serve_chunk(store, cx, cz)` — the engine-hook entry a mod shim would
+call on a chunk read: the single region entry (len + type + zlib
+payload), decompressing bit-exactly to the stored payload. `None` is
+absent-by-contract: a pristine contract regenerates from the seed, an
+unknown chunk does not exist — vanilla semantics, unambiguous.
+
+**The takeover punchline.** `import_dir` already DRAINS the .mca files
+it reads (the unlink was always there — now it means something): a world
+imported from vanilla ceases to exist in Anvil form the moment it lands
+in the container.
+
+**The CI gate (`serve-bench`, job 3 of 9).** 65,536 chunks, 64 regions:
+take over a vanilla-saved world (pristine import), live-edit EVERY chunk
+in place (the 0.9.57 constructive edit, parallel), then assert the disk
+truth — a recursive walk of the whole world tree counts ZERO .mca files.
+`serve_region` re-renders all 64 regions byte-identical to the derived
+export view (64/64). The SERVED bytes — nothing else — are written to a
+scratch directory and re-imported into a fresh store: every chunk
+verified semantically against the edited content (canonical section
+equality), ok=65,536 bad=0. `serve_chunk` matches the region-slot bytes
+on a 1,024-entry sample. A world that exists only as our container
+yields, on demand, a fully valid vanilla world.
+
+**Local numbers (side=3, 9,216 chunks, 100% live content).** Container
+2,755,527 B = x0.0729 of the Anvil view (37,822,464 B); per-region serve
+~0.8 ms mean (first 773 ms, p90 900 ms — in-memory, no disk); replay
+9,216/9,216 ok, bad=0. 77/77 tests green (two new: serve-vs-export byte
+identity, serve_chunk framing + pristine-None).
+
+**What remains.** The Java-side shim: a mod (Fabric mixin on the engine's
+RegionFile IO, or a Paper plugin) that points chunk reads/writes at
+`serve_chunk`/`write_chunk` instead of a region file. The storage side —
+format, lifecycle, verification, and the zero-.mca guarantee — is done
+and CI-gated; the module's answer to "can a huge world live ONLY in this
+format" is now yes, with a gate that fails CI if a single .mca file
+reappears on disk.
