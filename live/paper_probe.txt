@@ -1,4 +1,0 @@
-paper probe: chunks=756 read_ok=756 bad=0
-paper probe: container bytes on disk: 5113607
-paper probe: chunk (0,0) bytes=42043 diamond_block=ABSENT
-=== paper probe: FAIL (edit lost) ===

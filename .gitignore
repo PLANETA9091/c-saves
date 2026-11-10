@@ -2,3 +2,5 @@ native/target/
 *.log
 *.class.orig
 build/
+live/
+pa.zip
