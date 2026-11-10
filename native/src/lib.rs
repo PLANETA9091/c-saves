@@ -15,8 +15,8 @@ use std::sync::atomic::Ordering;
 pub mod anvil;
 mod anvil_import;
 pub mod chunknbt;
-mod engine;
-mod natives;
+pub mod engine;
+pub mod natives;
 mod shim;
 pub mod store;
 

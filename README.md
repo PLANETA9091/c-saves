@@ -154,6 +154,41 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.60 — the server plays from the container: the live path, gated end to end
+
+v0.9.59 made Anvil a view; this tick gates the part that actually
+matters: a server SESSION on the live path. The Paper integration is not
+hypothetical architecture — the module boots inside the server
+(cplugin_init), retransforms RegionFileStorage and binds its natives to
+a store registry: nReadChunk / nWriteChunk(fresh) / nEndSave. The new
+`play_probe` drives exactly that surface — `Registry::attach` (the
+natives' own registry), `write_chunk_fresh` (the freshness-evidence
+channel), `read_chunk` (None = ReadResult::NO_DATA → Paper regenerates),
+`sync` — through a complete session with a RESTART in the middle, and
+`engine`/`natives` became public integration surface to make that
+honest.
+
+The session (16,384 chunks, CI-gated): a worldgen burst saves every
+chunk with the freshness evidence (Status=minecraft:full,
+InhabitedTime==0 — genuinely untouched worldgen) → 16,384 regeneration
+contracts, ZERO stored blobs: on the live path worldgen is never stored,
+full stop. The player visits, loads (a contract reads None — the probe
+verifies the canon legend against a freshly serialized worldgen form:
+NBT byte order is not stable across serializations, the canonical
+structural hash is, which is exactly why the write path matches
+byte-different relight re-saves against it), and edits 4,096 chunks —
+dirty saves carry fresh=false and flip to honest storage (the v0.9.47
+mutation-safety rule: a contract can never swallow a live edit), while
+4,096 unchanged re-saves stay contracted through the identical/canon
+fast paths. Then the restart: sync (the nEndSave barrier), every handle
+dropped, a fresh Registry reopens the same dir — the new server process.
+Reload: 4,096/4,096 edits verify semantically against the edited
+content, 12,288/12,288 contracts' legends still equal their worldgen
+form, 0 lost. Disk truth: a recursive walk counts ZERO .mca files — the
+server's only world copy is the container, 358 B/chunk (stored ~250 B,
+contracts ~35 B). 77/77 tests green. The new CI `play-bench` job runs
+this whole session on every push.
+
 ## v0.9.59 — the container IS the world: Anvil becomes a view, never a file
 
 Every tick so far lived inside the round-trip story: vanilla saves Anvil,

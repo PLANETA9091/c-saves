@@ -163,6 +163,42 @@ jobs:
           grep -q "scale total gate: PASS (< x0.0001 — the whole-world arithmetic)" bench_scale_probe.txt || { echo "FAIL: whole-world arithmetic"; exit 1; }
           grep -q "=== scale probe: PASS ===" bench_scale_probe.txt || { echo "FAIL: scale verdict"; exit 1; }
 
+  play-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build play probe
+        working-directory: native
+        run: cargo build --release --example play_probe
+      - name: play gate — the server plays from the container, restart included (v0.9.60)
+        working-directory: native
+        run: |
+          # The live path the Paper shim actually serves: Registry::attach
+          # (the natives' own registry), write_chunk_fresh (the freshness
+          # evidence channel n_write_chunk uses), read_chunk (None =
+          # ReadResult::NO_DATA -> Paper regenerates), sync (nEndSave).
+          # Session: worldgen burst (fresh evidence -> contracts, zero
+          # stored blobs), play (visits load, edits flip to honest
+          # storage, unchanged re-saves stay contracted via the canon
+          # legend), RESTART (fresh registry, same dir — the new server
+          # process), reload (edits byte-exact, contracts' canon legends
+          # equal a freshly-serialized worldgen form). Disk truth: zero
+          # .mca files anywhere — the server's only world copy is the
+          # container.
+          ./target/release/examples/play_probe 2>&1 | tee bench_play.txt
+          grep -q "play worldgen: 16384 chunks saved with the freshness evidence -> 16384 contracts, 0 stored" bench_play.txt || { echo "FAIL: worldgen contracts"; exit 1; }
+          grep -q "play session: 169 chunks loaded (contract -> None -> regenerate), 4096 edits (fresh=false) -> 4096 stored, 4096 unchanged re-saves stayed contracted" bench_play.txt || { echo "FAIL: play session"; exit 1; }
+          grep -q "play restart: container reopened — 4096 stored + 12288 contracts = 16384 keys" bench_play.txt || { echo "FAIL: restart durability"; exit 1; }
+          grep -q "play reload: 4096/4096 edits byte-exact, 12288/12288 contracts regenerate to their worldgen form, 0 lost" bench_play.txt || { echo "FAIL: reload verification"; exit 1; }
+          grep -q "play disk truth: 0 .mca files — the server's only world copy is the container" bench_play.txt || { echo "FAIL: disk truth"; exit 1; }
+          grep -q "=== play probe: PASS ===" bench_play.txt || { echo "FAIL: verdict"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: play-results
+          path: native/bench_play.txt
+
   serve-bench:
     runs-on: ubuntu-latest
     timeout-minutes: 60

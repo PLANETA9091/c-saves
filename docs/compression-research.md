@@ -1147,3 +1147,48 @@ format, lifecycle, verification, and the zero-.mca guarantee — is done
 and CI-gated; the module's answer to "can a huge world live ONLY in this
 format" is now yes, with a gate that fails CI if a single .mca file
 reappears on disk.
+
+## 24. Research tick 20 — the server plays from the container (v0.9.60): the live path, gated end to end
+
+v0.9.59 made Anvil a rendering; this tick gates the live SESSION. The
+Paper integration is not a plan: the module boots inside the server
+(cplugin_init), retransforms RegionFileStorage and binds its natives
+(nReadChunk / nWriteChunk(fresh) / nEndSave) to a store registry. The
+new `play_probe` drives exactly that surface — `Registry::attach` (the
+natives' own registry), `write_chunk_fresh` (the freshness-evidence
+channel where Paper's chunk tag is in hand), `read_chunk` (None =
+ReadResult::NO_DATA → the engine regenerates from the seed), `sync`
+(the nEndSave barrier) — through a complete session with a restart in
+the middle. To make that surface honest API, `engine` and `natives`
+became public modules.
+
+**The session (16,384 chunks, CI job `play-bench`).** Worldgen burst:
+every chunk saved with the freshness evidence (Status=minecraft:full,
+InhabitedTime==0) → 16,384 regeneration contracts, ZERO stored blobs —
+on the live path worldgen is never stored, the elision is not an
+optimization of some saves but the DEFAULT of all first saves. Play:
+169 sampled contract loads verified `read = None` + canon legend ==
+`canonical_contract_hash` of a FRESHLY serialized worldgen form — the
+load-bearing subtlety: NBT byte order is not stable across
+serializations (compound maps iterate in hash order), so the raw hash
+is serialization-dependent while the canonical structural hash is
+stable; this is exactly why the write path matches byte-different
+relight re-saves against the canon legend (v0.9.46) and why the probe
+asserts canon, not raw. Edits: 4,096 dirty saves with fresh=false flip
+to honest storage (the v0.9.47 mutation-safety rule — a contract can
+never swallow a live edit); 4,096 unchanged re-saves of worldgen
+chunks stay contracted through the identical/canon fast paths. Restart:
+sync, every handle dropped, a FRESH registry reopens the same dir — the
+new server process. Reload: 4,096/4,096 edits verify semantically,
+12,288/12,288 contract legends regenerate to their worldgen form,
+0 lost. Disk truth: 0 .mca files anywhere under the world tree.
+
+**Weight.** The session container weighs 358 B/chunk across all keys —
+4,096 stored chunks (~250 B each, the player-built content) + 12,288
+contracts (~35 B each). The played world's storage cost converges to
+the stored fraction: every chunk the player never touched costs 35 B
+forever, every chunk they touched costs what worst_case_probe already
+proved (~250 B on 100% content).
+
+**77/77 tests green.** The CI matrix is now 10 jobs; play-bench runs
+the full session on every push.

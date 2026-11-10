@@ -1887,3 +1887,15 @@ files on disk: ZERO — the world lives only in the container; the served
 bytes re-import and verify bad=0; enc_fp needle untouched
 (6d240d7166cdda99 / members=12130 / bytes=9971843). 77/77 tests.
 Research §23.
+
+## v0.9.60 — the server plays from the container: the live-session gate (job 2 of 10)
+
+The shim surface this corpus path serves (nReadChunk / nWriteChunk(fresh)
+/ nEndSave over the natives' registry) got its own end-to-end gate:
+`play_probe` runs a full server session — worldgen burst (fresh evidence
+→ contracts, 0 stored), play (edits flip to honest storage, unchanged
+re-saves stay contracted via the canon legend), RESTART (fresh registry,
+same dir), reload (edits byte-exact, contract legends regenerate the
+worldgen form) — and counts the .mca files on disk: ZERO. 16,384 chunks,
+358 B/chunk (stored ~250 B, contracts ~35 B), 77/77 tests, enc_fp
+untouched. Research §24.
