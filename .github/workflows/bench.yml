@@ -480,3 +480,122 @@ jobs:
           path: |
             native/speed_bench.txt
             native/speed_stalls.txt
+
+  paper-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: build the engine + the offline probe
+        working-directory: native
+        run: |
+          cargo build --release
+          cargo build --release --example paper_probe
+      - name: fetch paperclip 26.3 and boot once to produce the mapped server jar
+        run: |
+          URL=$(curl -s https://fill.papermc.io/v3/projects/paper/versions/26.3/builds/latest | python3 -c "import json,sys; print(json.load(sys.stdin)['downloads']['server:default']['url'])")
+          curl -sL "$URL" -o paper.jar
+          mkdir patchrun && cd patchrun
+          echo "eula=true" > eula.txt
+          printf "online-mode=false\nview-distance=2\nsimulation-distance=2\ngenerate-structures=false\nmotd=csaves\n" > server.properties
+          java -Xms512M -Xmx1500M -jar ../paper.jar nogui > boot.log 2>&1 &
+          PID=$!
+          OK=0
+          for i in $(seq 1 150); do
+            if grep -q "Done (" boot.log 2>/dev/null; then OK=1; break; fi
+            sleep 2
+          done
+          [ "$OK" = 1 ] || { echo "FAIL: server never reached Done"; tail -40 boot.log; exit 1; }
+          kill -INT $PID; wait $PID || true
+          grep -q "Starting minecraft server version 26.3" boot.log
+          ls versions/26.3/paper-26.3.jar
+      - name: compile the agent against the REAL mapped server jar
+        run: |
+          MAPPED=patchrun/versions/26.3/paper-26.3.jar
+          mkdir -p build/agent
+          javac -cp "$MAPPED:cplug-sdk/asm-lib/asm-9.11.1.jar" -d build/agent $(find agent/src -name "*.java")
+          cp cplug-sdk/asm-lib/asm-9.11.1.jar build/agent/
+          cd build/agent
+          printf "Premain-Class: dev.crussty.saves.agent.CrusstyAgent\nClass-Path: asm-9.11.1.jar\nCan-Retransform-Classes: true\n" > manifest.txt
+          jar --create --file agent.jar --manifest manifest.txt -C . dev
+      - name: THE LIVE SESSION — a REAL Paper 26.3 server plays from the container (v0.9.62)
+        run: |
+          set -euo pipefail
+          ROOT=$PWD
+          CP="patchrun/versions/26.3/paper-26.3.jar:$(find patchrun/libraries -name '*.jar' | tr '\n' ':')build/agent/asm-9.11.1.jar"
+          AGENT="-javaagent:$ROOT/build/agent/agent.jar -Dcsaves.lib=$ROOT/native/target/release/libc_saves.so"
+          mkdir live && cd live
+          cp ../patchrun/eula.txt .
+          cp ../patchrun/server.properties .
+
+          check_stats() { # $1=min_writeOk $2=min_served
+            tail -n 1 stats-live.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('stats:', m); sys.exit(0 if m.get('writeOk',0)>=$1 and m.get('served',0)>=$2 and m.get('writeFail',1)==0 and m.get('vanillaFallback',1)==0 else 1)"
+          }
+          no_mca() {
+            MCA=$(find . -name "*.mca" | wc -l)
+            [ "$MCA" = 0 ] || { echo "FAIL: $MCA .mca files on disk"; exit 1; }
+            echo "disk truth: 0 .mca files"
+          }
+
+          # ---- run 1: the world is BORN into the container (spawn worldgen) ----
+          ( sleep 40; echo stop ) | timeout --signal=INT 220 \
+            java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
+            -cp "$CP" org.bukkit.craftbukkit.Main nogui > run1.log 2>&1 || true
+          grep -q "Done (" run1.log || { echo "FAIL run1: no Done"; tail -40 run1.log; exit 1; }
+          grep -q "patched net/minecraft/world/level/chunk/storage/RegionFileStorage: 7/7 methods" run1.log
+          for c in ChunkDataController EntityDataController PoiDataController; do
+            grep -q "patched ca/spottedleaf/moonrise/patches/chunk_system/io/datacontroller/$c: 1/1 methods" run1.log
+          done
+          echo "patch gates OK (RegionFileStorage 7/7, controllers 1/1 x3)"
+          check_stats 1 0
+          no_mca
+
+          # ---- run 2: force-load forces READS from the container ----
+          ( sleep 35; echo "forceload add -8 8"; sleep 90; echo stop ) | timeout --signal=INT 220 \
+            java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
+            -cp "$CP" org.bukkit.craftbukkit.Main nogui > run2.log 2>&1 || true
+          grep -q "Done (" run2.log || { echo "FAIL run2: no Done"; tail -40 run2.log; exit 1; }
+          check_stats 0 1
+          no_mca
+          echo "read gate OK: the server loaded chunks from the container on a cold restart"
+
+          # ---- run 3: a LIVE EDIT through the server console ----
+          ( sleep 35; echo "forceload add 0 0"; sleep 15; echo "setblock 0 -60 0 minecraft:diamond_block"; sleep 45; echo stop ) | timeout --signal=INT 220 \
+            java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
+            -cp "$CP" org.bukkit.craftbukkit.Main nogui > run3.log 2>&1 || true
+          grep -q "Changed the block at 0, -60, 0" run3.log || { echo "FAIL run3: setblock"; grep -F "System chat" run3.log | head -5; exit 1; }
+          no_mca
+          echo "edit gate OK: the edit went into the container (nothing else exists)"
+
+          # ---- run 4: the edit survives a restart — read back from the container ----
+          ( sleep 35; echo "forceload add -8 8"; sleep 90; echo stop ) | timeout --signal=INT 220 \
+            java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
+            -cp "$CP" org.bukkit.craftbukkit.Main nogui > run4.log 2>&1 || true
+          grep -q "Done (" run4.log || { echo "FAIL run4: no Done"; tail -40 run4.log; exit 1; }
+          check_stats 0 1
+          no_mca
+
+          # ---- offline ground truth: the container holds the edit, zero .mca ----
+          "$ROOT/native/target/release/examples/paper_probe" \
+            world/dimensions/minecraft/overworld/c-saves/region --diamond | tee paper_probe.txt
+          grep -q "read_ok=.* bad=0" paper_probe.txt
+          grep -q "diamond_block=PRESENT" paper_probe.txt
+          grep -q "=== paper probe: PASS ===" paper_probe.txt
+          echo "=== paper bench: PASS — the server plays from the container, end to end ==="
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paper-results
+          path: |
+            live/run1.log
+            live/run2.log
+            live/run3.log
+            live/run4.log
+            live/stats-live.txt
+            live/paper_probe.txt
+            patchrun/boot.log

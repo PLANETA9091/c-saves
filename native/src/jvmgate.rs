@@ -84,3 +84,77 @@ pub extern "system" fn Java_dev_crussty_saves_jvmgate_JvmGate_nMarkAutosave(
 ) {
     natives::n_mark_autosave(env, cls)
 }
+
+// ---------------------------------------------------------------------------
+// v0.9.62: the SAME pass-throughs under the standalone agent shim's class
+// name (agent/src/.../CrusstyShim.java). A REAL Paper server driven by the
+// plain -javaagent resolves these by STANDARD JNI naming — no kernel, no
+// RegisterNatives — and lands in the identical natives::n_* surface.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nActive(
+    env: *mut JNIEnv,
+    cls: jclass,
+) -> jboolean {
+    natives::n_active(env, cls)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nAttach(
+    env: *mut JNIEnv,
+    cls: jclass,
+    kind: jstring,
+    level: jstring,
+    dir: jstring,
+) -> jint {
+    natives::n_attach(env, cls, kind, level, dir)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nReadChunk(
+    env: *mut JNIEnv,
+    cls: jclass,
+    handle: jint,
+    x: jint,
+    z: jint,
+) -> jbyteArray {
+    natives::n_read_chunk(env, cls, handle, x, z)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nWriteChunk(
+    env: *mut JNIEnv,
+    cls: jclass,
+    handle: jint,
+    x: jint,
+    z: jint,
+    data: jbyteArray,
+    fresh: jboolean,
+) -> jboolean {
+    natives::n_write_chunk(env, cls, handle, x, z, data, fresh)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nBeginSave(
+    env: *mut JNIEnv,
+    cls: jclass,
+) -> jboolean {
+    natives::n_begin_save(env, cls)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nEndSave(
+    env: *mut JNIEnv,
+    cls: jclass,
+) -> jboolean {
+    natives::n_end_save(env, cls)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nMarkAutosave(
+    env: *mut JNIEnv,
+    cls: jclass,
+) {
+    natives::n_mark_autosave(env, cls)
+}

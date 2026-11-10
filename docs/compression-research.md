@@ -1258,3 +1258,75 @@ engine, which is exactly the surface any future mod-side integration
 (Fabric/Paper plugin) will reuse.
 
 **77/77 tests green.** The CI matrix is now 11 jobs.
+
+## 24. Research tick 20 (v0.9.62): the server plays from the container — a real Paper 26.3 boots through a plain -javaagent
+
+**The last unproven half.** v0.9.59 made the container the world's only
+on-disk form; v0.9.60 gated the live path from the Rust side of the natives;
+v0.9.61 gated a plain JVM driving them. What no gate had driven yet was the
+actual thing users run: a real Paper server. This tick adds `agent/` — a
+standalone `-javaagent` (premain, no CRUSSTY kernel) — and CI job
+`paper-bench` boots a real Paper 26.3 (build 248, fetched from the fill
+API at job time) whose ENTIRE chunk IO is re-routed into the native engine.
+
+**Three pieces, each measured against the mapped server jar:**
+
+1. **ASM in the agent.** `AgentAsm` carries the kernel's `replace_body`
+   rewrite in-tree (COMPUTE_FRAMES; Paper 26.3 classfiles are major 69, so
+   ASM 9.11.1 is a hard floor — 9.7.1 rejects them outright). Seven bodies
+   are replaced on `RegionFileStorage`
+   (moonrise$readData/finishRead/startWrite/finishWrite + read/write/scanChunk),
+   and the three Moonrise data controllers get `startWrite` bridged one
+   level higher (belt and braces: the storage-level body is verified live
+   in the same run by 4761 read misses through the same interface dispatch).
+   Natives resolve through STANDARD JNI exports
+   (`Java_dev_crussty_saves_agent_CrusstyShim_n*`) — one-line pass-throughs
+   into the same `natives::n_*` registry the kernel binds; zero duplicated
+   engine logic.
+
+2. **The gate that caught the silent bypass.** The first build printed
+   "patched 6/6" while only ONE descriptor actually matched —
+   `replace_body` returned the rewritten class even when the target method
+   was not found, so every non-matching spec was a silent no-op, the
+   vanilla write path stayed intact, and the stop-save wrote 12 full .mca
+   files (598 KB, 144 chunks, byte-identical to a vanilla run) behind a
+   "patched" log line. The diagnostic chain that surfaced it: stats
+   `writeOk=0` while .mca files existed → CFR decompilation of
+   NewChunkHolder/MoonriseRegionFileIO → descriptor diff. `replaceBody` now
+   returns null on a missing method and the CI gate asserts 7/7 + 3×1/1.
+
+3. **`moonrise$finishWrite` is the subtle .mca source.** Even with every
+   write landing in the container, the vanilla finishWrite body runs the
+   commit closure against `getRegionFile(pos, create=true)` — which
+   MATERIALIZES twelve empty .mca files as a side effect of a write that
+   never touches a region file. The zero-.mca guarantee required replacing
+   finishWrite too: shim-owned WriteData carries a no-op closure and the
+   finish body short-circuits it.
+
+**THE SESSION (four gated live runs + offline truth, CI job paper-bench):**
+
+- run 1 (birth): fresh world, spawn-area worldgen writes land in the
+  container (writeFail=0, vanillaFallback=0), ZERO .mca files;
+- run 2 (cold restart): `forceload add -8 8` forces chunk-system loads
+  through the patched IO — served>0 = chunks came FROM the container;
+- run 3 (live edit): `setblock 0 -60 0 minecraft:diamond_block` through the
+  server console — "Changed the block" in the server log;
+- run 4 (read-back): restart + force-load again, served>0 — the server
+  re-reads its (edited) world from the container;
+- `paper_probe` (offline Rust): every indexed chunk reads back (bad=0) and
+  the diamond block is PRESENT in chunk (0,0)'s palette.
+
+Local session numbers (2-core sandbox, Paper 26.3 build 248, flat=off
+default terrain): run 1 wrote 1,587 chunks into the container with zero
+failures and 12 .mca files that the finishWrite patch then eliminated;
+restarts served 25–594 chunk reads with 0 misses on stored chunks; the
+container for the overworld region set weighed ~460 KB for 756 indexed
+chunks (content-addressed section dedup over identical terrain) — and the
+diamond edit survived three server deaths inside the container.
+
+**What remains.** The kernel path (cplugin_init) remains the product
+integration; the agent path is the standalone proof + a developer harness.
+Player-visible latency through the live path (a bot client walking the
+world) is the next honest measurement.
+
+**77/77 tests green.** The CI matrix is now 12 jobs.

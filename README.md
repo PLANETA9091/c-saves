@@ -154,6 +154,52 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.62 — THE SERVER PLAYS FROM THE CONTAINER: a real Paper 26.3 server, no kernel
+
+v0.9.60 gated the live path from the Rust side of the natives and v0.9.61
+from a plain Java process. The unproven half was the SERVER ITSELF. This
+tick closes it: `agent/` is a standalone `-javaagent` (premain, no CRUSSTY
+kernel) that boots a real Paper 26.3 server with its entire chunk IO
+re-routed into the native engine.
+
+Mechanics, all measured against the mapped server jar:
+- `AgentAsm` performs the kernel's `replace_body` rewrite in-process (ASM
+  COMPUTE_FRAMES; Paper 26.3 classes are major 69, so ASM 9.11.1 is a hard
+  floor — 9.7.1 rejects the classfile). `AgentAsm.replaceBody` now returns
+  null when the target method is not found — the first build quietly
+  "patched 6/6" while only one descriptor actually matched, and the server
+  wrote full .mca files behind our back. The gate that caught it: writeOk
+  stayed 0 while 12 .mca files appeared on disk.
+- `RegionFileStorage` gets 7 replaced bodies (moonrise$readData/finishRead/
+  startWrite/finishWrite, read/write/scanChunk); the three Moonrise data
+  controllers get their `startWrite` bridged one level higher (belt and
+  braces — the storage-level body is verified live by 4761 read misses in
+  the same run). Natives resolve through STANDARD JNI exports
+  (`Java_dev_crussty_saves_agent_CrusstyShim_n*`) — one-line pass-throughs
+  into the same `natives::n_*` registry the kernel path binds.
+- `moonrise$finishWrite` is the subtle one: the vanilla body runs the commit
+  closure against `getRegionFile(pos, create=true)`, which materializes
+  EMPTY .mca files for every touched region even when nothing is written —
+  the zero-.mca guarantee requires replacing it too (shim-owned WriteData
+  carries a no-op closure).
+
+THE SESSION (CI job `paper-bench`, four gated live runs + offline truth):
+- run 1 (birth): fresh world, the server generates the spawn area — every
+  chunk write lands in the container (writeFail=0, vanillaFallback=0), ZERO
+  .mca files on disk;
+- run 2 (cold restart): `forceload add -8 8` forces the chunk system to
+  load through the patched IO — served>0 proves chunks came FROM the
+  container, still zero .mca;
+- run 3 (live edit): `setblock 0 -60 0 minecraft:diamond_block` through the
+  server console — "Changed the block" in the server log, the edit exists
+  ONLY in the container;
+- run 4 (read-back): another restart + force-load — the edit is served back
+  to the server from the container;
+- `paper_probe` (offline, Rust): every indexed chunk reads back (bad=0) and
+  the diamond block is verified PRESENT in chunk (0,0)'s palette.
+
+77/77 tests green. The CI matrix is now 12 jobs.
+
 ## v0.9.60 — the server plays from the container: the live path, gated end to end
 
 v0.9.59 made Anvil a view; this tick gates the part that actually

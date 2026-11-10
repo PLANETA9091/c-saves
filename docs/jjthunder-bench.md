@@ -1916,3 +1916,17 @@ then a 32,768-read concurrent burst. p50 ~127 µs, mean chunk ~18 KiB,
 whole gate ~30 s of CI time. 77/77 tests, enc_fp needle
 (6d240d7166cdda99 / members=12130 / bytes=9971843) untouched.
 Research §25.
+
+## v0.9.62 — paper-bench (job 12 of 12): the server plays from the container
+
+A real Paper 26.3 (build 248, fill API at job time) boots under a plain
+`-javaagent` — no CRUSSTY kernel: `agent/` ASM-replaces seven
+RegionFileStorage bodies + the three Moonrise controller `startWrite`s, and
+the natives resolve through standard JNI exports into the same
+`natives::n_*` registry. Four gated live runs: world birth into the
+container (zero .mca), cold-restart force-load reads (served>0), a live
+setblock edit, restart read-back; `paper_probe` verifies the container
+offline (bad=0, the diamond edit PRESENT in chunk (0,0)). The gate caught a
+silent ASM no-op: "patched 6/6" while 5 descriptors did not match and the
+vanilla path wrote 12 full .mca files — replace_body now fails loudly and
+the CI gate asserts 7/7 + 3×1/1. The enc_fp needle is untouched.
