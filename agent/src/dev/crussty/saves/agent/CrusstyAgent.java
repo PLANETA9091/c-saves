@@ -121,8 +121,11 @@ public final class CrusstyAgent {
         }
     }
 
-    /** The six RegionFileStorage bodies. */
+    /** The eight RegionFileStorage bodies. */
     private static final Object[][] RFS_SPECS = {
+        { "moonrise$doesRegionFileNotExistNoIO", "(II)Z", "rfDoesNotExistNoIO",
+          "(" + descOf(RFS) + "II)Z",
+          new int[][] { { 0, 'L' }, { 1, 'I' }, { 2, 'I' } } },
         { "moonrise$readData", "(II)" + RD, "rfReadData",
           "(" + descOf(RFS) + "II)" + RD,
           new int[][] { { 0, 'L' }, { 1, 'I' }, { 2, 'I' } } },

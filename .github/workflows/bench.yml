@@ -547,11 +547,11 @@ jobs:
             java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
             -cp "$CP" org.bukkit.craftbukkit.Main nogui > run1.log 2>&1 || true
           grep -q "Done (" run1.log || { echo "FAIL run1: no Done"; tail -40 run1.log; exit 1; }
-          grep -q "patched net/minecraft/world/level/chunk/storage/RegionFileStorage: 7/7 methods" run1.log
+          grep -q "patched net/minecraft/world/level/chunk/storage/RegionFileStorage: 8/8 methods" run1.log
           for c in ChunkDataController EntityDataController PoiDataController; do
             grep -q "patched ca/spottedleaf/moonrise/patches/chunk_system/io/datacontroller/$c: 1/1 methods" run1.log
           done
-          echo "patch gates OK (RegionFileStorage 7/7, controllers 1/1 x3)"
+          echo "patch gates OK (RegionFileStorage 8/8, controllers 1/1 x3)"
           check_stats 1 0
           no_mca
 

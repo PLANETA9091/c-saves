@@ -170,11 +170,21 @@ Mechanics, all measured against the mapped server jar:
   "patched 6/6" while only one descriptor actually matched, and the server
   wrote full .mca files behind our back. The gate that caught it: writeOk
   stayed 0 while 12 .mca files appeared on disk.
-- `RegionFileStorage` gets 7 replaced bodies (moonrise$readData/finishRead/
-  startWrite/finishWrite, read/write/scanChunk); the three Moonrise data
-  controllers get their `startWrite` bridged one level higher (belt and
-  braces — the storage-level body is verified live by 4761 read misses in
-  the same run). Natives resolve through STANDARD JNI exports
+- `RegionFileStorage` gets 8 replaced bodies (moonrise$readData/finishRead/
+  startWrite/finishWrite, read/write/scanChunk AND
+  doesRegionFileNotExistNoIO); the three Moonrise data controllers get their
+  `startWrite` bridged one level higher (belt and braces — the storage-level
+  body is verified live in the same run).
+- `doesRegionFileNotExistNoIO` is THE SILENT-REGENERATION FIX and was found
+  only by a live gate: the vanilla method answers "the region .mca does not
+  exist" — always true with zero .mca files — so Moonrise regenerated spawn
+  chunks on EVERY boot WITHOUT consulting the container (read miss count 0!),
+  and the second restart silently overwrote a stored live edit (the diamond
+  vanished; chunk size shrank by exactly the palette entry). The patched body
+  answers through the engine: a chunk exists iff the store knows its key
+  (`Store::has_chunk`, blobs and contracts alike); CI run 2 numbers changed
+  from 529 served/200 miss to 105 served/624 miss — the container finally
+  being ASKED. Natives resolve through STANDARD JNI exports
   (`Java_dev_crussty_saves_agent_CrusstyShim_n*`) — one-line pass-throughs
   into the same `natives::n_*` registry the kernel path binds.
 - `moonrise$finishWrite` is the subtle one: the vanilla body runs the commit

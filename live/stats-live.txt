@@ -1,0 +1,4 @@
+[c-saves] stats: block read=0/1587 served/miss, written=1587 | entities read=0/1587, written=0 | poi read=0/1587, written=0 | totals served=0 miss=4761 writeOk=1587 writeFail=0 vanillaFallback=0
+[c-saves] stats: block read=529/200 served/miss, written=729 | entities read=0/729, written=2 | poi read=0/729, written=1 | totals served=529 miss=1658 writeOk=732 writeFail=0 vanillaFallback=0
+[c-saves] stats: block read=726/27 served/miss, written=769 | entities read=2/751, written=4 | poi read=1/752, written=1 | totals served=729 miss=1530 writeOk=774 writeFail=0 vanillaFallback=0
+[c-saves] stats: block read=753/0 served/miss, written=769 | entities read=2/751, written=4 | poi read=1/752, written=1 | totals served=756 miss=1503 writeOk=774 writeFail=0 vanillaFallback=0

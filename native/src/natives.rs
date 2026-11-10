@@ -150,6 +150,24 @@ pub extern "system" fn n_write_chunk(
 }
 
 #[no_mangle]
+pub extern "system" fn n_has_chunk(
+    _env: JniEnvPtr,
+    _cls: jni_sys::jclass,
+    handle: i32,
+    x: i32,
+    z: i32,
+) -> jni_sys::jboolean {
+    // v0.9.62: does the engine know this chunk key (blob OR regeneration
+    // contract)? Moonrise's doesRegionFileNotExistNoIO fast-path consults it:
+    // with no .mca files on disk the vanilla answer is always "true", which
+    // makes the chunk system regenerate WITHOUT consulting the container.
+    registry()
+        .get(handle as usize)
+        .map(|e| e.0.has_chunk(key(x, z)))
+        .unwrap_or(false) as jni_sys::jboolean
+}
+
+#[no_mangle]
 pub extern "system" fn n_begin_save(_env: JniEnvPtr, _cls: jni_sys::jclass) -> jni_sys::jboolean {
     // append-only writes are already durable to the OS page cache; end_save
     // performs the fsync barrier.

@@ -1920,8 +1920,11 @@ Research §25.
 ## v0.9.62 — paper-bench (job 12 of 12): the server plays from the container
 
 A real Paper 26.3 (build 248, fill API at job time) boots under a plain
-`-javaagent` — no CRUSSTY kernel: `agent/` ASM-replaces seven
-RegionFileStorage bodies + the three Moonrise controller `startWrite`s, and
+`-javaagent` — no CRUSSTY kernel: `agent/` ASM-replaces eight
+RegionFileStorage bodies (incl. doesRegionFileNotExistNoIO — the silent-
+regeneration fix: without it Moonrise regenerated spawn chunks on every
+boot without consulting the container and overwrote a stored live edit)
++ the three Moonrise controller `startWrite`s, and
 the natives resolve through standard JNI exports into the same
 `natives::n_*` registry. Four gated live runs: world birth into the
 container (zero .mca), cold-restart force-load reads (served>0), a live

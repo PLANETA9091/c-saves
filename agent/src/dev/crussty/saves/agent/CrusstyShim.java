@@ -83,6 +83,7 @@ public final class CrusstyShim {
     public static native int nAttach(String kind, String level, String containerDir);
     public static native byte[] nReadChunk(int handle, int cx, int cz);
     public static native boolean nWriteChunk(int handle, int cx, int cz, byte[] nbt, boolean fresh);
+    public static native boolean nHasChunk(int handle, int cx, int cz);
     public static native boolean nBeginSave();
     public static native boolean nEndSave();
     public static native void nMarkAutosave();
@@ -241,6 +242,41 @@ public final class CrusstyShim {
     }
 
     // ------------------------------------------------------------------
+    // RegionFileStorage.moonrise$doesRegionFileNotExistNoIO(int, int)
+    // replacement.
+    // ==================================================================
+    // THE SILENT-REGENERATION FIX. Vanilla semantics: "does the region .mca
+    // file possibly not exist" — Moonrise consults it to skip reads it
+    // believes cannot succeed. With zero .mca files on disk the vanilla
+    // answer is ALWAYS true, so the chunk system regenerates chunks WITHOUT
+    // ever consulting the container (observed live: spawn chunks rewritten
+    // by worldgen on every boot while miss==0, overwriting a live edit that
+    // WAS stored). The container IS the region file now: a chunk exists iff
+    // the engine knows its key (blob or regeneration contract). Vanilla
+    // fallback (agent inactive): the private doesRegionFilePossiblyExist,
+    // called reflectively — its own body is untouched by the patch.
+    // ------------------------------------------------------------------
+    private static Method DOES_POSSIBLY_EXIST;
+
+    public static boolean rfDoesNotExistNoIO(RegionFileStorage st, int x, int z) throws IOException {
+        int h = ensureAttach(st);
+        if (nActive()) {
+            return !nHasChunk(h, x, z);
+        }
+        try {
+            if (DOES_POSSIBLY_EXIST == null) {
+                DOES_POSSIBLY_EXIST = RegionFileStorage.class.getDeclaredMethod(
+                        "doesRegionFilePossiblyExist", long.class);
+                DOES_POSSIBLY_EXIST.setAccessible(true);
+            }
+            long region = ((long) (x >> 5) << 32) | ((long) ((z >> 5) & 0xffff_ffffL) & 0xffff_ffffL);
+            return !((Boolean) DOES_POSSIBLY_EXIST.invoke(st, region));
+        } catch (ReflectiveOperationException e) {
+            throw new IOException("c-saves: doesRegionFilePossiblyExist reflection failed", e);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // RegionFileStorage.moonrise$readData(int, int) replacement
     // ==================================================================
     // Active: serve the chunk NBT straight from the c-saves container as an
@@ -261,11 +297,13 @@ public final class CrusstyShim {
         if (nActive()) {
             byte[] b = nReadChunk(h, x, z);
             if (b != null) {
+                if (WRITE_LOG) System.err.println("[c-saves] readData " + x + "," + z + " SERVED " + b.length + "B");
                 READ_SERVED.incrementAndGet();
                 KIND_STATS[kindOfHandle(st)][0].incrementAndGet();
                 return new ReadData(ReadResult.HAS_DATA,
                         new DataInputStream(new ByteArrayInputStream(b)), null, RECALC_OWNED);
             }
+            if (WRITE_LOG) System.err.println("[c-saves] readData " + x + "," + z + " MISS");
             READ_MISS.incrementAndGet();
             KIND_STATS[kindOfHandle(st)][1].incrementAndGet();
         } else {

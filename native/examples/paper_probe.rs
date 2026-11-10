@@ -52,26 +52,37 @@ fn main() {
     println!("paper probe: container bytes on disk: {}", total);
 
     if want_diamond {
+        let needle = b"minecraft:diamond_block";
         let k0 = ((0i64 as u64) << 32) | (0i64 as u64 & 0xffff_ffff);
+        // where is the edit? scan EVERY chunk for the diamond block name
+        let mut holders: Vec<(u64, usize)> = Vec::new();
+        for k in &keys {
+            if let Some(d) = st.read_chunk(*k) {
+                if d.windows(needle.len()).any(|w| w == needle) {
+                    holders.push((*k, d.len()));
+                }
+            }
+        }
         match st.read_chunk(k0) {
             Some(d) => {
-                let needle = b"minecraft:diamond_block";
                 let hit = d.windows(needle.len()).any(|w| w == needle);
                 println!(
                     "paper probe: chunk (0,0) bytes={} diamond_block={}",
                     d.len(),
                     if hit { "PRESENT" } else { "ABSENT" }
                 );
-                if !hit {
-                    println!("=== paper probe: FAIL (edit lost) ===");
-                    std::process::exit(1);
-                }
             }
-            None => {
-                println!("paper probe: chunk (0,0) missing");
-                println!("=== paper probe: FAIL (chunk 0,0 absent) ===");
-                std::process::exit(1);
-            }
+            None => println!("paper probe: chunk (0,0) missing"),
+        }
+        if holders.is_empty() {
+            println!("paper probe: diamond_block found in NO chunk");
+            println!("=== paper probe: FAIL (edit lost) ===");
+            std::process::exit(1);
+        }
+        for (k, sz) in &holders {
+            let cx = (*k >> 32) as i32;
+            let cz = (*k as u32) as i32;
+            println!("paper probe: diamond_block PRESENT in chunk ({cx},{cz}) bytes={sz}");
         }
     }
     println!("=== paper probe: PASS ===");

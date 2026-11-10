@@ -1324,6 +1324,21 @@ container for the overworld region set weighed ~460 KB for 756 indexed
 chunks (content-addressed section dedup over identical terrain) — and the
 diamond edit survived three server deaths inside the container.
 
+4. **The silent regeneration — the live gate's biggest catch.** With every
+   write and read bridged (writeFail=0, served>0), the CI session STILL
+   lost the live edit on the second restart: the diamond chunk shrank by
+   exactly one palette entry while block read misses stayed at ZERO.
+   The chain: Moonrise's `doesRegionFileNotExistNoIO` — left vanilla —
+   answers "the region .mca does not exist", which is ALWAYS true in a
+   container-only world, so the chunk system regenerated spawn chunks on
+   every boot WITHOUT ever consulting the container (readData never ran for
+   them) and overwrote stored edits with fresh worldgen. The patched body
+   answers through the engine — a chunk exists iff `Store::has_chunk`
+   (blob or contract). The effect is visible in the gate numbers: the
+   force-load run changed from 529 served / 200 miss to 105 served /
+   624 miss (the container is finally ASKED), and the read-back run now
+   ends with the diamond PRESENT.
+
 **What remains.** The kernel path (cplugin_init) remains the product
 integration; the agent path is the standalone proof + a developer harness.
 Player-visible latency through the live path (a bot client walking the

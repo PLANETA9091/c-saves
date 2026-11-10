@@ -158,3 +158,14 @@ pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nMarkAutosave(
 ) {
     natives::n_mark_autosave(env, cls)
 }
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nHasChunk(
+    env: *mut JNIEnv,
+    cls: jclass,
+    handle: jint,
+    x: jint,
+    z: jint,
+) -> jboolean {
+    natives::n_has_chunk(env, cls, handle, x, z)
+}
