@@ -511,7 +511,7 @@ jobs:
             sleep 2
           done
           [ "$OK" = 1 ] || { echo "FAIL: server never reached Done"; tail -40 boot.log; exit 1; }
-          kill -INT $PID; wait $PID || true
+          kill -TERM $PID; wait $PID || true
           grep -q "Starting minecraft server version 26.3" boot.log
           ls versions/26.3/paper-26.3.jar
       - name: compile the agent against the REAL mapped server jar
@@ -543,7 +543,7 @@ jobs:
           }
 
           # ---- run 1: the world is BORN into the container (spawn worldgen) ----
-          ( sleep 40; echo stop ) | timeout --signal=INT 220 \
+          ( sleep 40; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
             java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
             -cp "$CP" org.bukkit.craftbukkit.Main nogui > run1.log 2>&1 || true
           grep -q "Done (" run1.log || { echo "FAIL run1: no Done"; tail -40 run1.log; exit 1; }
@@ -556,7 +556,7 @@ jobs:
           no_mca
 
           # ---- run 2: force-load forces READS from the container ----
-          ( sleep 35; echo "forceload add -8 8"; sleep 90; echo stop ) | timeout --signal=INT 220 \
+          ( sleep 35; echo "forceload add -8 8"; sleep 90; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
             java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
             -cp "$CP" org.bukkit.craftbukkit.Main nogui > run2.log 2>&1 || true
           grep -q "Done (" run2.log || { echo "FAIL run2: no Done"; tail -40 run2.log; exit 1; }
@@ -565,7 +565,7 @@ jobs:
           echo "read gate OK: the server loaded chunks from the container on a cold restart"
 
           # ---- run 3: a LIVE EDIT through the server console ----
-          ( sleep 35; echo "forceload add 0 0"; sleep 15; echo "setblock 0 -60 0 minecraft:diamond_block"; sleep 45; echo stop ) | timeout --signal=INT 220 \
+          ( sleep 35; echo "forceload add 0 0"; sleep 15; echo "setblock 0 -60 0 minecraft:diamond_block"; sleep 45; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
             java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
             -cp "$CP" org.bukkit.craftbukkit.Main nogui > run3.log 2>&1 || true
           grep -q "Changed the block at 0, -60, 0" run3.log || { echo "FAIL run3: setblock"; grep -F "System chat" run3.log | head -5; exit 1; }
@@ -573,7 +573,7 @@ jobs:
           echo "edit gate OK: the edit went into the container (nothing else exists)"
 
           # ---- run 4: the edit survives a restart — read back from the container ----
-          ( sleep 35; echo "forceload add -8 8"; sleep 90; echo stop ) | timeout --signal=INT 220 \
+          ( sleep 35; echo "forceload add -8 8"; sleep 90; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
             java -Xms512M -Xmx1500M $AGENT -Dcsaves.statsfile=stats-live.txt \
             -cp "$CP" org.bukkit.craftbukkit.Main nogui > run4.log 2>&1 || true
           grep -q "Done (" run4.log || { echo "FAIL run4: no Done"; tail -40 run4.log; exit 1; }
