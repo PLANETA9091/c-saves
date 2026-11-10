@@ -527,7 +527,7 @@ jobs:
         run: |
           set -euo pipefail
           ROOT=$PWD
-          CP="patchrun/versions/26.3/paper-26.3.jar:$(find patchrun/libraries -name '*.jar' | tr '\n' ':')build/agent/asm-9.11.1.jar"
+          CP="$ROOT/patchrun/versions/26.3/paper-26.3.jar:$(find "$ROOT/patchrun/libraries" -name '*.jar' | tr '\n' ':')$ROOT/build/agent/asm-9.11.1.jar"
           AGENT="-javaagent:$ROOT/build/agent/agent.jar -Dcsaves.lib=$ROOT/native/target/release/libc_saves.so"
           mkdir live && cd live
           cp ../patchrun/eula.txt .
