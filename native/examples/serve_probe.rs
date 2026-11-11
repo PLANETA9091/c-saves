@@ -376,20 +376,43 @@ fn main() {
     let mut lat: Vec<f64> = Vec::with_capacity(n_regions);
     let mut identical = 0usize;
     let mut served_bytes = 0u64;
-    for ri in 0..n_regions {
-        let rx = (ri / side) as i32;
-        let rz = (ri % side) as i32;
-        let t = Instant::now();
-        let served = anvil::serve_region(&store, rx, rz).expect("serve ok");
-        lat.push(t.elapsed().as_secs_f64() * 1000.0);
-        let served = served.expect("region has keys");
-        served_bytes += served.len() as u64;
-        let on_disk = std::fs::read(ref_dir.join(format!("r.{rx}.{rz}.mca"))).unwrap();
-        if served == on_disk {
-            identical += 1;
-        } else {
-            eprintln!("[serve] region ({rx},{rz}) differs from the export view");
+    // v0.9.67: the identity pass renders regions in parallel (each region
+    // is an independent deflate stream; the per-region latency stays the
+    // honest per-render wall time on a saturated host).
+    let results: std::sync::Mutex<Vec<(usize, f64, bool, u64)>> =
+        std::sync::Mutex::new(Vec::with_capacity(n_regions));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let nproc = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    std::thread::scope(|s| {
+        for _ in 0..nproc.min(n_regions.max(1)) {
+            s.spawn(|| loop {
+                let ri = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if ri >= n_regions {
+                    return;
+                }
+                let rx = (ri / side) as i32;
+                let rz = (ri % side) as i32;
+                let t = Instant::now();
+                let served = anvil::serve_region(&store, rx, rz).expect("serve ok");
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                let served = served.expect("region has keys");
+                let on_disk = std::fs::read(ref_dir.join(format!("r.{rx}.{rz}.mca"))).unwrap();
+                let same = served == on_disk;
+                if !same {
+                    eprintln!("[serve] region ({rx},{rz}) differs from the export view");
+                }
+                results.lock().unwrap().push((ri, ms, same, served.len() as u64));
+            });
         }
+    });
+    let mut res = results.into_inner().unwrap();
+    res.sort_by_key(|(ri, _, _, _)| *ri);
+    for (_, ms, same, b) in &res {
+        lat.push(*ms);
+        if *same {
+            identical += 1;
+        }
+        served_bytes += *b;
     }
     let first_ms = lat[0];
     lat.sort_by(|a, b| a.partial_cmp(b).unwrap());

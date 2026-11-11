@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub struct ImportReport {
     pub files: usize,
@@ -323,28 +324,62 @@ pub fn export_dir(store: &Arc<Store>, out_dir: &Path) -> std::io::Result<ExportR
             .push((cx, cz, k));
     }
     let regions_n = regions.len();
-    for ((rx, rz), keys) in regions {
-        let path = out_dir.join(format!("r.{rx}.{rz}.mca"));
-        let file = fs::File::create(&path)?;
-        let mut w = std::io::BufWriter::new(file);
-        let rb = build_region_body(store, &keys)?;
-        count += rb.count;
-        bytes += rb.bytes;
-        pristine_skipped += rb.pristine_skipped;
-        lost += rb.lost;
-        let mut offsets = [0u32; 1024];
-        for (idx, so, sc) in &rb.placed {
-            offsets[*idx] = (so << 8) | (sc & 0xff);
+    // v0.9.67: parallel export — the deflate at vanilla zlib-6 is the wall
+    // (~2.4 ms/chunk; the level is pinned by byte-identity with the vanilla
+    // form, so cores are the only honest lever). Regions are independent
+    // files: a worker pool streams them concurrently, each with the same
+    // 1024-chunk ~20 MB RAM bound the streaming export introduced. File
+    // CONTENT is unchanged (deterministic per region); only completion
+    // order varies.
+    let region_list: Vec<((i32, i32), Vec<(i32, i32, u64)>)> = regions.into_iter().collect();
+    let out = std::sync::Mutex::new(Vec::<(usize, u64, usize, usize)>::new());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(region_list.len().max(1));
+    std::thread::scope(|s| -> std::io::Result<()> {
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            handles.push(s.spawn(|| -> std::io::Result<()> {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= region_list.len() {
+                        return Ok(());
+                    }
+                    let ((rx, rz), keys) = &region_list[i];
+                    let path = out_dir.join(format!("r.{rx}.{rz}.mca"));
+                    let file = fs::File::create(&path)?;
+                    let mut w = std::io::BufWriter::new(file);
+                    let rb = build_region_body(store, keys)?;
+                    let mut offsets = [0u32; 1024];
+                    for (idx, so, sc) in &rb.placed {
+                        offsets[*idx] = (so << 8) | (sc & 0xff);
+                    }
+                    for v in offsets {
+                        w.write_all(&v.to_be_bytes())?;
+                    }
+                    for _ in 0..1024 {
+                        w.write_all(&0u32.to_be_bytes())?;
+                    }
+                    w.write_all(&rb.body)?;
+                    w.flush()?;
+                    out.lock().unwrap().push((rb.count, rb.bytes, rb.pristine_skipped, rb.lost));
+                }
+            }));
         }
-        for v in offsets {
-            w.write_all(&v.to_be_bytes())?;
+        for h in handles {
+            h.join()
+                .map_err(|_| std::io::Error::other("export worker panicked"))??;
         }
-        let _timestamps = [0u32; 1024]; // zero timestamps: vanilla accepts them
-        for i in 0..1024 {
-            w.write_all(&0u32.to_be_bytes())?;
-        }
-        w.write_all(&rb.body)?;
-        w.flush()?;
+        Ok(())
+    })?;
+    let counts = out.into_inner().unwrap();
+    for (c, b, ps, l) in counts {
+        count += c;
+        bytes += b;
+        pristine_skipped += ps;
+        lost += l;
     }
     if pristine_skipped > 0 {
         eprintln!(
