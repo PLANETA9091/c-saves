@@ -611,6 +611,14 @@ impl Cfg {
 
 // ------------------------------------------------------------- varint -----
 
+/// Wall-clock ms since the Unix epoch (the live-traffic stamp's timebase).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn put_u64(v: &mut Vec<u8>, mut x: u64) {
     loop {
         let b = (x & 0x7f) as u8;
@@ -1579,6 +1587,14 @@ pub struct Store {
 
     pub writes: AtomicU64,
     pub reads: AtomicU64,
+    /// v0.9.66: ms-timestamp of the last SERVED read — the maintenance
+    /// thread defers pack steps while the live path is actively fetching
+    /// (a pack step steals 50-300 ms of CPU on small hosts and the fetch
+    /// meters pay for it in outliers).
+    last_read_ms: AtomicU64,
+    /// v0.9.66: ms-timestamp of the last maintenance pack step — the
+    /// starvation cap that keeps deferred compaction from never running.
+    last_pack_ms: AtomicU64,
     pub dedup_hits: AtomicU64,
     /// per-store write-skip count: the global ST_WRITE_SKIP is shared by
     /// every Store in the process, so parallel tests cannot assert on it
@@ -1695,6 +1711,8 @@ impl Store {
             dict_fresh: AtomicUsize::new(0),
             writes: AtomicU64::new(0),
             reads: AtomicU64::new(0),
+            last_read_ms: AtomicU64::new(0),
+            last_pack_ms: AtomicU64::new(0),
             dedup_hits: AtomicU64::new(0),
             write_skips: AtomicU64::new(0),
             pristine_flips: AtomicU64::new(0),
@@ -3919,6 +3937,9 @@ impl Store {
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
     pub fn read_chunk(&self, key: u64) -> Option<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
+        // v0.9.66: stamp live traffic — the maintenance thread defers pack
+        // steps while fetches are arriving (see compact_step_maintenance).
+        self.last_read_ms.store(now_ms(), Ordering::Relaxed);
         // v0.9.53 POI elision: the scratchpad IS the store within the
         // session; a miss means absent — the exact semantics of a missing
         // poi file (vanilla rebuilds from chunk block states on load).
@@ -5597,6 +5618,31 @@ impl Store {
     /// Compact at most one segment: move live data (recompressing blobs at
     /// the cold tier), then drop the segment. Returns true if work was done.
     pub fn compact_step(&self) -> bool {
+        self.compact_step_inner()
+    }
+
+    /// The maintenance thread's entry. v0.9.66: never compress while the
+    /// live path is actively fetching — a pack step is 50-300 ms of CPU on
+    /// a small host and the fetch latency meters pay for it in outliers
+    /// (CI live fp99). A 500 ms traffic window defers the step during
+    /// bursts; the 15 s starvation cap forces one through when the server
+    /// never goes quiet. Direct compact_step() callers (benches, tools,
+    /// tests) are untouched.
+    pub fn compact_step_maintenance(&self) -> bool {
+        let now = now_ms();
+        let last_read = self.last_read_ms.load(Ordering::Relaxed);
+        let last_pack = self.last_pack_ms.load(Ordering::Relaxed);
+        if last_read != 0
+            && now.saturating_sub(last_read) < 500
+            && now.saturating_sub(last_pack) < 15_000
+        {
+            return false;
+        }
+        self.last_pack_ms.store(now, Ordering::Relaxed);
+        self.compact_step_inner()
+    }
+
+    fn compact_step_inner(&self) -> bool {
         self.train_dict_if_needed();
         self.flush_recipe_batch();
         // seal any open writer so previously appended data (including our
@@ -8392,6 +8438,50 @@ mod repro {
                 "reopened read of ({cx},{cz}) must be byte-exact"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maintenance_pack_defers_under_live_traffic() {
+        // v0.9.66: the maintenance entry defers a pack step while reads are
+        // arriving (< 500 ms), forces one through after the 15 s starvation
+        // cap, and behaves exactly like compact_step() when the store is
+        // quiet (benches, tools, tests keep the direct entry).
+        let dir = temp_dir("maint-defer");
+        let s = Store::open_cfg(&dir, false, bench_cfg()).unwrap();
+        s.set_whole_mode();
+        for i in 0..24u64 {
+            let (cx, cz) = ((i % 8) as i32 - 4, (i / 8) as i32 - 2);
+            s.write_chunk_fresh(key(cx, cz), &chunk_payload(cx, cz, i), true, false)
+                .unwrap();
+        }
+        s.sync();
+        s.seal();
+        s.request_pack();
+        // fresh store, no reads yet: the maintenance entry MUST pack
+        assert!(
+            s.compact_step_maintenance(),
+            "quiet store: the maintenance step must do work"
+        );
+        // live traffic: a read stamps the clock, the next step defers
+        let (cx, cz) = (0, 0);
+        assert!(s.read_chunk(key(cx, cz)).is_some());
+        assert!(
+            !s.compact_step_maintenance(),
+            "a fetch 0 ms ago must defer the maintenance step"
+        );
+        // the direct entry is untouched by the guard: fresh hot material
+        // packs DESPITE the fresh read stamp
+        for i in 24..30u64 {
+            let (cx, cz) = ((i % 8) as i32 - 4, (i / 8) as i32 - 2);
+            s.write_chunk_fresh(key(cx, cz), &chunk_payload(cx, cz, i), true, false)
+                .unwrap();
+        }
+        s.request_pack();
+        assert!(
+            s.compact_step(),
+            "direct compact_step() ignores the traffic guard"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

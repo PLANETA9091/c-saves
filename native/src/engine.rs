@@ -101,6 +101,16 @@ impl Registry {
         }
         did
     }
+
+    /// v0.9.66: the maintenance face of compaction — per store, the
+    /// live-traffic-aware entry (defer while fetches are arriving).
+    pub fn compact_step_maintenance(&self) -> bool {
+        let mut did = false;
+        for (s, _) in self.all() {
+            did |= s.compact_step_maintenance();
+        }
+        did
+    }
 }
 
 // latency meters (micro-benchmark counters; printed by the bench harness)
@@ -287,7 +297,11 @@ pub fn spawn_maintenance(reg: Arc<Registry>) {
                     reg.seal_all();
                     last_sync = std::time::Instant::now();
                 }
-                let _ = reg.compact_step();
+                // v0.9.66: the maintenance entry defers pack steps while the
+                // live path is actively fetching (500 ms window, 15 s
+                // starvation cap) — pack CPU bursts were the fetch-meter
+                // outliers on small hosts.
+                let _ = reg.compact_step_maintenance();
             }
         })
         .ok();
