@@ -613,7 +613,13 @@ jobs:
           cp -a ../world ./anvil-world
           mkdir -p anvil-world/dimensions/minecraft/overworld/region
           cp ../export-anvil/*.mca anvil-world/dimensions/minecraft/overworld/region/
-          ( sleep 35; echo "forceload add -8 8"; sleep 90; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
+          # v0.9.64: the anvil world inherits the SET spawn from level.dat, so
+          # the boot's spawn search does not run and a bare forceload -8 8
+          # would fetch only ~30 chunks (the spawn radius). Force a 16x16
+          # chunk window instead — every chunk in it is in the export, so the
+          # fetch sample count is deterministic (>=200 for the percentile
+          # gates) regardless of the spawn-search behavior.
+          ( sleep 35; echo "forceload add -128 -128 128 128"; sleep 90; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
             java -Xms512M -Xmx1500M $AGENT -Dcsaves.mode=anvil -Dcsaves.statsfile=stats-anvil.txt \
             -cp "$CP" org.bukkit.craftbukkit.Main nogui > run5.log 2>&1 || true
           cd ..
