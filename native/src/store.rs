@@ -4762,12 +4762,12 @@ impl Store {
         }
         self.flush_recipe_batch();
         self.flush_writer();
-        {
-            let wg = self.writer.lock();
-            if let Some(w) = wg.as_ref() {
-                let _ = w.file.sync_data();
-            }
-        }
+        // v0.9.68: NO fsync under the writer lock — the lock is held by the
+        // live read path (flush_writer on writer-segment reads) and the
+        // write path (append); holding it across a 10-500 ms fsync was the
+        // fetch-meter outlier source. The segs loop below already syncs the
+        // writer segment's inode through its read handle (fsync is
+        // per-inode), so the dedicated writer-lock fsync was redundant.
         let segs = self.segs.read();
         for s in segs.values() {
             let _ = s.file.sync_data();
@@ -4782,12 +4782,30 @@ impl Store {
             let _ = self.persist_glob_reg();
         }
         self.flush_recipe_batch();
-        self.flush_writer();
-        let mut wg = self.writer.lock();
-        if let Some(w) = wg.as_ref() {
-            let _ = w.file.sync_data();
+        // flush + detach under ONE short lock acquisition (no fsync inside —
+        // the live read/write paths contend on this lock), then fsync the
+        // sealed segment's inode through its segs read handle (fsync is
+        // per-inode; the dedicated writer-handle fsync bought nothing but
+        // held the lock across the whole syscall — v0.9.68).
+        let seg_id = {
+            let mut wg = self.writer.lock();
+            if let Some(w) = wg.as_mut() {
+                if !w.buf.is_empty() {
+                    let _ = w.file.seek(SeekFrom::Start(w.written - w.buf.len() as u64));
+                    let _ = w.file.write_all(&w.buf);
+                    w.buf.clear();
+                }
+            }
+            let id = wg.as_ref().map(|w| w.seg_id);
+            *wg = None;
+            id
+        };
+        if let Some(id) = seg_id {
+            let segs = self.segs.read();
+            if let Some(s) = segs.get(&id) {
+                let _ = s.file.sync_data();
+            }
         }
-        *wg = None;
     }
 
     pub fn disk_bytes(&self) -> u64 {
