@@ -563,6 +563,12 @@ jobs:
           check_stats 0 1
           no_mca
           echo "read gate OK: the server loaded chunks from the container on a cold restart"
+          # v0.9.64: snapshot the BULK-READ line while it is the tail — the
+          # meters gates and the A/B must feed on the big fetch sample (531
+          # fetches in CI), not on stats-live.txt's tail AFTER run4 (the
+          # verify boot touches only the spawn window: ~37 fetches, too few
+          # for an n>=200 percentile gate)
+          tail -n 1 stats-live.txt > meters-live.txt
 
           # ---- run 3: a LIVE EDIT through the server console ----
           # v0.9.64: the edit is BACK at spawn (0, -60, 0). The 0.9.63 CI-red
@@ -631,8 +637,8 @@ jobs:
           grep -q "mode=anvil" anvil_stats_tail.txt
           grep -q "eng rn=0" anvil_stats_tail.txt || { echo "FAIL: the anvil baseline touched the engine"; exit 1; }
           tail -n 1 run5/stats-anvil.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('anvil meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=200 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
-          tail -n 1 stats-live.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('container meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=200 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
-          python3 -c "import re; p=lambda s:{k:int(v) for k,v in re.findall(r'(\w+)=(\d+)',s)}; c=p(open('stats-live.txt').read().strip().splitlines()[-1]); a=p(open('run5/stats-anvil.txt').read().strip().splitlines()[-1]); print('A/B read p50: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp50'], a['fp50'], c['fp50']/max(1,a['fp50']))); print('A/B read p90: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp90'], a['fp90'], c['fp90']/max(1,a['fp90']))); print('A/B read p99: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp99'], a['fp99'], c['fp99']/max(1,a['fp99']))); print('A/B write p50: container=%dus vs anvil=%dus (ratio %.2f)' % (c['swp50'], a['swp50'], c['swp50']/max(1,a['swp50'])))"
+          tail -n 1 meters-live.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('container meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=200 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
+          python3 -c "import re; p=lambda s:{k:int(v) for k,v in re.findall(r'(\w+)=(\d+)',s)}; c=p(open('meters-live.txt').read().strip().splitlines()[-1]); a=p(open('run5/stats-anvil.txt').read().strip().splitlines()[-1]); print('A/B read p50: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp50'], a['fp50'], c['fp50']/max(1,a['fp50']))); print('A/B read p90: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp90'], a['fp90'], c['fp90']/max(1,a['fp90']))); print('A/B read p99: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp99'], a['fp99'], c['fp99']/max(1,a['fp99']))); print('A/B write p50: container=%dus vs anvil=%dus (ratio %.2f)' % (c['swp50'], a['swp50'], c['swp50']/max(1,a['swp50'])))"
           echo "=== paper bench: PASS — the server plays from the container, end to end ==="
       - uses: actions/upload-artifact@v4
         if: always()
@@ -645,6 +651,7 @@ jobs:
             live/run4.log
             live/run5/run5.log
             live/stats-live.txt
+            live/meters-live.txt
             live/run5/stats-anvil.txt
             live/paper_probe.txt
             live/paper_export.txt
