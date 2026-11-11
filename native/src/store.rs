@@ -4712,6 +4712,27 @@ impl Store {
         v
     }
 
+    /// v0.9.67: committed chunk keys ordered by their on-disk location
+    /// (segment id, then record offset). A full-container walk in this
+    /// order streams every packed slab frame exactly once — each
+    /// decompressed slab serves the ~dozens of neighboring members read
+    /// right after it — instead of re-decompressing a fresh frame per key
+    /// in HashMap order (the worst-case verify paid ~20 ms/chunk in slab
+    /// misses; ordered, the amortized read cost collapses). Batched
+    /// pointers resolve through batch_idx at read time, so the ORDER is
+    /// the only thing this accessor sells; content and semantics are
+    /// untouched. Pending (unflushed) keys and contract-only slots have
+    /// no location and stay out — callers union with keys() as needed.
+    pub fn keys_sorted_by_location(&self) -> Vec<u64> {
+        let chunks = self.chunks.read();
+        let mut v: Vec<(u32, u64, u64)> = chunks
+            .iter()
+            .map(|(&k, &(seg, off, _len))| (seg, off, k))
+            .collect();
+        v.sort_unstable();
+        v.into_iter().map(|(_, _, k)| k).collect()
+    }
+
     pub fn delete_chunk(&self, key: u64) -> Result<(), String> {
         self.flush_recipe_batch();
         self.last_written.lock().remove(&key);
