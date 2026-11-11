@@ -4265,6 +4265,160 @@ impl Store {
         self.decompress(loc.dict_id, &data, loc.raw_len)
     }
 
+    // ---- v0.9.65: attach-time prefetch — the live tail is the first touch --
+
+    /// Decompress the store's sealed batch + slab bodies into the slab cache
+    /// BEFORE the server asks for its first chunk. The live-path tail (CI:
+    /// container fp99=738 us vs anvil 179 us; lat99 local: cold p99=702 us,
+    /// max=13.7 ms — warm p99=13 us) is exactly the first-touch decompression
+    /// of a compressed recipe batch or a packed slab; after the warm-up every
+    /// read is a cache hit and the tail collapses into the join cost.
+    /// Order: batches first (EVERY chunk read parses its recipe and a batch
+    /// miss decompresses a whole compressed frame), then slabs in append
+    /// order — the pack pass writes spawn-area sections first, matching a
+    /// boot's spiral fetch. The walk stops once the decompressed footprint
+    /// exceeds the cache budget (further inserts would only churn the FIFO);
+    /// writer-segment records are skipped (fresh writes stay pay-on-first-
+    /// touch, they are the hot set by definition). CSAVES_PREFETCH=0 opts
+    /// out. Returns (batches, slabs, bytes) warmed.
+    pub fn prefetch_slabs(&self) -> (usize, usize, u64) {
+        let gated = std::env::var("CSAVES_PREFETCH")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if gated {
+            return (0, 0, 0);
+        }
+        let cap = self.cfg.slab_cache;
+        let writer_id = self.writer_seg_id();
+        // distinct batch frames (seg, boff), sorted by append order
+        let batches: Vec<(u32, u64)> = {
+            let idx = self.batch_idx.lock();
+            let chunks = self.chunks.read();
+            let mut m: std::collections::HashSet<(u32, u64)> = Default::default();
+            for (k, (boff, _s, _r)) in idx.iter() {
+                if let Some((seg, _o, _l)) = chunks.get(k) {
+                    if Some(*seg) != writer_id {
+                        m.insert((*seg, *boff));
+                    }
+                }
+            }
+            let mut v: Vec<(u32, u64)> = m.into_iter().collect();
+            v.sort_unstable();
+            v
+        };
+        // distinct slab frames (seg, off, dict), append order
+        let slabs: Vec<(u32, u64, u8)> = {
+            let blobs = self.blobs.read();
+            let mut m: HashMap<(u32, u64), u8> = HashMap::new();
+            for l in blobs.values() {
+                if l.slab && Some(l.seg) != writer_id {
+                    m.insert((l.seg, l.off), l.dict_id);
+                }
+            }
+            let mut v: Vec<(u32, u64, u8)> = m.into_iter().map(|(k, d)| (k.0, k.1, d)).collect();
+            v.sort_unstable();
+            v
+        };
+        let bytes_a = std::sync::atomic::AtomicU64::new(0);
+        let nb_a = std::sync::atomic::AtomicUsize::new(0);
+        let ns_a = std::sync::atomic::AtomicUsize::new(0);
+        let over = std::sync::atomic::AtomicBool::new(false);
+        // phase 1: batches (serial — few records, budget check is sequential)
+        for (seg, boff) in &batches {
+            if over.load(Ordering::Relaxed) {
+                break;
+            }
+            let ck = (*seg, *boff | (1u64 << 63));
+            if self.slab_cache.lock().get(&ck).is_some() {
+                continue;
+            }
+            let Some(raw) = self.prefetch_batch_body(*seg, *boff) else { continue };
+            let sz = raw.len() as u64;
+            self.slab_cache.lock().put(ck, raw);
+            nb_a.fetch_add(1, Ordering::Relaxed);
+            let b = bytes_a.fetch_add(sz, Ordering::Relaxed) + sz;
+            if b > cap {
+                over.store(true, Ordering::Relaxed);
+            }
+        }
+        // phase 2: slabs (parallel decompression over a shared index)
+        if !slabs.is_empty() {
+            let queue = parking_lot::Mutex::new(&slabs[..]);
+            let qi = std::sync::atomic::AtomicUsize::new(0);
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(6);
+            std::thread::scope(|sc| {
+                for _ in 0..workers {
+                    sc.spawn(|| loop {
+                        if over.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let i = qi.fetch_add(1, Ordering::Relaxed);
+                        let list = *queue.lock();
+                        if i >= list.len() {
+                            return;
+                        }
+                        let (seg, off, dict) = list[i];
+                        if self.slab_cache.lock().get(&(seg, off)).is_some() {
+                            continue;
+                        }
+                        let Some(raw) = self.prefetch_slab_body(seg, off, dict) else {
+                            continue;
+                        };
+                        let sz = raw.len() as u64;
+                        self.slab_cache.lock().put((seg, off), raw);
+                        ns_a.fetch_add(1, Ordering::Relaxed);
+                        let b = bytes_a.fetch_add(sz, Ordering::Relaxed) + sz;
+                        if b > cap {
+                            over.store(true, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+        }
+        (
+            nb_a.load(Ordering::Relaxed),
+            ns_a.load(Ordering::Relaxed),
+            bytes_a.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One batch frame's decompressed body (load_batched's miss path minus
+    /// the cache probe; cache key carries the batch tag bit).
+    fn prefetch_batch_body(&self, seg: u32, boff: u64) -> Option<Arc<Vec<u8>>> {
+        let segs = self.segs.read();
+        let s = segs.get(&seg)?;
+        let sealed = Some(seg) != self.writer_seg_id();
+        let hdr = s.read_at(boff, 13, sealed)?;
+        if hdr.first() != Some(&9) {
+            return None;
+        }
+        let cl = u32::from_le_bytes(hdr[5..9].try_into().ok()?) as usize;
+        let raw_total = u32::from_le_bytes(hdr[9..13].try_into().ok()?) as usize;
+        let data = s.read_at(boff + 13, cl, sealed)?;
+        self.decompress(0, &data, raw_total as u32).map(Arc::new)
+    }
+
+    /// One slab frame's decompressed body (the read_blob slab miss path
+    /// minus the cache probe and member slicing).
+    fn prefetch_slab_body(&self, seg: u32, off: u64, dict_id: u8) -> Option<Arc<Vec<u8>>> {
+        let segs = self.segs.read();
+        let s = segs.get(&seg)?;
+        let sealed = Some(seg) != self.writer_seg_id();
+        let hdr = s.read_at(off, 13, sealed)?;
+        let kind = hdr[0] & 0x3f;
+        if kind != 5 && kind != 8 {
+            return None;
+        }
+        let hlen = if hdr[0] & 0x80 != 0 { 13usize } else { 12usize };
+        let cl = u32::from_le_bytes(hdr[2..6].try_into().ok()?) as usize;
+        let raw_total = u32::from_le_bytes(hdr[6..10].try_into().ok()?);
+        let data = s.read_at(off + hlen as u64, cl, sealed)?;
+        self.decompress(dict_id, &data, raw_total).map(Arc::new)
+    }
+
     /// Convert a member's raw bytes to canonical CSEC when they carry a
     /// GLOB form (0xCB raw-u8 legacy or 0xCC rle/u16). Reads are the only
     /// place GLOB bytes exist; every decoder and every re-pack sees
@@ -4464,6 +4618,11 @@ impl Store {
         self.cfg.pristine_region
             && self.region_assert_has(key)
             && self.recipe_batch.lock().get(key).is_none()
+    }
+
+    /// Test/tooling face: how many decompressed bodies sit in the slab cache.
+    pub fn slab_cache_entries(&self) -> usize {
+        self.slab_cache.lock().map.len()
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -8159,6 +8318,55 @@ mod repro {
             "opt-out must restore unconditional first-write contracts"
         );
         assert!(s.read_chunk(k).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefetch_warms_every_sealed_body_and_reads_stay_exact() {
+        // v0.9.65: the attach-time prefetch decompresses the sealed batch +
+        // slab frames into the slab cache so the FIRST read of every chunk is
+        // a cache hit (the live-path tail WAS the first touch: cold p99
+        // ~700 us / max ~13 ms vs warm p99 ~13 us on the lat99 probe).
+        // Contract under test: after sync+seal+pack+prefetch, (a) the cache
+        // is non-empty, (b) every read returns the exact original payload.
+        let dir = temp_dir("pf-warm");
+        let s = Store::open_cfg(&dir, false, bench_cfg()).unwrap();
+        s.set_whole_mode();
+        let mut payloads = Vec::new();
+        for i in 0..24u64 {
+            let (cx, cz) = ((i % 8) as i32 - 4, (i / 8) as i32 - 2);
+            let p = chunk_payload(cx, cz, i);
+            s.write_chunk_fresh(key(cx, cz), &p, true, false).unwrap();
+            payloads.push((cx, cz, p));
+        }
+        s.sync();
+        s.seal();
+        s.request_pack();
+        while s.compact_step() {}
+        s.sync();
+        // the cache starts cold: nothing was read yet, the pack pass does
+        // not populate the read cache
+        let (nb, ns, bytes) = s.prefetch_slabs();
+        assert!(
+            nb + ns > 0,
+            "prefetch must warm at least one sealed frame (nb={nb}, ns={ns})"
+        );
+        assert!(bytes > 0, "warmed bytes must be counted");
+        assert!(
+            s.slab_cache_entries() >= nb + ns,
+            "every warmed frame must sit in the cache"
+        );
+        // every first read is exact — byte-identical to what was written
+        for (cx, cz, p) in &payloads {
+            assert_eq!(
+                s.read_chunk(key(*cx, *cz)).as_deref(),
+                Some(p.as_slice()),
+                "prefetched read of ({cx},{cz}) must be byte-exact"
+            );
+        }
+        // a second prefetch pass warms nothing new: cached frames are skipped
+        let (nb2, ns2, _b2) = s.prefetch_slabs();
+        assert_eq!((nb2, ns2), (0, 0), "re-prefetch must skip cached frames");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

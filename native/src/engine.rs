@@ -58,6 +58,11 @@ impl Registry {
         );
         drop(by_dir);
         drop(stores);
+        // v0.9.65: warm the slab cache in the background BEFORE the first
+        // fetch — the cold first-touch decompression was the whole live-path
+        // tail (container fp99 738 us vs anvil 179 us; warm reads sit at
+        // p99 ~= 13 us). Boot takes seconds; the warm-up takes tens of ms.
+        spawn_prefetch(store.clone());
         crate::anvil_import::maybe_spawn_import(store.clone(), container_dir, kind, chunk_count);
         idx
     }
@@ -244,6 +249,27 @@ pub fn latency_snapshot() -> (u64, u64, u64, u64, u64) {
         wn,
         AUTOSAVES.load(Ordering::Relaxed),
     )
+}
+
+/// v0.9.65: background slab-cache warm-up at attach time. The store's sealed
+/// batch + slab bodies are decompressed into the slab cache while the server
+/// is still booting; by the first spawn fetch every read is a cache hit.
+/// One log line per store, only when something was actually warmed.
+pub fn spawn_prefetch(st: Arc<Store>) {
+    std::thread::Builder::new()
+        .name("csaves-prefetch".into())
+        .spawn(move || {
+            let t0 = std::time::Instant::now();
+            let (batches, slabs, bytes) = st.prefetch_slabs();
+            if batches + slabs > 0 {
+                eprintln!(
+                    "[c-saves] prefetch: {batches} batches + {slabs} slabs, {:.1} MiB warm in {:.0} ms",
+                    bytes as f64 / 1048576.0,
+                    t0.elapsed().as_millis()
+                );
+            }
+        })
+        .ok();
 }
 
 /// Background maintenance: periodic fsync + compaction. Runs detached from
