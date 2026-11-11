@@ -610,7 +610,8 @@ jobs:
             --export export-anvil | tee paper_export.txt
           grep -q "export out=.* lost=0" paper_export.txt
           mkdir run5 && cd run5
-          cp ../patchrun/eula.txt .
+          # run5/ sits INSIDE live/, so the repo-root patchrun is two levels up
+          cp ../../patchrun/eula.txt .
           printf "online-mode=false\nview-distance=2\nsimulation-distance=2\ngenerate-structures=false\nmotd=csaves\nlevel-name=anvil-world\n" > server.properties
           cp -a ../world ./anvil-world
           mkdir -p anvil-world/dimensions/minecraft/overworld/region
