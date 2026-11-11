@@ -2463,6 +2463,7 @@ impl Store {
                                 } else {
                                     match self.decompress(0, &body[13..13 + cl], raw_total as u32) {
                                         Some(raw) if raw.len() == raw_total => {
+                                            let raw = Arc::new(raw);
                                             let mut ok = true;
                                             let mut keys = Vec::with_capacity(n);
                                             let mut lens = Vec::with_capacity(n);
@@ -2505,6 +2506,17 @@ impl Store {
                                                 }
                                                 if ok && p != raw.len() {
                                                     ok = false;
+                                                }
+                                                if ok {
+                                                    // v0.9.65: scan already paid the
+                                                    // decompression — cache the body
+                                                    // under the exact key load_batched
+                                                    // probes, so boot-time reads (and the
+                                                    // attach prefetch) never re-decompress
+                                                    // a batch the scan just parsed
+                                                    self.slab_cache
+                                                        .lock()
+                                                        .put((id, base | (1u64 << 63)), raw);
                                                 }
                                             }
                                             ok
@@ -8367,6 +8379,19 @@ mod repro {
         // a second prefetch pass warms nothing new: cached frames are skipped
         let (nb2, ns2, _b2) = s.prefetch_slabs();
         assert_eq!((nb2, ns2), (0, 0), "re-prefetch must skip cached frames");
+        drop(s);
+        // REOPEN: the boot scan itself decompresses every batch to rebuild
+        // the index — since 0.9.65 it caches those bodies, so a fresh open
+        // starts with warm batches (no re-decompression on first reads)
+        let s2 = Store::open_cfg(&dir, false, bench_cfg()).unwrap();
+        assert!(s2.slab_cache_entries() > 0, "scan must warm batch bodies");
+        for (cx, cz, p) in &payloads {
+            assert_eq!(
+                s2.read_chunk(key(*cx, *cz)).as_deref(),
+                Some(p.as_slice()),
+                "reopened read of ({cx},{cz}) must be byte-exact"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
