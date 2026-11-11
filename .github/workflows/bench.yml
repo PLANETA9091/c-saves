@@ -438,6 +438,16 @@ jobs:
         working-directory: native
         run: |
           grep -E "^SPEED" speed_bench.txt | tee speed_stalls.txt
+      - name: the live-tail gate — the prefetch kills the first touch (lat99 A/B, v0.9.65)
+        working-directory: native
+        run: |
+          cargo build --release --example lat99
+          ./target/release/examples/lat99 ../bench-corpus/dim 2>/dev/null | tee lat99.txt
+          cat lat99.txt
+          C99=$(grep "A cold" lat99.txt | grep -oE "p99=[0-9]+" | cut -d= -f2)
+          P99=$(grep "B prefetched" lat99.txt | grep -oE "p99=[0-9]+" | cut -d= -f2)
+          echo "cold first-touch p99=${C99}us vs prefetched p99=${P99}us"
+          awk -v c="$C99" -v p="$P99" 'BEGIN { if (p+0 > c/5) { print "FAIL: prefetched p99 " p "us must be <= cold p99/5 (" c "us) — the first-touch tail is back"; exit 1 } print "OK: the first-touch tail is prefetched away" }'
       - name: gates — verify clean + throughput/latency floors (3 attempts; hosted runners have noisy neighbors — one clean attempt passes)
         working-directory: native
         run: |
@@ -480,6 +490,7 @@ jobs:
           path: |
             native/speed_bench.txt
             native/speed_stalls.txt
+            native/lat99.txt
 
   paper-bench:
     runs-on: ubuntu-latest
