@@ -70,75 +70,83 @@ fn main() {
     let dim = std::path::PathBuf::from(
         std::env::args().nth(1).unwrap_or_else(|| "bench-corpus/dim".into()),
     );
-    let tmp = std::env::temp_dir().join("lat99-store");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let mut cfg = Cfg::default();
-    if let Ok(v) = std::env::var("CSAVES_SLAB_CACHE") {
-        if let Ok(n) = v.parse::<u64>() { cfg.slab_cache = n; }
-    }
-    let st = Store::open_cfg(&tmp, true, cfg).unwrap();
-    st.set_whole_mode();
     let corpus = load_dir(&dim.join("region"));
     let total_raw: usize = corpus.iter().map(|c| c.2.len()).sum();
     println!("corpus: {} chunks, {:.1} MiB raw", corpus.len(), total_raw as f64 / 1048576.0);
-    for (cx, cz, p) in &corpus {
-        st.write_chunk(key(*cx, *cz), p, true).unwrap();
-    }
-    st.sync(); st.seal(); st.request_pack();
-    while st.compact_step() {}
-    st.sync();
-    let sum_dir = |d: &std::path::Path| -> u64 {
-        std::fs::read_dir(d).map(|rd| rd.flatten()
-            .filter_map(|e| e.metadata().ok())
-            .map(|m| m.len())
-            .sum()).unwrap_or(0)
-    };
-    let container = sum_dir(&tmp) + sum_dir(&tmp.join("segs"));
-    println!("container: {:.1} MiB on disk", container as f64 / 1048576.0);
 
-    // COLD: fresh random order (prime stride), like a boot's spiral fetch
+    // A/B: the SAME corpus through TWO stores — the first pass cold (the
+    // pre-0.9.65 live path: every first touch decompresses its frame), the
+    // second store prefetched at attach (the v0.9.65 hook) so the first pass
+    // is all cache hits. One process, one corpus, honest side-by-side.
     let mut order: Vec<usize> = (0..corpus.len()).collect();
     let ln = order.len();
     for i in 0..ln { order.swap(i, (i * 7919 + 13) % ln); }
+
+    // store A: cold first pass
+    let tmp = std::env::temp_dir().join("lat99-store-cold");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let sa = Store::open_cfg(&tmp, true, cfg2()).unwrap();
+    sa.set_whole_mode();
+    for (cx, cz, p) in &corpus {
+        sa.write_chunk(key(*cx, *cz), p, true).unwrap();
+    }
+    sa.sync(); sa.seal(); sa.request_pack();
+    while sa.compact_step() {}
+    sa.sync();
     let mut lat = Vec::with_capacity(ln);
     let mut per_read = Vec::with_capacity(ln);
-    let mut served = 0usize;
     for &i in &order {
         let t0 = Instant::now();
-        let r = st.read_chunk(key(corpus[i].0, corpus[i].1));
+        let r = sa.read_chunk(key(corpus[i].0, corpus[i].1));
         lat.push(t0.elapsed().as_nanos() as u64 / 1000);
-        if r.is_some() { served += 1; per_read.push(r.unwrap().len() as u64); }
+        if let Some(p) = r { per_read.push(p.len() as u64); }
     }
     let mut avg_payload = 0u64;
-    report("cold", &lat, &mut avg_payload, &per_read);
-    // PREFETCH: warm the slab cache (the v0.9.65 attach hook), then re-measure
+    report("A cold (pre-0.9.65 live path)", &lat, &mut avg_payload, &per_read);
+
+    // store B: prefetched at attach, then the FIRST read pass
+    let tmp = std::env::temp_dir().join("lat99-store-pf");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let sb = Store::open_cfg(&tmp, true, cfg2()).unwrap();
+    sb.set_whole_mode();
+    for (cx, cz, p) in &corpus {
+        sb.write_chunk(key(*cx, *cz), p, true).unwrap();
+    }
+    sb.sync(); sb.seal(); sb.request_pack();
+    while sb.compact_step() {}
+    sb.sync();
     let tp = Instant::now();
-    let (nb, ns, bytes) = st.prefetch_slabs();
+    let (nb, ns, bytes) = sb.prefetch_slabs();
     println!(
         "prefetch: {nb} batches + {ns} slabs, {:.1} MiB in {:.0} ms",
         bytes as f64 / 1048576.0,
         tp.elapsed().as_millis()
     );
     let mut lat = Vec::with_capacity(ln);
-    let mut sink = 0u64;
     for &i in &order {
         let t0 = Instant::now();
-        st.read_chunk(key(corpus[i].0, corpus[i].1)).unwrap();
+        sb.read_chunk(key(corpus[i].0, corpus[i].1)).unwrap();
         lat.push(t0.elapsed().as_nanos() as u64 / 1000);
     }
-    report("prefetched", &lat, &mut sink, &per_read);
-    // WARM: same order again — everything cached
+    let mut sink = 0u64;
+    report("B prefetched (v0.9.65 attach)", &lat, &mut sink, &per_read);
+    // and the fully-warm floor for reference
     let mut lat = Vec::with_capacity(ln);
     for &i in &order {
         let t0 = Instant::now();
-        st.read_chunk(key(corpus[i].0, corpus[i].1)).unwrap();
+        sb.read_chunk(key(corpus[i].0, corpus[i].1)).unwrap();
         lat.push(t0.elapsed().as_nanos() as u64 / 1000);
     }
-    let mut sink = 0u64;
-    report("warm", &lat, &mut sink, &per_read);
-    // stage stats for the cold phase are folded into the global counters;
-    // print the accumulated stage picture
+    report("B warm floor", &lat, &mut sink, &per_read);
     let stages = c_saves::store::read_stage_json();
     println!("STAGES {stages}");
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn cfg2() -> c_saves::store::Cfg {
+    let mut c = c_saves::store::Cfg::default();
+    if let Ok(v) = std::env::var("CSAVES_SLAB_CACHE") {
+        if let Ok(n) = v.parse::<u64>() { c.slab_cache = n; }
+    }
+    c
 }

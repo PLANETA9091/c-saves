@@ -4353,9 +4353,10 @@ impl Store {
                 over.store(true, Ordering::Relaxed);
             }
         }
-        // phase 2: slabs (parallel decompression over a shared index)
+        // phase 2: slabs (parallel decompression over a shared index; the
+        // list is immutable — work distribution is just the index counter)
         if !slabs.is_empty() {
-            let queue = parking_lot::Mutex::new(&slabs[..]);
+            let list: &[(u32, u64, u8)] = &slabs;
             let qi = std::sync::atomic::AtomicUsize::new(0);
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -4368,7 +4369,6 @@ impl Store {
                             return;
                         }
                         let i = qi.fetch_add(1, Ordering::Relaxed);
-                        let list = *queue.lock();
                         if i >= list.len() {
                             return;
                         }
