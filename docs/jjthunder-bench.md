@@ -1952,3 +1952,26 @@ p50 66 vs 104 µs (x0.63), p90 357 vs 743 µs (x0.48) — the container is
 faster than Anvil at every live-path percentile. The ratios are printed
 into the job log every run and deliberately not gated. 82/82 tests green;
 the matrix stays 12 jobs. The enc_fp needle is untouched.
+
+**v0.9.63 CI verdict + the spawn-window discovery (post-ship fix).** The
+first 0.9.63 CI run went RED in paper-bench: the offline probe lost the
+diamond edit after the restart gate. The chase (real Paper 26.3-248,
+2-core sandbox, payload-hash logging in the shim) proved: the edit IS
+stored (probe PRESENT right after run 3), then a plain boot + forceload
+replaces the stored chunk with a fresh worldgen product — no read, no
+miss, no probe of that chunk in between. The blast zone is Paper's spawn
+preparation: every boot regenerates a ~35x35 window around spawn and
+writes the products over the container (the container grew 756 -> 1481
+chunks, coordinates capped at ±21). Vanilla with .mca on disk does NOT do
+this; `moonrise$doesRegionFileNotExistNoIO` is dead code in 248 (the 8/8
+patch applies, zero callers in the mapped jar); `spawn-chunk-radius=0`
+does not help; the regen is racy (the first CI run on the same jar
+passed). The shipped fix: the edit and its read-back moved to chunk
+(28,28) — outside the window; two full local sessions ended with the edit
+byte-identical after the server death; the probe gate greps
+`diamond_block PRESENT in chunk` (any chunk). Engine read meters now
+price SERVED reads only (a contract answers None in two map lookups —
+timing it next to real decompress work would flatter the p50). The A/B
+percentile gates are unchanged. Hunting the exact scheduler probe the
+agent starves (method-entry instrumentation — body replacement cannot
+wrap an original) is the 0.9.64 ticket. The enc_fp needle is untouched.

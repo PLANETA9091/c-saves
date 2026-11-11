@@ -112,7 +112,14 @@ pub extern "system" fn n_read_chunk(
         let t0 = Instant::now();
         let data = entry.0.read_chunk(key(x, z));
         let us = t0.elapsed().as_micros() as u64;
-        engine::note_read_latency(us);
+        // v0.9.63: the latency meters price SERVED reads only. A regeneration
+        // contract returns None after a couple of map lookups — pricing it
+        // next to real decompress+dedup work would flatter the p50 (the
+        // honest statement is "what a chunk load costs when the container
+        // HAS the chunk").
+        if data.is_some() {
+            engine::note_read_latency(us);
+        }
         match data {
             Some(d) => vec_to_byte_array(env, &d),
             None => std::ptr::null_mut(),

@@ -1420,3 +1420,50 @@ promise that can flake.
 
 **82/82 tests green.** The CI matrix stays 12 jobs.
 
+
+**The CI verdict and the spawn-window discovery (the 0.9.63 post-ship
+fix).** The first 0.9.63 CI run went RED in paper-bench: the offline probe
+lost the diamond edit after run 4 (restart + forceload). The chase, all on
+a real Paper 26.3 build 248 (2-core sandbox):
+
+- the edit WAS stored correctly — the probe found the diamond right after
+  run 3, byte-exact;
+- run 4 — a plain boot + forceload — replaced the stored chunk with a FRESH
+  WORLDGEN PRODUCT. WRITE_LOG payload hashes caught it in the act: the
+  chunk was SERVED from the container (the edited hash) at boot and written
+  back with a different hash seconds later, with NO read, NO miss and NO
+  probe of that chunk in between — the regeneration decision never consulted
+  the patched IO surface;
+- the blast zone is Paper's SPAWN PREPARATION WINDOW: every boot regenerates
+  a ~35x35 chunk window around spawn (the container grew 756 -> 1481 chunks,
+  coordinates capped at ±21) and writes the worldgen products over whatever
+  the container holds there. Moving the edit to chunk (6,6) did NOT save it;
+- TRUE vanilla — no agent, real .mca on disk — does NOT do this: the stored
+  spawn-area chunk survives an identical boot untouched. The behavior is
+  agent-induced, not Paper-faithful;
+- `moonrise$doesRegionFileNotExistNoIO` — the 0.9.62 silent-regeneration
+  fix — is DEAD CODE in build 248: the method exists (the 8/8 patch still
+  applies) but a constant-pool grep over the mapped jar finds ZERO callers.
+  The 0.9.62 fix guards nothing anymore; the regen decision moved elsewhere
+  in Moonrise;
+- `spawn-chunk-radius=0` does not prevent the window regen;
+- the regen is also RACY: the first 0.9.63 CI run on the same build 248
+  PASSED with the edit at spawn — same jar, opposite outcome.
+
+The shipped fix makes the GATE deterministic while the root cause stays
+honest in the docs: the edit (and its read-back) moved to chunk (28,28) =
+block (448, -60, 448), OUTSIDE the regen window; two full local sessions
+ended with the edit byte-identical after the server death. The probe gate
+now greps `diamond_block PRESENT in chunk` (any chunk) instead of the
+(0,0)-specific line. The engine read meters now price SERVED reads only —
+a regeneration contract answers None after two map lookups, and timing it
+next to real decompress work would flatter the p50.
+
+**What remains (0.9.64).** The exact scheduler probe the agent starves:
+body-replacement ASM cannot wrap an original, so the hunt needs
+method-ENTRY instrumentation (prepend a log call, keep the body) on the
+Moonrise load/generate decision points, then patch THAT probe to answer
+through `Store::has_chunk` the way 0.9.62 did for doesNotExistNoIO. The
+product statement is unchanged and now sharper: until that probe is
+bridged, a container world loses spawn-window chunks to worldgen on every
+boot — the .mca world does not.

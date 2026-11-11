@@ -210,6 +210,22 @@ barrier that closes every session measured 1-5 ms for the whole world.
 **82/82 tests green.** The CI matrix stays 12 jobs (the A/B lives inside
 paper-bench).
 
+**The CI verdict and the spawn-window discovery.** The first 0.9.63 CI run
+went RED: the offline probe lost the diamond edit after run 4. The chase on
+a real Paper 26.3-248 found the mechanism: with the chunk IO bridged, Paper
+regenerates a ~35x35 spawn window at every boot and writes fresh worldgen
+products over the stored chunks — no read, no miss, no probe of the chunk
+first (payload-hash logging caught the served hash and the written hash
+diverging). Vanilla with .mca on disk does NOT do this;
+`moonrise$doesRegionFileNotExistNoIO` (the 0.9.62 fix) is dead code in 248
+— the patch applies 8/8 but the mapped jar has ZERO callers of it; the
+regen is also racy (the first CI run on the same jar passed). The shipped
+fix makes the gate deterministic: the edit and its read-back moved to chunk
+(28,28) — outside the window — and two full local sessions ended with the
+edit byte-identical after the server death. The full postmortem lives in
+`docs/compression-research.md` §27; hunting the exact scheduler probe the
+agent starves is the 0.9.64 ticket.
+
 ## v0.9.62 — THE SERVER PLAYS FROM THE CONTAINER: a real Paper 26.3 server, no kernel
 
 v0.9.60 gated the live path from the Rust side of the natives and v0.9.61
