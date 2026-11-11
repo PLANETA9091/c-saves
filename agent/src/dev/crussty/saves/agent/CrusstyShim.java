@@ -287,6 +287,51 @@ public final class CrusstyShim {
     }
 
     // ------------------------------------------------------------------
+    // v0.9.64 DIAGNOSTIC PROBES (method-entry instrumentation, -Dcsaves.probe):
+    // they log the scheduler's load-vs-generate decisions for the tracked
+    // chunk (0,0) WITHOUT altering behavior — prependBody keeps the original
+    // body. The goal is to catch the spawn-window regeneration decision that
+    // never consults the patched IO surface.
+    // ------------------------------------------------------------------
+    private static void probe(String tag, int x, int z, Object... kv) {
+        if (x != 0 || z != 0) return;
+        StringBuilder sb = new StringBuilder("[c-saves] PROBE ").append(tag)
+                .append(" (0,0)");
+        for (int i = 0; i + 1 < kv.length; i += 2) {
+            sb.append(' ').append(kv[i]).append('=').append(kv[i + 1]);
+        }
+        System.err.println(sb);
+    }
+
+    public static void probeSCL4(int x, int z, Object status, boolean gen) {
+        probe("scheduleChunkLoad6", x, z, "status", status, "gen", gen);
+    }
+
+    public static void probeSCL7(int x, int z, boolean b0, Object status, boolean gen) {
+        probe("scheduleChunkLoad7", x, z, "b0", b0, "status", status, "gen", gen);
+    }
+
+    public static void probeSync3(int x, int z, Object status) {
+        probe("syncLoad", x, z, "status", status);
+    }
+
+    public static void probeBCL4(int x, int z, Object status, Object prio) {
+        probe("beginChunkLoadForNonFullSync", x, z, "status", status);
+    }
+
+    private static volatile boolean SCHED_STACK_DUMPPED;
+    public static void probeSched6(int x, int z, Object status, Object holder, Object list, Object prio) {
+        probe("schedule", x, z, "status", status, "holder", holder);
+        if ((x == 0 && z == 0) && !SCHED_STACK_DUMPPED) {
+            SCHED_STACK_DUMPPED = true;
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            StringBuilder ts = new StringBuilder("[c-saves] SCHED(0,0) first-call stack:");
+            for (int i = 1; i < Math.min(st.length, 16); i++) ts.append(" \n  at ").append(st[i]);
+            System.err.println(ts);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // v0.9.62 diagnostic + belt-and-braces: controller-level write entry.
     // The storage-level moonrise$startWrite body was patched and verified
     // (readData through the SAME interface dispatch serves 1587 misses),

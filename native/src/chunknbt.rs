@@ -4481,7 +4481,9 @@ fn pal_semantic_equal(a: &Value, b: &Value, entries: usize) -> bool {
 /// Decode the custom section form back to the exact NBT value.
 pub fn section_decode(b: &[u8]) -> Option<Value> {
     if is_csec4(b.first()) {
-        return section_decode3(b);
+        let mut v = section_decode3(b)?;
+        vanillify_section_value(&mut v);
+        return Some(v);
     }
     if b.first() != Some(&CSEC_MAGIC) || b.len() < 3 {
         return None;
@@ -4556,7 +4558,9 @@ pub fn section_decode(b: &[u8]) -> Option<Value> {
             Value::ByteArray(fastnbt::ByteArray::new(arr.iter().map(|x| *x as i8).collect())),
         );
     }
-    Some(Value::Compound(sec_map))
+    let mut out = Value::Compound(sec_map);
+    vanillify_section_value(&mut out);
+    Some(out)
 }
 
 /// Repack a 37-long 9-bit heightmap into a compact byte array (with marker).
@@ -6015,6 +6019,60 @@ fn whole_split(payload: &[u8], pos_hint: Option<(i32, i32)>) -> Result<Split, St
 }
 
 /// Reassemble the uncompressed payload from a split recipe.
+/// v0.9.64: force every decoded section's PalettedContainer into the exact
+/// shape the vanilla 26.x strict reader accepts (measured on vanilla-written
+/// 26.3 chunks):
+///   palette n == 1 -> `data` ABSENT (single-value palette, no storage);
+///   n >= 2 -> bits = max(min_bits, ceil(lg2 n)) with min_bits 4 for block
+///   containers (4096 entries) and 1 for biomes (64 entries) — the historic
+///   clamp to 4 bits was BLOCK-ONLY, so a small biome palette carried a
+///   storage the reader rejects ("Invalid length given for storage, got: 4
+///   but expected: 1"); the chunk data was then silently dropped by the live
+///   load path ("chunk data will be lost") and the chunk system regenerated
+///   the chunk — the spawn-window wipe of stored edits.
+/// Longs are floor-packed (ceil(entries / floor(64/bits))), which
+/// pack_nostroddle already implements.
+fn vanillify_section_value(sec: &mut Value) {
+    let Value::Compound(sec_map) = sec else { return };
+    if std::env::var("CSAVES_VANILLIFY_DEBUG").as_deref() == Ok("1") {
+        eprintln!("[vanillify] keys={:?} biomes={:?} bs={:?}", sec_map.keys().collect::<Vec<_>>(), sec_map.get("biomes").is_some(), sec_map.get("block_states").is_some());
+    }
+    for key in ["block_states", "biomes"] {
+        let Some(Value::Compound(c)) = sec_map.get_mut(key) else { continue };
+        let entries: usize = if key == "block_states" { 4096 } else { 64 };
+        let Some(Value::List(pal)) = c.get("palette") else { continue };
+        let n = pal.len();
+        if n <= 1 {
+            // single-value palette: the reader IGNORES the storage there, so
+            // the historic form is tolerated — leave it untouched to keep the
+            // canonical contract hashes stable across the upgrade
+            continue;
+        }
+        let min_bits: u32 = if entries == 4096 { 4 } else { 1 };
+        let want_bits = bits_for(n).max(min_bits);
+        let want_per = (64u32 / want_bits) as usize;
+        let want_longs = (entries + want_per - 1) / want_per;
+        let Some(Value::LongArray(arr)) = c.get_mut("data") else { continue };
+        let cur_longs = arr.len(); // LongArray derefs to [i64]
+        if cur_longs == want_longs {
+            continue; // already vanilla-valid
+        }
+        // the historic decoders emitted the block clamp (max(4, bits)) for
+        // both container kinds; repack the index stream at the vanilla width
+        let old_bits = bits_for(n).max(4);
+        let old_per = (64u32 / old_bits) as usize;
+        let old_longs = (entries + old_per - 1) / old_per;
+        if cur_longs != old_longs {
+            continue; // unknown provenance, leave untouched rather than corrupt
+        }
+        if std::env::var("CSAVES_VANILLIFY_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[vanillify] {key} n={n} want_bits={want_bits} want={want_longs} cur={cur_longs} old={old_longs} -> repack");
+        }
+        let indices: Vec<u8> = unpack_nostroddle(&arr[..], entries, old_bits);
+        *arr = fastnbt::LongArray::new(pack_nostroddle(&indices, want_bits));
+    }
+}
+
 pub fn join(sections: &[Vec<u8>], tail: &[u8]) -> Result<Vec<u8>, String> {
     let tail_val: Value = fastnbt::from_bytes(tail).map_err(|e| format!("tail parse: {e}"))?;
     let Value::Compound(mut map) = tail_val else {
@@ -6027,11 +6085,12 @@ pub fn join(sections: &[Vec<u8>], tail: &[u8]) -> Result<Vec<u8>, String> {
     }
     let mut list = Vec::with_capacity(sections.len());
     for s in sections {
-        let v = if s.first() == Some(&CSEC_MAGIC) || is_csec4(s.first()) {
+        let mut v = if s.first() == Some(&CSEC_MAGIC) || is_csec4(s.first()) {
             section_decode(s).ok_or("bad csec section")?
         } else {
             fastnbt::from_bytes(s).map_err(|e| format!("section parse: {e}"))?
         };
+        vanillify_section_value(&mut v);
         list.push(v);
     }
     map.insert("sections".to_string(), Value::List(list));
@@ -6282,8 +6341,15 @@ fn section_emit_csec3_inner(b: &[u8], out: &mut Vec<u8>) -> Option<()> {
         pal.extend_from_slice(&ents);
         pal.push(0x00); // compound terminator for {data, palette}
         // "data" sorts before "palette"
+        // v0.9.64: the vanilla 26.x reader's width rule — the 4-bit clamp is
+        // BLOCK-ONLY (4096 entries); biomes (64 entries) use the unclamped
+        // ceil(lg2 n). The old clamp made small biome palettes carry a
+        // storage the strict reader rejects ("Invalid length given for
+        // storage, got: 4 but expected: 1"), the load path silently dropped
+        // the chunk data, and the chunk system regenerated the chunk.
         if has_data {
-            let out_bits = bits_for(n).max(4);
+            let min_bits: u32 = if entries == 4096 { 4 } else { 1 };
+            let out_bits = bits_for(n).max(min_bits);
             let longs: Vec<i64> = if order != 0 {
                 // RLE form (v0.6): expand (idx, run) pairs to the canonical
                 // voxel stream, transpose back for order 2, then pack to
@@ -9240,5 +9306,112 @@ mod glob_tests {
         let back2 = glob_any_to_section(&glob, &reg2).expect("decode with reloaded registry");
         assert_eq!(back2, canon);
         crate::chunknbt::set_gid_rle_div_for_tests(None);
+    }
+}
+
+#[cfg(test)]
+mod vanilla_palette_tests {
+    use super::*;
+    use std::collections::HashMap as Map;
+
+    /// A section compound with a palette of `n` distinct entries and the
+    /// vanilla-26.x storage for that size (block: 4-bit-clamped floor-packed,
+    /// biome: unclamped).
+    fn section_with(entries: usize, n: usize) -> Map<String, Value> {
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(0));
+        let key = if entries == 4096 { "block_states" } else { "biomes" };
+        let mut c: Map<String, Value> = Map::new();
+        let mut pal = Vec::new();
+        for i in 0..n {
+            pal.push(Value::String(format!("minecraft:block{i}")));
+        }
+        c.insert("palette".to_string(), Value::List(pal));
+        // vanilla width: bits = max(min_bits, ceil(lg2(n))); longs =
+        // ceil(entries / floor(64/bits)); n == 1 -> no storage at all
+        if n > 1 {
+            let min_bits: u32 = if entries == 4096 { 4 } else { 1 };
+            let bits = bits_for(n).max(min_bits);
+            let per = (64 / bits) as usize;
+            let _longs = (entries + per - 1) / per;
+            let mut entries_vec = Vec::with_capacity(entries);
+            for i in 0..entries {
+                entries_vec.push((i % n) as u8);
+            }
+            c.insert(
+                "data".to_string(),
+                Value::LongArray(fastnbt::LongArray::new(pack_nostroddle(&entries_vec, bits))),
+            );
+        }
+        sec.insert(key.to_string(), Value::Compound(c));
+        sec
+    }
+
+    fn decoded_section(entries: usize, n: usize) -> Value {
+        let sec = section_with(entries, n);
+        let enc = section_encode(&Value::Compound(sec)).expect("encode");
+        section_decode(&enc).expect("decode")
+    }
+
+    fn container_of(sec: &Value, entries: usize) -> Map<String, Value> {
+        let key = if entries == 4096 { "block_states" } else { "biomes" };
+        match sec {
+            Value::Compound(m) => match m.get(key) {
+                Some(Value::Compound(c)) => c.clone(),
+                _ => panic!("container missing"),
+            },
+            _ => panic!("not a compound"),
+        }
+    }
+
+    /// THE v0.9.64 REGRESSION: the canonical rebuild must emit the storage
+    /// width vanilla's strict PalettedContainer reader accepts, or the live
+    /// load path throws "Invalid length given for storage", the chunk data
+    /// is silently lost, and the chunk system regenerates the chunk (the
+    /// spawn-window wipe of stored edits).
+    #[test]
+    fn biome_palette_widths_match_vanilla_reader() {
+        // n == 2: unclamped 1 bit -> 1 long (the old clamp emitted 4 and the
+        // strict reader rejected the chunk: "got: 4 but expected: 1")
+        let sec = decoded_section(64, 2);
+        let c = container_of(&sec, 64);
+        match c.get("data") {
+            Some(Value::LongArray(a)) => assert_eq!(a.len(), 1, "n=2 biome storage must be 1 long"),
+            _ => panic!("n=2 biome container must carry data"),
+        }
+        // n == 3..=4: 2 bits -> 2 longs ("got: 4 but expected: 2")
+        let sec = decoded_section(64, 4);
+        let c = container_of(&sec, 64);
+        match c.get("data") {
+            Some(Value::LongArray(a)) => assert_eq!(a.len(), 2, "n=4 biome storage must be 2 longs"),
+            _ => panic!("n=4 biome container must carry data"),
+        }
+        // n >= 16: bits_for(n) >= 4 — the clamp is a no-op there
+        let sec = decoded_section(64, 16);
+        let c = container_of(&sec, 64);
+        match c.get("data") {
+            Some(Value::LongArray(a)) => assert_eq!(a.len(), 4, "n=16 biome storage must be 4 longs"),
+            _ => panic!("n=16 biome container must carry data"),
+        }
+    }
+
+    #[test]
+    fn block_palette_widths_match_vanilla_reader() {
+        // n == 1: reader-valid either way (the reader ignores the storage;
+        // the encoder may legitimately drop the redundant uniform storage)
+        let sec = decoded_section(4096, 1);
+        let c = container_of(&sec, 4096);
+        match c.get("data") {
+            Some(Value::LongArray(a)) => assert_eq!(a.len(), 256, "n=1 block storage keeps the clamped width"),
+            None => {} // the single-value form: storage omitted, vanilla-valid
+            _ => panic!("n=1 block container: unexpected data shape"),
+        }
+        // n in 2..=16: the 4-bit clamp holds for BLOCK containers
+        let sec = decoded_section(4096, 3);
+        let c = container_of(&sec, 4096);
+        match c.get("data") {
+            Some(Value::LongArray(a)) => assert_eq!(a.len(), 256, "n=3 block storage must be 256 longs"),
+            _ => panic!("n=3 block container must carry data"),
+        }
     }
 }

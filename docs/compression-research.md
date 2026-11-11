@@ -1467,3 +1467,55 @@ through `Store::has_chunk` the way 0.9.62 did for doesNotExistNoIO. The
 product statement is unchanged and now sharper: until that probe is
 bridged, a container world loses spawn-window chunks to worldgen on every
 boot — the .mca world does not.
+
+## 28. Research tick 24 (v0.9.64): the PalettedContainer fix — the spawn window loads
+
+**The byte-level root cause.** The 0.9.63 postmortem stopped at "the
+scheduler probe the agent starves". The method-entry instrumentation
+(`AgentAsm.prependBody` — an injected void call at the head of an untouched
+body) let the probes walk the decision chain: `processTicketLevelUpdate ->
+schedule -> createTask` created a GENERATION ladder from `minecraft:empty`
+for chunk (0,0) while `ChunkLoadTask`'s own read completed and was
+DISCARDED. The discard was not a race — the read FAILED to parse:
+
+    Recoverable errors when loading section [-1, -4, 0]: Failed to read
+    PalettedContainer: Invalid length given for storage, got: 4 but
+    expected: 1
+    [ChunkLoadTask] Failed to parse chunk data ... chunk data will be lost
+
+**The format audit.** The canonical section rebuild emitted biome
+containers at the block 4-bit clamp (4 longs for any small palette). The
+vanilla 26.x strict reader computes the expected width PER CONTAINER KIND
+from the palette size and rejects the mismatch — recoverably (the section
+is dropped, the chunk loads as if the data never existed). Measured on
+vanilla-written 26.3 chunks with a real NBT parser:
+
+| container | entries | bits | longs | n == 1 |
+|---|---|---|---|---|
+| block_states | 4096 | max(4, ceil(lg2 n)) | ceil(4096/floor(64/bits)) | reader ignores storage |
+| biomes | 64 | **ceil(lg2 n) — unclamped** | ceil(64/floor(64/bits)) | reader ignores storage |
+
+Our biome n=2 containers carried 4 longs where the reader wants 1; n=3..4
+wanted 2. Every such section was dropped on the live path, and because the
+drop is per-SECTION and recoverable, the chunks did not fail LOUDLY — the
+world came back regenerated instead, which had been misread as the
+silent-regeneration bug 0.9.62 fixed (that fix's target,
+`moonrise$doesRegionFileNotExistNoIO`, is dead code in build 248 — but the
+real leak was the parser, not the probe).
+
+**The fix.** Three layers, all width-rule driven: `dec_pal_data`
+(decode), `vanillify_section_value` — a new post-pass run by BOTH `join`
+and `section_decode` (the decoder variants are numerous; the post-pass is
+the belt over every brace), and `emit_pal_data` (the fused emitter — the
+live hot path; the last 54 failures came from exactly there). The rule is
+pinned by regression tests (biome n=2 -> 1 long, n=4 -> 2, n=16 -> 4;
+block n=3 -> 256).
+
+**The verdict.** Full live sessions with the edit AT SPAWN: zero parse
+failures, the spawn window loads from the container, the spawn edit
+survives the restart byte-exact. The CI session is back to the (0, -60, 0)
+edit. The Instrumentation side effect: `AgentAsm.prependBody` (method-entry
+wraps, `-Dcsaves.probe`) is now part of the agent's toolbox — body
+replacement cannot wrap an original; this can.
+
+**84/84 tests green.** The CI matrix stays 12 jobs.

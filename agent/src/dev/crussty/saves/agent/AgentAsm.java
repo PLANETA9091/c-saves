@@ -113,6 +113,82 @@ public final class AgentAsm {
         }
     }
 
+    /**
+     * v0.9.64: METHOD-ENTRY probe — injects an INVOKESTATIC of a VOID bridge
+     * at the head of the method and lets the ORIGINAL body run untouched
+     * after it. This is what body replacement cannot do: wrap an original.
+     * The bridge must be void; args are passed per the same (slot,typeChar)
+     * pairs replaceBody takes.
+     */
+    public static byte[] prependBody(byte[] cls, String methodName, String methodDesc,
+            String bridgeOwner, String bridgeName, String bridgeDesc, int[][] args) {
+        lastError = "";
+        try {
+            boolean[] found = new boolean[1];
+            ClassReader cr = new ClassReader(cls);
+            ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_FRAMES);
+            cr.accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                @Override
+                public MethodVisitor visitMethod(int access, String name, String desc,
+                        String signature, String[] exceptions) {
+                    MethodVisitor mv = super.visitMethod(access, name, desc, signature, exceptions);
+                    if (!name.equals(methodName) || !desc.equals(methodDesc)) {
+                        return mv;
+                    }
+                    found[0] = true;
+                    return new MethodVisitor(Opcodes.ASM9, mv) {
+                        boolean injected;
+                        @Override
+                        public void visitCode() {
+                            mv.visitCode();
+                            for (int[] arg : args) {
+                                mv.visitVarInsn(loadOpcode((char) arg[1]), arg[0]);
+                            }
+                            mv.visitMethodInsn(Opcodes.INVOKESTATIC,
+                                    bridgeOwner, bridgeName, bridgeDesc, false);
+                            injected = true;
+                            // the original instructions flow through the
+                            // forwarded events below; frames are dropped (the
+                            // writer's COMPUTE_FRAMES rebuilds them) and the
+                            // original maxs are stale (recomputed anyway)
+                        }
+                        @Override public void visitFrame(int a, int b, Object[] c, int d, Object[] e) { }
+                        // ASM requires visitMaxs before visitEnd; COMPUTE_FRAMES
+                        // recomputes the real values, the +16 headroom covers
+                        // the injected argument pushes (<= 5 wide slots)
+                        @Override public void visitMaxs(int a, int b) { mv.visitMaxs(a + 16, b); }
+                        @Override public void visitInsn(int i) { if (injected) mv.visitInsn(i); }
+                        @Override public void visitIntInsn(int i, int v) { if (injected) mv.visitIntInsn(i, v); }
+                        @Override public void visitVarInsn(int i, int v) { if (injected) mv.visitVarInsn(i, v); }
+                        @Override public void visitTypeInsn(int i, String s) { if (injected) mv.visitTypeInsn(i, s); }
+                        @Override public void visitFieldInsn(int i, String a, String b, String c) { if (injected) mv.visitFieldInsn(i, a, b, c); }
+                        @Override public void visitMethodInsn(int i, String a, String b, String c, boolean d) { if (injected) mv.visitMethodInsn(i, a, b, c, d); }
+                        @Override public void visitInvokeDynamicInsn(String a, String b, Handle h, Object... o) { if (injected) mv.visitInvokeDynamicInsn(a, b, h, o); }
+                        @Override public void visitJumpInsn(int i, Label l) { if (injected) mv.visitJumpInsn(i, l); }
+                        @Override public void visitLabel(Label l) { if (injected) mv.visitLabel(l); }
+                        @Override public void visitLdcInsn(Object o) { if (injected) mv.visitLdcInsn(o); }
+                        @Override public void visitIincInsn(int i, int v) { if (injected) mv.visitIincInsn(i, v); }
+                        @Override public void visitTableSwitchInsn(int a, int b, Label l, Label... ls) { if (injected) mv.visitTableSwitchInsn(a, b, l, ls); }
+                        @Override public void visitLookupSwitchInsn(Label l, int[] k, Label[] ls) { if (injected) mv.visitLookupSwitchInsn(l, k, ls); }
+                        @Override public void visitMultiANewArrayInsn(String s, int d) { if (injected) mv.visitMultiANewArrayInsn(s, d); }
+                        @Override public void visitTryCatchBlock(Label a, Label b, Label c, String s) { if (injected) mv.visitTryCatchBlock(a, b, c, s); }
+                        @Override public void visitLineNumber(int i, Label l) { if (injected) mv.visitLineNumber(i, l); }
+                        @Override public void visitLocalVariable(String a, String b, String c, Label l, Label m, int i) { if (injected) mv.visitLocalVariable(a, b, c, l, m, i); }
+                        // visitEnd forwards through super (closes the method)
+                    };
+                }
+            }, 0);
+            if (!found[0]) {
+                lastError = "method " + methodName + methodDesc + " not found in class";
+                return null;
+            }
+            return cw.toByteArray();
+        } catch (Throwable t) {
+            lastError = t.toString();
+            return null;
+        }
+    }
+
     private static int returnOpcode(char t) {
         switch (t) {
             case 'V': return Opcodes.RETURN;

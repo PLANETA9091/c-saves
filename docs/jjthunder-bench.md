@@ -1975,3 +1975,18 @@ timing it next to real decompress work would flatter the p50). The A/B
 percentile gates are unchanged. Hunting the exact scheduler probe the
 agent starves (method-entry instrumentation — body replacement cannot
 wrap an original) is the 0.9.64 ticket. The enc_fp needle is untouched.
+
+**v0.9.64 — the PalettedContainer fix (the 0.9.63 CI-red root cause).** The
+spawn-window wipe was not a scheduler probe issue at the bottom: the
+canonical rebuild emitted biome containers at the block 4-bit clamp, the
+vanilla 26.x strict reader rejected them per-SECTION ("Invalid length given
+for storage, got: 4 but expected: 1" — recoverable, silent), the live load
+path dropped the chunk data, and the chunk system regenerated the window.
+Rule measured on vanilla chunks and applied in all three rebuild layers
+(dec_pal_data / vanillify_section_value post-pass / fused emit_pal_data):
+block containers keep the 4-bit clamp, biome containers are unclamped
+(n=2 -> 1 long, n=4 -> 2), n==1 storage is reader-ignored. Spawn-window
+chunks now LOAD from the container; the CI session is back to the spawn
+edit and it survives restarts byte-exact. Regression tests pin the width
+table; 84/84 tests green; the matrix stays 12 jobs. The enc_fp needle is
+untouched.

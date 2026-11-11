@@ -154,6 +154,48 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.64 — the PalettedContainer fix: the spawn window loads, spawn edits survive restarts
+
+The 0.9.63 CI chase bottomed out in a byte-level format bug that had been
+invisible for the whole live-path arc. The full chain, now closed:
+
+1. **The symptom.** The offline probe lost the diamond edit after the
+   restart gate; with payload-hash logging the same chunk was SERVED from
+   the container (the edited hash) and written back seconds later with a
+   fresh-worldgen hash — no read, no miss, no probe in between.
+2. **The method.** `AgentAsm.prependBody` — method-ENTRY instrumentation
+   (inject a void log call at the head, keep the original body; body
+   replacement cannot wrap an original). Scheduler probes (-Dcsaves.probe)
+   caught the generation ladder for chunk (0,0): `minecraft:empty ->
+   structure_starts -> ... -> spawn` — a fresh holder walking the whole
+   worldgen chain without a single storage probe, under
+   `processTicketLevelUpdate -> schedule -> createTask`.
+3. **The root cause.** `ChunkLoadTask` DID read — and failed to parse.
+   `SerializableChunkData`: `Failed to read PalettedContainer: Invalid
+   length given for storage, got: 4 but expected: 1` — "chunk data will be
+   lost" — the holder fell back to an empty proto and the generation ladder
+   ran. Our canonical section rebuild emitted biome containers at the BLOCK
+   4-bit clamp; the vanilla 26.x reader computes the expected storage width
+   per container kind and rejects the mismatch, **silently**.
+4. **The rule, measured on vanilla-written 26.3 chunks** (a real NBT audit
+   of a vanilla .mca): block containers (4096 entries) — bits =
+   max(4, ceil(lg2 n)), longs = ceil(4096 / floor(64/bits)); biome
+   containers (64 entries) — bits = ceil(lg2 n) **unclamped** (n=2 -> 1
+   long, n=3..4 -> 2 longs); n == 1 -> the reader ignores the storage.
+5. **The fix**, applied in every rebuild path: `dec_pal_data`, a new
+   `vanillify_section_value` post-pass (run by both `join` and
+   `section_decode` — belt and braces over the decoder variants), and the
+   fused emitter `emit_pal_data` (the live hot path — the last 54 failures
+   came from there). Regression tests pin the width table.
+6. **The verdict.** Full live sessions with the edit AT SPAWN (0, -60, 0):
+   zero parse failures across birth/cold-read/edit/restart, the spawn
+   window LOADS from the container, and the edit survives the restart
+   byte-exact. The CI session returns to the spawn edit — the strongest
+   form of the claim: even the chunk Paper touches first every boot keeps
+   its stored content.
+
+**84/84 tests green.** The CI matrix stays 12 jobs.
+
 ## v0.9.63 — the live path, priced: percentiles through a REAL Paper, container vs Anvil, same meters
 
 The 0.9.62 gate proved the server plays from the container. It never

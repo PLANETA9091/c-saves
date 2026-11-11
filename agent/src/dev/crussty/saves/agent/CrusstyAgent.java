@@ -73,7 +73,42 @@ public final class CrusstyAgent {
             { DC + "PoiDataController", new Object[][] {
                 { "startWrite", "(II" + CPT + ")" + WD, "dcStartWrite", DC_BRIDGE,
                   new int[][] { { 0, 'L' }, { 1, 'I' }, { 2, 'I' }, { 3, 'L' } } } } },
+            // v0.9.64 DIAGNOSTIC PROBES (-Dcsaves.probe): method-entry wraps on
+            // the Moonrise scheduler's load-vs-generate decision points. The
+            // original bodies run untouched after the log call.
+            { "ca/spottedleaf/moonrise/patches/chunk_system/scheduling/ChunkTaskScheduler",
+              new Object[][] {
+                { "scheduleChunkLoad", "(IILnet/minecraft/world/level/chunk/status/ChunkStatus;Z"
+                    + "Lca/spottedleaf/concurrentutil/util/Priority;Ljava/util/function/Consumer;)V",
+                  "probeSCL4", "(IILjava/lang/Object;Z)V",
+                  new int[][] { { 1, 'I' }, { 2, 'I' }, { 3, 'L' }, { 4, 'Z' } }, "prepend" },
+                { "scheduleChunkLoad", "(IIZLnet/minecraft/world/level/chunk/status/ChunkStatus;Z"
+                    + "Lca/spottedleaf/concurrentutil/util/Priority;Ljava/util/function/Consumer;)V",
+                  "probeSCL7", "(IIZLjava/lang/Object;ZZ)V",
+                  new int[][] { { 1, 'I' }, { 2, 'I' }, { 3, 'Z' }, { 4, 'L' }, { 5, 'Z' } }, "prepend" },
+                { "syncLoadNonFull", "(IILnet/minecraft/world/level/chunk/status/ChunkStatus;)"
+                    + "Lnet/minecraft/world/level/chunk/ChunkAccess;",
+                  "probeSync3", "(IILjava/lang/Object;)V",
+                  new int[][] { { 1, 'I' }, { 2, 'I' }, { 3, 'L' } }, "prepend" },
+                { "beginChunkLoadForNonFullSync", "(IILnet/minecraft/world/level/chunk/status/ChunkStatus;"
+                    + "Lca/spottedleaf/concurrentutil/util/Priority;)Z",
+                  "probeBCL4", "(IILjava/lang/Object;Ljava/lang/Object;)V",
+                  new int[][] { { 1, 'I' }, { 2, 'I' }, { 3, 'L' }, { 4, 'L' } }, "prepend" },
+                { "schedule", "(IILnet/minecraft/world/level/chunk/status/ChunkStatus;"
+                    + "Lca/spottedleaf/moonrise/patches/chunk_system/scheduling/NewChunkHolder;"
+                    + "Ljava/util/List;Lca/spottedleaf/concurrentutil/util/Priority;)"
+                    + "Lca/spottedleaf/moonrise/patches/chunk_system/scheduling/task/ChunkProgressionTask;",
+                  "probeSched6", "(IILjava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V",
+                  new int[][] { { 1, 'I' }, { 2, 'I' }, { 3, 'L' }, { 4, 'L' }, { 5, 'L' }, { 6, 'L' } }, "prepend" } } },
+            { "net/minecraft/server/level/ServerChunkCache",
+              new Object[][] {
+                { "syncLoad", "(IILnet/minecraft/world/level/chunk/status/ChunkStatus;)"
+                    + "Lnet/minecraft/world/level/chunk/ChunkAccess;",
+                  "probeSync3", "(IILjava/lang/Object;)V",
+                  new int[][] { { 1, 'I' }, { 2, 'I' }, { 3, 'L' } }, "prepend" } } },
         };
+
+        static final boolean PROBE_ON = Boolean.getBoolean("csaves.probe");
 
         @Override
         public byte[] transform(ClassLoader loader, String className, Class<?> beingDefined,
@@ -88,13 +123,24 @@ public final class CrusstyAgent {
             if (specs == null) {
                 return null;
             }
+            String verb = "patched";
             List<String> missing = new ArrayList<>();
             byte[] out = bytes;
             int patched = 0;
+            int attempted = 0;
             for (Object[] spec : specs) {
-                byte[] next = AgentAsm.replaceBody(out, (String) spec[0], (String) spec[1],
-                        "dev/crussty/saves/agent/CrusstyShim", (String) spec[2],
-                        (String) spec[3], (int[][]) spec[4]);
+                String mode = spec.length > 5 ? (String) spec[5] : "replace";
+                if (mode.equals("prepend") && !PROBE_ON) {
+                    continue;
+                }
+                attempted++;
+                byte[] next = mode.equals("prepend")
+                        ? AgentAsm.prependBody(out, (String) spec[0], (String) spec[1],
+                            "dev/crussty/saves/agent/CrusstyShim", (String) spec[2],
+                            (String) spec[3], (int[][]) spec[4])
+                        : AgentAsm.replaceBody(out, (String) spec[0], (String) spec[1],
+                            "dev/crussty/saves/agent/CrusstyShim", (String) spec[2],
+                            (String) spec[3], (int[][]) spec[4]);
                 if (next == null) {
                     String err = AgentAsm.lastError();
                     missing.add((String) spec[0] + (err == null || err.isEmpty() ? "" : " (" + err + ")"));
@@ -103,7 +149,10 @@ public final class CrusstyAgent {
                     patched++;
                 }
             }
-            System.err.println("[c-saves] patched " + className + ": " + patched + "/" + specs.length
+            if (attempted < specs.length) {
+                verb = "patched";
+            }
+            System.err.println("[c-saves] " + verb + " " + className + ": " + patched + "/" + attempted
                     + " methods" + (missing.isEmpty() ? "" : " — MISSING: " + missing));
             if (patched < specs.length) {
                 System.err.println("[c-saves] FAIL: " + className + " mismatch — "
