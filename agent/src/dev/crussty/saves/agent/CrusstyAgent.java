@@ -149,12 +149,11 @@ public final class CrusstyAgent {
                     patched++;
                 }
             }
-            if (attempted < specs.length) {
-                verb = "patched";
-            }
             System.err.println("[c-saves] " + verb + " " + className + ": " + patched + "/" + attempted
                     + " methods" + (missing.isEmpty() ? "" : " — MISSING: " + missing));
-            if (patched < specs.length) {
+            // a mismatch is only when an ATTEMPTED spec failed to apply —
+            // probe specs filtered by -Dcsaves.probe are deliberately absent
+            if (patched < attempted) {
                 System.err.println("[c-saves] FAIL: " + className + " mismatch — "
                         + "the shim signatures do not cover this Paper build");
             }

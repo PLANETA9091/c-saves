@@ -619,7 +619,10 @@ jobs:
           # chunk window instead — every chunk in it is in the export, so the
           # fetch sample count is deterministic (>=200 for the percentile
           # gates) regardless of the spawn-search behavior.
-          ( sleep 35; echo "forceload add -128 -128 128 128"; sleep 90; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
+          # the forceload area is capped at 256 chunks (-128..128 blocks is
+          # 289 chunks inclusive and gets REJECTED: "Too many chunks in the
+          # specified area") — -112..112 blocks is 15x15 = 225 chunks
+          ( sleep 35; echo "forceload add -112 -112 112 112"; sleep 90; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
             java -Xms512M -Xmx1500M $AGENT -Dcsaves.mode=anvil -Dcsaves.statsfile=stats-anvil.txt \
             -cp "$CP" org.bukkit.craftbukkit.Main nogui > run5.log 2>&1 || true
           cd ..
