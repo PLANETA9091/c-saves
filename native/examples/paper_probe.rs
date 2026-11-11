@@ -1,4 +1,4 @@
-//! paper_probe (v0.9.62): offline verification of a REAL Paper server's
+//! paper_probe (v0.9.62/63): offline verification of a REAL Paper server's
 //! container — the ground truth behind "the server plays from the container".
 //!
 //! Gates (CI asserts on the exact lines):
@@ -6,20 +6,43 @@
 //!   - the diamond block set by the live `setblock` command survived the
 //!     server restart inside the chunk (0,0) palette — the edit only ever
 //!     touched the container (zero .mca files on disk);
-//!   - container size on disk is printed for the size accounting.
+//!   - container size on disk is printed for the size accounting;
+//!   - --export <dir> renders the honest (stored) chunks back into a vanilla
+//!     region tree — the Anvil A/B baseline world (contracts CANNOT be
+//!     rendered: they are regeneration promises, not bytes).
 //!
-//! Usage: paper_probe <container-dir> [--diamond]
+//! Usage: paper_probe <dir> [--diamond] [--export <outdir>]
 
 use c_saves::store::{Cfg, Store};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("usage: paper_probe <dir> [--diamond]");
-    let want_diamond = args.next().as_deref() == Some("--diamond");
+    let dir = args.next().expect("usage: paper_probe <dir> [--diamond] [--export <outdir>]");
+    let mut want_diamond = false;
+    let mut export_to: Option<String> = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--diamond" => want_diamond = true,
+            "--export" => export_to = args.next(),
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     let st = Store::open_cfg(std::path::Path::new(&dir), true, Cfg::default())
         .expect("open container");
     let keys = st.keys();
+    let mut stored = 0usize;
+    let mut contracted = 0usize;
+    for k in &keys {
+        if st.is_pristine(*k) {
+            contracted += 1;
+        } else {
+            stored += 1;
+        }
+    }
     let mut ok = 0usize;
     let mut bad = 0usize;
     for k in &keys {
@@ -28,7 +51,10 @@ fn main() {
             _ => bad += 1,
         }
     }
-    println!("paper probe: chunks={} read_ok={} bad={}", keys.len(), ok, bad);
+    println!(
+        "paper probe: chunks={} stored={} contracted={} read_ok={} bad={}",
+        keys.len(), stored, contracted, ok, bad
+    );
     if bad != 0 {
         println!("=== paper probe: FAIL (bad>0) ===");
         std::process::exit(1);
@@ -83,6 +109,18 @@ fn main() {
             let cx = (*k >> 32) as i32;
             let cz = (*k as u32) as i32;
             println!("paper probe: diamond_block PRESENT in chunk ({cx},{cz}) bytes={sz}");
+        }
+    }
+    if let Some(out) = export_to {
+        let rep = c_saves::anvil::export_dir(&st, std::path::Path::new(&out))
+            .expect("export ok");
+        println!(
+            "paper probe: export out={} chunks={} pristine_skipped={} lost={} bytes={}",
+            out, rep.chunks, rep.pristine_skipped, rep.lost, rep.bytes
+        );
+        if rep.lost != 0 {
+            println!("=== paper probe: FAIL (export lost>0) ===");
+            std::process::exit(1);
         }
     }
     println!("=== paper probe: PASS ===");

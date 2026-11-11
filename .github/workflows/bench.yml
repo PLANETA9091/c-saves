@@ -586,6 +586,33 @@ jobs:
           grep -q "read_ok=.* bad=0" paper_probe.txt
           grep -q "diamond_block=PRESENT" paper_probe.txt
           grep -q "=== paper probe: PASS ===" paper_probe.txt
+
+          # ---- v0.9.63: the ANVIL A/B BASELINE — same server, same world,
+          # same agent, storage swapped. The honest chunks export to a vanilla
+          # region tree; -Dcsaves.mode=anvil routes every patched body through
+          # the faithful vanilla transcriptions. The engine meters must stay
+          # EMPTY (rn=0: vanilla mode provably never touches the container). ----
+          "$ROOT/native/target/release/examples/paper_probe" \
+            world/dimensions/minecraft/overworld/c-saves/region \
+            --export export-anvil | tee paper_export.txt
+          grep -q "export out=.* lost=0" paper_export.txt
+          mkdir run5 && cd run5
+          cp ../patchrun/eula.txt .
+          printf "online-mode=false\nview-distance=2\nsimulation-distance=2\ngenerate-structures=false\nmotd=csaves\nlevel-name=anvil-world\n" > server.properties
+          cp -a ../world ./anvil-world
+          mkdir -p anvil-world/dimensions/minecraft/overworld/region
+          cp ../export-anvil/*.mca anvil-world/dimensions/minecraft/overworld/region/
+          ( sleep 35; echo "forceload add -8 8"; sleep 90; echo stop ) | timeout --signal=TERM --kill-after=120 260 \
+            java -Xms512M -Xmx1500M $AGENT -Dcsaves.mode=anvil -Dcsaves.statsfile=stats-anvil.txt \
+            -cp "$CP" org.bukkit.craftbukkit.Main nogui > run5.log 2>&1 || true
+          cd ..
+          grep -q "Done (" run5/run5.log || { echo "FAIL run5: no Done"; tail -40 run5/run5.log; exit 1; }
+          tail -n 1 run5/stats-anvil.txt | tee anvil_stats_tail.txt
+          grep -q "mode=anvil" anvil_stats_tail.txt
+          grep -q "eng rn=0" anvil_stats_tail.txt || { echo "FAIL: the anvil baseline touched the engine"; exit 1; }
+          tail -n 1 run5/stats-anvil.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('anvil meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=200 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
+          tail -n 1 stats-live.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('container meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=200 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
+          python3 -c "import re; p=lambda s:{k:int(v) for k,v in re.findall(r'(\w+)=(\d+)',s)}; c=p(open('stats-live.txt').read().strip().splitlines()[-1]); a=p(open('run5/stats-anvil.txt').read().strip().splitlines()[-1]); print('A/B read p50: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp50'], a['fp50'], c['fp50']/max(1,a['fp50']))); print('A/B read p90: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp90'], a['fp90'], c['fp90']/max(1,a['fp90']))); print('A/B read p99: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp99'], a['fp99'], c['fp99']/max(1,a['fp99']))); print('A/B write p50: container=%dus vs anvil=%dus (ratio %.2f)' % (c['swp50'], a['swp50'], c['swp50']/max(1,a['swp50'])))"
           echo "=== paper bench: PASS — the server plays from the container, end to end ==="
       - uses: actions/upload-artifact@v4
         if: always()
@@ -596,6 +623,9 @@ jobs:
             live/run2.log
             live/run3.log
             live/run4.log
+            live/run5/run5.log
             live/stats-live.txt
+            live/run5/stats-anvil.txt
             live/paper_probe.txt
+            live/paper_export.txt
             patchrun/boot.log

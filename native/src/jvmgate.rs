@@ -169,3 +169,34 @@ pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nHasChunk(
 ) -> jboolean {
     natives::n_has_chunk(env, cls, handle, x, z)
 }
+
+// ---------------------------------------------------------------------------
+// v0.9.63: the live-path latency snapshot. long[10] =
+// {rn, rp50, rp90, rp99, rmax, wn, wp50, wp90, wp99, wmax} (µs; 0 where no
+// sample exists). The agent's shutdown hook folds it into the stats line the
+// CI gate parses — the averages hid the tail, the percentiles do not.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_crussty_saves_agent_CrusstyShim_nLatSnapshot(
+    env: *mut JNIEnv,
+    _cls: jclass,
+) -> *mut jni_sys::_jobject {
+    use crate::engine::{read_lat, write_lat};
+    let r = read_lat();
+    let w = write_lat();
+    let vals: [i64; 10] = [
+        r.n as i64, r.p50 as i64, r.p90 as i64, r.p99 as i64, r.max as i64,
+        w.n as i64, w.p50 as i64, w.p90 as i64, w.p99 as i64, w.max as i64,
+    ];
+    unsafe {
+        let new = (**env).v1_1.NewLongArray;
+        let arr = new(env, 10);
+        if arr.is_null() {
+            return std::ptr::null_mut();
+        }
+        let set = (**env).v1_1.SetLongArrayRegion;
+        set(env, arr as jni_sys::jarray, 0, 10, vals.as_ptr());
+        arr as *mut jni_sys::_jobject
+    }
+}

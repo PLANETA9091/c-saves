@@ -154,6 +154,62 @@ fail lines in bench logs come from the G2 dirty phase deliberately
 flipping a payload byte; scan_root rejecting corrupted NBT into the
 full-parse fallback is the designed safety behavior.
 
+## v0.9.63 — the live path, priced: percentiles through a REAL Paper, container vs Anvil, same meters
+
+The 0.9.62 gate proved the server plays from the container. It never
+answered what that costs per chunk. Averages existed; the tail did not.
+This tick instruments the live path end to end and runs the honest A/B:
+the SAME Paper 26.3 server, the SAME world, the SAME agent build — the
+storage swapped underneath it.
+
+- **Engine histograms** (`engine.rs`): every `read_chunk`/`write_chunk`
+  through the JNI surface now lands in a lock-free histogram — linear
+  microsecond slots up to 1023 µs (a live fetch lives there, so p-values
+  are EXACT below 1 ms), floor-log2 buckets above, exact max. `LatPct`
+  = n/p50/p90/p99/max.
+- **JVM-side meters** (`CrusstyShim`): the fetch cost as the server thread
+  experiences it — container: the `nReadChunk` call incl. JNI marshalling;
+  anvil: the vanilla transcription incl. region open + zlib inflate —
+  counted ONLY for samples that returned data (a NO_DATA probe is a
+  near-free lookup, timing it would flatter the baseline). Store meters
+  cover serialize + put on both sides. `dumpStats` now ends with the full
+  latency section plus the `endSave` fsync barrier cost in ms.
+- **The A/B mode**: `-Dcsaves.mode=anvil` routes EVERY patched body through
+  the faithful vanilla transcriptions (real region-file IO on a real .mca
+  world exported from the container via `paper_probe --export`). The engine
+  meters must stay EMPTY there — CI asserts `eng rn=0`: vanilla mode
+  provably never touches the container. One agent build, both storages.
+- **The CI session (paper-bench, run 5)**: export -> vanilla world copy ->
+  boot with `csaves.mode=anvil` -> forceload -8 8 -> the same percentile
+  line the container runs produce. Gates: n>=200 fetch samples both sides,
+  p50<=5 ms / p99<=20 ms both sides (pathology bounds, 20-500x above the
+  measured values), `rn=0` on the anvil line; the A/B ratios are printed
+  into the job log.
+
+Local session numbers (2-core sandbox, Paper 26.3 build 248, the same
+17x17-chunk forceload window, 716-717 served fetches per run):
+
+| read fetch (served) | container | anvil | ratio |
+|---|---|---|---|
+| p50 | **10 µs** | 21 µs | **x0.48** |
+| p90 | **110 µs** | 156 µs | x0.71 |
+| p99 | **253 µs** | 328 µs | x0.77 |
+| max | 4.6 ms | 20.6 ms | x0.22 |
+
+| store write | container | anvil | ratio |
+|---|---|---|---|
+| p50 | **66 µs** | 104 µs | x0.63 |
+| p90 | **357 µs** | 743 µs | x0.48 |
+
+The container is faster than Anvil at every percentile of the live read
+path: the bytes served per chunk are smaller (content-addressed dedup +
+zstd over identical terrain), and the engine reads them without region
+file bookkeeping. The write path wins the same way. The durable fsync
+barrier that closes every session measured 1-5 ms for the whole world.
+
+**82/82 tests green.** The CI matrix stays 12 jobs (the A/B lives inside
+paper-bench).
+
 ## v0.9.62 — THE SERVER PLAYS FROM THE CONTAINER: a real Paper 26.3 server, no kernel
 
 v0.9.60 gated the live path from the Rust side of the natives and v0.9.61

@@ -105,16 +105,133 @@ static WRITE_LAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 static WRITE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AUTOSAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// v0.9.63: per-op latency HISTOGRAMS for the live path (n_read_chunk /
+// n_write_chunk drive note_read_latency / note_write_latency). Averages hid
+// the tail; the player-visible question is p50/p90/p99. Bucketing: linear
+// microsecond slots up to 1023 µs — a live chunk read lands in the exact-µs
+// zone — then floor-log2 buckets up to 2^31 µs. p-values below 1 ms are
+// therefore exact; above, the reported number is the bucket's LOWER bound
+// (a conservative "at least this fast" claim).
+const LIN_SLOTS: usize = 1024; // us 0..=1023 (slot == us)
+const LOG_SLOTS: usize = 22; // 2^10 ..= 2^31 boundaries
+const OVERFLOW_SLOT: usize = LIN_SLOTS + LOG_SLOTS; // > 2^31 µs
+const TOTAL_SLOTS: usize = OVERFLOW_SLOT + 1;
+
+pub struct LatPct {
+    pub n: u64,
+    pub p50: u64,
+    pub p90: u64,
+    pub p99: u64,
+    pub max: u64,
+}
+
+struct Hist {
+    slots: Box<[std::sync::atomic::AtomicU64]>,
+    max: std::sync::atomic::AtomicU64,
+}
+
+impl Hist {
+    fn new() -> Self {
+        Hist {
+            slots: (0..TOTAL_SLOTS)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            max: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn slot_of(us: u64) -> usize {
+        if us < LIN_SLOTS as u64 {
+            us as usize
+        } else {
+            let k = 63 - us.leading_zeros() as usize; // floor(log2(us)), us >= 1024 -> k >= 10
+            if k >= 10 + LOG_SLOTS {
+                OVERFLOW_SLOT
+            } else {
+                LIN_SLOTS + (k - 10)
+            }
+        }
+    }
+
+    /// Lower bound of the µs range a slot represents (exact below 1 ms).
+    fn slot_lower(slot: usize) -> u64 {
+        if slot < LIN_SLOTS {
+            slot as u64
+        } else if slot < OVERFLOW_SLOT {
+            1u64 << (slot - LIN_SLOTS + 10)
+        } else {
+            1u64 << (10 + LOG_SLOTS)
+        }
+    }
+
+    fn record(&self, us: u64) {
+        self.slots[Self::slot_of(us)].fetch_add(1, Ordering::Relaxed);
+        self.max.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn percentile(&self, q: u64) -> u64 {
+        // q in percent (50, 90, 99); rank is 1-indexed: ceil(q/100 * n)
+        let mut n = 0u64;
+        for s in &self.slots {
+            n += s.load(Ordering::Relaxed);
+        }
+        if n == 0 {
+            return 0;
+        }
+        let rank = ((q as u128 * n as u128) + 99) / 100; // ceil, u128-safe
+        let mut cum = 0u64;
+        for (idx, s) in self.slots.iter().enumerate() {
+            cum += s.load(Ordering::Relaxed);
+            if (cum as u128) >= rank {
+                return Self::slot_lower(idx);
+            }
+        }
+        Self::slot_lower(OVERFLOW_SLOT)
+    }
+
+    fn snapshot(&self, n_hint: u64) -> LatPct {
+        LatPct {
+            n: n_hint,
+            p50: self.percentile(50),
+            p90: self.percentile(90),
+            p99: self.percentile(99),
+            max: self.max.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static READ_HIST: std::sync::OnceLock<Hist> = std::sync::OnceLock::new();
+static WRITE_HIST: std::sync::OnceLock<Hist> = std::sync::OnceLock::new();
+
+fn read_hist() -> &'static Hist {
+    READ_HIST.get_or_init(Hist::new)
+}
+fn write_hist() -> &'static Hist {
+    WRITE_HIST.get_or_init(Hist::new)
+}
+
 pub fn note_read_latency(us: u64) {
     READ_LAT.fetch_add(us, Ordering::Relaxed);
     READ_N.fetch_add(1, Ordering::Relaxed);
+    read_hist().record(us);
 }
 pub fn note_write_latency(us: u64) {
     WRITE_LAT.fetch_add(us, Ordering::Relaxed);
     WRITE_N.fetch_add(1, Ordering::Relaxed);
+    write_hist().record(us);
 }
 pub fn note_autosave() {
     AUTOSAVES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// v0.9.63: percentile snapshot of the live-path latency meters.
+/// One JNI call returns the whole picture: reads and writes, each with
+/// n / p50 / p90 / p99 / max (µs; 0 where no sample exists).
+pub fn read_lat() -> LatPct {
+    read_hist().snapshot(READ_N.load(Ordering::Relaxed))
+}
+pub fn write_lat() -> LatPct {
+    write_hist().snapshot(WRITE_N.load(Ordering::Relaxed))
 }
 
 pub fn latency_snapshot() -> (u64, u64, u64, u64, u64) {
@@ -148,4 +265,66 @@ pub fn spawn_maintenance(reg: Arc<Registry>) {
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod lat_tests {
+    use super::*;
+
+    #[test]
+    fn exact_us_below_one_ms() {
+        let h = Hist::new();
+        for &v in &[5u64, 5, 5, 250, 250, 900, 1023] {
+            h.record(v);
+        }
+        // n=7; ranks: p50 -> ceil(3.5)=4 -> sorted[3]=250 (exact);
+        // with a 7-sample histogram p90/p99 collapse onto the max (1023)
+        let s = h.snapshot(7);
+        assert_eq!(s.n, 7);
+        assert_eq!(s.p50, 250, "p50 below 1 ms must be the exact µs value");
+        assert_eq!(s.p90, 1023);
+        assert_eq!(s.p99, 1023);
+        assert_eq!(s.max, 1023);
+    }
+
+    #[test]
+    fn log2_buckets_report_lower_bounds() {
+        let h = Hist::new();
+        h.record(2000); // [1024, 2048) -> lower bound 1024
+        h.record(5_000_000); // [2^22, 2^23) -> lower bound 4_194_304
+        let s = h.snapshot(2);
+        assert_eq!(s.p50, 1024, "n=2: p50 rank 1 = the smaller sample's bucket");
+        assert_eq!(s.p99, 4_194_304, "n=2: p99 rank 2 = the larger sample's bucket");
+        assert_eq!(s.max, 5_000_000, "max stays exact at any scale");
+    }
+
+    #[test]
+    fn empty_hist_is_all_zero() {
+        let s = Hist::new().snapshot(0);
+        assert_eq!((s.n, s.p50, s.p90, s.p99, s.max), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn overflow_slot_never_panics() {
+        let h = Hist::new();
+        h.record(u32::MAX as u64);
+        h.record(u64::MAX);
+        let s = h.snapshot(2);
+        assert_eq!(s.max, u64::MAX);
+        assert_eq!(s.p50, 1u64 << 31, "n=2: rank 1 = the 2^31-boundary sample");
+    }
+
+    #[test]
+    fn live_meters_surface_percentiles() {
+        // the natives drive note_*; one value each so the global histograms
+        // have deterministic content as long as no other test records reads
+        let before = read_lat().n;
+        note_read_latency(7);
+        let s = read_lat();
+        assert_eq!(s.n, before + 1);
+        assert!(s.p50 <= 7, "a 7 µs sample cannot push p50 above 7");
+        let wb = write_lat().n;
+        note_write_latency(11);
+        assert_eq!(write_lat().n, wb + 1);
+    }
 }

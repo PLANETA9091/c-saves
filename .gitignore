@@ -4,3 +4,7 @@ native/target/
 build/
 live/
 pa.zip
+patchrun/
+paper.jar
+paper.zip
+paper-results/

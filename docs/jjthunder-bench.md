@@ -1933,3 +1933,22 @@ offline (bad=0, the diamond edit PRESENT in chunk (0,0)). The gate caught a
 silent ASM no-op: "patched 6/6" while 5 descriptors did not match and the
 vanilla path wrote 12 full .mca files — replace_body now fails loudly and
 the CI gate asserts 7/7 + 3×1/1. The enc_fp needle is untouched.
+
+**v0.9.63 — the live path, priced (CI job 12 paper-bench, run 5).** The
+percentile answer to "what does playing from the container cost": engine
+histograms (exact µs below 1 ms, log2 above, exact max) behind every JNI
+read/write, JVM-side fetch meters in the agent (served samples only —
+NO_DATA probes are excluded on both sides so the baseline is not flattered),
+and the A/B control group via `-Dcsaves.mode=anvil`: the same agent routes
+every patched body through the faithful vanilla transcriptions on a real
+.mca world exported from the container (`paper_probe --export`; the live
+container held 1018/1018 honest chunks, zero contracts — stop-save re-saves
+change content, so pristine never forms on the Paper path). CI asserts
+n>=200 fetch samples both sides, p50<=5 ms / p99<=20 ms both sides, and the
+inversion proof `eng rn=0` on the anvil line — vanilla mode provably never
+touches the engine. Local A/B (same Paper 26.3, same window, same agent):
+read fetch p50 10 µs vs 21 µs (x0.48), p99 253 vs 328 µs (x0.77), write
+p50 66 vs 104 µs (x0.63), p90 357 vs 743 µs (x0.48) — the container is
+faster than Anvil at every live-path percentile. The ratios are printed
+into the job log every run and deliberately not gated. 82/82 tests green;
+the matrix stays 12 jobs. The enc_fp needle is untouched.

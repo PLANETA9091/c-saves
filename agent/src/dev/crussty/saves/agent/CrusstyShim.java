@@ -87,22 +87,101 @@ public final class CrusstyShim {
     public static native boolean nBeginSave();
     public static native boolean nEndSave();
     public static native void nMarkAutosave();
+    /** v0.9.63: {rn, rp50, rp90, rp99, rmax, wn, wp50, wp90, wp99, wmax} in µs. */
+    public static native long[] nLatSnapshot();
 
     /** set -Dcsaves.wlog=true to log every chunk write */
     static final boolean WRITE_LOG = Boolean.getBoolean("csaves.wlog")
             || System.getenv("CSAVES_WLOG") != null;
 
+    // ------------------------------------------------------------------
+    // v0.9.63: the A/B mode + the JVM-side latency meters.
+    //
+    // -Dcsaves.mode=anvil routes EVERY patched body through the faithful
+    // vanilla transcriptions (real region-file IO on a real .mca world) —
+    // one agent build measures both storages on the same server. The engine
+    // meters must stay EMPTY in anvil mode (rn=0 is itself a CI gate:
+    // vanilla mode provably never touches the container).
+    //
+    // FETCH / STORE_WRITE time the per-chunk work as the server thread
+    // experiences it, ONLY for samples that actually returned data:
+    // container — the nReadChunk call incl. JNI marshalling; anvil — the
+    // vanilla transcription incl. region open + zlib inflate. Contract-miss
+    // fetches (None -> the chunk system regenerates) are identical worldgen
+    // work in both worlds and are excluded from both histograms.
+    // ------------------------------------------------------------------
+    static final boolean ANVIL_MODE = "anvil".equals(
+            System.getProperty("csaves.mode", "container"));
+
+    /** Linear µs slots up to 1023 (exact values), floor-log2 buckets above —
+     * the exact mirror of the engine's native histogram (engine.rs). */
+    static final class Lat {
+        private final java.util.concurrent.atomic.AtomicLongArray slots =
+                new java.util.concurrent.atomic.AtomicLongArray(1047);
+        private final AtomicLong max = new AtomicLong();
+        private final AtomicLong n = new AtomicLong();
+
+        void add(long us) {
+            n.incrementAndGet();
+            slots.incrementAndGet(slotOf(us));
+            max.accumulateAndGet(us, Math::max);
+        }
+
+        private static int slotOf(long us) {
+            if (us < 1024) return (int) us;
+            int k = 63 - Long.numberOfLeadingZeros(us);
+            return k >= 32 ? 1046 : 1024 + (k - 10);
+        }
+
+        private static long slotLower(int slot) {
+            if (slot < 1024) return slot;
+            if (slot < 1046) return 1L << (slot - 1024 + 10);
+            return 1L << 32;
+        }
+
+        /** {n, p50, p90, p99, max} in µs (all 0 when empty). */
+        long[] snap() {
+            long count = 0;
+            for (int i = 0; i < slots.length(); i++) count += slots.get(i);
+            if (count == 0) return new long[5];
+            return new long[] { count, pct(count, 50), pct(count, 90), pct(count, 99), max.get() };
+        }
+
+        private long pct(long count, int q) {
+            long rank = (q * count + 99) / 100; // 1-indexed, ceil
+            long cum = 0;
+            for (int i = 0; i < slots.length(); i++) {
+                cum += slots.get(i);
+                if (cum >= rank) return slotLower(i);
+            }
+            return slotLower(1046);
+        }
+    }
+
+    /** per-chunk fetch cost (served samples only), as the server thread sees it */
+    static final Lat FETCH = new Lat();
+    /** per-chunk store cost (successful samples only) */
+    static final Lat STORE_WRITE = new Lat();
+    static volatile long END_SAVE_MS;
+
     /** Shutdown-barrier stats dump (registered by the agent): fsync + counts. */
     public static void dumpStats() {
         StringBuilder sb = new StringBuilder();
-        if (!ACTIVE_SEEN) {
+        // v0.9.63: in ANVIL mode nothing ever attaches (by design — vanilla
+        // IO must not touch the engine), so "never active" is the EXPECTED
+        // state there and the latency section still has to print (the anvil
+        // meters live on the JVM side). Only a non-anvil process with no IO
+        // attached keeps the legacy marker.
+        if (!ACTIVE_SEEN && !ANVIL_MODE) {
             sb.append("[c-saves] stats: never active (no IO attached)");
         } else {
+            long t0 = System.nanoTime();
             try {
                 nEndSave(); // the durable barrier the server's normal save path would run
             } catch (Throwable t) {
                 sb.append("[c-saves] endSave failed: ").append(t).append("; ");
             }
+            END_SAVE_MS = (System.nanoTime() - t0) / 1_000_000;
             sb.append("[c-saves] stats: block read=").append(KIND_STATS[KIND_CHUNK][0])
                 .append('/').append(KIND_STATS[KIND_CHUNK][1]).append(" served/miss, written=")
                 .append(KIND_STATS[KIND_CHUNK][2])
@@ -115,6 +194,26 @@ public final class CrusstyShim {
                 .append(" | totals served=").append(READ_SERVED).append(" miss=").append(READ_MISS)
                 .append(" writeOk=").append(WRITE_OK).append(" writeFail=").append(WRITE_FAIL)
                 .append(" vanillaFallback=").append(VANILLA_FALLBACK);
+            // ---- v0.9.63: the latency section (all values µs) ----
+            sb.append(" | mode=").append(ANVIL_MODE ? "anvil" : "container");
+            try {
+                long[] e = nLatSnapshot();
+                if (e != null && e.length == 10) {
+                    sb.append(" | eng rn=").append(e[0]).append(" rp50=").append(e[1])
+                      .append(" rp90=").append(e[2]).append(" rp99=").append(e[3]).append(" rmax=").append(e[4])
+                      .append(" wn=").append(e[5]).append(" wp50=").append(e[6])
+                      .append(" wp90=").append(e[7]).append(" wp99=").append(e[8]).append(" wmax=").append(e[9]);
+                }
+            } catch (Throwable t) {
+                sb.append(" | eng lat failed: ").append(t);
+            }
+            long[] f = FETCH.snap();
+            sb.append(" | jvm fn=").append(f[0]).append(" fp50=").append(f[1])
+              .append(" fp90=").append(f[2]).append(" fp99=").append(f[3]).append(" fmax=").append(f[4]);
+            long[] sw = STORE_WRITE.snap();
+            sb.append(" | store swn=").append(sw[0]).append(" swp50=").append(sw[1])
+              .append(" swp90=").append(sw[2]).append(" swp99=").append(sw[3]).append(" swmax=").append(sw[4]);
+            sb.append(" | endSaveMs=").append(END_SAVE_MS);
         }
         String line = sb.toString();
         System.err.println(line);
@@ -211,6 +310,15 @@ public final class CrusstyShim {
             System.err.println("[c-saves] controller cache class: " + rfs.getClass().getName()
                     + " (loader=" + rfs.getClass().getClassLoader() + ")");
         }
+        if (ANVIL_MODE) {
+            if (tag == null) {
+                return new WriteData(null, WriteResult.DELETE, null, null);
+            }
+            long t0 = System.nanoTime();
+            WriteData wd = vanillaStartWrite(rfs, x, z, tag);
+            STORE_WRITE.add((System.nanoTime() - t0) / 1000);
+            return wd;
+        }
         final int kind = ctrl instanceof ca.spottedleaf.moonrise.patches.chunk_system.io.datacontroller.EntityDataController
                 ? KIND_ENTITY
                 : ctrl instanceof ca.spottedleaf.moonrise.patches.chunk_system.io.datacontroller.PoiDataController
@@ -222,9 +330,11 @@ public final class CrusstyShim {
         }
         int h = ensureAttach(rfs);
         if (nActive()) {
+            long t0 = System.nanoTime();
             ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 14);
             NbtIo.write(tag, new DataOutputStream(bos));
             boolean ok = nWriteChunk(h, x, z, bos.toByteArray(), isFreshChunk(tag));
+            STORE_WRITE.add((System.nanoTime() - t0) / 1000);
             if (ok) {
                 WRITE_OK.incrementAndGet();
                 KIND_STATS[kind][2].incrementAndGet();
@@ -259,9 +369,11 @@ public final class CrusstyShim {
     private static Method DOES_POSSIBLY_EXIST;
 
     public static boolean rfDoesNotExistNoIO(RegionFileStorage st, int x, int z) throws IOException {
-        int h = ensureAttach(st);
-        if (nActive()) {
-            return !nHasChunk(h, x, z);
+        if (!ANVIL_MODE) {
+            int h = ensureAttach(st);
+            if (nActive()) {
+                return !nHasChunk(h, x, z);
+            }
         }
         try {
             if (DOES_POSSIBLY_EXIST == null) {
@@ -293,10 +405,22 @@ public final class CrusstyShim {
 
     public static ReadData rfReadData(RegionFileStorage st, int x, int z) throws IOException {
         if (WRITE_LOG) System.err.println("[c-saves] ENTER readData " + x + "," + z);
+        if (ANVIL_MODE) {
+            long t0 = System.nanoTime();
+            ReadData rd = vanillaReadData(st, x, z);
+            // HAS_DATA only: a NO_DATA lookup is a near-free probe, not a
+            // served chunk — timing it would flatter the anvil baseline.
+            if (rd.input() != null) {
+                FETCH.add((System.nanoTime() - t0) / 1000);
+            }
+            return rd;
+        }
         int h = ensureAttach(st);
         if (nActive()) {
+            long t0 = System.nanoTime();
             byte[] b = nReadChunk(h, x, z);
             if (b != null) {
+                FETCH.add((System.nanoTime() - t0) / 1000);
                 if (WRITE_LOG) System.err.println("[c-saves] readData " + x + "," + z + " SERVED " + b.length + "B");
                 READ_SERVED.incrementAndGet();
                 KIND_STATS[kindOfHandle(st)][0].incrementAndGet();
@@ -320,6 +444,9 @@ public final class CrusstyShim {
     // of the original body (recovery-aware re-reads for .mca fallback).
     // ------------------------------------------------------------------
     public static CompoundTag rfFinishRead(RegionFileStorage st, int x, int z, ReadData readData) throws IOException {
+        if (ANVIL_MODE) {
+            return vanillaFinishRead(st, x, z, readData);
+        }
         if (readData.recalculateCount() == RECALC_OWNED) {
             DataInputStream in = readData.input();
             try {
@@ -375,16 +502,27 @@ public final class CrusstyShim {
     // ------------------------------------------------------------------
     public static WriteData rfStartWrite(RegionFileStorage st, int x, int z, CompoundTag tag) throws IOException {
         if (WRITE_LOG) System.err.println("[c-saves] ENTER startWrite " + x + "," + z + " tag=" + (tag == null ? "null" : tag.getStringOr("Status", "?")));
+        if (ANVIL_MODE) {
+            if (tag == null) {
+                return new WriteData(null, WriteResult.DELETE, null, null);
+            }
+            long t0 = System.nanoTime();
+            WriteData wd = vanillaStartWrite(st, x, z, tag);
+            STORE_WRITE.add((System.nanoTime() - t0) / 1000);
+            return wd;
+        }
         if (tag == null) {
             return new WriteData(null, WriteResult.DELETE, null, null);
         }
         int h = ensureAttach(st);
         if (nActive()) {
+            long t0 = System.nanoTime();
             ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 14);
             NbtIo.write(tag, new DataOutputStream(bos));
             // per-write freshness evidence from the tag itself — pristine
             // contracts may form only on genuinely fresh chunks (v0.9.47).
             boolean ok = nWriteChunk(h, x, z, bos.toByteArray(), isFreshChunk(tag));
+            STORE_WRITE.add((System.nanoTime() - t0) / 1000);
             if (ok) {
                 WRITE_OK.incrementAndGet();
                 KIND_STATS[kindOfHandle(st)][2].incrementAndGet();
@@ -448,6 +586,9 @@ public final class CrusstyShim {
     // SimpleRegionStorage / IOWorker: entities + poi + misc scans).
     // ------------------------------------------------------------------
     public static CompoundTag rfRead(RegionFileStorage st, ChunkPos pos) throws IOException {
+        if (ANVIL_MODE) {
+            return vanillaRead(st, pos);
+        }
         int h = ensureAttach(st);
         if (nActive()) {
             byte[] b = nReadChunk(h, pos.x(), pos.z());
@@ -485,11 +626,17 @@ public final class CrusstyShim {
     // ------------------------------------------------------------------
     public static void rfWrite(RegionFileStorage st, ChunkPos pos, CompoundTag tag) throws IOException {
         if (WRITE_LOG) System.err.println("[c-saves] ENTER write " + pos.x() + "," + pos.z());
+        if (ANVIL_MODE) {
+            vanillaWrite(st, pos, tag);
+            return;
+        }
         int h = ensureAttach(st);
         if (nActive()) {
+            long t0 = System.nanoTime();
             ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 14);
             NbtIo.write(tag, new DataOutputStream(bos));
             boolean ok = nWriteChunk(h, pos.x(), pos.z(), bos.toByteArray(), isFreshChunk(tag));
+            STORE_WRITE.add((System.nanoTime() - t0) / 1000);
             if (ok) {
                 WRITE_OK.incrementAndGet();
                 KIND_STATS[kindOfHandle(st)][2].incrementAndGet();
@@ -559,6 +706,10 @@ public final class CrusstyShim {
     // Streams the visitor over the stored uncompressed NBT.
     // ------------------------------------------------------------------
     public static void rfScan(RegionFileStorage st, ChunkPos pos, StreamTagVisitor visitor) throws IOException {
+        if (ANVIL_MODE) {
+            vanillaScan(st, pos, visitor);
+            return;
+        }
         int h = ensureAttach(st);
         if (nActive()) {
             byte[] b = nReadChunk(h, pos.x(), pos.z());

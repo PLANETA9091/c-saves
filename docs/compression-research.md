@@ -1259,7 +1259,7 @@ engine, which is exactly the surface any future mod-side integration
 
 **77/77 tests green.** The CI matrix is now 11 jobs.
 
-## 24. Research tick 20 (v0.9.62): the server plays from the container — a real Paper 26.3 boots through a plain -javaagent
+## 26. Research tick 22 (v0.9.62): the server plays from the container — a real Paper 26.3 boots through a plain -javaagent
 
 **The last unproven half.** v0.9.59 made the container the world's only
 on-disk form; v0.9.60 gated the live path from the Rust side of the natives;
@@ -1345,3 +1345,78 @@ Player-visible latency through the live path (a bot client walking the
 world) is the next honest measurement.
 
 **77/77 tests green.** The CI matrix is now 12 jobs.
+## 27. Research tick 23 (v0.9.63): the live path, priced — percentiles through a real Paper, container vs Anvil with the same meters
+
+**The declared next honest measurement.** 0.9.62 proved the server plays
+from the container; nothing had priced it per chunk. Averages existed
+(the engine's µs meters) but the player-visible question is the tail.
+This tick adds the meters AND the control group:
+
+1. **Engine histograms** (engine.rs). Every read_chunk/write_chunk behind
+   the JNI surface records into a lock-free histogram: linear microsecond
+   slots up to 1023 µs — a live fetch lands in the exact-µs zone, so every
+   p-value below 1 ms is EXACT — then floor-log2 buckets, plus an exact
+   max. LatPct = n/p50/p90/p99/max; one standard-JNI export
+   (nLatSnapshot, long[10]) hands both meters to the agent's shutdown
+   dump in a single call. Five new unit tests pin the bucket math
+   (exactness below 1 ms, lower-bound semantics above, overflow, the
+   n=1/n=2 rank collapse).
+
+2. **JVM-side meters with an anti-flattery rule.** The fetch histogram in
+   CrusstyShim counts ONLY samples that returned data: a NO_DATA lookup
+   is a near-free probe (open region table, empty slot / engine None),
+   and timing it would flatter whichever side has more misses. Container
+   fetch = the nReadChunk call incl. JNI marshalling; anvil fetch = the
+   vanilla transcription incl. region open + zlib inflate. Store meters
+   cover serialize + put on both sides. dumpStats closes with the
+   endSave fsync barrier in ms.
+
+3. **The A/B mode — one agent build, both storages.** `-Dcsaves.mode=anvil`
+   routes every patched body through the faithful vanilla transcriptions
+   (real region-file IO). The baseline world is the container's own:
+   `paper_probe --export` renders the honest chunks back into a vanilla
+   region tree (this live container held 1018/1018 honest chunks, ZERO
+   contracts — the stop-save rewrites change content, so pristine
+   contracts never form on the Paper path; the export is complete).
+   CI asserts the inversion proof: the anvil line must carry `eng rn=0`
+   (and wn=0) — vanilla mode provably never touches the engine.
+
+**THE SESSION (local, 2-core sandbox, Paper 26.3 build 248, JDK 25):**
+birth 1587 chunks -> cold forceload (240 served) -> second forceload
+(716 served / 0 miss — the whole window is container-served) -> export
+(1018 chunks -> 4.27 MB .mca, lost=0) -> anvil boot forceload (716
+fetched from .mca). Same window, same agent, same server:
+
+| read fetch (served) | container | anvil | ratio |
+|---|---|---|---|
+| p50 | **10 µs** | 21 µs | **x0.48** |
+| p90 | **110 µs** | 156 µs | x0.71 |
+| p99 | **253 µs** | 328 µs | x0.77 |
+| max | 4.6 ms | 20.6 ms | x0.22 |
+
+| store write | container | anvil | ratio |
+|---|---|---|---|
+| p50 | **66 µs** | 104 µs | x0.63 |
+| p90 | **357 µs** | 743 µs | x0.48 |
+| p99 | 2.0 ms | 4.1 ms | x0.50 |
+
+The container wins at every percentile. The mechanics are the ones the
+project was built on: the served bytes are smaller (content-addressed
+section dedup over identical terrain), decompression is zstd instead of
+zlib, and there is no region-file bookkeeping on the path. The durable
+endSave barrier cost 1-5 ms per whole-world session close.
+
+**The CI gate (paper-bench run 5).** Export -> vanilla world copy ->
+`csaves.mode=anvil` boot -> forceload -8 8 -> gates: n>=200 fetch samples
+on both sides, p50<=5 ms and p99<=20 ms on both sides (pathology bounds,
+20-500x above the measured values — they catch a re-scan-the-world
+regression, not weather), `mode=anvil` + `eng rn=0` on the baseline line.
+The A/B ratios are printed into the job log every run; the ratio itself
+is deliberately NOT gated — it is a measurement, published, not a
+promise that can flake.
+
+**Doc note.** The 0.9.62 section below was mis-numbered as a second
+"24"; renumbered to 26 (tick 22) to keep the tick/section ladder honest.
+
+**82/82 tests green.** The CI matrix stays 12 jobs.
+
