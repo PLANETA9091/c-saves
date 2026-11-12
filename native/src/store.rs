@@ -743,6 +743,13 @@ struct Handoff {
     seg: u32,
     off: u64,
     data: Arc<Vec<u8>>,
+    /// a clone of the writer fd the buffer was built on — the flusher
+    /// writes THROUGH it (positional write_all_at), never re-opening the
+    /// path: a segment whose directory was removed mid-flight (tests drop
+    /// the dir before the store) keeps its open inode writable, exactly
+    /// like the inline write_all it replaced. A per-job fd also makes the
+    /// roll trivially correct: jobs of the old segment carry the old fd.
+    fd: File,
 }
 
 /// The handoff queue + its writer thread. append() hands full buffers off
@@ -761,13 +768,16 @@ struct FlushCtl {
     cv: Condvar,
     /// disk position the flusher has written up to (current segment)
     flushed: AtomicU64,
+    /// handoff boundary: every buffer handed off is stamped at this offset
+    /// and the counter advances by its length — INFLIGHT JOBS INCLUDED.
+    /// Deriving the offset from `flushed`/queue-tail raced the pop-at-take
+    /// flusher (a popped still-writing job made an empty queue reuse its
+    /// range). Reset at segment roll/creation.
+    handed_to: AtomicU64,
     stop: AtomicBool,
     /// drained buffers come back here — append reuses them, zero
     /// steady-state allocation (bounded: at most 4 × 1 MiB parked)
     free: Mutex<Vec<Arc<Vec<u8>>>>,
-    /// the flusher's own write fd, cached per segment (the writer's fd and
-    /// the segs read handles are never touched by the flusher)
-    wfd: Mutex<(u32, Option<File>)>,
 }
 
 impl FlushCtl {
@@ -776,57 +786,43 @@ impl FlushCtl {
             q: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             flushed: AtomicU64::new(0),
+            handed_to: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             free: Mutex::new(Vec::new()),
-            wfd: Mutex::new((u32::MAX, None)),
         }
     }
 }
 
-/// The flusher body: pop the front entry, write it on a private fd, land it
-/// (flushed += len, recycle, notify). Write errors retry forever with a
-/// loud log — queued bytes must land, the drain sites (sync/seal/roll) hang
-/// otherwise exactly as an inline write_all error used to fail the append.
-fn flusher_loop(dir: PathBuf, ctl: Arc<FlushCtl>) {
+/// The flusher body: pop the front entry (ownership), write it through the
+/// job's fd clone (positional write_all_at — no path re-open, no shared
+/// seek position), land it (flushed += len, recycle, notify). Write errors
+/// retry forever with a loud log — queued bytes must land, the drain sites
+/// (sync/seal/roll) hang otherwise exactly as an inline write_all error
+/// used to fail the append.
+fn flusher_loop(ctl: Arc<FlushCtl>) {
     loop {
-        let (seg, off, data) = {
+        let job = {
             let mut q = ctl.q.lock();
             ctl.cv.wait_while(&mut q, |qd| {
                 qd.front().is_none() && !ctl.stop.load(Ordering::Acquire)
             });
-            match q.front() {
-                Some(h) => (h.seg, h.off, h.data.clone()),
+            match q.pop_front() {
+                Some(h) => h,
                 // stop stamped and queue drained
                 None => return,
             }
         };
-        let len = data.len() as u64;
+        let off = job.off;
+        let len = job.data.len() as u64;
         loop {
-            let ok = {
-                let mut wfd = ctl.wfd.lock();
-                if wfd.0 != seg {
-                    *wfd = (
-                        seg,
-                        std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(dir.join(format!("seg-{seg:05}.log")))
-                            .ok(),
-                    );
-                }
-                match wfd.1.as_mut() {
-                    Some(f) => {
-                        use std::io::{Seek, Write};
-                        f.seek(SeekFrom::Start(off)).is_ok()
-                            && f.write_all(&data).is_ok()
-                    }
-                    None => false,
-                }
-            };
+            use std::os::unix::fs::FileExt;
+            let ok = job.fd.write_all_at(&job.data, off).is_ok();
             if ok {
                 break;
             }
             eprintln!(
-                "[c-saves] flusher: seg-{seg:05} write failed (off={off}, {len} B) — retrying"
+                "[c-saves] flusher: seg-{:05} write failed (off={}, {} B) — retrying",
+                job.seg, off, len
             );
             if ctl.stop.load(Ordering::Acquire) {
                 return;
@@ -835,11 +831,10 @@ fn flusher_loop(dir: PathBuf, ctl: Arc<FlushCtl>) {
         }
         {
             let mut q = ctl.q.lock();
-            q.pop_front();
             ctl.flushed.store(off + len, Ordering::Release);
             let mut free = ctl.free.lock();
             if free.len() < 4 {
-                free.push(data);
+                free.push(job.data);
             }
             ctl.cv.notify_all();
         }
@@ -847,6 +842,109 @@ fn flusher_loop(dir: PathBuf, ctl: Arc<FlushCtl>) {
 }
 
 // ------------------------------------------------------------- recipe -----
+
+// ---- v0.9.72: the batcher thread — recipe-batch compression off the write
+// path ---------------------------------------------------------------
+
+/// One handed-off recipe batch: the keys, their Arc'd pending bodies (the
+/// commit retires exactly these — a newer pending write survives the
+/// ptr_eq check), the per-entry stream offsets and the built raw stream.
+struct BatchJob {
+    keys: Vec<u64>,
+    arcs: Vec<Arc<Vec<u8>>>,
+    starts: Vec<u32>,
+    stream: Arc<Vec<u8>>,
+}
+
+/// The batch handoff queue + its thread. The write path pushes at the
+/// 192 KiB crossing WITHOUT waiting (the pending entries stay readable);
+/// the batcher compresses ~1.5-4 ms per job OFF the critical path and
+/// commits FIFO on its own thread. The job is POPPED at take (ownership)
+/// and `inflight` marks it as being committed — the blocking wait covers
+/// the queue AND the in-flight job. On a commit failure the job goes back
+/// to the FRONT (order preserved); when the store is dropping
+/// (Weak::upgrade fails — the strong count is already 0 inside
+/// Drop::drop) the job is restored and the thread exits, and Drop drains
+/// the queue inline after `exited`.
+struct BatchCtl {
+    q: Mutex<VecDeque<BatchJob>>,
+    cv: Condvar,
+    stop: AtomicBool,
+    inflight: AtomicBool,
+    exited: AtomicBool,
+}
+
+impl BatchCtl {
+    fn new() -> Self {
+        BatchCtl {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            stop: AtomicBool::new(false),
+            inflight: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
+        }
+    }
+}
+
+fn batcher_loop(weak: std::sync::Weak<Store>, ctl: Arc<BatchCtl>) {
+    loop {
+        let job = {
+            let mut q = ctl.q.lock();
+            ctl.cv.wait_while(&mut q, |qd| {
+                qd.front().is_none() && !ctl.stop.load(Ordering::Acquire)
+            });
+            match q.pop_front() {
+                Some(j) => {
+                    ctl.inflight.store(true, Ordering::Release);
+                    j
+                }
+                None => {
+                    ctl.exited.store(true, Ordering::Release);
+                    ctl.cv.notify_all();
+                    return;
+                }
+            }
+        };
+        let done = {
+            let ctl = ctl.clone();
+            move || {
+                ctl.inflight.store(false, Ordering::Release);
+                ctl.cv.notify_all();
+            }
+        };
+        match weak.upgrade() {
+            Some(st) => match st.commit_batch_job(&job) {
+                Ok(()) => done(),
+                Err(e) => {
+                    done();
+                    let mut q = ctl.q.lock();
+                    q.push_front(job);
+                    drop(q);
+                    ctl.cv.notify_all();
+                    if ctl.stop.load(Ordering::Acquire) {
+                        ctl.exited.store(true, Ordering::Release);
+                        ctl.cv.notify_all();
+                        return;
+                    }
+                    eprintln!("[c-saves] batcher: commit failed ({e}) — retrying");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            },
+            None => {
+                // the store is dropping: restore the job, exit, and let the
+                // Drop drain commit the queue inline
+                done();
+                let mut q = ctl.q.lock();
+                q.push_front(job);
+                drop(q);
+                ctl.cv.notify_all();
+                ctl.exited.store(true, Ordering::Release);
+                ctl.cv.notify_all();
+                return;
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum Tail {
@@ -1397,7 +1495,7 @@ impl CanonCache {
 /// The O(1) index + running byte total replace the per-write linear scans
 /// that made the save path quadratic under autosave storms.
 struct RecipeBatch {
-    entries: Vec<(u64, Vec<u8>)>,
+    entries: Vec<(u64, Arc<Vec<u8>>)>,
     index: HashMap<u64, usize>,
     bytes: usize,
 }
@@ -1411,20 +1509,33 @@ impl Default for RecipeBatch {
 impl RecipeBatch {
     /// Queue a recipe; a pending entry for the same key is superseded
     /// (last write wins — matches the chunks-map behavior at flush).
+    /// v0.9.72: bodies are Arc'd so the batcher thread can hold its handoff
+    /// snapshot while PENDING READS keep hitting the same bytes.
     fn push(&mut self, key: u64, bare: Vec<u8>) {
-        if self.index.contains_key(&key) {
-            self.remove(key);
+        let arc = Arc::new(bare);
+        if let Some(&i) = self.index.get(&key) {
+            // v0.9.74: supersede REPLACES the Arc IN PLACE (position kept) —
+            // a handed-off job commits pointers ONLY while its snapshot is
+            // still the live pending version (ptr_eq gate in commit)
+            self.bytes = self.bytes.saturating_sub(10 + self.entries[i].1.len());
+            let alen = arc.len();
+            self.entries[i].1 = arc;
+            self.bytes += 10 + alen;
+            return;
         }
         self.index.insert(key, self.entries.len());
-        self.bytes += 10 + bare.len();
-        self.entries.push((key, bare));
+        self.bytes += 10 + arc.len();
+        self.entries.push((key, arc));
     }
     /// Remove one pending entry (swap_remove; the moved entry's index slot
     /// is fixed up). Returns the removed recipe body.
-    fn remove(&mut self, key: u64) -> Option<Vec<u8>> {
+    fn remove(&mut self, key: u64) -> Option<Arc<Vec<u8>>> {
         let i = *self.index.get(&key)?;
         self.index.remove(&key);
-        self.bytes -= 10 + self.entries[i].1.len();
+        // saturating: the batcher's commit-retire removes entries whose
+        // bytes were already reset at handoff (bytes counts only entries
+        // that were never handed off)
+        self.bytes = self.bytes.saturating_sub(10 + self.entries[i].1.len());
         let last = self.entries.len() - 1;
         let (_, bare) = self.entries.swap_remove(i);
         if i != last {
@@ -1433,7 +1544,7 @@ impl RecipeBatch {
         }
         Some(bare)
     }
-    fn get(&self, key: u64) -> Option<&Vec<u8>> {
+    fn get(&self, key: u64) -> Option<&Arc<Vec<u8>>> {
         self.entries.get(*self.index.get(&key)?).map(|(_, b)| b)
     }
 }
@@ -1681,6 +1792,8 @@ pub struct Store {
     writer: Mutex<Option<Writer>>,
     /// the flusher queue + thread control (see FlushCtl)
     flush_ctl: Arc<FlushCtl>,
+    /// the batch handoff queue + thread control (see BatchCtl)
+    batch_ctl: Arc<BatchCtl>,
     next_seg: AtomicU64,
     next_blob_id: AtomicU64,
     dicts: RwLock<HashMap<u8, Arc<Vec<u8>>>>,
@@ -1809,11 +1922,41 @@ impl Drop for Store {
     /// store nor touches a closed dir after this point. No fsync — crash
     /// durability stays sync()'s job (Paper syncs every save cycle; the
     /// final sync precedes shutdown).
+    /// v0.9.72: the batcher CANNOT commit during a drop (Weak::upgrade
+    /// fails — the strong count is already 0 inside Drop::drop). Stop it
+    /// first, wait for `exited` (it restores any job it had taken), then
+    /// drain the batch queue INLINE on this thread — FIFO preserved, no
+    /// concurrency.
     fn drop(&mut self) {
-        self.flush_recipe_batch();
+        self.flush_recipe_batch_async();
+        self.batch_ctl.stop.store(true, Ordering::Release);
+        self.batch_ctl.cv.notify_all();
+        {
+            let mut q = self.batch_ctl.q.lock();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !self.batch_ctl.exited.load(Ordering::Acquire) {
+                if std::time::Instant::now() > deadline {
+                    eprintln!("[c-saves] batcher exit wait stuck — draining inline anyway");
+                    break;
+                }
+                self.batch_ctl.cv.wait_while_for(
+                    &mut q,
+                    |_| !self.batch_ctl.exited.load(Ordering::Acquire),
+                    std::time::Duration::from_secs(1),
+                );
+            }
+            // the batcher is gone: drain inline, FIFO
+            for job in q.drain(..) {
+                if let Err(e) = self.commit_batch_job(&job) {
+                    eprintln!("[c-saves] drop: batch commit failed ({e}) — data stays pending");
+                    break;
+                }
+            }
+        }
         self.flush_writer();
         self.flush_ctl.stop.store(true, Ordering::Release);
         self.flush_ctl.cv.notify_all();
+        self.batch_ctl.cv.notify_all();
     }
 }
 
@@ -1841,6 +1984,7 @@ impl Store {
             batch_idx: Mutex::new(HashMap::new()),
             writer: Mutex::new(None),
             flush_ctl: Arc::new(FlushCtl::new()),
+            batch_ctl: Arc::new(BatchCtl::new()),
             slab_cache: Mutex::new(SlabCache::new(32 * 1024 * 1024)),
             canon_cache: Mutex::new(CanonCache::new(16 * 1024 * 1024)),
             next_seg: AtomicU64::new(0),
@@ -1883,20 +2027,61 @@ impl Store {
         st.load_glob_reg();
         st.scan()?;
         st.load_pristine_regions();
-        // v0.9.71: the flusher thread — one per store, owns only its FlushCtl
-        // (never the store), exits when Drop drains + stamps stop
+        // attach diagnostics: the CI paper gate keys off served reads; a
+        // served=0 red run must show WHERE the recovered state went
+        if std::env::var("CSAVES_ATTACH_DIAG").map(|v| v == "1").unwrap_or(false) {
+            eprintln!(
+                "[c-saves] diag: dir={} chunks={} batched={} batch_idx={} blobs={} pristine_regions={} segs={}",
+                st.dir.display(),
+                st.chunks.read().len(),
+                st.chunks.read().values().filter(|v| v.2 == BATCHED).count(),
+                st.batch_idx.lock().len(),
+                st.blobs.read().len(),
+                st.pristine_regions.read().len(),
+                st.segs.read().len()
+            );
+        }
+        // attach diagnostics: the CI paper gate keys off served reads; a
+        // served=0 red run must show WHERE the recovered state went
+        if std::env::var("CSAVES_ATTACH_DIAG").map(|v| v == "1").unwrap_or(false) {
+            eprintln!(
+                "[c-saves] diag: dir={} chunks={} batched={} batch_idx={} blobs={} pristine_regions={} segs={}",
+                st.dir.display(),
+                st.chunks.read().len(),
+                st.chunks.read().values().filter(|v| v.2 == BATCHED).count(),
+                st.batch_idx.lock().len(),
+                st.blobs.read().len(),
+                st.pristine_regions.read().len(),
+                st.segs.read().len()
+            );
+        }
+        // v0.9.71/72: the flusher + batcher threads — one per store, owning
+        // only their control blocks (the batcher holds a Weak — never keeps
+        // the store alive; Drop drains first, then stops it)
         {
             let ctl = st.flush_ctl.clone();
-            let dir = st.dir.clone();
             if std::thread::Builder::new()
                 .name("csaves-flush".into())
-                .spawn(move || flusher_loop(dir, ctl))
+                .spawn(move || flusher_loop(ctl))
                 .is_err()
             {
-                eprintln!("[c-saves] flusher thread spawn failed — falling back is impossible, aborting open");
+                eprintln!("[c-saves] flusher thread spawn failed — aborting open");
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "flusher thread spawn failed",
+                ));
+            }
+            let bctl = st.batch_ctl.clone();
+            let weak = Arc::downgrade(&st);
+            if std::thread::Builder::new()
+                .name("csaves-batch".into())
+                .spawn(move || batcher_loop(weak, bctl))
+                .is_err()
+            {
+                eprintln!("[c-saves] batcher thread spawn failed — aborting open");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "batcher thread spawn failed",
                 ));
             }
         }
@@ -2860,93 +3045,178 @@ impl Store {
     /// bytes/counts across entries — measured ~2x on the JJThunder corpus).
     /// Each entry is indexed in `chunks` with len=BATCHED; the true
     /// (rec_off, stream_off, len) sits in `batch_idx`.
+    ///
+    /// v0.9.72: the compression MOVED OFF THE WRITE PATH. The z6 compress of
+    /// a 192 KiB batch (~1.5-4 ms) ran INLINE in whichever write crossed the
+    /// cap — the write p99 spike on every autosave storm. Now the crossing
+    /// snapshots the pending entries (Arc clones) and hands the built stream
+    /// to the batcher thread; PENDING ENTRIES STAY in the map, so reads keep
+    /// hitting them for the whole compression window and the commit retires
+    /// only entries that are still the handoff snapshot (ptr_eq) — a newer
+    /// pending write always survives. Commit order is FIFO (single batcher),
+    /// so a key that is handed off twice always commits newest-last. The
+    /// commit re-points chunks + batch_idx BEFORE retiring the pending
+    /// entries — a read in the interlude hits either the committed batch or
+    /// the still-pending entry (same bytes): no stale window at all.
     fn flush_recipe_batch(&self) {
+        self.flush_recipe_batch_async();
+        // blocking variant for the drain sites (sync/seal/pack/Drop): the
+        // batcher must commit everything queued AND the in-flight job before
+        // this returns (pop-at-take means the queue alone does not see the
+        // job being committed). The caller must NOT hold the writer mutex —
+        // the batcher's append takes it. The 60 s no-progress guard returns
+        // with the data still pending (safe: nothing lost, just not
+        // committed) instead of hanging a shutdown on a broken disk.
+        let mut q = self.batch_ctl.q.lock();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !q.is_empty() || self.batch_ctl.inflight.load(Ordering::Acquire) {
+            if std::time::Instant::now() > deadline {
+                eprintln!(
+                    "[c-saves] batcher drain stuck: {} queued, inflight={} (data stays pending)",
+                    q.len(),
+                    self.batch_ctl.inflight.load(Ordering::Relaxed)
+                );
+                return;
+            }
+            self.batch_ctl.cv.wait_while_for(
+                &mut q,
+                |qd| {
+                    !qd.is_empty()
+                        || self.batch_ctl.inflight.load(Ordering::Acquire)
+                },
+                std::time::Duration::from_secs(5),
+            );
+        }
+    }
+
+    fn flush_recipe_batch_async(&self) {
         const BATCH_BYTES: usize = 192 * 1024;
-        let entries: Vec<(u64, Vec<u8>)> = {
+        // snapshot + stream build under one short lock pass; entries STAY
+        let jobs: Vec<BatchJob> = {
             let mut b = self.recipe_batch.lock();
             if b.entries.is_empty() {
                 return;
             }
-            let e = std::mem::take(&mut b.entries);
-            b.index.clear();
+            let snapshot: Vec<(u64, Arc<Vec<u8>>)> =
+                b.entries.iter().map(|(k, a)| (*k, a.clone())).collect();
             b.bytes = 0;
-            e
+            // split into batch-sized groups (same accumulation as before)
+            let mut groups: Vec<Vec<(u64, Arc<Vec<u8>>)>> = Vec::new();
+            let mut cur: Vec<(u64, Arc<Vec<u8>>)> = Vec::new();
+            let mut cur_bytes = 0usize;
+            for (k, arc) in snapshot {
+                let need = 10 + arc.len();
+                if !cur.is_empty() && cur_bytes + need > BATCH_BYTES {
+                    groups.push(std::mem::take(&mut cur));
+                    cur_bytes = 0;
+                }
+                cur_bytes += need;
+                cur.push((k, arc));
+            }
+            if !cur.is_empty() {
+                groups.push(cur);
+            }
+            groups
+                .into_iter()
+                .map(|group| {
+                    let n = group.len();
+                    let mut stream = Vec::with_capacity(BATCH_BYTES + 4096);
+                    for (k, _) in &group {
+                        stream.extend_from_slice(&k.to_le_bytes());
+                    }
+                    for (_, a) in &group {
+                        stream.extend_from_slice(&(a.len() as u16).to_le_bytes());
+                    }
+                    let mut starts = Vec::with_capacity(n);
+                    let mut so = (8 * n + 2 * n) as u32;
+                    let mut keys = Vec::with_capacity(n);
+                    let mut arcs = Vec::with_capacity(n);
+                    for (k, a) in group {
+                        starts.push(so);
+                        stream.extend_from_slice(&a);
+                        so += a.len() as u32;
+                        keys.push(k);
+                        arcs.push(a);
+                    }
+                    BatchJob { keys, arcs, starts, stream: Arc::new(stream) }
+                })
+                .collect()
         };
-        // split into batch-sized groups (same 64 KiB accumulation as before)
-        let mut groups: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
-        let mut cur: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut cur_bytes = 0usize;
-        for (k, bare) in entries {
-            let need = 10 + bare.len();
-            if !cur.is_empty() && cur_bytes + need > BATCH_BYTES {
-                groups.push(std::mem::take(&mut cur));
-                cur_bytes = 0;
+        {
+            let mut q = self.batch_ctl.q.lock();
+            for j in jobs {
+                q.push_back(j);
             }
-            cur_bytes += need;
-            cur.push((k, bare));
+            self.batch_ctl.cv.notify_one();
         }
-        if !cur.is_empty() {
-            groups.push(cur);
-        }
-        for group in groups {
-            let n = group.len();
-            let mut stream = Vec::with_capacity(BATCH_BYTES + 4096);
-            for (k, bare) in &group {
-                stream.extend_from_slice(&k.to_le_bytes());
-            }
-            for (_, bare) in &group {
-                stream.extend_from_slice(&(bare.len() as u16).to_le_bytes());
-            }
-            let mut starts = Vec::with_capacity(n);
-            let mut so = (8 * n + 2 * n) as u32;
-            for (_, bare) in &group {
-                starts.push(so);
-                stream.extend_from_slice(bare);
-                so += bare.len() as u32;
-            }
-            let raw_total = stream.len() as u32;
-            // z6: the recipe flush runs in the WRITE thread's critical path;
-            // z19 there ate ~49% of fresh-import wall time in sync pauses
-            // (measured via SPEED stages-import on the JJ corpus). Container
-            // cost of z6 vs z19 on these streams is a few %; section/BE
-            // payload bytes are re-tiered at the cold level by the pack pass.
-            let (dict_id, comp) = self.compress_tier_level(&stream, self.cfg.recipe_level);
-            debug_assert_eq!(dict_id, 0);
-            let mut body = Vec::with_capacity(13 + comp.len());
-            body.push(9u8);
-            body.extend_from_slice(&(n as u32).to_le_bytes());
-            body.extend_from_slice(&(comp.len() as u32).to_le_bytes());
-            body.extend_from_slice(&raw_total.to_le_bytes());
-            body.extend_from_slice(&comp);
-            let blen = body.len() as u64;
-            let Ok((seg, off, _)) = self.append(&body) else {
-                // put entries back so nothing is lost
-                let mut b = self.recipe_batch.lock();
-                for (k, bare) in group {
-                    b.push(k, bare);
-                }
-                return;
-            };
-            // virtual live accounting: append added 8+blen; the per-entry
-            // scheme accounts Σ(8+rl). Adjust by the difference.
-            let virt: u64 = group.iter().map(|(_, b)| 8 + b.len() as u64).sum();
-            {
-                let mut chunks = self.chunks.write();
-                let mut bidx = self.batch_idx.lock();
-                for (i, (k, bare)) in group.iter().enumerate() {
-                    chunks.insert(*k, (seg, off, BATCHED));
-                    bidx.insert(*k, (off, starts[i], bare.len() as u32));
-                }
-            }
-            if let Some(sg) = self.segs.read().get(&seg) {
-                let phys = 8 + blen;
-                if phys >= virt {
-                    sg.live.fetch_sub(phys - virt, Ordering::Relaxed);
-                } else {
-                    sg.live.fetch_add(virt - phys, Ordering::Relaxed);
+    }
+
+    /// Commit one handed-off batch: compress, append the kind-9 record,
+    /// re-point chunks + batch_idx, retire the pending entries that are
+    /// still the handoff snapshot. Runs on the batcher thread. On an append
+    /// failure the caller re-queues the job — pointer state was never
+    /// touched and the pending entries remain readable, so the retry is
+    /// self-healing.
+    fn commit_batch_job(&self, job: &BatchJob) -> Result<(), String> {
+        let n = job.keys.len();
+        let raw_total = job.stream.len() as u32;
+        // z6: the recipe flush used to run in the WRITE thread's critical
+        // path; z19 there ate ~49% of fresh-import wall time in sync pauses
+        // (measured via SPEED stages-import on the JJ corpus). Container
+        // cost of z6 vs z19 on these streams is a few %; section/BE
+        // payload bytes are re-tiered at the cold level by the pack pass.
+        let (dict_id, comp) =
+            self.compress_tier_level(&job.stream, self.cfg.recipe_level);
+        debug_assert_eq!(dict_id, 0);
+        let mut body = Vec::with_capacity(13 + comp.len());
+        body.push(9u8);
+        body.extend_from_slice(&(n as u32).to_le_bytes());
+        body.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+        body.extend_from_slice(&raw_total.to_le_bytes());
+        body.extend_from_slice(&comp);
+        let blen = body.len() as u64;
+        let (seg, off, _) = self.append(&body).map_err(|e| e.to_string())?;
+        // virtual live accounting: append added 8+blen; the per-entry
+        // scheme accounts Σ(8+rl). Adjust by the difference.
+        let virt: u64 = job.arcs.iter().map(|a| 8 + a.len() as u64).sum();
+        // v0.9.74 contract: pointers are inserted ONLY for keys whose
+        // pending entry is STILL this job's snapshot — decided atomically
+        // under the batch lock together with the retire. A key rewritten
+        // after the snapshot keeps its pending entry (in-place Arc
+        // replace) and is committed by the job carrying the rewrite; the
+        // stale job's record bytes stay on disk as harmless garbage the
+        // next flush supersedes. Without this gate a stale job re-pointed
+        // chunks at the OLD version on top of the writer's newer pending
+        // entry and raced the supersede's ref retirement.
+        let mut live: Vec<(usize, u64)> = Vec::with_capacity(job.keys.len());
+        {
+            let mut b = self.recipe_batch.lock();
+            for (i, (k, a)) in job.keys.iter().zip(&job.arcs).enumerate() {
+                if let Some(cur) = b.get(*k) {
+                    if Arc::ptr_eq(cur, a) {
+                        b.remove(*k);
+                        live.push((i, *k));
+                    }
                 }
             }
         }
+        if !live.is_empty() {
+            let mut chunks = self.chunks.write();
+            let mut bidx = self.batch_idx.lock();
+            for (i, k) in &live {
+                chunks.insert(*k, (seg, off, BATCHED));
+                bidx.insert(*k, (off, job.starts[*i], job.arcs[*i].len() as u32));
+            }
+        }
+        if let Some(sg) = self.segs.read().get(&seg) {
+            let phys = 8 + blen;
+            if phys >= virt {
+                sg.live.fetch_sub(phys - virt, Ordering::Relaxed);
+            } else {
+                sg.live.fetch_add(virt - phys, Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 
     fn writer_seg_id(&self) -> Option<u32> {
@@ -2977,20 +3247,25 @@ impl Store {
         if w.buf.is_empty() {
             return;
         }
-        let off = {
-            let ctl = &self.flush_ctl;
-            let q = ctl.q.lock();
-            match q.back() {
-                // entries land in order, so the back's end is stable until
-                // everything before it has landed
-                Some(b) => b.off + b.data.len() as u64,
-                // queue empty means nothing in flight: `flushed` cannot move
-                // (the flusher only advances it on queued entries)
-                None => ctl.flushed.load(Ordering::Acquire),
-            }
-        };
+        // the offset comes from the handed_to boundary — the inflight
+        // (popped, still-writing) job's range is ALREADY consumed there
+        let off = self.flush_ctl.handed_to.load(Ordering::Acquire);
+        let fd = w.file.try_clone();
+        if let Err(e) = fd {
+            // no fd clone (fd exhaustion) — write inline like 0.9.71 did;
+            // the buffer content stays ours until it is on disk
+            eprintln!("[c-saves] flusher fd clone failed ({e}) — writing inline");
+            let _ = w.file.write_all(&w.buf);
+            w.buf.clear();
+            return;
+        }
         let data = Arc::new(std::mem::replace(&mut w.buf, self.take_free_buf()));
-        self.flush_ctl.q.lock().push_back(Handoff { seg: w.seg_id, off, data });
+        let dlen = data.len() as u64;
+        self.flush_ctl
+            .q
+            .lock()
+            .push_back(Handoff { seg: w.seg_id, off, data, fd: fd.unwrap() });
+        self.flush_ctl.handed_to.store(off + dlen, Ordering::Release);
         self.flush_ctl.cv.notify_one();
     }
 
@@ -3138,6 +3413,7 @@ impl Store {
             // first buffers off at the WRONG offset (a hole of zeros over
             // the segment head; seal() detaches without resetting it)
             self.flush_ctl.flushed.store(0, Ordering::Release);
+            self.flush_ctl.handed_to.store(0, Ordering::Release);
             *wg = Some(Writer { file, seg_id: id, written: 0, buf: Vec::with_capacity(BUF_CAP) });
         }
         let w = wg.as_mut().unwrap();
@@ -3163,6 +3439,7 @@ impl Store {
             self.drain_flusher(target);
             let _ = w.file.sync_data();
             self.flush_ctl.flushed.store(0, Ordering::Release);
+            self.flush_ctl.handed_to.store(0, Ordering::Release);
             let id = self.next_seg.fetch_add(1, Ordering::SeqCst) as u32;
             let file = self.new_seg(id)?;
             w.file = file;
@@ -4108,7 +4385,9 @@ impl Store {
             let total = batch.bytes;
             drop(batch);
             if total >= 192 * 1024 {
-                self.flush_recipe_batch();
+                // v0.9.72: the compression runs on the batcher thread — the
+                // write path only snapshots + hands off (microseconds)
+                self.flush_recipe_batch_async();
             }
         }
         if let Some((oseg, ooff, olen, old_rec, rl)) = old_committed {
@@ -4153,7 +4432,7 @@ impl Store {
     pub fn chunk_intact(&self, key: u64) -> bool {
         enum Loc {
             Seg(u32, u64, u32),
-            Pending(Vec<u8>),
+            Pending(Arc<Vec<u8>>),
         }
         // pending batch first (read-your-writes — see read_chunk)
         let hashes: Option<Arc<Vec<Hash>>> =
@@ -4270,7 +4549,7 @@ impl Store {
         // located in a segment, or still pending in the recipe batch?
         enum Loc {
             Seg(u32, u64, u32),
-            Pending(Vec<u8>),
+            Pending(Arc<Vec<u8>>),
         }
         // READ-YOUR-WRITES: the pending batch wins over the committed
         // chunks-map entry. A rewrite of a BATCHED chunk removes its batch_idx
@@ -7115,10 +7394,44 @@ pub mod tests {
         assert_eq!(st.chunk_count(), 25);
         assert!(st.read_chunk(key(30, 0)).is_some());
         assert!(st.read_chunk(key(0, 0)).is_none());
+        // v0.9.74: sync is the durability point under parallel test load —
+        // the batcher + flusher are async by design and this test's
+        // contract is delete+dedup correctness across a reopen, not
+        // drop-timing (drop durability is pinned by the single-threaded
+        // drop_durable_without_sync below)
+        st.sync();
         drop(st);
         let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
         assert_eq!(st2.chunk_count(), 25);
         assert!(st2.read_chunk(key(30, 0)).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_durable_without_sync() {
+        // v0.9.74: a graceful close with NO explicit sync must be durable —
+        // Store::drop drains the batcher (stop -> exited -> inline FIFO
+        // commit) and the flusher (flush_writer -> drain). Single-threaded:
+        // deterministic, no parallel-load timing.
+        let dir = temp_dir("drop-durable");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        s.set_whole_mode();
+        let mut payloads = Vec::new();
+        for i in 0..40u64 {
+            let (cx, cz) = ((i % 8) as i32 - 4, (i / 8) as i32 - 2);
+            let p = chunk_payload(cx, cz, i);
+            s.write_chunk_fresh(key(cx, cz), &p, true, false).unwrap();
+            payloads.push((cx, cz, p));
+        }
+        drop(s);
+        let s2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for (cx, cz, p) in &payloads {
+            assert_eq!(
+                s2.read_chunk(key(*cx, *cz)).as_deref(),
+                Some(p.as_slice()),
+                "drop-without-sync read of ({cx},{cz}) must be byte-exact"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
