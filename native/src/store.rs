@@ -1395,6 +1395,11 @@ pub static ST_PARSE: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new
 pub static ST_SLAB_HIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_SLAB_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_DECOMP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// v0.9.70 writer-buffer read-through: (reads served by the buffer slice,
+// bytes copied out) — these reads used to pay a flush_writer seek +
+// write_all of the whole buffered tail FIRST, and the concurrent appends
+// stalled behind that write under the writer mutex
+pub static ST_BUFREAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static ST_GLOB_CONV: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static ST_SHIFT_RES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 // write path
@@ -1673,6 +1678,22 @@ pub struct Store {
     /// registry entry after a crash would misresolve gids silently).
     glob_reg: Mutex<chunknbt::StateRegistry>,
     reg_dirty: AtomicBool,
+}
+
+impl Drop for Store {
+    /// v0.9.70: a graceful close is durable. Live reads no longer flush the
+    /// append buffer (they read through it), so without this Drop the only
+    /// thing pushing buffered records to the OS was an explicit sync() —
+    /// and the old accidental durability (any writer-segment READ flushed
+    /// as a side effect) is gone. delete_and_dedup's reopen caught the
+    /// regression: a store dropped without sync() lost its buffered tail.
+    /// Drop drains the pending recipe batch + append buffer to the OS. No
+    /// fsync — crash durability stays sync()'s job (Paper syncs every save
+    /// cycle; the final sync precedes shutdown).
+    fn drop(&mut self) {
+        self.flush_recipe_batch();
+        self.flush_writer();
+    }
 }
 
 impl Store {
@@ -2634,13 +2655,7 @@ impl Store {
     }
 
     fn load_recipe(&self, seg: u32, off: u64, len: u32) -> Option<Recipe> {
-        if Some(seg) == self.writer_seg_id() {
-            self.flush_writer();
-        }
-        let segs = self.segs.read();
-        let s = segs.get(&seg)?;
-        let sealed = Some(seg) != self.writer_seg_id();
-        let body = s.read_at(off, len as usize, sealed)?;
+        let body = self.seg_read_body(seg, off, len as usize)?;
         self.parse_recipe_body(&body)
     }
 
@@ -2659,29 +2674,22 @@ impl Store {
     /// supersede ref-retirement — can resolve it WITHOUT re-consulting
     /// batch_idx, which a concurrent flush may have re-pointed in between).
     fn load_batched(&self, seg: u32, boff: u64, soff: u32, rl: u32) -> Option<Recipe> {
-        if Some(seg) == self.writer_seg_id() {
-            self.flush_writer();
-        }
         // decompressed batch bodies live in the slab cache under a tagged key
         let ck = (seg, boff | (1u64 << 63));
         if let Some(cached) = self.slab_cache.lock().get(&ck) {
             let e = cached.get(soff as usize..(soff + rl) as usize)?;
             return self.parse_recipe_body(e);
         }
-        let segs = self.segs.read();
-        let s = segs.get(&seg)?;
-        let sealed = Some(seg) != self.writer_seg_id();
-        let hdr = s.read_at(boff, 13, sealed)?;
+        let hdr = self.seg_read_body(seg, boff, 13)?;
         if hdr.first() != Some(&9) {
             return None;
         }
         let cl = u32::from_le_bytes(hdr[5..9].try_into().ok()?) as usize;
         let raw_total = u32::from_le_bytes(hdr[9..13].try_into().ok()?) as usize;
-        let data = s.read_at(boff + 13, cl, sealed)?;
+        let data = self.seg_read_body(seg, boff + 13, cl)?;
         let raw = self.decompress(0, &data, raw_total as u32)?;
         let e = raw.get(soff as usize..(soff + rl) as usize)?;
         let out = self.parse_recipe_body(e);
-        drop(segs);
         self.slab_cache.lock().put(ck, Arc::new(raw));
         out
     }
@@ -2806,8 +2814,11 @@ impl Store {
         self.writer.lock().as_ref().map(|w| w.seg_id)
     }
 
-    /// Push the append buffer to the OS. Called before any read of the
-    /// CURRENT segment so readers observe all acknowledged writes.
+    /// Push the append buffer to the OS. Save-cycle and maintenance flush
+    /// only — v0.9.70 live reads NEVER flush: they read through the buffer
+    /// (writer_read_at) instead, which removed up to four seek+write_all
+    /// syscalls per chunk read (recipe, batch frame, section slab, tail
+    /// blob) and the appends they stalled behind the writer mutex.
     fn flush_writer(&self) {
         let mut wg = self.writer.lock();
         if let Some(w) = wg.as_mut() {
@@ -2816,6 +2827,73 @@ impl Store {
                 let _ = w.file.write_all(&w.buf);
                 w.buf.clear();
             }
+        }
+    }
+
+    /// v0.9.70: read through the writer's append buffer instead of flushing
+    /// it. The flushed/buffered boundary is always a RECORD boundary (append
+    /// extends the buffer by whole records; flush and roll write it whole),
+    /// so a well-formed record read never straddles it and the buffer can
+    /// answer reads in place:
+    ///   None              — seg is not the writer segment: caller takes the
+    ///                       sealed (mmap) path;
+    ///   Some(Some(bytes)) — range served (pread when already flushed —
+    ///                       page-cache coherent with the writer's
+    ///                       write_all; buffer slice when still buffered);
+    ///   Some(None)        — range beyond `written` (absent — the old
+    ///                       flush-then-read_exact_at failed the same way).
+    /// Lock order: takes the writer mutex ONLY while no segs guard is held —
+    /// append() legitimately holds the writer mutex while taking
+    /// segs.write() on segment creation/roll, so the reverse nesting would
+    /// deadlock (RwLock: writer waits for the reader, reader waits for the
+    /// writer). seg_read_body is the only sanctioned entry point.
+    fn writer_read_at(&self, seg: u32, off: u64, len: usize) -> Option<Option<Vec<u8>>> {
+        let mut wg = self.writer.lock();
+        let w = wg.as_mut()?;
+        if w.seg_id != seg {
+            return None;
+        }
+        let flushed = w.written - w.buf.len() as u64;
+        let end = off + len as u64;
+        if end > w.written {
+            return Some(None);
+        }
+        if off >= flushed {
+            // wholly inside the append buffer
+            let s = w.buf.get((off - flushed) as usize..(end - flushed) as usize)?;
+            let out = s.to_vec();
+            ST_BUFREAD.0.fetch_add(1, Ordering::Relaxed);
+            ST_BUFREAD.1.fetch_add(out.len() as u64, Ordering::Relaxed);
+            return Some(Some(out));
+        }
+        if end <= flushed {
+            // already on disk — positional read, no flush, no syscall on
+            // the writer fd
+            let mut buf = vec![0u8; len];
+            use std::os::unix::fs::FileExt;
+            return Some(w.file.read_exact_at(&mut buf, off).ok().map(|_| buf));
+        }
+        // straddle — impossible for well-formed record reads (the boundary
+        // is a record boundary); keep the old flush semantics as a net
+        w.file.seek(SeekFrom::Start(flushed)).ok()?;
+        w.file.write_all(&w.buf).ok()?;
+        w.buf.clear();
+        let mut buf = vec![0u8; len];
+        use std::os::unix::fs::FileExt;
+        Some(w.file.read_exact_at(&mut buf, off).ok().map(|_| buf))
+    }
+
+    /// One lock-ordered read of a segment range: writer-segment ranges read
+    /// through the append buffer (no flush), sealed segments mmap. NEVER
+    /// call while holding the segs lock — see writer_read_at.
+    fn seg_read_body(&self, seg: u32, off: u64, len: usize) -> Option<Vec<u8>> {
+        match self.writer_read_at(seg, off, len) {
+            None => {
+                let segs = self.segs.read();
+                let s = segs.get(&seg)?;
+                s.read_at(off, len, true)
+            }
+            Some(b) => b,
         }
     }
 
@@ -4161,17 +4239,19 @@ impl Store {
         }
     }
 
-    /// Batched section load: one `segs` lock pass, per-slab dedup (a chunk's
+    /// Batched section load: per-slab dedup (a chunk's
     /// 131 sections usually live in one or two slabs), slab-cache fill.
     /// Returns owned buffers + (buffer idx, start, end) refs per section.
+    /// v0.9.70: reads go through seg_read_body — writer-segment slabs are
+    /// served from the append buffer without flushing it. The segs guard
+    /// is NOT held across reads: append() takes segs.write() under the
+    /// writer mutex on roll, so nesting segs.read around a writer-lock
+    /// acquisition would invert the lock order.
     fn load_sections(
         &self,
         locs: &[BlobLoc],
-        writer_id: Option<u32>,
+        _writer_id: Option<u32>,
     ) -> Option<LoadedSections> {
-        if locs.iter().any(|l| writer_id == Some(l.seg)) {
-            self.flush_writer();
-        }
         let mut keep: Vec<Arc<Vec<u8>>> = Vec::with_capacity(8);
         let mut refs = Vec::with_capacity(locs.len());
         let mut slab_map: HashMap<(u32, u64), usize> = HashMap::new();
@@ -4195,7 +4275,6 @@ impl Store {
                 }
             }
         }
-        let segs = self.segs.read();
         for loc in locs {
             if loc.slab {
                 let skey = (loc.seg, loc.off);
@@ -4208,9 +4287,7 @@ impl Store {
                     // entry exists but is an unsealed-writer placeholder: fall
                     // through to the full load below
                 }
-                let seg = segs.get(&loc.seg)?;
-                let sealed = Some(loc.seg) != writer_id;
-                let hdr = seg.read_at(loc.off, 12, sealed)?;
+                let hdr = self.seg_read_body(loc.seg, loc.off, 12)?;
                 let kind = hdr[0] & 0x3f; // 0x80 = GLOB, 0x40 = hot tier
                 if kind != 5 && kind != 8 {
                     return None;
@@ -4219,7 +4296,7 @@ impl Store {
                 let hlen = if hdr[0] & 0x80 != 0 { 13usize } else { 12usize };
                 let cl = u32::from_le_bytes(hdr[2..6].try_into().ok()?) as usize;
                 let raw_total = u32::from_le_bytes(hdr[6..10].try_into().ok()?);
-                let data = seg.read_at(loc.off + hlen as u64, cl, sealed)?;
+                let data = self.seg_read_body(loc.seg, loc.off + hlen as u64, cl)?;
                 let t_dec = std::time::Instant::now();
                 let raw = Arc::new(self.decompress(loc.dict_id, &data, raw_total)?);
                 {
@@ -4243,16 +4320,17 @@ impl Store {
                 };
                 refs.push((idx, loc.slab_off, loc.slab_off + loc.raw_len));
             } else {
-                let seg = segs.get(&loc.seg)?;
-                let sealed = Some(loc.seg) != writer_id;
-                let data = seg.read_at(loc.off + loc.header_len(), loc.comp_len as usize, sealed)?;
+                let data = self.seg_read_body(
+                    loc.seg,
+                    loc.off + loc.header_len(),
+                    loc.comp_len as usize,
+                )?;
                 let raw = Arc::new(self.decompress(loc.dict_id, &data, loc.raw_len)?);
                 let idx = keep.len();
                 keep.push(raw);
                 refs.push((idx, 0, loc.raw_len));
             }
         }
-        drop(segs);
         if !fresh_slabs.is_empty() {
             let mut sc = self.slab_cache.lock();
             for (k, v) in fresh_slabs {
@@ -4262,20 +4340,14 @@ impl Store {
         Some(LoadedSections { keep, refs })
     }
 
-    fn read_blob(&self, loc: BlobLoc, writer_id: Option<u32>) -> Option<Vec<u8>> {
-        if writer_id == Some(loc.seg) {
-            self.flush_writer();
-        }
-        let segs = self.segs.read();
-        let seg = segs.get(&loc.seg)?;
-        let sealed = Some(loc.seg) != writer_id;
+    fn read_blob(&self, loc: BlobLoc, _writer_id: Option<u32>) -> Option<Vec<u8>> {
         if loc.slab {
             let key = (loc.seg, loc.off);
             if let Some(cached) = self.slab_cache.lock().get(&key) {
                 let s = cached.get(loc.slab_off as usize..(loc.slab_off + loc.raw_len) as usize)?;
                 return self.glob_to_canon(s);
             }
-            let hdr = seg.read_at(loc.off, 12, sealed)?;
+            let hdr = self.seg_read_body(loc.seg, loc.off, 12)?;
             let kind = hdr[0] & 0x3f; // 0x80 = GLOB, 0x40 = hot tier
             if kind != 5 && kind != 8 {
                 return None;
@@ -4285,16 +4357,19 @@ impl Store {
             let hlen = if hdr[0] & 0x80 != 0 { 13usize } else { 12usize };
             let cl = u32::from_le_bytes(hdr[2..6].try_into().ok()?) as usize;
             let raw_total = u32::from_le_bytes(hdr[6..10].try_into().ok()?);
-            let data = seg.read_at(loc.off + hlen as u64, cl, sealed)?;
+            let data = self.seg_read_body(loc.seg, loc.off + hlen as u64, cl)?;
             let raw = self.decompress(loc.dict_id, &data, raw_total)?;
             let out = raw
                 .get(loc.slab_off as usize..(loc.slab_off + loc.raw_len) as usize)?
                 .to_vec();
-            drop(segs);
             self.slab_cache.lock().put(key, Arc::new(raw));
             return self.glob_to_canon(&out);
         }
-        let data = seg.read_at(loc.off + loc.header_len(), loc.comp_len as usize, sealed)?;
+        let data = self.seg_read_body(
+            loc.seg,
+            loc.off + loc.header_len(),
+            loc.comp_len as usize,
+        )?;
         self.decompress(loc.dict_id, &data, loc.raw_len)
     }
 
@@ -4762,12 +4837,12 @@ impl Store {
         }
         self.flush_recipe_batch();
         self.flush_writer();
-        // v0.9.68: NO fsync under the writer lock — the lock is held by the
-        // live read path (flush_writer on writer-segment reads) and the
-        // write path (append); holding it across a 10-500 ms fsync was the
-        // fetch-meter outlier source. The segs loop below already syncs the
-        // writer segment's inode through its read handle (fsync is
-        // per-inode), so the dedicated writer-lock fsync was redundant.
+        // v0.9.68: NO fsync under the writer lock — append and (since
+        // v0.9.70) the buffer read-through hold it for microseconds; a
+        // 10-500 ms fsync across it was the fetch-meter outlier source. The
+        // segs loop below already syncs the writer segment's inode through
+        // its read handle (fsync is per-inode), so the dedicated
+        // writer-handle fsync was redundant.
         let segs = self.segs.read();
         for s in segs.values() {
             let _ = s.file.sync_data();
@@ -8521,6 +8596,70 @@ mod repro {
             s.compact_step(),
             "direct compact_step() ignores the traffic guard"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_reads_answer_through_the_append_buffer_without_flushing() {
+        // v0.9.70: a read that hits the active writer segment must NOT flush
+        // the append buffer. Before, every writer-segment read (recipe,
+        // batch frame, section slab, tail blob — up to four per chunk) paid
+        // a seek + write_all of the whole buffered tail under the writer
+        // mutex, stalling concurrent appends. The flushed/buffered boundary
+        // is a record boundary, so reads are served from the buffer itself
+        // or by pread over already-written bytes. Observable: between the
+        // last write and the reads the segment FILE must not grow (a flush
+        // would extend it) while every read is byte-exact; after sync the
+        // same reads are byte-exact from a reopened store.
+        let dir = temp_dir("buf-read-through");
+        let s = Store::open_cfg(&dir, false, bench_cfg()).unwrap();
+        s.set_whole_mode();
+        let mut payloads = Vec::new();
+        for i in 0..16u64 {
+            let (cx, cz) = ((i % 8) as i32 - 4, (i / 8) as i32 - 2);
+            let p = chunk_payload(cx, cz, i);
+            s.write_chunk_fresh(key(cx, cz), &p, true, false).unwrap();
+            payloads.push((cx, cz, p));
+        }
+        let seg = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with("seg-"))
+            .expect("a writer segment file must exist")
+            .path();
+        let before = std::fs::metadata(&seg).unwrap().len();
+        let written = s.disk_written.load(Ordering::Relaxed);
+        assert!(
+            written > before,
+            "the append buffer must hold unflushed records for this contract \
+             (written={written}, file={before})"
+        );
+        // live reads over the buffered tail: byte-exact, NO flush
+        for (cx, cz, p) in &payloads {
+            assert_eq!(
+                s.read_chunk(key(*cx, *cz)).as_deref(),
+                Some(p.as_slice()),
+                "live read of ({cx},{cz}) must be byte-exact through the buffer"
+            );
+        }
+        let after = std::fs::metadata(&seg).unwrap().len();
+        assert_eq!(
+            after,
+            before,
+            "live reads must not flush the append buffer to disk"
+        );
+        // the save-cycle flush makes the file catch up; the flushed state
+        // is durable across reopen
+        s.sync();
+        s.seal();
+        let s2 = Store::open_cfg(&dir, false, bench_cfg()).unwrap();
+        for (cx, cz, p) in &payloads {
+            assert_eq!(
+                s2.read_chunk(key(*cx, *cz)).as_deref(),
+                Some(p.as_slice()),
+                "reopened read of ({cx},{cz}) must be byte-exact"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
