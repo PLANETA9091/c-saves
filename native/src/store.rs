@@ -31,7 +31,7 @@
 use crate::chunknbt::{self, Hash, Split};
 use crc32fast::Hasher as Crc;
 use memmap2::Mmap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -731,6 +731,119 @@ struct Writer {
     seg_id: u32,
     written: u64,
     buf: Vec<u8>,
+}
+
+// ---- v0.9.71: the flusher thread — no disk write ever holds the writer
+// mutex ---------------------------------------------------------------
+
+/// A full append buffer handed to the flusher. `off` is the disk offset the
+/// buffer starts at; the data is immutable once handed off (readers slice it
+/// in place — read-your-writes survives the handoff).
+struct Handoff {
+    seg: u32,
+    off: u64,
+    data: Arc<Vec<u8>>,
+}
+
+/// The handoff queue + its writer thread. append() hands full buffers off
+/// under the writer mutex WITHOUT waiting; the flusher does the disk write
+/// on its own fd, outside every lock. Readers resolve ranges through
+/// (flushed, queue, active buffer) in writer_read_at; sync/seal/roll drain
+/// under the writer mutex (the flusher never takes that mutex, so the wait
+/// cannot deadlock). The front entry STAYS in the queue while it is being
+/// written — a reader either slices it or preads over landed bytes; the
+/// boundary is `flushed`, updated only after a write completes.
+struct FlushCtl {
+    /// unwritten buffers, append order. Roll drains before detaching, so
+    /// every entry always belongs to the CURRENT writer segment.
+    q: Mutex<VecDeque<Handoff>>,
+    /// signaled after every landed write, on every push, and on stop
+    cv: Condvar,
+    /// disk position the flusher has written up to (current segment)
+    flushed: AtomicU64,
+    stop: AtomicBool,
+    /// drained buffers come back here — append reuses them, zero
+    /// steady-state allocation (bounded: at most 4 × 1 MiB parked)
+    free: Mutex<Vec<Arc<Vec<u8>>>>,
+    /// the flusher's own write fd, cached per segment (the writer's fd and
+    /// the segs read handles are never touched by the flusher)
+    wfd: Mutex<(u32, Option<File>)>,
+}
+
+impl FlushCtl {
+    fn new() -> Self {
+        FlushCtl {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            flushed: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            free: Mutex::new(Vec::new()),
+            wfd: Mutex::new((u32::MAX, None)),
+        }
+    }
+}
+
+/// The flusher body: pop the front entry, write it on a private fd, land it
+/// (flushed += len, recycle, notify). Write errors retry forever with a
+/// loud log — queued bytes must land, the drain sites (sync/seal/roll) hang
+/// otherwise exactly as an inline write_all error used to fail the append.
+fn flusher_loop(dir: PathBuf, ctl: Arc<FlushCtl>) {
+    loop {
+        let (seg, off, data) = {
+            let mut q = ctl.q.lock();
+            ctl.cv.wait_while(&mut q, |qd| {
+                qd.front().is_none() && !ctl.stop.load(Ordering::Acquire)
+            });
+            match q.front() {
+                Some(h) => (h.seg, h.off, h.data.clone()),
+                // stop stamped and queue drained
+                None => return,
+            }
+        };
+        let len = data.len() as u64;
+        loop {
+            let ok = {
+                let mut wfd = ctl.wfd.lock();
+                if wfd.0 != seg {
+                    *wfd = (
+                        seg,
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(dir.join(format!("seg-{seg:05}.log")))
+                            .ok(),
+                    );
+                }
+                match wfd.1.as_mut() {
+                    Some(f) => {
+                        use std::io::{Seek, Write};
+                        f.seek(SeekFrom::Start(off)).is_ok()
+                            && f.write_all(&data).is_ok()
+                    }
+                    None => false,
+                }
+            };
+            if ok {
+                break;
+            }
+            eprintln!(
+                "[c-saves] flusher: seg-{seg:05} write failed (off={off}, {len} B) — retrying"
+            );
+            if ctl.stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        {
+            let mut q = ctl.q.lock();
+            q.pop_front();
+            ctl.flushed.store(off + len, Ordering::Release);
+            let mut free = ctl.free.lock();
+            if free.len() < 4 {
+                free.push(data);
+            }
+            ctl.cv.notify_all();
+        }
+    }
 }
 
 // ------------------------------------------------------------- recipe -----
@@ -1563,7 +1676,11 @@ pub struct Store {
     /// len=BATCHED for these keys; (record body off, stream off, entry len)
     /// lives here. Rebuilt by scan on reopen.
     batch_idx: Mutex<HashMap<u64, (u64, u32, u32)>>,
+    /// active append state — v0.9.71: `buf` is handed to the flusher thread
+    /// at BUF_CAP; no disk write ever runs under this mutex
     writer: Mutex<Option<Writer>>,
+    /// the flusher queue + thread control (see FlushCtl)
+    flush_ctl: Arc<FlushCtl>,
     next_seg: AtomicU64,
     next_blob_id: AtomicU64,
     dicts: RwLock<HashMap<u8, Arc<Vec<u8>>>>,
@@ -1687,12 +1804,16 @@ impl Drop for Store {
     /// and the old accidental durability (any writer-segment READ flushed
     /// as a side effect) is gone. delete_and_dedup's reopen caught the
     /// regression: a store dropped without sync() lost its buffered tail.
-    /// Drop drains the pending recipe batch + append buffer to the OS. No
-    /// fsync — crash durability stays sync()'s job (Paper syncs every save
-    /// cycle; the final sync precedes shutdown).
+    /// v0.9.71: the drop also drains the flusher thread and stamps stop —
+    /// the thread owns nothing but its FlushCtl, so it neither leaks the
+    /// store nor touches a closed dir after this point. No fsync — crash
+    /// durability stays sync()'s job (Paper syncs every save cycle; the
+    /// final sync precedes shutdown).
     fn drop(&mut self) {
         self.flush_recipe_batch();
         self.flush_writer();
+        self.flush_ctl.stop.store(true, Ordering::Release);
+        self.flush_ctl.cv.notify_all();
     }
 }
 
@@ -1719,6 +1840,7 @@ impl Store {
             recipe_batch: Mutex::new(RecipeBatch::default()),
             batch_idx: Mutex::new(HashMap::new()),
             writer: Mutex::new(None),
+            flush_ctl: Arc::new(FlushCtl::new()),
             slab_cache: Mutex::new(SlabCache::new(32 * 1024 * 1024)),
             canon_cache: Mutex::new(CanonCache::new(16 * 1024 * 1024)),
             next_seg: AtomicU64::new(0),
@@ -1761,6 +1883,23 @@ impl Store {
         st.load_glob_reg();
         st.scan()?;
         st.load_pristine_regions();
+        // v0.9.71: the flusher thread — one per store, owns only its FlushCtl
+        // (never the store), exits when Drop drains + stamps stop
+        {
+            let ctl = st.flush_ctl.clone();
+            let dir = st.dir.clone();
+            if std::thread::Builder::new()
+                .name("csaves-flush".into())
+                .spawn(move || flusher_loop(dir, ctl))
+                .is_err()
+            {
+                eprintln!("[c-saves] flusher thread spawn failed — falling back is impossible, aborting open");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "flusher thread spawn failed",
+                ));
+            }
+        }
         Ok(st)
     }
 
@@ -2814,32 +2953,106 @@ impl Store {
         self.writer.lock().as_ref().map(|w| w.seg_id)
     }
 
-    /// Push the append buffer to the OS. Save-cycle and maintenance flush
-    /// only — v0.9.70 live reads NEVER flush: they read through the buffer
-    /// (writer_read_at) instead, which removed up to four seek+write_all
-    /// syscalls per chunk read (recipe, batch frame, section slab, tail
-    /// blob) and the appends they stalled behind the writer mutex.
+    /// Push the append buffer to the flusher and wait for every appended
+    /// byte to land on disk. Save-cycle and maintenance flush only —
+    /// v0.9.70 live reads NEVER flush (they read through the buffer and the
+    /// handoff queue); v0.9.71 even the flush sites no longer write inline:
+    /// the buffer goes to the flusher thread and this thread only WAITS (the
+    /// flusher never takes the writer mutex, so the wait cannot deadlock).
     fn flush_writer(&self) {
         let mut wg = self.writer.lock();
         if let Some(w) = wg.as_mut() {
-            if !w.buf.is_empty() {
-                let _ = w.file.seek(SeekFrom::Start(w.written - w.buf.len() as u64));
-                let _ = w.file.write_all(&w.buf);
-                w.buf.clear();
-            }
+            self.hand_off_buffer(w);
+            let target = w.written;
+            self.drain_flusher(target);
         }
     }
 
-    /// v0.9.70: read through the writer's append buffer instead of flushing
-    /// it. The flushed/buffered boundary is always a RECORD boundary (append
-    /// extends the buffer by whole records; flush and roll write it whole),
-    /// so a well-formed record read never straddles it and the buffer can
-    /// answer reads in place:
+    /// Hand the active buffer to the flusher (BUF_CAP crossing + drain
+    /// sites). The writer mutex covers only the queue push; the flusher does
+    /// the disk write on its own fd. The replacement buffer comes from the
+    /// free list — zero steady-state allocation. Called ONLY under the
+    /// writer mutex.
+    fn hand_off_buffer(&self, w: &mut Writer) {
+        if w.buf.is_empty() {
+            return;
+        }
+        let off = {
+            let ctl = &self.flush_ctl;
+            let q = ctl.q.lock();
+            match q.back() {
+                // entries land in order, so the back's end is stable until
+                // everything before it has landed
+                Some(b) => b.off + b.data.len() as u64,
+                // queue empty means nothing in flight: `flushed` cannot move
+                // (the flusher only advances it on queued entries)
+                None => ctl.flushed.load(Ordering::Acquire),
+            }
+        };
+        let data = Arc::new(std::mem::replace(&mut w.buf, self.take_free_buf()));
+        self.flush_ctl.q.lock().push_back(Handoff { seg: w.seg_id, off, data });
+        self.flush_ctl.cv.notify_one();
+    }
+
+    fn take_free_buf(&self) -> Vec<u8> {
+        let mut free = self.flush_ctl.free.lock();
+        if let Some(a) = free.pop() {
+            if let Ok(mut v) = Arc::try_unwrap(a) {
+                v.clear();
+                return v;
+            }
+        }
+        Vec::with_capacity(BUF_CAP)
+    }
+
+    /// Wait until every appended byte up to `target` (a disk position of the
+    /// current segment) has landed. Called under the writer mutex; the
+    /// flusher never takes that mutex, so the wait cannot deadlock. The 1 s
+    /// timeout only breaks a lost wakeup — write errors retry inside the
+    /// flusher forever (loud), the drain cannot spin past a real failure.
+    fn drain_flusher(&self, target: u64) {
+        let mut q = self.flush_ctl.q.lock();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let pending = self.flush_ctl.flushed.load(Ordering::Acquire) < target
+                || !q.is_empty();
+            if !pending {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                eprintln!(
+                    "[c-saves] flusher drain stuck: flushed={} target={} queued={}",
+                    self.flush_ctl.flushed.load(Ordering::Relaxed),
+                    target,
+                    q.len()
+                );
+                return;
+            }
+            // the 1 s timeout only breaks a lost wakeup — write errors retry
+            // inside the flusher forever (loud), the drain cannot spin past
+            // a real failure
+            self.flush_ctl.cv.wait_while_for(
+                &mut q,
+                |qd| {
+                    self.flush_ctl.flushed.load(Ordering::Acquire) < target
+                        || !qd.is_empty()
+                },
+                std::time::Duration::from_millis(1000),
+            );
+        }
+    }
+
+    /// v0.9.70/71: read through the writer's append state instead of
+    /// flushing it. Three zones between `flushed` (disk truth, advanced only
+    /// by the flusher thread after a write completes) and `written` (logical
+    /// append position): the handoff queue covers [flushed, buf_start), the
+    /// active buffer covers [buf_start, written). Record-aligned reads never
+    /// straddle zones (append extends buffers by whole records; handoff and
+    /// roll swap them whole), so:
     ///   None              — seg is not the writer segment: caller takes the
     ///                       sealed (mmap) path;
-    ///   Some(Some(bytes)) — range served (pread when already flushed —
-    ///                       page-cache coherent with the writer's
-    ///                       write_all; buffer slice when still buffered);
+    ///   Some(Some(bytes)) — range served (pread when landed — page-cache
+    ///                       coherent; queue or buffer slice otherwise);
     ///   Some(None)        — range beyond `written` (absent — the old
     ///                       flush-then-read_exact_at failed the same way).
     /// Lock order: takes the writer mutex ONLY while no segs guard is held —
@@ -2853,31 +3066,48 @@ impl Store {
         if w.seg_id != seg {
             return None;
         }
-        let flushed = w.written - w.buf.len() as u64;
         let end = off + len as u64;
         if end > w.written {
             return Some(None);
         }
-        if off >= flushed {
-            // wholly inside the append buffer
-            let s = w.buf.get((off - flushed) as usize..(end - flushed) as usize)?;
+        let buf_start = w.written - w.buf.len() as u64;
+        if off >= buf_start {
+            // wholly inside the active append buffer
+            let s = w.buf.get((off - buf_start) as usize..(end - buf_start) as usize)?;
             let out = s.to_vec();
             ST_BUFREAD.0.fetch_add(1, Ordering::Relaxed);
             ST_BUFREAD.1.fetch_add(out.len() as u64, Ordering::Relaxed);
             return Some(Some(out));
         }
+        let flushed = self.flush_ctl.flushed.load(Ordering::Acquire);
         if end <= flushed {
-            // already on disk — positional read, no flush, no syscall on
-            // the writer fd
+            // landed — positional read on the writer fd (page-cache
+            // coherent with the flusher's write_all), no flush, no stall
             let mut buf = vec![0u8; len];
             use std::os::unix::fs::FileExt;
             return Some(w.file.read_exact_at(&mut buf, off).ok().map(|_| buf));
         }
+        // still queued: slice it from its handoff buffer (immutable once
+        // handed off; the front entry stays in the queue while the flusher
+        // writes it, so the slice is valid for the whole window)
+        {
+            let q = self.flush_ctl.q.lock();
+            for h in q.iter() {
+                let he = h.off + h.data.len() as u64;
+                if off >= h.off && end <= he {
+                    let a = (off - h.off) as usize;
+                    let b = (end - h.off) as usize;
+                    let out = h.data[a..b].to_vec();
+                    ST_BUFREAD.0.fetch_add(1, Ordering::Relaxed);
+                    ST_BUFREAD.1.fetch_add(out.len() as u64, Ordering::Relaxed);
+                    return Some(Some(out));
+                }
+            }
+        }
         // straddle — impossible for well-formed record reads (the boundary
-        // is a record boundary); keep the old flush semantics as a net
-        w.file.seek(SeekFrom::Start(flushed)).ok()?;
-        w.file.write_all(&w.buf).ok()?;
-        w.buf.clear();
+        // is a record boundary); wait for the flusher to land everything,
+        // then pread (holds the writer mutex; the flusher never needs it)
+        self.drain_flusher(w.written);
         let mut buf = vec![0u8; len];
         use std::os::unix::fs::FileExt;
         Some(w.file.read_exact_at(&mut buf, off).ok().map(|_| buf))
@@ -2903,6 +3133,11 @@ impl Store {
         if wg.is_none() {
             let id = self.next_seg.fetch_add(1, Ordering::SeqCst) as u32;
             let file = self.new_seg(id)?;
+            // v0.9.71: the new segment starts at disk position 0 — a stale
+            // `flushed` from the previously sealed segment would hand the
+            // first buffers off at the WRONG offset (a hole of zeros over
+            // the segment head; seal() detaches without resetting it)
+            self.flush_ctl.flushed.store(0, Ordering::Release);
             *wg = Some(Writer { file, seg_id: id, written: 0, buf: Vec::with_capacity(BUF_CAP) });
         }
         let w = wg.as_mut().unwrap();
@@ -2917,13 +3152,17 @@ impl Store {
             // into permanent dangling references (23,380 missing chunks on
             // the 262k-chunk bigworld run; JJ-corpus benches never roll a
             // segment with a non-empty buffer, so they stayed clean).
-            w.file
-                .seek(SeekFrom::Start(w.written - w.buf.len() as u64))?;
-            if !w.buf.is_empty() {
-                w.file.write_all(&w.buf)?;
-                w.buf.clear();
-            }
+            // v0.9.71: the tail goes to the flusher, and the old segment
+            // MUST be complete before it detaches — sealed segments are
+            // mmap-read, an unwritten tail would read back zeros. The drain
+            // holds the writer mutex (the flusher never needs it), then the
+            // old inode is fsynced through the writer handle. Rolls are 64
+            // MiB apart — the wait costs what the inline write_all used to.
+            self.hand_off_buffer(w);
+            let target = w.written;
+            self.drain_flusher(target);
             let _ = w.file.sync_data();
+            self.flush_ctl.flushed.store(0, Ordering::Release);
             let id = self.next_seg.fetch_add(1, Ordering::SeqCst) as u32;
             let file = self.new_seg(id)?;
             w.file = file;
@@ -2939,8 +3178,12 @@ impl Store {
         w.buf.extend_from_slice(body);
         w.written += 8 + body.len() as u64;
         if w.buf.len() >= BUF_CAP {
-            w.file.write_all(&w.buf)?;
-            w.buf.clear();
+            // v0.9.71: the buffer goes to the flusher thread — the writer
+            // mutex never covers a disk write. The appending thread used to
+            // pay a ~100-300 us write_all here (and every reader stalled
+            // behind the same lock for it); now it swaps buffers (memcpy of
+            // the fresh one from the free list) and keeps appending.
+            self.hand_off_buffer(w);
         }
         if let Some(s) = self.segs.read().get(&w.seg_id) {
             s.total.fetch_add(8 + body.len() as u64, Ordering::Relaxed);
@@ -4865,11 +5108,15 @@ impl Store {
         let seg_id = {
             let mut wg = self.writer.lock();
             if let Some(w) = wg.as_mut() {
-                if !w.buf.is_empty() {
-                    let _ = w.file.seek(SeekFrom::Start(w.written - w.buf.len() as u64));
-                    let _ = w.file.write_all(&w.buf);
-                    w.buf.clear();
-                }
+                // v0.9.71: hand the tail to the flusher and wait for it to
+                // land — the segment must be complete before it detaches
+                // (sealed = mmap reads; an unwritten tail would read zeros).
+                // The drain holds the writer mutex; the flusher never needs
+                // it, so the wait cannot deadlock. The fsync moved below,
+                // outside the lock (per-inode, v0.9.68).
+                self.hand_off_buffer(w);
+                let target = w.written;
+                self.drain_flusher(target);
             }
             let id = wg.as_ref().map(|w| w.seg_id);
             *wg = None;
