@@ -647,8 +647,13 @@ jobs:
           tail -n 1 run5/stats-anvil.txt | tee anvil_stats_tail.txt
           grep -q "mode=anvil" anvil_stats_tail.txt
           grep -q "eng rn=0" anvil_stats_tail.txt || { echo "FAIL: the anvil baseline touched the engine"; exit 1; }
-          tail -n 1 run5/stats-anvil.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('anvil meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=200 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
-          tail -n 1 meters-live.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('container meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=200 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
+          # fn floor is a traffic sanity check, not a count assertion: the
+          # spawn search in Paper 26.3-248 is racy (0.9.63 postmortem) and
+          # faster served reads shift how many spawn-window fetches a run
+          # issues (529 -> 130 across green runs with identical semantics —
+          # probe PASS / edit PRESENT in both). 20 proves the meters saw data.
+          tail -n 1 run5/stats-anvil.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('anvil meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=20 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
+          tail -n 1 meters-live.txt | python3 -c "import re,sys; m={k:int(v) for k,v in re.findall(r'(\w+)=(\d+)', sys.stdin.read())}; print('container meters:', {k:m[k] for k in ('fn','fp50','fp90','fp99','fmax') if k in m}); sys.exit(0 if m.get('fn',0)>=20 and m.get('fp50',10**9)<=5000 and m.get('fp99',10**9)<=20000 else 1)"
           python3 -c "import re; p=lambda s:{k:int(v) for k,v in re.findall(r'(\w+)=(\d+)',s)}; c=p(open('meters-live.txt').read().strip().splitlines()[-1]); a=p(open('run5/stats-anvil.txt').read().strip().splitlines()[-1]); print('A/B read p50: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp50'], a['fp50'], c['fp50']/max(1,a['fp50']))); print('A/B read p90: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp90'], a['fp90'], c['fp90']/max(1,a['fp90']))); print('A/B read p99: container=%dus vs anvil=%dus (ratio %.2f)' % (c['fp99'], a['fp99'], c['fp99']/max(1,a['fp99']))); print('A/B write p50: container=%dus vs anvil=%dus (ratio %.2f)' % (c['swp50'], a['swp50'], c['swp50']/max(1,a['swp50'])))"
           echo "=== paper bench: PASS — the server plays from the container, end to end ==="
       - uses: actions/upload-artifact@v4
