@@ -277,7 +277,11 @@ jobs:
 
   worst-case-bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 0.9.76: 180 min killed the job mid-run (a successful pass measured
+    # 151 min; the batcher ticks added enough overhead to cross it on a
+    # slower runner — 3h exactly = the hard cap). 300 gives the phase A/B
+    # double 262144-chunk sweep room on any runner.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
