@@ -4946,6 +4946,17 @@ impl Store {
         }
         let cap = self.cfg.slab_cache;
         let writer_id = self.writer_seg_id();
+        // v0.9.78: writer-segment frames ARE prefetched now — after a
+        // restart the writer segment holds yesterday's autosaves, exactly
+        // what the server reads first, and the 0.9.65 skip left them on the
+        // expensive first-touch path (paper live rp99 ~800 us vs p50 10).
+        // ONLY frames fully below the flusher's disk boundary warm up: the
+        // flusher may be mid-write past that point, and a pread over a
+        // partially-written tail would poison the warmed cache with zeros.
+        let writer_flushed = self
+            .flush_ctl
+            .flushed
+            .load(Ordering::Acquire);
         // distinct batch frames (seg, boff), sorted by append order
         let batches: Vec<(u32, u64)> = {
             let idx = self.batch_idx.lock();
@@ -4954,6 +4965,11 @@ impl Store {
             for (k, (boff, _s, _r)) in idx.iter() {
                 if let Some((seg, _o, _l)) = chunks.get(k) {
                     if Some(*seg) != writer_id {
+                        m.insert((*seg, *boff));
+                    } else if boff + 13 <= writer_flushed {
+                        // writer-segment candidate: the header must be on
+                        // disk to learn the frame length; the body is
+                        // verified below, after the header read
                         m.insert((*seg, *boff));
                     }
                 }
@@ -4967,7 +4983,7 @@ impl Store {
             let blobs = self.blobs.read();
             let mut m: HashMap<(u32, u64), u8> = HashMap::new();
             for l in blobs.values() {
-                if l.slab && Some(l.seg) != writer_id {
+                if l.slab && (Some(l.seg) != writer_id || l.off + 13 <= writer_flushed) {
                     m.insert((l.seg, l.off), l.dict_id);
                 }
             }
@@ -4983,7 +4999,7 @@ impl Store {
             let blobs = self.blobs.read();
             let mut m: HashMap<(u32, u64), Vec<(chunknbt::Hash, u32, u32)>> = HashMap::new();
             for (h, l) in blobs.iter() {
-                if l.slab && Some(l.seg) != writer_id {
+                if l.slab && (Some(l.seg) != writer_id || l.off + 13 <= writer_flushed) {
                     m.entry((l.seg, l.off)).or_default().push((*h, l.slab_off, l.raw_len));
                 }
             }
@@ -5069,15 +5085,23 @@ impl Store {
     /// One batch frame's decompressed body (load_batched's miss path minus
     /// the cache probe; cache key carries the batch tag bit).
     fn prefetch_batch_body(&self, seg: u32, boff: u64) -> Option<Arc<Vec<u8>>> {
+        let is_writer = Some(seg) == self.writer_seg_id();
         let segs = self.segs.read();
         let s = segs.get(&seg)?;
-        let sealed = Some(seg) != self.writer_seg_id();
+        let sealed = !is_writer;
         let hdr = s.read_at(boff, 13, sealed)?;
         if hdr.first() != Some(&9) {
             return None;
         }
         let cl = u32::from_le_bytes(hdr[5..9].try_into().ok()?) as usize;
         let raw_total = u32::from_le_bytes(hdr[9..13].try_into().ok()?) as usize;
+        // v0.9.78: same writer-segment boundary rule as prefetch_slab_body
+        if is_writer {
+            let flushed = self.flush_ctl.flushed.load(Ordering::Acquire);
+            if boff + 13 + cl as u64 > flushed {
+                return None;
+            }
+        }
         let data = s.read_at(boff + 13, cl, sealed)?;
         self.decompress(0, &data, raw_total as u32).map(Arc::new)
     }
@@ -5085,9 +5109,10 @@ impl Store {
     /// One slab frame's decompressed body (the read_blob slab miss path
     /// minus the cache probe and member slicing).
     fn prefetch_slab_body(&self, seg: u32, off: u64, dict_id: u8) -> Option<Arc<Vec<u8>>> {
+        let is_writer = Some(seg) == self.writer_seg_id();
         let segs = self.segs.read();
         let s = segs.get(&seg)?;
-        let sealed = Some(seg) != self.writer_seg_id();
+        let sealed = !is_writer;
         let hdr = s.read_at(off, 13, sealed)?;
         let kind = hdr[0] & 0x3f;
         if kind != 5 && kind != 8 {
@@ -5096,6 +5121,15 @@ impl Store {
         let hlen = if hdr[0] & 0x80 != 0 { 13usize } else { 12usize };
         let cl = u32::from_le_bytes(hdr[2..6].try_into().ok()?) as usize;
         let raw_total = u32::from_le_bytes(hdr[6..10].try_into().ok()?);
+        // v0.9.78: a writer-segment frame is warmed ONLY when it ends below
+        // the flusher's disk boundary — past it the write may be partial,
+        // and a pread would cache zeros for the unwritten tail
+        if is_writer {
+            let flushed = self.flush_ctl.flushed.load(Ordering::Acquire);
+            if off + hlen as u64 + cl as u64 > flushed {
+                return None;
+            }
+        }
         let data = s.read_at(off + hlen as u64, cl, sealed)?;
         self.decompress(dict_id, &data, raw_total).map(Arc::new)
     }
