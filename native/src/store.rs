@@ -424,6 +424,8 @@ pub struct Cfg {
     /// are pure functions of immutable content-addressed member bytes, so
     /// each member decodes once per process instead of once per read.
     pub canon_cache: u64,
+    /// decompressed tail/small-blob cache cap (v0.9.77; 0 = off)
+    pub tail_cache: u64,
     /// Writer segment roll threshold. 64 MiB in production; tests shrink it
     /// to force rolls while the append buffer is guaranteed non-empty (the
     /// exact window of the roll-hole corruption this once caused).
@@ -507,6 +509,7 @@ impl Default for Cfg {
             slab_max_raw_whole: 4 * 1024 * 1024,
             slab_cache: 32 * 1024 * 1024,
             canon_cache: 16 * 1024 * 1024,
+            tail_cache: 16 * 1024 * 1024,
             seg_roll: 64 * 1024 * 1024,
             pack_mt_min: 1024 * 1024,
             pack_mt_workers: 0,
@@ -584,6 +587,7 @@ impl Cfg {
             slab_max_raw_whole: env_parse("CSAVES_SLAB_MAX_RAW_WHOLE", 4 * 1024 * 1024),
             slab_cache: env_parse("CSAVES_SLAB_CACHE", 32 * 1024 * 1024),
             canon_cache: env_parse("CSAVES_CANON_CACHE", 16 * 1024 * 1024),
+            tail_cache: env_parse("CSAVES_TAIL_CACHE", 16 * 1024 * 1024),
             seg_roll: env_parse("CSAVES_SEG_ROLL", 64 * 1024 * 1024),
             pack_mt_min: env_parse("CSAVES_PACK_MT_MIN", 1024 * 1024),
             pack_mt_workers: env_parse("CSAVES_PACK_MT_WORKERS", 0),
@@ -1799,6 +1803,14 @@ pub struct Store {
     dicts: RwLock<HashMap<u8, Arc<Vec<u8>>>>,
     slab_cache: Mutex<SlabCache>,
     canon_cache: Mutex<CanonCache>,
+    /// v0.9.77: decompressed tail/small-blob cache, keyed by content hash —
+    /// the slab cache covers slab frames, but single (non-slab) blobs —
+    /// chunk tails (block entities), whole-mode payloads, small fields —
+    /// decompressed on EVERY read before this (stages-warm: tail 33.7 us x
+    /// 3858 = 130 ms = 22% of the warm read wall). Blob bytes are
+    /// immutable (content-addressed) and zstd dictionaries are content-
+    /// pinned, so the decoded form is a pure function of the hash.
+    tail_cache: Mutex<CanonCache>,
     cur_dict: AtomicU8,
     next_dict_ver: AtomicU8,
     /// v0.9.30: content-hash bucket representatives for dictionary
@@ -1987,6 +1999,7 @@ impl Store {
             batch_ctl: Arc::new(BatchCtl::new()),
             slab_cache: Mutex::new(SlabCache::new(32 * 1024 * 1024)),
             canon_cache: Mutex::new(CanonCache::new(16 * 1024 * 1024)),
+            tail_cache: Mutex::new(CanonCache::new(16 * 1024 * 1024)),
             next_seg: AtomicU64::new(0),
             next_blob_id: AtomicU64::new(1),
             dicts: RwLock::new(HashMap::new()),
@@ -2023,6 +2036,7 @@ impl Store {
         });
         *st.slab_cache.lock() = SlabCache::new(st.cfg.slab_cache);
         *st.canon_cache.lock() = CanonCache::new(st.cfg.canon_cache);
+        *st.tail_cache.lock() = CanonCache::new(st.cfg.tail_cache);
         st.load_dicts()?;
         st.load_glob_reg();
         st.scan()?;
@@ -4416,7 +4430,7 @@ impl Store {
     /// glob_to_canon applied). For probes/forensics only.
     pub fn read_blob_by_hash(&self, h: Hash) -> Option<Vec<u8>> {
         let loc = *self.blobs.read().get(&h)?;
-        self.read_blob(loc, None)
+        self.read_blob(loc, None, h)
     }
 
     /// DIAGNOSTIC: the section hashes of a chunk's recipe, in order.
@@ -4602,7 +4616,7 @@ impl Store {
             Tail::Inline { dict, comp, raw } => self.decompress(*dict, comp, *raw),
             Tail::Blob(h) => {
                 let loc = *self.blobs.read().get(h)?;
-                self.read_blob(loc, writer_id)
+                self.read_blob(loc, writer_id, *h)
             }
         };
         {
@@ -4613,7 +4627,7 @@ impl Store {
         match rec.whole {
             Some(h) => {
                 let loc = *self.blobs.read().get(&h)?;
-                self.read_blob(loc, writer_id).or_else(|| fail("whole-blob"))
+                self.read_blob(loc, writer_id, h).or_else(|| fail("whole-blob"))
             }
             None if !rec.fields.is_empty() => {
                 let keytab = self.keys_tab.read();
@@ -4624,7 +4638,8 @@ impl Store {
                         FieldVal::Inline { raw } => raw.clone(),
                         FieldVal::Hash(h) => {
                             let loc = *self.blobs.read().get(h)?;
-                            self.read_blob(loc, writer_id).or_else(|| fail("field-blob"))?
+                            self.read_blob(loc, writer_id, *h)
+                                .or_else(|| fail("field-blob"))?
                         }
                     };
                     parts.push(chunknbt::FieldBytes { key: key.clone(), inline: matches!(val, FieldVal::Inline { .. }), bytes });
@@ -4862,7 +4877,7 @@ impl Store {
         Some(LoadedSections { keep, refs })
     }
 
-    fn read_blob(&self, loc: BlobLoc, _writer_id: Option<u32>) -> Option<Vec<u8>> {
+    fn read_blob(&self, loc: BlobLoc, _writer_id: Option<u32>, h: Hash) -> Option<Vec<u8>> {
         if loc.slab {
             let key = (loc.seg, loc.off);
             if let Some(cached) = self.slab_cache.lock().get(&key) {
@@ -4887,12 +4902,23 @@ impl Store {
             self.slab_cache.lock().put(key, Arc::new(raw));
             return self.glob_to_canon(&out);
         }
+        // v0.9.77: single (non-slab) blobs decompressed once per process —
+        // the decoded bytes are a pure function of the content hash
+        if loc.raw_len <= 4 * 1024 * 1024 {
+            if let Some(c) = self.tail_cache.lock().get(&h) {
+                return Some((*c).clone());
+            }
+        }
         let data = self.seg_read_body(
             loc.seg,
             loc.off + loc.header_len(),
             loc.comp_len as usize,
         )?;
-        self.decompress(loc.dict_id, &data, loc.raw_len)
+        let out = self.decompress(loc.dict_id, &data, loc.raw_len)?;
+        if loc.raw_len <= 4 * 1024 * 1024 {
+            self.tail_cache.lock().put(h, Arc::new(out.clone()));
+        }
+        Some(out)
     }
 
     // ---- v0.9.65: attach-time prefetch — the live tail is the first touch --
@@ -6215,7 +6241,7 @@ impl Store {
                         let mut demoted = false;
                         if let Some(loc) = loc {
                             if loc.refs <= 1 && loc.raw_len <= 64 {
-                                if let Some(data) = self.read_blob(loc, self.writer_seg_id()) {
+                                if let Some(data) = self.read_blob(loc, self.writer_seg_id(), *h) {
                                     if let Some(v) = chunknbt::unwrap_wrapped(&data) {
                                         let mut raw2 = Vec::with_capacity(48);
                                         if chunknbt::write_unnamed(&v, &mut raw2).is_some()
@@ -6516,7 +6542,7 @@ impl Store {
                 continue; // cold-tier material: leave in place
             }
             let _rb = std::time::Instant::now();
-            let Some(data) = self.read_blob(loc, Some(worst_id)) else {
+            let Some(data) = self.read_blob(loc, Some(worst_id), h) else {
                 eprintln!(
                     "[c-saves] PACK LOSS RISK: blob {h:016x} unreadable in seg-{worst_id:05} — segment will be KEPT"
                 );
