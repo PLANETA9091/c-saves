@@ -4949,6 +4949,20 @@ impl Store {
             v.sort_unstable();
             v
         };
+        // v0.9.75: members per slab frame — the canon warm-up converts every
+        // GLOB member of a warmed frame right after the frame lands in the
+        // slab cache, so the first live read of each section is a canon-cache
+        // hit (the conversion is the 26%-of-warm first-touch cost otherwise)
+        let frame_members: HashMap<(u32, u64), Vec<(chunknbt::Hash, u32, u32)>> = {
+            let blobs = self.blobs.read();
+            let mut m: HashMap<(u32, u64), Vec<(chunknbt::Hash, u32, u32)>> = HashMap::new();
+            for (h, l) in blobs.iter() {
+                if l.slab && Some(l.seg) != writer_id {
+                    m.entry((l.seg, l.off)).or_default().push((*h, l.slab_off, l.raw_len));
+                }
+            }
+            m
+        };
         let bytes_a = std::sync::atomic::AtomicU64::new(0);
         let nb_a = std::sync::atomic::AtomicUsize::new(0);
         let ns_a = std::sync::atomic::AtomicUsize::new(0);
@@ -4998,7 +5012,18 @@ impl Store {
                             continue;
                         };
                         let sz = raw.len() as u64;
-                        self.slab_cache.lock().put((seg, off), raw);
+                        self.slab_cache.lock().put((seg, off), raw.clone());
+                        // v0.9.75: warm the canon cache for this frame's GLOB
+                        // members (off the live path — attach-time)
+                        if let Some(members) = frame_members.get(&(seg, off)) {
+                            for (h, so, sr) in members {
+                                let s = *so as usize;
+                                let e = s + *sr as usize;
+                                if let Some(slice) = raw.get(s..e) {
+                                    let _ = self.glob_to_canon_cached(*h, slice);
+                                }
+                            }
+                        }
                         ns_a.fetch_add(1, Ordering::Relaxed);
                         let b = bytes_a.fetch_add(sz, Ordering::Relaxed) + sz;
                         if b > cap {

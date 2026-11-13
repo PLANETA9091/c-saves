@@ -7540,24 +7540,19 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         .filter(|&g| counts[g as usize] > 0)
         .map(|g| (counts[g as usize], g))
         .collect();
-    let reg_snap: Vec<(u32, bool, String, Vec<(String, String)>)> = used
-        .iter()
-        .map(|&(c, g)| {
-            let s = reg.get(g);
-            (
-                c,
-                s.map(|s| s.plain).unwrap_or(false),
-                s.map(|s| s.name.clone()).unwrap_or_default(),
-                s.map(|s| s.props.clone()).unwrap_or_default(),
-            )
-        })
-        .collect();
+    // v0.9.75: borrow the registry entries instead of CLONING name+props
+    // per used gid (the registry is immutable for the call's lifetime and
+    // append-only across calls) — the clone-per-comparison version spent
+    // most of its 11.6 us/call in String/Vec allocations. Same comparisons,
+    // byte-identical output.
+    let snap: Vec<Option<&GlobState>> = used.iter().map(|&(_, g)| reg.get(g)).collect();
+    let key = state_key;
     let mut order: Vec<usize> = (0..used.len()).collect();
     order.sort_by(|&i, &j| {
         let (ci, _) = used[i];
         let (cj, _) = used[j];
-        let (_, pi, ni, propsi) = &reg_snap[i];
-        let (_, pj, nj, propsj) = &reg_snap[j];
+        let (pi, ni, propsi) = key(snap[i]);
+        let (pj, nj, propsj) = key(snap[j]);
         // count DESC, then (plain, name, props) ASC — enc_pal_data_canon
         cj.cmp(&ci).then_with(|| (pi, ni, propsi).cmp(&(pj, nj, propsj)))
     });
@@ -7650,6 +7645,18 @@ pub fn glob_member_wide(b: &[u8]) -> bool {
 
 /// Dispatch any GLOB member (0xCB legacy raw-u8 or 0xCC) back to canonical
 /// CSEC bytes. This is the single read-side entry point.
+static EMPTY_PROPS: Vec<(String, String)> = Vec::new();
+
+/// Sort key for a registry state in the frequency-canonical order:
+/// (plain, name, props) borrowed — the registry is immutable for the
+/// call's lifetime, so no per-gid clones are needed (v0.9.75).
+fn state_key<'a>(s: Option<&'a GlobState>) -> (bool, &'a str, &'a Vec<(String, String)>) {
+    match s {
+        Some(s) => (s.plain, s.name.as_str(), &s.props),
+        None => (false, "", &EMPTY_PROPS),
+    }
+}
+
 pub fn glob_any_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     match glob.first() {
         Some(&GLOB_MAGIC) => glob_to_section(glob, reg),
@@ -7757,24 +7764,15 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         .filter(|&g| counts[g as usize] > 0)
         .map(|g| (counts[g as usize], g))
         .collect();
-    let reg_snap: Vec<(u32, bool, String, Vec<(String, String)>)> = used
-        .iter()
-        .map(|&(c, g)| {
-            let s = reg.get(g);
-            (
-                c,
-                s.map(|s| s.plain).unwrap_or(false),
-                s.map(|s| s.name.clone()).unwrap_or_default(),
-                s.map(|s| s.props.clone()).unwrap_or_default(),
-            )
-        })
-        .collect();
+    // v0.9.75: reference snapshot (see glob_to_section) — no per-gid clones
+    let snap: Vec<Option<&GlobState>> = used.iter().map(|&(_, g)| reg.get(g)).collect();
+    let key = state_key;
     let mut order: Vec<usize> = (0..used.len()).collect();
     order.sort_by(|&i, &j| {
         let (ci, _) = used[i];
         let (cj, _) = used[j];
-        let (_, pi, ni, propsi) = &reg_snap[i];
-        let (_, pj, nj, propsj) = &reg_snap[j];
+        let (pi, ni, propsi) = key(snap[i]);
+        let (pj, nj, propsj) = key(snap[j]);
         cj.cmp(&ci).then_with(|| (pi, ni, propsi).cmp(&(pj, nj, propsj)))
     });
     let ordered: Vec<(u32, u32)> = order.into_iter().map(|i| used[i]).collect();
