@@ -194,6 +194,14 @@ struct RegionBody {
 }
 
 fn build_region_body(store: &Arc<Store>, keys: &[(i32, i32, u64)]) -> std::io::Result<RegionBody> {
+    // v0.9.80: per-phase serve timers (CSAVES_SERVE_STAGE=1) — the identity
+    // pass priced the wall at 2.7 ms/chunk; these name the stage (chunk
+    // read vs zlib-6 deflate vs region framing)
+    let probe = std::env::var("CSAVES_SERVE_STAGE").map(|v| v == "1").unwrap_or(false);
+    let mut t_read_ns = 0u64;
+    let mut t_deflate_ns = 0u64;
+    let mut t_frame_ns = 0u64;
+    let t_all = std::time::Instant::now();
     let mut body: Vec<u8> = Vec::new();
     let mut placed: Vec<(usize, u32, u32)> = Vec::new();
     let mut sector_off = 2u32; // 2 header sectors
@@ -202,7 +210,10 @@ fn build_region_body(store: &Arc<Store>, keys: &[(i32, i32, u64)]) -> std::io::R
     let mut pristine_skipped = 0usize;
     let mut lost = 0usize;
     for (cx, cz, k) in keys {
-        let Some(payload) = store.read_chunk(*k) else {
+        let t_r = std::time::Instant::now();
+        let payload = store.read_chunk(*k);
+        t_read_ns += t_r.elapsed().as_nanos() as u64;
+        let Some(payload) = payload else {
             if store.is_pristine(*k) {
                 pristine_skipped += 1;
             } else {
@@ -213,9 +224,12 @@ fn build_region_body(store: &Arc<Store>, keys: &[(i32, i32, u64)]) -> std::io::R
             }
             continue;
         };
+        let t_d = std::time::Instant::now();
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         z.write_all(&payload)?;
         let comp = z.finish()?;
+        t_deflate_ns += t_d.elapsed().as_nanos() as u64;
+        let t_f = std::time::Instant::now();
         let entry_len = 5 + comp.len(); // len field(4) + type(1) + data
         let sector_count = ((entry_len + 4095) / 4096) as u32;
         let idx = ((cx.rem_euclid(32)) + (cz.rem_euclid(32)) * 32) as usize;
@@ -230,6 +244,14 @@ fn build_region_body(store: &Arc<Store>, keys: &[(i32, i32, u64)]) -> std::io::R
         sector_off += sector_count;
         count += 1;
         bytes += sector_count as u64 * 4096;
+        t_frame_ns += t_f.elapsed().as_nanos() as u64;
+    }
+    if probe {
+        let total = t_all.elapsed().as_nanos() as u64;
+        eprintln!(
+            "[c-saves] serve-stage: regions={keys_len} chunks={count} total={total} read={t_read_ns} deflate={t_deflate_ns} frame={t_frame_ns}",
+            keys_len = keys.len()
+        );
     }
     Ok(RegionBody { body, placed, count, bytes, pristine_skipped, lost })
 }

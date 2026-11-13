@@ -21,7 +21,7 @@ zstd-safe = "7"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
 parking_lot = "0.12"
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
 memmap2 = "0.9"
 liblzma = { version = "0.4", features = ["static"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
