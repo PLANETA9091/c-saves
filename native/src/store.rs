@@ -1493,6 +1493,65 @@ impl CanonCache {
     }
 }
 
+/// v0.9.82: warm RESULT cache — the decoded chunk payload keyed by the
+/// chunk key and stamped with the recipe record's (seg, off, len). A
+/// record's location is fixed at commit and segments are append-only with
+/// monotonically increasing ids, so the triple is a version stamp: any
+/// rewrite lands at a new record location and the stale entry can never
+/// match. Pending (batched) recipes skip the cache — no location yet and
+/// the Arc body path is already cheap. This collapses the whole warm
+/// decode (tail + slab slices + glob conversion + shift resolve + join)
+/// into one lookup + one memcpy for re-read chunks.
+struct ResEnt {
+    seg: u32,
+    off: u64,
+    len: u32,
+    val: Arc<Vec<u8>>,
+}
+struct ResCache {
+    map: HashMap<u64, ResEnt>,
+    order: VecDeque<(u64, u64)>,
+    total: u64,
+    cap: u64,
+}
+impl ResCache {
+    fn new(cap: u64) -> Self {
+        ResCache { map: HashMap::new(), order: VecDeque::new(), total: 0, cap }
+    }
+    fn probe(&self, k: u64, seg: u32, off: u64, len: u32) -> Option<Arc<Vec<u8>>> {
+        let e = self.map.get(&k)?;
+        if e.seg == seg && e.off == off && e.len == len {
+            Some(e.val.clone())
+        } else {
+            None
+        }
+    }
+    fn put(&mut self, k: u64, seg: u32, off: u64, len: u32, v: Arc<Vec<u8>>) {
+        let sz = v.len() as u64;
+        if sz > self.cap {
+            return;
+        }
+        match self.map.insert(k, ResEnt { seg, off, len, val: v }) {
+            Some(old) => {
+                self.total = self.total + sz - old.val.len() as u64;
+            }
+            None => {
+                self.order.push_front((k, sz));
+                self.total += sz;
+            }
+        }
+        while self.total > self.cap {
+            if let Some((ek, esz)) = self.order.pop_back() {
+                if self.map.remove(&ek).is_some() {
+                    self.total -= esz;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------- recipe batch -----
 
 /// Pending chunk recipes queued as one kind-9 batch record on flush.
@@ -1618,6 +1677,10 @@ pub static ST_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(
 // how many tail stages were served by the hash-keyed RAM copy vs inflated
 pub static ST_TAILC_HIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_TAILC_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// v0.9.82: result-cache counters (count-only; the decode ns stays in the
+// per-stage meters, a hit costs one lookup + one memcpy)
+pub static ST_RESC_HIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_RESC_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_SECTLOAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_FUSED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_LEGACY: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -1726,11 +1789,13 @@ pub fn read_stage_json() -> String {
         format!("\"{}\":{{ns:{},n:{},per_call:{}}}", name, ns, n, if n > 0 { ns / n } else { 0 })
     };
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
         fmt("recipe", &ST_RECIPE),
         fmt("tail", &ST_TAIL),
         fmt("tailc_hit", &ST_TAILC_HIT),
         fmt("tailc_miss", &ST_TAILC_MISS),
+        fmt("resc_hit", &ST_RESC_HIT),
+        fmt("resc_miss", &ST_RESC_MISS),
         fmt("sectload", &ST_SECTLOAD),
         fmt("join_fused", &ST_JOIN_FUSED),
         fmt("join_legacy", &ST_JOIN_LEGACY),
@@ -1757,7 +1822,7 @@ pub fn write_stage_json() -> String {
 }
 
 pub fn read_stage_reset() {
-    for st in [&ST_RECIPE, &ST_TAIL, &ST_TAILC_HIT, &ST_TAILC_MISS, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_SHIFT_RES] {
+    for st in [&ST_RECIPE, &ST_TAIL, &ST_TAILC_HIT, &ST_TAILC_MISS, &ST_RESC_HIT, &ST_RESC_MISS, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_SHIFT_RES] {
         st.0.store(0, Ordering::Relaxed);
         st.1.store(0, Ordering::Relaxed);
     }
@@ -1817,6 +1882,8 @@ pub struct Store {
     /// immutable (content-addressed) and zstd dictionaries are content-
     /// pinned, so the decoded form is a pure function of the hash.
     tail_cache: Mutex<CanonCache>,
+    /// v0.9.82: warm result cache — decoded payloads stamped by recipe loc
+    res_cache: Mutex<ResCache>,
     cur_dict: AtomicU8,
     next_dict_ver: AtomicU8,
     /// v0.9.30: content-hash bucket representatives for dictionary
@@ -2006,6 +2073,11 @@ impl Store {
             slab_cache: Mutex::new(SlabCache::new(32 * 1024 * 1024)),
             canon_cache: Mutex::new(CanonCache::new(16 * 1024 * 1024)),
             tail_cache: Mutex::new(CanonCache::new(16 * 1024 * 1024)),
+            // v0.9.82: 64 MiB — the speed-bench corpus alone cycles 24.6 MB
+            // of chunk payloads; a 16 MiB cap thrashed (resc_hit=0, the
+            // put+clone overhead made warm reads SLOWER). 64 MiB holds a
+            // full server view-distance hot set (~1900 chunks); 0 disables.
+            res_cache: Mutex::new(ResCache::new(env_parse("CSAVES_RESULT_CACHE", 64 * 1024 * 1024))),
             next_seg: AtomicU64::new(0),
             next_blob_id: AtomicU64::new(1),
             dicts: RwLock::new(HashMap::new()),
@@ -4554,6 +4626,20 @@ impl Store {
         self.pristine_legend_of(key).map(|l| (l.raw, l.canon))
     }
 
+    /// v0.9.82 warm result cache: probe keyed by (key, seg, off, len).
+    fn res_probe(&self, key: u64, seg: u32, off: u64, len: u32) -> Option<Arc<Vec<u8>>> {
+        self.res_cache.lock().probe(key, seg, off, len)
+    }
+    /// Store a freshly decoded payload and hand back the owned copy: the
+    /// Vec moves into the Arc (zero-copy), the caller clones out of it —
+    /// one memcpy either way.
+    fn res_return(&self, key: u64, seg: u32, off: u64, len: u32, v: Vec<u8>) -> Option<Vec<u8>> {
+        let arc = Arc::new(v);
+        self.res_cache.lock().put(key, seg, off, len, arc.clone());
+        ST_RESC_MISS.1.fetch_add(1, Ordering::Relaxed);
+        Some((*arc).clone())
+    }
+
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
     pub fn read_chunk(&self, key: u64) -> Option<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -4582,6 +4668,16 @@ impl Store {
                 None => return None,
             },
         };
+        // v0.9.82: warm result cache — a committed recipe's (seg, off, len)
+        // is its version stamp; a match serves the decoded payload straight
+        // from RAM (one lookup + one memcpy instead of the whole decode).
+        if let Loc::Seg(s, o, l) = &loc {
+            let hit = self.res_probe(key, *s, *o, *l);
+            if let Some(v) = hit {
+                ST_RESC_HIT.1.fetch_add(1, Ordering::Relaxed);
+                return Some((*v).clone());
+            }
+        }
         let dbg = |stage: &str| {
             if std::env::var("CSAVES_READ_DEBUG").map(|v| v == "1").unwrap_or(false) {
                 eprintln!("[c-saves] read fail key={key:016x} stage={stage}");
@@ -4662,7 +4758,7 @@ impl Store {
             ST_TAIL.0.fetch_add(el, Ordering::Relaxed);
             ST_TAIL.1.fetch_add(1, Ordering::Relaxed);
         }
-        match rec.whole {
+        let out = match rec.whole {
             Some(h) => {
                 let loc = *self.blobs.read().get(&h)?;
                 self.read_blob(loc, writer_id, h).or_else(|| fail("whole-blob"))
@@ -4796,21 +4892,34 @@ impl Store {
                     ST_JOIN_FUSED.1.fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some(v) = fused {
-                    return Some(v);
+                    // v0.9.82 fix: NOT a bare `return` — the early return
+                    // skipped the result-cache post-match below, so region
+                    // (fused-path) chunks never got cached while whole-mode
+                    // stores did (654 = exactly the entity warm reads).
+                    Some(v)
+                } else {
+                    let t_leg = std::time::Instant::now();
+                    let sec_bytes: Vec<Vec<u8>> = slices.iter().map(|s| s.to_vec()).collect();
+                    let r = match chunknbt::join(&sec_bytes, &tail) {
+                        Ok(v) => Some(v),
+                        Err(e) => fail(&format!("join: {e}")),
+                    };
+                    {
+                        let el = t_leg.elapsed().as_nanos() as u64;
+                        ST_JOIN_LEGACY.0.fetch_add(el, Ordering::Relaxed);
+                        ST_JOIN_LEGACY.1.fetch_add(1, Ordering::Relaxed);
+                    }
+                    r
                 }
-                let t_leg = std::time::Instant::now();
-                let sec_bytes: Vec<Vec<u8>> = slices.iter().map(|s| s.to_vec()).collect();
-                let r = match chunknbt::join(&sec_bytes, &tail) {
-                    Ok(v) => Some(v),
-                    Err(e) => fail(&format!("join: {e}")),
-                };
-                {
-                    let el = t_leg.elapsed().as_nanos() as u64;
-                    ST_JOIN_LEGACY.0.fetch_add(el, Ordering::Relaxed);
-                    ST_JOIN_LEGACY.1.fetch_add(1, Ordering::Relaxed);
-                }
-                r
             }
+        };
+        // v0.9.82: a successful decode of a located recipe is cached keyed
+        // by the chunk key, stamped with the record's (seg, off, len) —
+        // the stamp IS the invalidation (any rewrite lands at a new
+        // record location; pending recipes never reach here).
+        match (out, &loc) {
+            (Some(v), Loc::Seg(s, o, l)) => self.res_return(key, *s, *o, *l, v),
+            (v, _) => v,
         }
     }
 
