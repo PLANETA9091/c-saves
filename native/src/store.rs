@@ -1614,6 +1614,10 @@ pub static ST_PRISTINE_CANON: AtomicU64 = AtomicU64::new(0);
 /// path can no longer silently revert on regeneration.
 pub static ST_PRISTINE_UNFRESH: AtomicU64 = AtomicU64::new(0);
 pub static ST_TAIL: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// v0.9.81: inline-tail cache — count-only meters (ns already in ST_TAIL):
+// how many tail stages were served by the hash-keyed RAM copy vs inflated
+pub static ST_TAILC_HIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_TAILC_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_SECTLOAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_FUSED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_LEGACY: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -1722,9 +1726,11 @@ pub fn read_stage_json() -> String {
         format!("\"{}\":{{ns:{},n:{},per_call:{}}}", name, ns, n, if n > 0 { ns / n } else { 0 })
     };
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
         fmt("recipe", &ST_RECIPE),
         fmt("tail", &ST_TAIL),
+        fmt("tailc_hit", &ST_TAILC_HIT),
+        fmt("tailc_miss", &ST_TAILC_MISS),
         fmt("sectload", &ST_SECTLOAD),
         fmt("join_fused", &ST_JOIN_FUSED),
         fmt("join_legacy", &ST_JOIN_LEGACY),
@@ -1751,7 +1757,7 @@ pub fn write_stage_json() -> String {
 }
 
 pub fn read_stage_reset() {
-    for st in [&ST_RECIPE, &ST_TAIL, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_SHIFT_RES] {
+    for st in [&ST_RECIPE, &ST_TAIL, &ST_TAILC_HIT, &ST_TAILC_MISS, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_SHIFT_RES] {
         st.0.store(0, Ordering::Relaxed);
         st.1.store(0, Ordering::Relaxed);
     }
@@ -4613,7 +4619,39 @@ impl Store {
         let t_tail = std::time::Instant::now();
         let tail_bytes: Option<Vec<u8>> = match &rec.tail {
             Tail::None => Some(Vec::new()),
-            Tail::Inline { dict, comp, raw } => self.decompress(*dict, comp, *raw),
+            Tail::Inline { dict, comp, raw } => {
+                // v0.9.81: inline tails inflated zstd on EVERY read — the
+                // 0.9.77 tail cache only covered Blob tails. Decoding is a
+                // pure function of (dict, comp), so the same hash-keyed
+                // cache serves inline tails too: warm repeats clone from
+                // RAM instead of inflating (xxh3 of the comp slice costs
+                // ~50x less than the inflate itself). The dict id is mixed
+                // into the key — the same comp bytes under a different
+                // dictionary must not share an entry.
+                if comp.len() <= 1024 * 1024 {
+                    let kt = chunknbt::hash_of(comp) ^ ((*dict as u128) << 120);
+                    // v0.9.81 fix: bind the probe FIRST — the MutexGuard
+                    // temporary of an `if let` scrutinee lives to the end
+                    // of the whole if-let (edition 2021), so re-locking
+                    // inside the miss branch self-deadlocked the reader.
+                    let hit = self.tail_cache.lock().get(&kt);
+                    if let Some(c) = hit {
+                        ST_TAILC_HIT.1.fetch_add(1, Ordering::Relaxed);
+                        Some((*c).clone())
+                    } else {
+                        ST_TAILC_MISS.1.fetch_add(1, Ordering::Relaxed);
+                        match self.decompress(*dict, comp, *raw) {
+                            Some(out) => {
+                                self.tail_cache.lock().put(kt, Arc::new(out.clone()));
+                                Some(out)
+                            }
+                            None => None,
+                        }
+                    }
+                } else {
+                    self.decompress(*dict, comp, *raw)
+                }
+            }
             Tail::Blob(h) => {
                 let loc = *self.blobs.read().get(h)?;
                 self.read_blob(loc, writer_id, *h)

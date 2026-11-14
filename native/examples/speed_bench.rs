@@ -524,6 +524,11 @@ fn main() {
         if miss > 0 {
             println!("SPEED INFO: cold read size-diff={miss} (GLOB rebuild normalizes payloads; semantic verify is the gate)");
         }
+        // v0.9.81: snapshot + reset HERE — the warm snapshot below used to
+        // accumulate the verify pass and the whole cold read (every first-
+        // touch inflate), so per_call mixed miss costs into the warm floor.
+        println!("SPEED stages-cold: {}", c_saves::store::read_stage_json());
+        c_saves::store::read_stage_reset();
     }
 
     // ---------------- F: warm reads ----------------
