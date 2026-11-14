@@ -253,25 +253,33 @@ fn verify_all_semantic(
             }
             let (store, world, ok, bad, done) = (&store, world, &ok, &bad, &done);
             s.spawn(move || {
+                let mut t_gen = 0u64; let mut t_read = 0u64; let mut t_walk = 0u64;
                 for i in lo..hi {
                     let k = keys[i];
                     let cx = (k >> 32) as i32;
                     let cz = (k & 0xffff_ffff) as u32 as i32;
-                    let expect = fastnbt::from_bytes::<Value>(&wgen::chunk_payload(world, cx, cz, 1))
+                    let t0 = std::time::Instant::now();
+                    let payload = wgen::chunk_payload(world, cx, cz, 1);
+                    t_gen += t0.elapsed().as_nanos() as u64;
+                    let expect = fastnbt::from_bytes::<Value>(&payload)
                         .expect("edited content parses");
-                    match store.read_chunk(k) {
-                        Some(q) => match fastnbt::from_bytes::<Value>(&q) {
-                            Ok(got) => {
-                                if chunks_semantic(expect, &got, strip) {
+                    let t0 = std::time::Instant::now();
+                    let r = store.read_chunk(k);
+                    t_read += t0.elapsed().as_nanos() as u64;
+                    match r {
+                        Some(q) => {
+                            let t0 = std::time::Instant::now();
+                            let w = fastnbt::from_bytes::<Value>(&q).ok()
+                                .map(|got| chunks_semantic(expect, &got, strip));
+                            t_walk += t0.elapsed().as_nanos() as u64;
+                            match w {
+                                Some(true) => {
                                     ok.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    bad.fetch_add(1, Ordering::Relaxed);
-                                    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {tag}: semantic mismatch at key {k:016x}");
                                 }
-                            }
-                            Err(_) => {
-                                bad.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {tag}: stored form unparseable at key {k:016x}");
+                                _ => {
+                                    bad.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {tag}: semantic mismatch/unparseable at key {k:016x}");
+                                }
                             }
                         },
                         None => {
@@ -282,6 +290,8 @@ fn verify_all_semantic(
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     if d % 32768 == 0 || d == keys.len() {
                         eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {tag}: verified {d}/{}", keys.len());
+                        eprintln!("[worst-stages] {tag} d={d} gen_s={:.1} read_s={:.1} walk_s={:.1}",
+                            t_gen as f64/1e9, t_read as f64/1e9, t_walk as f64/1e9);
                     }
                 }
             });
