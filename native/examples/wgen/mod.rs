@@ -99,26 +99,79 @@ impl World {
         ) & 0x3F
     }
 
+    /// v0.9.84: block_at's ore cells are chunk-independent (call sites pass
+    /// cx=cz=0), so all cells fit a 4x4 col-bucket x 96 y-bucket x 3-tag
+    /// table computed ONCE per process (~4.6k splitmix instead of ~245k per
+    /// chunk). Buckets follow (y as u64)/4 exactly, negative ys included.
+    fn cell_idx(lx: usize, y: i32, lz: usize) -> Option<usize> {
+        if lx >= 16 || lz >= 16 || y < -64 || y > 319 {
+            return None;
+        }
+        let xb = lx / 4;
+        let zb = lz / 4;
+        let yb = if y >= 0 {
+            (y / 4) as usize
+        } else {
+            let g = (-y + 3) / 4; // y=-1..-4 -> g=1, ..., y=-61..-64 -> g=16
+            79 + g as usize
+        };
+        Some(((xb * 4 + zb) * 96 + yb) * 3)
+    }
+
+    fn cells_for(&self, lx: usize, y: i32, lz: usize) -> [u8; 3] {
+        static TAB: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let tab = TAB.get_or_init(|| {
+            let mut t = vec![0u8; 16 * 96 * 3];
+            for lx in 0..16 {
+                for lz in 0..16 {
+                    for yi in 0..96 {
+                        let y = if yi < 80 {
+                            (yi * 4) as i32
+                        } else {
+                            -((4 * (yi - 79) - 3) as i32)
+                        };
+                        for (ti, tag) in [T_ORE, T_ORE_KIND, T_TUFF].into_iter().enumerate() {
+                            let v = self.cell(0, 0, lx, y, lz, tag);
+                            t[Self::cell_idx(lx, y, lz).unwrap() + ti] = (v & 0x3F) as u8;
+                        }
+                    }
+                }
+            }
+            t
+        });
+        match Self::cell_idx(lx, y, lz) {
+            Some(i) => [tab[i], tab[i + 1], tab[i + 2]],
+            None => {
+                let ore = self.cell(0, 0, lx, y, lz, T_ORE) as u8;
+                let kind = self.cell(0, 0, lx, y, lz, T_ORE_KIND) as u8;
+                let tuff = self.cell(0, 0, lx, y, lz, T_TUFF) as u8;
+                [ore, kind, tuff]
+            }
+        }
+    }
+
     /// Palette id per position.
     /// 0 air, 1 stone, 2 deepslate, 3 dirt, 4 grass_block, 5 water, 6 sand,
     /// 7 gravel, 8 coal_ore, 9 iron_ore, 10 copper_ore, 11 tuff, 12 bedrock,
     /// 13 clay
     pub fn block_at(&self, cx: i32, cz: i32, h: i32, y: i32, lx: usize, lz: usize) -> u8 {
+        let _ = (cx, cz);
         if y <= -60 {
             return 12; // bedrock floor
         }
+        let [ore, kind, tuff] = self.cells_for(lx, y, lz);
         if y < 0 {
-            if self.cell(0, 0, lx, y, lz, T_ORE) < 3 {
-                return 8 + (self.cell(0, 0, lx, y, lz, T_ORE_KIND) % 3) as u8;
+            if ore < 3 {
+                return 8 + (kind % 3);
             }
-            if self.cell(0, 0, lx, y, lz, T_TUFF) > 26 {
+            if tuff > 26 {
                 return 11;
             }
             return 2;
         }
         if y < h - 4 {
-            if self.cell(0, 0, lx, y, lz, T_ORE) < 3 {
-                return 8 + (self.cell(0, 0, lx, y, lz, T_ORE_KIND) % 3) as u8;
+            if ore < 3 {
+                return 8 + (kind % 3);
             }
             return 1; // stone
         }
@@ -246,7 +299,12 @@ pub fn build_section(
                 "minecraft:bedrock",
                 "minecraft:clay",
             ];
-            let mut slot_of: Map<&str, u8> = Map::new();
+            // v0.9.84: slot lookup by fixed array over NAMES — the old
+            // per-voxel HashMap<&str, u8> probe SipHash-hashed the same 14
+            // strings ~98k times per chunk (the single biggest worldgen
+            // cost). Same first-seen slot order, same palette content.
+            let mut slots = [0xFFu8; 14];
+            let mut next_slot = 0u8;
             let mut entries = Vec::with_capacity(4096);
             for lz in 0..16 {
                 for lx in 0..16 {
@@ -267,16 +325,23 @@ pub fn build_section(
                                 7
                             };
                         }
-                        let name = NAMES[id as usize];
-                        let next = slot_of.len() as u8;
-                        let slot = *slot_of.entry(name).or_insert(next);
+                        let nid = id as usize;
+                        let slot = if slots[nid] == 0xFF {
+                            slots[nid] = next_slot;
+                            next_slot += 1;
+                            slots[nid]
+                        } else {
+                            slots[nid]
+                        };
                         entries.push(slot);
                     }
                 }
             }
-            let mut by_slot = vec![""; slot_of.len()];
-            for (k, s) in &slot_of {
-                by_slot[*s as usize] = k;
+            let mut by_slot = vec![""; next_slot as usize];
+            for (i, &sl) in slots.iter().enumerate() {
+                if sl != 0xFF {
+                    by_slot[sl as usize] = NAMES[i];
+                }
             }
             let palette: Vec<Value> = by_slot.iter().map(|k| Value::String(k.to_string())).collect();
             // vanilla clamps linear palettes to a 4-bit minimum
