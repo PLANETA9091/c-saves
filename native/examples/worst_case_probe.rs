@@ -266,22 +266,22 @@ fn verify_all_semantic(
                                     ok.fetch_add(1, Ordering::Relaxed);
                                 } else {
                                     bad.fetch_add(1, Ordering::Relaxed);
-                                    eprintln!("[worst] {tag}: semantic mismatch at key {k:016x}");
+                                    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {tag}: semantic mismatch at key {k:016x}");
                                 }
                             }
                             Err(_) => {
                                 bad.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("[worst] {tag}: stored form unparseable at key {k:016x}");
+                                eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {tag}: stored form unparseable at key {k:016x}");
                             }
                         },
                         None => {
                             bad.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("[worst] {tag}: read=None at key {k:016x}");
+                            eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {tag}: read=None at key {k:016x}");
                         }
                     }
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     if d % 32768 == 0 || d == keys.len() {
-                        eprintln!("[worst] {tag}: verified {d}/{}", keys.len());
+                        eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {tag}: verified {d}/{}", keys.len());
                     }
                 }
             });
@@ -319,13 +319,19 @@ fn drive_maintenance(store: &Store) -> usize {
         }
         steps += 1;
         if steps % 10 == 0 {
-            eprintln!("[worst] compaction step {steps}");
+            eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] compaction step {steps}");
         }
     }
     steps
 }
 
+static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+fn stamp() -> f64 {
+    T0.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+}
+
 fn main() {
+    T0.set(std::time::Instant::now()).ok();
     let side: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -374,7 +380,7 @@ fn main() {
     let seed_bytes = anvil_seed.load(Ordering::Relaxed);
     let anvil_per_chunk = anvil / total_chunks as u64;
     let t_gen = t0.elapsed().as_secs_f64();
-    eprintln!("[worst] generation done in {t_gen:.1}s");
+    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] generation done in {t_gen:.1}s");
     println!(
         "worst-case world: {} regions x 1024 chunks = {} chunks, every chunk player-edited",
         n_regions, total_chunks
@@ -420,7 +426,8 @@ fn main() {
     let container_a = dir_size(&work.join("store-a"));
     let per_chunk_a = container_a / total_chunks as u64;
     let ratio_a = container_a as f64 / anvil.max(1) as f64;
-    eprintln!("[worst] phase A import done in {t_import_a:.1}s, compaction {steps_a} step(s)");
+    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] phase A import done in {t_import_a:.1}s, compaction {steps_a} step(s)");
+    eprintln!("[pack-census A] {}", c_saves::store::pack_census_json());
     println!(
         "worst-case import A: {} stored, {} contracted, {} failed (pristine OFF — pure codec, no elision)",
         stored_a.len(),
@@ -453,7 +460,7 @@ fn main() {
     let t_verify_a = t2.elapsed().as_secs_f64();
     assert_eq!(bad_a, 0, "phase A: every stored chunk must match its edit");
     assert_eq!(ok_a, total_chunks);
-    eprintln!("[worst] phase A verify done in {t_verify_a:.1}s");
+    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] phase A verify done in {t_verify_a:.1}s");
     println!(
         "worst-case verify A: ok={} bad={} — every stored chunk read back and semantically matched",
         ok_a, bad_a
@@ -481,7 +488,7 @@ fn main() {
     let store_b = Store::open_cfg(&work.join("store-b"), true, cfg_pristine).unwrap();
     let irep_b = anvil::import_dir(&gen_seed_b, &store_b).expect("pristine import ok");
     let t_import_b = t3.elapsed().as_secs_f64();
-    eprintln!("[worst] phase B pristine import done in {t_import_b:.1}s");
+    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] phase B pristine import done in {t_import_b:.1}s");
     assert_eq!(irep_b.chunks, total_chunks, "seed twin imports fully");
     assert_eq!(irep_b.failed, 0, "no import failures");
     let (stored_b0, contracted_b0) = classify(&store_b);
@@ -510,7 +517,7 @@ fn main() {
                         store_b.sync(); // bound writer buffers + fsync progress
                     }
                     if d % 32768 == 0 || d == keys.len() {
-                        eprintln!("[worst] edits {d}/{}", keys.len());
+                        eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] edits {d}/{}", keys.len());
                     }
                 }
             });
@@ -525,7 +532,7 @@ fn main() {
     let container_b = dir_size(&work.join("store-b"));
     let per_chunk_b = container_b / total_chunks as u64;
     let ratio_b = container_b as f64 / anvil.max(1) as f64;
-    eprintln!("[worst] {} live edits done in {t_edits:.1}s, compaction {steps_b} step(s)", total_chunks);
+    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] {} live edits done in {t_edits:.1}s, compaction {steps_b} step(s)", total_chunks);
     println!(
         "worst-case lifecycle: {} edits -> 0 pristine remain (every contract superseded by a real edit)",
         total_chunks
@@ -555,7 +562,7 @@ fn main() {
     assert_eq!(bad_b, 0, "phase B: every stored chunk must match its edit");
     assert_eq!(ok_b, total_chunks);
     let t_verify_b = t5.elapsed().as_secs_f64();
-    eprintln!("[worst] phase B verify done in {t_verify_b:.1}s");
+    eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] phase B verify done in {t_verify_b:.1}s");
     println!(
         "worst-case verify B: ok={} bad={} — every stored chunk read back and semantically matched",
         ok_b, bad_b

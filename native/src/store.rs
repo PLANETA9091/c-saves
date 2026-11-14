@@ -70,6 +70,12 @@ const SLAB_KIND_HOT: u8 = 0x40;
 /// already past the documented exhaustion edge, same reasoning class as
 /// the 0xFF reservation.
 const SLAB_CODEC_LZMA2: u8 = 0xFE;
+/// v0.9.85: multithreaded LZMA2 cold slab streams. The MT encoder is the
+/// .xz BLOCKED container (liblzma has no raw-LZMA2 MT encoder), so the wire
+/// form differs from the raw stream above — its own codec stamp keeps old
+/// stores decoding exactly as stored, and the block boundaries only trade
+/// a little ratio for N-way pack parallelism.
+const SLAB_CODEC_LZMA2_MT: u8 = 0xFD;
 /// LZMA2 preset for cold slab streams (research probe point: -24.8% vs
 /// zstd-6 on the real corpus). FIXED on both encode and decode so the raw
 /// decoder's window always matches — CSAVES_COLD_LEVEL applies to the zstd
@@ -229,6 +235,48 @@ fn lzma2_compress(data: &[u8]) -> Option<Vec<u8>> {
     f.lzma2(&opts);
     let mut stream = liblzma::stream::Stream::new_raw_encoder(&f).ok()?;
     let mut out = Vec::with_capacity(data.len() / 3 + 64);
+    stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
+    stream.process_vec(&[], &mut out, liblzma::stream::Action::Finish).ok()?;
+    Some(out)
+}
+
+/// Multithreaded LZMA2 (blocked .xz container). The filter chain matches
+/// the raw encoder exactly (preset 6|EXTREME lzma2 filter), so the ratio
+/// differs only by the block boundaries: `block_size` is scaled to give
+/// every worker at least one block without cutting the 8 MiB preset dict
+/// more than necessary. Decode is the auto-detecting .xz stream decoder.
+/// Returns (codec stamp, bytes) — the stamp follows the ACTUAL wire form:
+/// small streams take the raw encoder (0xFE), big ones the blocked .xz
+/// container (0xFD). The caller must never stamp independently: a raw
+/// stream carrying the MT stamp would land in the .xz decoder and corrupt.
+fn lzma2_compress_maybe_mt(data: &[u8], threads: u32) -> Option<(u8, Vec<u8>)> {
+    if threads < 2 || data.len() < 2 * 1024 * 1024 {
+        let c = lzma2_compress(data)?;
+        return Some((SLAB_CODEC_LZMA2, c));
+    }
+    let opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
+        .ok()?;
+    let mut f = liblzma::stream::Filters::new();
+    f.lzma2(&opts);
+    let mut b = liblzma::stream::MtStreamBuilder::new();
+    b.threads(threads);
+    b.filters(f);
+    // at least one block per worker, never below 1 MiB (block overhead),
+    // never above the stream itself
+    let per = (data.len() as u64 / threads as u64).clamp(1024 * 1024, 64 * 1024 * 1024);
+    b.block_size(per);
+    let mut stream = b.encoder().ok()?;
+    let mut out = Vec::with_capacity(data.len() / 3 + 64);
+    stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
+    stream.process_vec(&[], &mut out, liblzma::stream::Action::Finish).ok()?;
+    Some((SLAB_CODEC_LZMA2_MT, out))
+}
+
+/// Decode an .xz-container MT LZMA2 slab stream (auto-detecting decoder —
+/// the container is self-describing, no pinned window needed).
+fn lzma2_mt_decompress(data: &[u8], raw_len: usize) -> Option<Vec<u8>> {
+    let mut stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, 0).ok()?;
+    let mut out = Vec::with_capacity(raw_len);
     stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
     stream.process_vec(&[], &mut out, liblzma::stream::Action::Finish).ok()?;
     Some(out)
@@ -3629,6 +3677,9 @@ impl Store {
         if dict_id == SLAB_CODEC_LZMA2 {
             return lzma2_decompress(data, raw_len as usize);
         }
+        if dict_id == SLAB_CODEC_LZMA2_MT {
+            return lzma2_mt_decompress(data, raw_len as usize);
+        }
         DEC_C.with(|c| {
             let mut slot = c.borrow_mut();
             let key = (self.uid, dict_id);
@@ -6079,6 +6130,15 @@ impl Store {
         // lever, may oversubscribe on any host).
         let k = if self.cfg.pack_mt_workers > 0 {
             big_cnt
+        } else if lz {
+            // v0.9.85: the 4-core gate above was tuned for zstd, where the
+            // 2-core runner is work-bound and intra-frame MT only adds
+            // overhead. LZMA2 single-stream speed is ~1-2 MB/s — ONE big
+            // stream pins the whole pack wall to itself even on 2 cores,
+            // so the rank-select fires from 2 cores up (the pool workers
+            // stay: k streams x per_big threads may oversubscribe, LZMA2
+            // blocked pipelines overlap fine).
+            (big_cnt.min(cores.max(2) / 2)).max(1)
         } else if cores >= 4 {
             (big_cnt.min(cores / 2)).max(1)
         } else {
@@ -6087,6 +6147,10 @@ impl Store {
         let per_big: u32 = if mt_min > 0 && big_cnt > 0 && k > 0 {
             if self.cfg.pack_mt_workers > 0 {
                 (self.cfg.pack_mt_workers as u32).min(16)
+            } else if lz {
+                // one thread per core across the k selected streams; at
+                // least 2 so the MT encoder is actually engaged
+                ((cores.max(2) / k) as u32).clamp(2, 16)
             } else {
                 ((cores / k) as u32).min(16)
             }
@@ -6110,17 +6174,29 @@ impl Store {
         let compress_one = |i: usize| -> (u8, Vec<u8>) {
             let stream = flat[i];
             if lz {
-                // v0.9.41: LZMA2 cold slab streams. Per-stream intra-frame
-                // MT stays zstd-specific; the outer per-stream scope already
-                // spreads streams across cores. Any error falls back to the
-                // zstd path WITH the matching codec stamp (a stream is never
-                // mislabeled).
-                match lzma2_compress(stream) {
-                    Some(c) => {
-                        PK_MT_BYTES.fetch_add(stream.len() as u64, Ordering::Relaxed);
-                        (SLAB_CODEC_LZMA2, c)
+                // v0.9.41: LZMA2 cold slab streams. v0.9.85: big streams go
+                // through the blocked .xz MT encoder with the same rank-
+                // select policy the zstd path uses — LZMA2 single-stream
+                // speed is ~1-2 MB/s, and one 10 MiB stream used to pin a
+                // whole pack step's wall to itself. Any error falls back to
+                // the raw path WITH the matching codec stamp (a stream is
+                // never mislabeled).
+                if mt_sel[i] && per_big > 1 {
+                    match lzma2_compress_maybe_mt(stream, per_big) {
+                        Some((stamp, c)) => {
+                            if stamp == SLAB_CODEC_LZMA2_MT {
+                                PK_MT_JOBS.fetch_add(1, Ordering::Relaxed);
+                                PK_MT_BYTES.fetch_add(stream.len() as u64, Ordering::Relaxed);
+                            }
+                            (stamp, c)
+                        }
+                        None => (0, bulk_compress(stream, level).1),
                     }
-                    None => (0, bulk_compress(stream, level).1),
+                } else {
+                    match lzma2_compress(stream) {
+                        Some(c) => (SLAB_CODEC_LZMA2, c),
+                        None => (0, bulk_compress(stream, level).1),
+                    }
                 }
             } else if mt_sel[i] {
                 PK_MT_JOBS.fetch_add(1, Ordering::Relaxed);
@@ -7111,6 +7187,28 @@ pub mod tests {
         let va: Value = fastnbt::from_bytes(a).unwrap();
         let vb: Value = fastnbt::from_bytes(b).unwrap();
         va == vb
+    }
+
+    #[test]
+    fn lzma2_mt_stream_roundtrip() {
+        // v0.9.85: the MT (blocked .xz) cold-slab codec must roundtrip
+        // through the SAME dispatch the read path uses (dict_id=0xFD) and
+        // stay decodable below the MT threshold (small streams take the
+        // raw encoder, big ones the blocked container).
+        let big: Vec<u8> = (0..3 * 1024 * 1024usize)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add((i / 4096) as u8))
+            .collect();
+        // small stream: routes to the RAW encoder and MUST carry the raw
+        // stamp (a raw stream under the MT stamp would land in the .xz
+        // decoder and corrupt — the stamp decision lives inside the helper)
+        let small: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
+        let (stamp, sb) = lzma2_compress_maybe_mt(&small, 4).expect("small encode");
+        assert_eq!(stamp, SLAB_CODEC_LZMA2, "small stream keeps the raw stamp");
+        assert_eq!(lzma2_decompress(&sb, small.len()).unwrap(), small);
+        // big stream: MT container stamp + .xz decode
+        let (stamp2, eb) = lzma2_compress_maybe_mt(&big, 4).expect("mt encode");
+        assert_eq!(stamp2, SLAB_CODEC_LZMA2_MT, "big stream takes the MT stamp");
+        assert_eq!(lzma2_mt_decompress(&eb, big.len()).unwrap(), big);
     }
 
     #[test]
