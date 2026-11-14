@@ -4426,7 +4426,16 @@ pub fn sections_semantically_equal(a: &Value, b: &Value) -> bool {
 
 fn pal_semantic_equal(a: &Value, b: &Value, entries: usize) -> bool {
     let (Value::Compound(ma), Value::Compound(mb)) = (a, b) else { return a == b };
-    let expand = |m: &std::collections::HashMap<String, Value>| -> Option<Vec<String>> {
+    // v0.9.83: the expansion used to materialize the FULL per-voxel name
+    // vectors — 2 x `entries` cloned Strings per section pair (24 sections
+    // x 4096 voxels x 2 = ~196k string allocations per chunk) — that was
+    // 82% of the whole worst-case verify walk. The equality needs only
+    // the INDEX streams plus a palette remap: decode both sides to voxel
+    // indices (u16), map b's palette into a's index space ONCE (palette
+    // size, not voxel count), compare u16s. Unused palette entries and
+    // out-of-range voxels keep the exact original semantics (name "" for
+    // out-of-range, per-voxel string equality).
+    let expand = |m: &std::collections::HashMap<String, Value>| -> Option<(Vec<String>, Vec<u32>)> {
         let Value::List(pal) = m.get("palette")? else { return None };
         let mut names: Vec<String> = Vec::with_capacity(pal.len());
         for p in pal {
@@ -4461,19 +4470,50 @@ fn pal_semantic_equal(a: &Value, b: &Value, entries: usize) -> bool {
                 // unpack — modded biome palettes can exceed 256 entries
                 let bits = ((la.as_ref().len() as u32) * 64 / entries as u32).max(1);
                 let idx = unpack_nostroddle_vox(la.as_ref(), entries, bits);
-                Some(idx.into_iter().map(|i| names.get(i as usize).cloned().unwrap_or_default()).collect())
+                Some((names, idx))
             }
             Some(_) => None,
             None => {
                 if names.len() > 1 {
                     return None;
                 }
-                Some(vec![names[0].clone(); entries])
+                Some((names, vec![0u32; entries]))
             }
         }
     };
     match (expand(ma), expand(mb)) {
-        (Some(x), Some(y)) => x == y,
+        (Some((na, xa)), Some((nb, xb))) => {
+            if xa.len() != xb.len() {
+                return false;
+            }
+            // b-palette -> a-index space; NO_A means "b name absent from
+            // a's palette" (a real string, can never equal an a voxel's
+            // name — not even the out-of-range "")
+            const NO_A: u32 = u32::MAX;
+            let mut amap: std::collections::HashMap<&str, u32> =
+                std::collections::HashMap::with_capacity(na.len());
+            for (i, s) in na.iter().enumerate() {
+                amap.insert(s.as_str(), i as u32);
+            }
+            let remap: Vec<u32> = nb
+                .iter()
+                .map(|s| amap.get(s.as_str()).copied().unwrap_or(NO_A))
+                .collect();
+            xa.iter().zip(xb.iter()).all(|(&x, &y)| {
+                let ry = if (y as usize) < nb.len() { remap[y as usize] } else { NO_A };
+                if ry != NO_A && (x as usize) < na.len() {
+                    ry == x
+                } else {
+                    // out-of-range voxel = "" on that side; b-name absent
+                    // from a's palette (NO_A) is a real string that can
+                    // never equal an a voxel's name — not even the
+                    // out-of-range "" (pathological but the old
+                    // name-vector compare allowed it)
+                    na.get(x as usize).map(|s| s.as_str()).unwrap_or("")
+                        == nb.get(y as usize).map(|s| s.as_str()).unwrap_or("")
+                }
+            })
+        }
         _ => a == b,
     }
 }

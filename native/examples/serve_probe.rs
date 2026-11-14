@@ -161,13 +161,18 @@ fn write_region_round(
 /// Semantic chunk equality — the canonical section re-encoding permutes
 /// palette order (semantically neutral), so chunk equality = per-section
 /// expanded state vectors + structural equality of everything else.
-fn chunks_semantic(a: &Value, b: &Value, strip: bool) -> bool {
-    let mut ma = a.clone();
+fn chunks_semantic(
+    // v0.9.83: OWNED — strip in place instead of deep-cloning the expected
+    // tree (the clone dominated the verify walk).
+    mut a: Value,
+    b: &Value,
+    strip: bool,
+) -> bool {
     let Value::Compound(mb) = b else { return false };
     if strip {
-        strip_derived_chunk(&mut ma);
+        strip_derived_chunk(&mut a);
     }
-    let Value::Compound(ma) = ma else { return false };
+    let Value::Compound(ma) = a else { return false };
     if ma.len() != mb.len() {
         return false;
     }
@@ -216,7 +221,7 @@ fn verify_all_stored(
                     match store.read_chunk(k) {
                         Some(q) => match fastnbt::from_bytes::<Value>(&q) {
                             Ok(got) => {
-                                if chunks_semantic(&expect, &got, strip) {
+                                if chunks_semantic(expect, &got, strip) {
                                     ok.fetch_add(1, Ordering::Relaxed);
                                 } else {
                                     bad.fetch_add(1, Ordering::Relaxed);

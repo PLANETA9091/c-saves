@@ -165,18 +165,20 @@ fn write_region_round(
 /// palette order (semantically neutral), so chunk equality = per-section
 /// expanded state vectors + structural equality of everything else.
 fn chunks_semantic(
-    a: &Value,
+    // v0.9.83: OWNED — the walker used to deep-clone the whole expected
+    // tree just to strip it; the parsed Value is ours, strip in place
+    // (a 59 KiB tree clone was ~60% of the verify walk).
+    mut a: Value,
     b: &Value,
     strip: bool,
 ) -> bool {
-    let mut ma = a.clone();
     let Value::Compound(mb) = b else { return false };
     if strip {
         // the import path strips derived light (the server relights from
         // isLightOn=0); strip the source side symmetrically
-        strip_derived_chunk(&mut ma);
+        strip_derived_chunk(&mut a);
     }
-    let Value::Compound(ma) = ma else { return false };
+    let Value::Compound(ma) = a else { return false };
     if ma.len() != mb.len() {
         return false;
     }
@@ -260,7 +262,7 @@ fn verify_all_semantic(
                     match store.read_chunk(k) {
                         Some(q) => match fastnbt::from_bytes::<Value>(&q) {
                             Ok(got) => {
-                                if chunks_semantic(&expect, &got, strip) {
+                                if chunks_semantic(expect, &got, strip) {
                                     ok.fetch_add(1, Ordering::Relaxed);
                                 } else {
                                     bad.fetch_add(1, Ordering::Relaxed);
