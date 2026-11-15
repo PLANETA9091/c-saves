@@ -24,6 +24,9 @@ parking_lot = "0.12"
 flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
 memmap2 = "0.9"
 liblzma = { version = "0.4", features = ["static", "parallel"] }
+# direct access to the raw C API (lzma_options_lzma.preset_dict — the crate
+# type does not expose it; same resolution as liblzma's own dep = one build)
+liblzma-sys = { version = "0.4", default-features = false, features = ["static", "parallel"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 
 [profile.release]

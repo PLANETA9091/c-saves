@@ -26,6 +26,7 @@ dependencies = [
  "jni-sys",
  "jvmti-bindings",
  "liblzma",
+ "liblzma-sys",
  "memmap2",
  "parking_lot",
  "serde",

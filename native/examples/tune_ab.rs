@@ -133,6 +133,14 @@ fn leg(tag: &str, corpus: &[(i32, i32, Vec<u8>)]) -> u64 {
     }
     let disk = st.disk_bytes();
     println!("{tag}: chunks={} verified={} pack_steps={} disk={} B", st.chunk_count(), verified, steps, disk);
+    if tag.starts_with("tuned") {
+        println!("{tag} profile: {}", st.profile_json());
+        let viol = st.slab_invariant_scan();
+        println!("{tag} invariant violations: {}", viol.len());
+        for v in viol.iter().take(5) {
+            println!("  {v}");
+        }
+    }
     drop(st);
     let _ = std::fs::remove_dir_all(&dir);
     disk
@@ -155,23 +163,32 @@ fn main() {
     // parent: force the LEGACY config for this process before anything
     // resolves cold_lzma_tuned()
     std::env::set_var("CSAVES_LZMA_TUNE", "0");
+    std::env::set_var("CSAVES_SLAB_HASHES", "0");
     let legacy_disk = leg("legacy(0xFE)", &corpus);
 
     let exe = std::env::current_exe().expect("exe");
     let out = std::process::Command::new(exe)
         .arg(&dim)
         .env("CSAVES_LZMA_TUNE", "1")
+        .env("CSAVES_SLAB_HASHES", "1")
         .env("TUNE_AB_CHILD", "1")
         .output()
         .expect("child run");
-    let tuned_disk: u64 = String::from_utf8_lossy(&out.stdout)
+    let child_out = String::from_utf8_lossy(&out.stdout);
+    let tuned_disk: u64 = child_out
         .lines()
         .find_map(|l| l.strip_prefix("TUNED_DISK=").and_then(|v| v.trim().parse().ok()))
         .unwrap_or_else(|| {
-            eprintln!("child stdout:\n{}", String::from_utf8_lossy(&out.stdout));
+            eprintln!("child stdout:\n{child_out}");
             eprintln!("child stderr:\n{}", String::from_utf8_lossy(&out.stderr));
             panic!("tuned child produced no TUNED_DISK line");
         });
+    for l in child_out
+        .lines()
+        .filter(|l| l.contains("profile:") || l.contains("invariant") || l.starts_with("  "))
+    {
+        println!("{l}");
+    }
 
     println!("=== A/B drained container ===");
     println!("legacy 0xFE: {legacy_disk} B");
