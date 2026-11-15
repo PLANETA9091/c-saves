@@ -81,6 +81,19 @@ impl Registry {
         }
     }
 
+    /// v0.9.89: cheap per-tick durability — the writer buffer and the
+    /// pending recipe batch reach the OS page cache within one maintenance
+    /// tick instead of the 20 s sync cadence. A crashed JVM (or a killed
+    /// host process — there is no Rust Drop at JVM exit) used to lose up to
+    /// 20 s of accepted writes; the paper-bench 0.9.82 postmortem showed a
+    /// whole run's container erased this way. No fsync here — power-loss
+    /// durability stays with sync_all's 20 s cadence.
+    pub fn durability_all(&self) {
+        for (s, _) in self.all() {
+            s.durability_tick();
+        }
+    }
+
     /// Seal active segments so background compaction can reclaim dead bytes.
     pub fn seal_all(&self) {
         for (s, _) in self.all() {
@@ -297,6 +310,9 @@ pub fn spawn_maintenance(reg: Arc<Registry>) {
                     reg.seal_all();
                     last_sync = std::time::Instant::now();
                 }
+                // v0.9.89: page-cache durability every tick (see
+                // durability_all) — buffer + pending batch, no fsync.
+                reg.durability_all();
                 // v0.9.66: the maintenance entry defers pack steps while the
                 // live path is actively fetching (500 ms window, 15 s
                 // starvation cap) — pack CPU bursts were the fetch-meter

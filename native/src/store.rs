@@ -1729,6 +1729,12 @@ pub static ST_TAILC_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64
 // per-stage meters, a hit costs one lookup + one memcpy)
 pub static ST_RESC_HIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_RESC_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// v0.9.90: tail-stage sub-meters (count-only, ns in .1) — the scale meters
+// showed the tail read at 10.76 ms/chunk in CI vs 18 us locally; split the
+// stage into pread / decomp / cache-put to find where the wall goes
+pub static ST_TAIL_PREAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_TAIL_DEC: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_TAIL_PUT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_SECTLOAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_FUSED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 pub static ST_JOIN_LEGACY: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -1837,13 +1843,16 @@ pub fn read_stage_json() -> String {
         format!("\"{}\":{{ns:{},n:{},per_call:{}}}", name, ns, n, if n > 0 { ns / n } else { 0 })
     };
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
         fmt("recipe", &ST_RECIPE),
         fmt("tail", &ST_TAIL),
         fmt("tailc_hit", &ST_TAILC_HIT),
         fmt("tailc_miss", &ST_TAILC_MISS),
         fmt("resc_hit", &ST_RESC_HIT),
         fmt("resc_miss", &ST_RESC_MISS),
+        fmt("tail_pread", &ST_TAIL_PREAD),
+        fmt("tail_dec", &ST_TAIL_DEC),
+        fmt("tail_put", &ST_TAIL_PUT),
         fmt("sectload", &ST_SECTLOAD),
         fmt("join_fused", &ST_JOIN_FUSED),
         fmt("join_legacy", &ST_JOIN_LEGACY),
@@ -1870,7 +1879,7 @@ pub fn write_stage_json() -> String {
 }
 
 pub fn read_stage_reset() {
-    for st in [&ST_RECIPE, &ST_TAIL, &ST_TAILC_HIT, &ST_TAILC_MISS, &ST_RESC_HIT, &ST_RESC_MISS, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_SHIFT_RES] {
+    for st in [&ST_RECIPE, &ST_TAIL, &ST_TAILC_HIT, &ST_TAILC_MISS, &ST_RESC_HIT, &ST_RESC_MISS, &ST_TAIL_PREAD, &ST_TAIL_DEC, &ST_TAIL_PUT, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_SHIFT_RES] {
         st.0.store(0, Ordering::Relaxed);
         st.1.store(0, Ordering::Relaxed);
     }
@@ -3361,6 +3370,30 @@ impl Store {
 
     fn writer_seg_id(&self) -> Option<u32> {
         self.writer.lock().as_ref().map(|w| w.seg_id)
+    }
+
+    /// v0.9.89: per-tick page-cache durability — hand the writer buffer to
+    /// the flusher thread (the data lands in the OS page cache in ~1 ms, so
+    /// a crashed JVM loses at most one tick of writes) and hand the pending
+    /// recipe batch to the batcher (its commit appends through the same
+    /// writer buffer, flushed next tick). No fsync, no waiting: both
+    /// handoffs are queue pushes under short locks.
+    pub fn durability_tick(&self) {
+        // ORDER MATTERS: the batcher's commit APPENDS the batch record into
+        // the writer buffer, so the batch must be committed BEFORE the
+        // buffer handoff — otherwise the record (the only pointer to the
+        // tick's chunks) dies in RAM with the process. The blocking drain
+        // waits for the queue AND the in-flight job (sub-ms for a tick's
+        // worth of writes; the 60 s no-progress guard still applies).
+        self.flush_recipe_batch();
+        {
+            let mut wg = self.writer.lock();
+            if let Some(w) = wg.as_mut() {
+                if !w.buf.is_empty() {
+                    self.hand_off_buffer(w);
+                }
+            }
+        }
     }
 
     /// Push the append buffer to the flusher and wait for every appended
@@ -5107,14 +5140,23 @@ impl Store {
                 return Some((*c).clone());
             }
         }
+        let t_p = std::time::Instant::now();
         let data = self.seg_read_body(
             loc.seg,
             loc.off + loc.header_len(),
             loc.comp_len as usize,
         )?;
+        ST_TAIL_PREAD.0.fetch_add(t_p.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ST_TAIL_PREAD.1.fetch_add(1, Ordering::Relaxed);
+        let t_d = std::time::Instant::now();
         let out = self.decompress(loc.dict_id, &data, loc.raw_len)?;
+        ST_TAIL_DEC.0.fetch_add(t_d.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ST_TAIL_DEC.1.fetch_add(1, Ordering::Relaxed);
         if loc.raw_len <= 4 * 1024 * 1024 {
+            let t_c = std::time::Instant::now();
             self.tail_cache.lock().put(h, Arc::new(out.clone()));
+            ST_TAIL_PUT.0.fetch_add(t_c.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            ST_TAIL_PUT.1.fetch_add(1, Ordering::Relaxed);
         }
         Some(out)
     }
@@ -7187,6 +7229,40 @@ pub mod tests {
         let va: Value = fastnbt::from_bytes(a).unwrap();
         let vb: Value = fastnbt::from_bytes(b).unwrap();
         va == vb
+    }
+
+    #[test]
+    fn durability_tick_persists_without_sync() {
+        // v0.9.89: the crash-durability contract — accepted writes reach the
+        // OS page cache within one maintenance tick even when the process
+        // dies WITHOUT a graceful sync (a JVM exit never runs the Rust
+        // Drop). The tick hands the writer buffer to the flusher and the
+        // pending batch to the batcher; a fresh open must see every chunk.
+        let dir = temp_dir("durability-tick");
+        {
+            let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+            let p = chunk_payload(1, 2, 7);
+            for i in 0..40usize {
+                s.write_chunk(i as u64, &p, false).unwrap();
+            }
+            // NO sync(), NO seal() — the raw kill -9 shape: the buffer and
+            // the pending batch are the only homes of this data.
+            s.durability_tick();
+            // give the flusher + batcher threads a moment to land the bytes
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            // simulate process death: the store drops WITHOUT the blocking
+            // drain — Leak the store instead of dropping it, like a killed
+            // process would.
+            std::mem::forget(s);
+        }
+        let s2 = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        let p = chunk_payload(1, 2, 7);
+        for i in 0..40usize {
+            let got = s2
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("durability: chunk {i} lost without sync"));
+            assert!(semantic(&got, &p), "durability: chunk {i} mismatched");
+        }
     }
 
     #[test]
