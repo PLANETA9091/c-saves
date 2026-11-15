@@ -142,7 +142,11 @@ fn leg(tag: &str, corpus: &[(i32, i32, Vec<u8>)]) -> u64 {
         }
     }
     drop(st);
-    let _ = std::fs::remove_dir_all(&dir);
+    if std::env::var("TUNE_AB_KEEP").as_deref() == Ok("1") {
+        println!("KEPT_DIR={}", dir.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     disk
 }
 
