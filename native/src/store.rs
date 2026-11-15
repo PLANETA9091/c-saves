@@ -108,6 +108,22 @@ const SLAB_CODEC_LZMA2_TUNE: u8 = 0xFC;
 const SLAB_CODEC_LZMA2_NH: u8 = 0xFA;
 const SLAB_CODEC_LZMA2_MT_NH: u8 = 0xF9;
 const SLAB_CODEC_ZSTD_NH: u8 = 0xF8;
+/// v0.9.93: HASHLESS GLOB slabs. A GLOB slab mixes 0xCB/0xCC gid-stream
+/// members with members that refused the conversion (canonical CSEC and
+/// 0xC9 shift-ref bytes stay verbatim); the per-member 16 B hash column is
+/// dropped from the wire exactly like the canon family. The scan-side
+/// recompute routes by magic: gid members reconstruct their canonical form
+/// with glob_any_to_section over the ALREADY-LOADED persistent registry
+/// (load_glob_reg runs before scan; pack persists the registry before any
+/// slab that introduced new gids) and hash the result — the glob_par probe
+/// measured 2715/2715 byte-exact reconstructions and 0 divergences on the
+/// JJ corpus; canonical/shift-ref members hash their stored bytes; NBT
+/// members (tails) take the structural route. Unresolvable gids fail the
+/// parse LOUDLY (segment poison), never mint a wrong identity.
+/// CSAVES_SLAB_HASHES=0 keeps hashed rows on both families.
+const SLAB_CODEC_LZMA2_GNH: u8 = 0xF7;
+const SLAB_CODEC_LZMA2_GMT_NH: u8 = 0xF6;
+const SLAB_CODEC_ZSTD_GNH: u8 = 0xF5;
 /// Env opt-out for hashless canon slabs ("0" = keep the hashed 0xFC/0xFD
 /// wire; unset/any other value = hashless 0xFA/0xF9).
 fn slab_hashless() -> bool {
@@ -292,7 +308,8 @@ fn lzma2_compress_as(data: &[u8], stamp: u8) -> Option<(u8, Vec<u8>)> {
     // legacy 0xFE config. The stamp follows the ACTUAL config minted.
     let mut opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
         .ok()?;
-    if stamp == SLAB_CODEC_LZMA2_TUNE || stamp == SLAB_CODEC_LZMA2_NH {
+    if stamp == SLAB_CODEC_LZMA2_TUNE || stamp == SLAB_CODEC_LZMA2_NH || stamp == SLAB_CODEC_LZMA2_GNH
+    {
         opts.literal_context_bits(LZMA2_COLD_LC)
             .literal_position_bits(LZMA2_COLD_LP)
             .position_bits(LZMA2_COLD_PB);
@@ -335,7 +352,10 @@ fn lzma2_compress_maybe_mt_as(data: &[u8], threads: u32, st_raw: u8, st_mt: u8) 
     // lc/lp/pb the container declares).
     let mut opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
         .ok()?;
-    if st_mt == SLAB_CODEC_LZMA2_MT_NH || st_mt == SLAB_CODEC_LZMA2_MT {
+    if st_mt == SLAB_CODEC_LZMA2_MT_NH
+        || st_mt == SLAB_CODEC_LZMA2_MT
+        || st_mt == SLAB_CODEC_LZMA2_GMT_NH
+    {
         if cold_lzma_tuned() {
             opts.literal_context_bits(LZMA2_COLD_LC)
                 .literal_position_bits(LZMA2_COLD_LP)
@@ -3821,6 +3841,9 @@ impl Store {
         if dict_id == SLAB_CODEC_LZMA2_NH {
             return lzma2_decompress_tuned(data, raw_len as usize);
         }
+        if dict_id == SLAB_CODEC_LZMA2_GNH {
+            return lzma2_decompress_tuned(data, raw_len as usize);
+        }
         if dict_id == SLAB_CODEC_LZMA2_TUNE {
             return lzma2_decompress_tuned(data, raw_len as usize);
         }
@@ -3830,10 +3853,14 @@ impl Store {
         if dict_id == SLAB_CODEC_LZMA2_MT_NH {
             return lzma2_mt_decompress(data, raw_len as usize);
         }
+        if dict_id == SLAB_CODEC_LZMA2_GMT_NH {
+            return lzma2_mt_decompress(data, raw_len as usize);
+        }
         // v0.9.91: 0xF8 = zstd cold_level fallback carrying hashless rows —
         // decode is the no-dict zstd path (same as dict_id 0), the stamp
-        // only routes the row format.
-        let no_dict = dict_id == 0 || dict_id == SLAB_CODEC_ZSTD_NH;
+        // only routes the row format. 0xF5 = the same for the GLOB family.
+        let no_dict =
+            dict_id == 0 || dict_id == SLAB_CODEC_ZSTD_NH || dict_id == SLAB_CODEC_ZSTD_GNH;
         DEC_C.with(|c| {
             let mut slot = c.borrow_mut();
             let key = (self.uid, dict_id);
@@ -4147,8 +4174,15 @@ impl Store {
         raw_total: u32,
         n: usize,
     ) -> Option<(Vec<(u32, u32, Hash)>, usize)> {
-        let hashless =
-            matches!(dict_id, SLAB_CODEC_LZMA2_NH | SLAB_CODEC_LZMA2_MT_NH | SLAB_CODEC_ZSTD_NH);
+        let hashless = matches!(
+            dict_id,
+            SLAB_CODEC_LZMA2_NH
+                | SLAB_CODEC_LZMA2_MT_NH
+                | SLAB_CODEC_ZSTD_NH
+                | SLAB_CODEC_LZMA2_GNH
+                | SLAB_CODEC_LZMA2_GMT_NH
+                | SLAB_CODEC_ZSTD_GNH
+        );
         let raw = self.decompress(dict_id, comp, raw_total)?;
         let mut out = Vec::with_capacity(n);
         let mut p = 0usize;
@@ -4183,13 +4217,23 @@ impl Store {
                     return None;
                 }
                 let bytes = &raw[q..end];
-                // Identity must equal the WRITE-TIME dedup key exactly:
-                // CSEC3/4 members and 0xC9 shift-refs are keyed by
-                // hash_of(stored bytes); fallback members (the non-CSEC
-                // wire = stripped section NBT) are keyed by
-                // structural_hash(value), which is re-serialization-stable
-                // and therefore recomputable from the stored bytes.
+                // Identity must equal the WRITE-TIME dedup key exactly.
+                // v0.9.93: 0xCB/0xCC GLOB members reconstruct their canonical
+                // form over the persistent registry (loaded before scan;
+                // glob_par measured 0 divergences) and hash it; CSEC3/4 +
+                // 0xC9 shift-ref members are keyed by hash_of(stored bytes);
+                // fallback NBT members (tails) are keyed structurally, which
+                // structural_hash_wire recomputes without a parse.
                 e.2 = match bytes.first() {
+                    Some(&0xCB) | Some(&0xCC) => {
+                        let reg = self.glob_reg.lock();
+                        match chunknbt::glob_any_to_section(bytes, &reg) {
+                            Some(canon) => xxhash_rust::xxh3::xxh3_128(&canon),
+                            // unresolvable gid = real corruption: fail the
+                            // parse LOUDLY, never mint a wrong identity
+                            None => return None,
+                        }
+                    }
                     Some(&0xC7) | Some(&0xC8) | Some(&0xC9) => {
                         xxhash_rust::xxh3::xxh3_128(bytes)
                     }
@@ -6286,7 +6330,7 @@ impl Store {
                     if any {
                         let graws_ref: Vec<&[u8]> = graws.iter().map(|v| v.as_slice()).collect();
                         let _tbg = std::time::Instant::now();
-                        let (gs, gtab_len) = build(&glens, &graws_ref, false);
+                        let (gs, gtab_len) = build(&glens, &graws_ref, nh);
                         PK_B_TAB_NS.fetch_add(_tbg.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let reg_w = if graws.iter().any(|g| chunknbt::glob_member_wide(g)) {
                             2u8
@@ -6354,9 +6398,14 @@ impl Store {
         let stamp_pairs: Vec<(u8, u8)> = builds
             .iter()
             .flat_map(|b| {
+                let nh = slab_hashless();
                 let mut v = vec![canon_pair];
                 if b.glob.is_some() {
-                    v.push((SLAB_CODEC_LZMA2_TUNE, SLAB_CODEC_LZMA2_MT));
+                    v.push(if nh {
+                        (SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH)
+                    } else {
+                        (SLAB_CODEC_LZMA2_TUNE, SLAB_CODEC_LZMA2_MT)
+                    });
                 }
                 v
             })
@@ -6445,14 +6494,21 @@ impl Store {
                 if mt_sel[i] && per_big > 1 {
                     match lzma2_compress_maybe_mt_as(stream, per_big, st_raw, st_mt) {
                         Some((stamp, c)) => {
-                            if stamp == SLAB_CODEC_LZMA2_MT || stamp == SLAB_CODEC_LZMA2_MT_NH {
+                            if stamp == SLAB_CODEC_LZMA2_MT
+                                || stamp == SLAB_CODEC_LZMA2_MT_NH
+                                || stamp == SLAB_CODEC_LZMA2_GMT_NH
+                            {
                                 PK_MT_JOBS.fetch_add(1, Ordering::Relaxed);
                                 PK_MT_BYTES.fetch_add(stream.len() as u64, Ordering::Relaxed);
                             }
                             (stamp, c)
                         }
                         None => (
-                            if st_raw == SLAB_CODEC_LZMA2_NH { SLAB_CODEC_ZSTD_NH } else { 0 },
+                            match st_raw {
+                                SLAB_CODEC_LZMA2_NH => SLAB_CODEC_ZSTD_NH,
+                                SLAB_CODEC_LZMA2_GNH => SLAB_CODEC_ZSTD_GNH,
+                                _ => 0,
+                            },
                             bulk_compress(stream, level).1,
                         ),
                     }
@@ -6460,7 +6516,11 @@ impl Store {
                     match lzma2_compress_as(stream, st_raw) {
                         Some((stamp, c)) => (stamp, c),
                         None => (
-                            if st_raw == SLAB_CODEC_LZMA2_NH { SLAB_CODEC_ZSTD_NH } else { 0 },
+                            match st_raw {
+                                SLAB_CODEC_LZMA2_NH => SLAB_CODEC_ZSTD_NH,
+                                SLAB_CODEC_LZMA2_GNH => SLAB_CODEC_ZSTD_GNH,
+                                _ => 0,
+                            },
                             bulk_compress(stream, level).1,
                         ),
                     }
