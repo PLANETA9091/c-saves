@@ -468,6 +468,11 @@ fn main() {
     // here, now fed in location order (slab streaming).
     let (ok_a, bad_a) = verify_all_semantic(&store_a, &world, &order_a, nproc, true, "verify A");
     let t_verify_a = t2.elapsed().as_secs_f64();
+    // v0.9.88: the read-path stage decomposition AT SCALE — the local probe
+    // cannot reproduce the phase A/B read delta (1.56x); the stage meters
+    // are process-global atomics the verify threads already feed.
+    eprintln!("[worst-readstages A] {}", c_saves::store::read_stage_json());
+    c_saves::store::read_stage_reset();
     assert_eq!(bad_a, 0, "phase A: every stored chunk must match its edit");
     assert_eq!(ok_a, total_chunks);
     eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] phase A verify done in {t_verify_a:.1}s");
@@ -572,6 +577,8 @@ fn main() {
     assert_eq!(bad_b, 0, "phase B: every stored chunk must match its edit");
     assert_eq!(ok_b, total_chunks);
     let t_verify_b = t5.elapsed().as_secs_f64();
+    eprintln!("[worst-readstages B] {}", c_saves::store::read_stage_json());
+    c_saves::store::read_stage_reset();
     eprintln!("[{:8.1}s] worst ", stamp()); eprintln!("[worst] phase B verify done in {t_verify_b:.1}s");
     println!(
         "worst-case verify B: ok={} bad={} — every stored chunk read back and semantically matched",
