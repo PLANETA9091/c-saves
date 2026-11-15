@@ -584,12 +584,15 @@ jobs:
           check_stats 0 1
           no_mca
           echo "read gate OK: the server loaded chunks from the container on a cold restart"
-          # v0.9.64: snapshot the BULK-READ line while it is the tail — the
-          # meters gates and the A/B must feed on the big fetch sample (531
-          # fetches in CI), not on stats-live.txt's tail AFTER run4 (the
-          # verify boot touches only the spawn window: ~37 fetches, too few
-          # for an n>=200 percentile gate)
-          tail -n 1 stats-live.txt > meters-live.txt
+          # v0.9.94: the meters snapshot MOVED below (after run4) — the
+          # spawn search in Paper 26.3-248 is racy (0.9.63 postmortem) and a
+          # single boot can lose its ENTIRE spawn-window fetch sample (0.9.91
+          # red: fn=0 in run2 while run4 of the same job served 483). The
+          # meters take the BEST bulk-read line across all live boots (max
+          # fn): runs 2 and 4 are both forceload phases reading the same
+          # window, every line is a per-process cumulative snapshot, so the
+          # max-fn line is the honest bulk-read sample and the percentile
+          # gates keep their n.
 
           # ---- run 3: a LIVE EDIT through the server console ----
           # v0.9.64: the edit is BACK at spawn (0, -60, 0). The 0.9.63 CI-red
@@ -616,6 +619,8 @@ jobs:
           grep -q "Done (" run4.log || { echo "FAIL run4: no Done"; tail -40 run4.log; exit 1; }
           check_stats 0 1
           no_mca
+
+          python3 -c "import re; lines=[l.strip() for l in open('stats-live.txt') if re.search(r\"'fn': (\d+)\", l)]; cands=[(int(re.search(r\"'fn': (\d+)\", l).group(1)), l) for l in lines]; best=max(cands)[1] if cands else ''; open('meters-live.txt','w').write(best+chr(10)); print('meters-live: fn=%d best of %d lines' % (max(cands)[0] if cands else -1, len(lines)))"
 
           # ---- offline ground truth: the container holds the edit, zero .mca ----
           "$ROOT/native/target/release/examples/paper_probe" \
