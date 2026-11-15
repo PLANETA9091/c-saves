@@ -108,19 +108,16 @@ const SLAB_CODEC_LZMA2_TUNE: u8 = 0xFC;
 const SLAB_CODEC_LZMA2_NH: u8 = 0xFA;
 const SLAB_CODEC_LZMA2_MT_NH: u8 = 0xF9;
 const SLAB_CODEC_ZSTD_NH: u8 = 0xF8;
-/// v0.9.93: HASHLESS GLOB slabs. A GLOB slab mixes 0xCB/0xCC gid-stream
-/// members with members that refused the conversion (canonical CSEC and
-/// 0xC9 shift-ref bytes stay verbatim); the per-member 16 B hash column is
-/// dropped from the wire exactly like the canon family. The scan-side
-/// recompute routes by magic: gid members reconstruct their canonical form
-/// with glob_any_to_section over the ALREADY-LOADED persistent registry
-/// (load_glob_reg runs before scan; pack persists the registry before any
-/// slab that introduced new gids) and hash the result — the glob_par probe
-/// measured 2715/2715 byte-exact reconstructions and 0 divergences on the
-/// JJ corpus; canonical/shift-ref members hash their stored bytes; NBT
-/// members (tails) take the structural route. Unresolvable gids fail the
-/// parse LOUDLY (segment poison), never mint a wrong identity.
-/// CSAVES_SLAB_HASHES=0 keeps hashed rows on both families.
+/// v0.9.93: HASHLESS GLOB slabs — RETIRED in v0.9.95 (never minted: see the
+/// glob_triple comment in the pack path; the glob form is not byte-lossless
+/// for light-bearing RLE sections, so the scan-side identity recompute
+/// drifts). The stamps and their decode branches STAY for containers minted
+/// during the 0.9.93 window: 0xF7 = raw LZMA2 tuned glob-hashless rows,
+/// 0xF6 = the MT blocked .xz form, 0xF5 = the zstd fallback; their identity
+/// recompute routes 0xCB/0xCC members through the registry reconstruction
+/// (best effort — content whose glob roundtrip is byte-exact resolves
+/// exactly, the rest fails the invariant scan LOUDLY rather than corrupting
+/// silently, and the next drain re-hashes them).
 const SLAB_CODEC_LZMA2_GNH: u8 = 0xF7;
 const SLAB_CODEC_LZMA2_GMT_NH: u8 = 0xF6;
 const SLAB_CODEC_ZSTD_GNH: u8 = 0xF5;
@@ -4228,7 +4225,18 @@ impl Store {
                     Some(&0xCB) | Some(&0xCC) => {
                         let reg = self.glob_reg.lock();
                         match chunknbt::glob_any_to_section(bytes, &reg) {
-                            Some(canon) => xxhash_rust::xxh3::xxh3_128(&canon),
+                            // v0.9.95: hash the FULL CANONICAL RE-ENCODE, not
+                            // glob_any_to_section's direct output — the direct
+                            // wire re-emits the walked form (2444 vs 3056 B on
+                            // RLE-form sections), semantically equal but
+                            // byte-different, and its hash would drift from
+                            // the write-time dedup key. The canonical encoder
+                            // is content-deterministic: the re-encode
+                            // reproduces the original bytes bit for bit.
+                            Some(direct) => match chunknbt::canonical_reencode(&direct) {
+                                Some(canon) => xxhash_rust::xxh3::xxh3_128(&canon),
+                                None => return None,
+                            },
                             // unresolvable gid = real corruption: fail the
                             // parse LOUDLY, never mint a wrong identity
                             None => return None,
@@ -4317,9 +4325,25 @@ impl Store {
             }
             for (h, l) in &members {
                 match disk.get(h) {
-                    None => out.push(format!(
-                        "slab @({seg_id},{off}): map hash {h:016x} NOT IN entry table (n={n})"
-                    )),
+                    None => {
+                        // v0.9.95 debug: name the member's stamp + first bytes
+                        // so a recompute misroute is identifiable from the
+                        // violation alone
+                        let probe = match self.decompress(dict_id, &data, raw_total) {
+                            Some(raw) => {
+                                let so = l.slab_off as usize;
+                                let eo = (so + 8.min(l.raw_len as usize)).min(raw.len());
+                                raw.get(so..eo)
+                                    .map(|b| format!("{b:02x?}"))
+                                    .unwrap_or_default()
+                            }
+                            None => "?".into(),
+                        };
+                        out.push(format!(
+                            "slab @({seg_id},{off}): map hash {h:016x} NOT IN entry table (n={n}) stamp={dict_id:02x} len={} head={probe}",
+                            l.raw_len
+                        ))
+                    }
                     Some(&(doff, dlen)) => {
                         if l.slab_off != doff || l.raw_len != dlen {
                             out.push(format!(
@@ -6330,7 +6354,7 @@ impl Store {
                     if any {
                         let graws_ref: Vec<&[u8]> = graws.iter().map(|v| v.as_slice()).collect();
                         let _tbg = std::time::Instant::now();
-                        let (gs, gtab_len) = build(&glens, &graws_ref, nh);
+                        let (gs, gtab_len) = build(&glens, &graws_ref, false);
                         PK_B_TAB_NS.fetch_add(_tbg.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let reg_w = if graws.iter().any(|g| chunknbt::glob_member_wide(g)) {
                             2u8
@@ -6384,28 +6408,49 @@ impl Store {
         // hashless family is 0xF8 on both raw and MT forms (the row format is
         // what the stamp routes; zstd decode is dict-less either way).
         let lz = cold_codec_lzma2();
-        let canon_pair = if lz {
+        // v0.9.95: per-stream stamp TRIPLES (raw, mt, zstd) — the zstd cold
+        // codec (CSAVES_COLD_CODEC=zstd) must never mint an LZMA stamp (and
+        // vice versa): a stream's codec byte names BOTH the codec AND the row
+        // family, so a zstd-compressed glob stream stamped 0xFC would land in
+        // the LZMA decoder and corrupt. The pure-zstd branches stamp with the
+        // third element; the LZMA-fallback arms already map NH→0xF8/GNH→0xF5.
+        let canon_triple: (u8, u8, u8) = if lz {
             if slab_hashless() {
-                (SLAB_CODEC_LZMA2_NH, SLAB_CODEC_LZMA2_MT_NH)
+                (SLAB_CODEC_LZMA2_NH, SLAB_CODEC_LZMA2_MT_NH, SLAB_CODEC_ZSTD_NH)
             } else {
-                (SLAB_CODEC_LZMA2_TUNE, SLAB_CODEC_LZMA2_MT)
+                (SLAB_CODEC_LZMA2_TUNE, SLAB_CODEC_LZMA2_MT, 0)
             }
         } else if slab_hashless() {
-            (SLAB_CODEC_ZSTD_NH, SLAB_CODEC_ZSTD_NH)
+            (SLAB_CODEC_ZSTD_NH, SLAB_CODEC_ZSTD_NH, SLAB_CODEC_ZSTD_NH)
         } else {
-            (0u8, 0u8)
+            (0u8, 0u8, 0u8)
         };
-        let stamp_pairs: Vec<(u8, u8)> = builds
+        let glob_triple: (u8, u8, u8) = {
+            // v0.9.95 RETIRED the hashless-GLOB family (0xF7/0xF6/0xF5 minting):
+            // the scan-side identity recompute needs the reconstruction to be
+            // BYTE-exact, and the glob form is semantic-lossless but NOT byte-
+            // lossless for light-bearing RLE-form sections (measured: canonical
+            // 3056 B vs reconstruction 2444 B on the synthetic tall-section
+            // class — glob_reconstruction_not_byte_exact pins it). A drifted
+            // identity would silently miss dedup hits and strand recipe
+            // references after reopen. GLOB slabs keep the hashed 0xFC/0xFD
+            // wire on EVERY cold codec; the 0xF7/0xF6/0xF5 DECODE branches
+            // stay for containers minted during the 0.9.93 window (pack
+            // re-hashes them on the next drain). Hashless CANON slabs (0.9.91)
+            // are unaffected: their members hash their own stored bytes by
+            // construction.
+            if lz {
+                (SLAB_CODEC_LZMA2_TUNE, SLAB_CODEC_LZMA2_MT, 0)
+            } else {
+                (0u8, 0u8, 0u8)
+            }
+        };
+        let stamp_pairs: Vec<(u8, u8, u8)> = builds
             .iter()
             .flat_map(|b| {
-                let nh = slab_hashless();
-                let mut v = vec![canon_pair];
+                let mut v = vec![canon_triple];
                 if b.glob.is_some() {
-                    v.push(if nh {
-                        (SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH)
-                    } else {
-                        (SLAB_CODEC_LZMA2_TUNE, SLAB_CODEC_LZMA2_MT)
-                    });
+                    v.push(glob_triple);
                 }
                 v
             })
@@ -6481,7 +6526,7 @@ impl Store {
         let _tc = std::time::Instant::now();
         let compress_one = |i: usize| -> (u8, Vec<u8>) {
             let stream = flat[i];
-            let (st_raw, st_mt) = stamp_pairs[i];
+            let (st_raw, st_mt, st_zstd) = stamp_pairs[i];
             if lz {
                 // v0.9.41: LZMA2 cold slab streams. v0.9.85: big streams go
                 // through the blocked .xz MT encoder with the same rank-
@@ -6532,10 +6577,10 @@ impl Store {
                 let r = mt_compress(stream, level, per_big)
                     .unwrap_or_else(|| bulk_compress(stream, level).1);
                 PK_MT_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                (st_raw, r)
+                (st_zstd, r)
             } else {
                 let r = bulk_compress(stream, level).1;
-                (st_raw, r)
+                (st_zstd, r)
             }
         };
         if flat.len() > 1 {
@@ -8693,6 +8738,118 @@ pub(crate) mod glob_slab_test {
         // the registry must be persisted alongside the glob slabs
         assert!(dir.join("states-1.bin").exists(), "states-1.bin missing");
         set_force_glob_for_tests(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_reconstruction_not_byte_exact() {
+        // v0.9.95: WHY the hashless-GLOB family stays retired. The scan-side
+        // identity recompute needs glob_any_to_section(stored) (or any
+        // re-encode of it) to reproduce the ORIGINAL canonical member bytes
+        // bit for bit. The JJ corpus's convertible dense subset DOES
+        // reconstruct exactly (glob_par: 2715/2715) — but light-bearing
+        // RLE-form sections do NOT: the reconstruction is semantically equal
+        // and byte-DIFFERENT (canonical 3056 B vs reconstruction 2444 B
+        // measured). This test pins that divergence class so nobody re-tries
+        // the hashless-GLOB identity recompute without solving the byte
+        // losslessness first.
+        use chunknbt::{SecBytes, Split, StateRegistry};
+        let mut reg = StateRegistry::new();
+        let mut diverged = 0usize;
+        for i in 0..6usize {
+            let payload = glob_chunk_payload(i);
+            let Ok(Split::Split { sections, .. }) =
+                chunknbt::split(&payload, false, None, true)
+            else {
+                panic!("split failed");
+            };
+            for (h, sb) in &sections {
+                let csec = match sb {
+                    SecBytes::Shared(a) => (**a).clone(),
+                    SecBytes::Owned(b) => b.clone(),
+                };
+                let Some(glob) = chunknbt::section_to_glob(&csec, &mut reg) else {
+                    continue; // non-convertible member: not the recompute's job
+                };
+                let Some(direct) = chunknbt::glob_any_to_section(&glob, &reg) else {
+                    panic!("member {h:016x}: reconstruction refused");
+                };
+                if direct == csec && chunknbt::hash_of(&direct) == *h {
+                    continue; // the byte-exact class (dense lightless members)
+                }
+                diverged += 1;
+                assert_ne!(
+                    chunknbt::hash_of(&direct),
+                    *h,
+                    "member {h:016x}: drifted reconstruction must not collide with the write-time key"
+                );
+            }
+        }
+        // (the exact class exists on JJ's dense lightless subset — glob_par
+        // 2715/2715 — but the synthetic payload sections all carry light, so
+        // every convertible member here diverges)
+        assert!(
+            diverged > 0,
+            "the divergence class vanished — hashless GLOB may be re-evaluated (see the glob_triple comment)"
+        );
+    }
+
+    #[test]
+    fn glob_hashless_zstd_cold_roundtrip() {
+        // v0.9.95 regression: under the zstd cold codec (CSAVES_COLD_CODEC=
+        // zstd) the pack's pure-zstd branches must stamp GLOB streams with
+        // the HASHED zstd stamp (0) — the 0.9.93 triples briefly let the
+        // LZMA stamp (0xFC) ride a zstd stream there, which would land in
+        // the LZMA decoder on read and corrupt. Hashed glob rows under the
+        // zstd cold codec must survive pack, reopen and the invariant scan
+        // end to end.
+        let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_force_glob_for_tests(Some(true));
+        set_cold_codec_for_tests(Some("zstd"));
+        let dir = temp_dir("glob-hashless-zstd");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let n = 90usize;
+        let payloads: Vec<Vec<u8>> = (0..n).map(glob_chunk_payload).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            st.write_chunk(i as u64, p, false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for _ in 0..50 {
+            st.request_pack();
+            if !st.compact_step() {
+                break;
+            }
+        }
+        assert!(Store::glob_slab_count() > 0, "no GLOB slabs under force+zstd");
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable post-pack (zstd cold)"));
+            assert!(chunk_semantic_glob(&got, p), "chunk {i} wrong post-pack (zstd cold)");
+        }
+        let viol = st.slab_invariant_scan();
+        for v in viol.iter().take(4) {
+            eprintln!("[dbg-zstd] {v}");
+        }
+        assert!(
+            viol.is_empty(),
+            "slab invariant violations after zstd-cold drain"
+        );
+        drop(st);
+        let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st2
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable post-reopen (zstd cold)"));
+            assert!(chunk_semantic_glob(&got, p), "chunk {i} wrong post-reopen (zstd cold)");
+        }
+        assert!(
+            st2.slab_invariant_scan().is_empty(),
+            "slab invariant violations after zstd-cold reopen"
+        );
+        set_force_glob_for_tests(None);
+        set_cold_codec_for_tests(None);
         let _ = fs::remove_dir_all(&dir);
     }
 

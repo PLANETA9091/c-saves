@@ -7971,6 +7971,23 @@ fn state_key<'a>(s: Option<&'a GlobState>) -> (bool, &'a str, &'a Vec<(String, S
     }
 }
 
+/// Canonical re-encode of a section member given in ANY wire form (v0.9.95):
+/// decode to the section Value, then run the FULL canonical encoder — the
+/// content-deterministic dense/RLE/RLE-transposed form selection and the
+/// frequency-canonical palette order. This is the ONLY identity-safe way to
+/// hash a GLOB-reconstructed section: `glob_any_to_section`'s direct output
+/// re-emits the wire form it walked (measured 2444 B vs the canonical 3056 B
+/// on RLE-form tall sections — semantically equal, byte-DIFFERENT), so its
+/// hash drifts from the write-time dedup key. The canonical encoder is a
+/// pure function of the section content, so the re-encode reproduces the
+/// original bytes bit for bit (differential-tested).
+pub fn canonical_reencode(member: &[u8]) -> Option<Vec<u8>> {
+    let v = section_decode(member)?;
+    let view = sec_view_of_value(&v)?;
+    let (c, _) = section_encode_view(&view, false)?;
+    Some(c)
+}
+
 pub fn glob_any_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     match glob.first() {
         Some(&GLOB_MAGIC) => glob_to_section(glob, reg),
