@@ -4813,6 +4813,280 @@ pub fn hash_of(payload: &[u8]) -> Hash {
     xxh3_128(payload)
 }
 
+/// structural_hash directly over NBT WIRE bytes, without materializing a
+/// `Value` (v0.9.92): the byte stream fed into Xxh3 is IDENTICAL to
+/// `feed(&mut h, &Value)` — scalars feed their little-endian bits (the wire
+/// is big-endian, so every scalar is read and re-emitted LE), byte arrays
+/// feed their raw bytes, long/int arrays feed LE words, strings feed
+/// [len u64 LE][utf8 bytes], lists feed [9][len u64 LE][elements], compounds
+/// feed [10][n u64 LE] then every key in SORTED order as
+/// [klen u64 LE][key bytes][value].
+///
+/// Returns None (bail) when the wire cannot be walked exactly: any string
+/// containing non-ASCII bytes (Java modified UTF-8 may re-encode to a
+/// different Rust `String` byte length, which would desynchronize the
+/// stream from feed's `s.len()`), a malformed length, or a truncated
+/// payload. Callers fall back to `structural_hash(&parsed Value)` — the
+/// parse-back this function exists to avoid. Chunk tails (the only NBT
+/// members that ride hashless slabs) are ASCII-keyed compounds in practice,
+/// so the fast path covers essentially every real payload; the differential
+/// test pins parity on the corpus and on adversarial synthetic values.
+pub fn structural_hash_wire(payload: &[u8]) -> Option<Hash> {
+    struct W<'a> {
+        b: &'a [u8],
+    }
+    impl<'a> W<'a> {
+        fn u8(&mut self) -> Option<u8> {
+            let v = *self.b.first()?;
+            self.b = &self.b[1..];
+            Some(v)
+        }
+        fn u16(&mut self) -> Option<u16> {
+            if self.b.len() < 2 {
+                return None;
+            }
+            let v = u16::from_be_bytes([self.b[0], self.b[1]]);
+            self.b = &self.b[2..];
+            Some(v)
+        }
+        fn i32(&mut self) -> Option<i32> {
+            if self.b.len() < 4 {
+                return None;
+            }
+            let v = i32::from_be_bytes([self.b[0], self.b[1], self.b[2], self.b[3]]);
+            self.b = &self.b[4..];
+            Some(v)
+        }
+        fn i64(&mut self) -> Option<i64> {
+            if self.b.len() < 8 {
+                return None;
+            }
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&self.b[..8]);
+            self.b = &self.b[8..];
+            Some(i64::from_be_bytes(a))
+        }
+        fn exact(&mut self, n: usize) -> Option<&'a [u8]> {
+            if self.b.len() < n {
+                return None;
+            }
+            let (h, t) = self.b.split_at(n);
+            self.b = t;
+            Some(h)
+        }
+    }
+
+    /// Advance past one value of wire type `t` without feeding.
+    fn skip_value(w: &mut W, t: u8) -> Option<()> {
+        match t {
+            1 => {
+                w.exact(1)?;
+            }
+            2 => {
+                w.exact(2)?;
+            }
+            3 | 5 => {
+                w.exact(4)?;
+            }
+            4 | 6 => {
+                w.exact(8)?;
+            }
+            7 => {
+                let n = w.i32()?;
+                let n = usize::try_from(n).ok()?;
+                w.exact(n)?;
+            }
+            8 => {
+                let n = w.u16()? as usize;
+                w.exact(n)?;
+            }
+            9 => {
+                let et = w.u8()?;
+                let n = w.i32()?;
+                let n = usize::try_from(n).ok()?;
+                for _ in 0..n {
+                    skip_value(w, et)?;
+                }
+            }
+            10 => loop {
+                let t2 = w.u8()?;
+                if t2 == 0 {
+                    break;
+                }
+                let nlen = w.u16()? as usize;
+                w.exact(nlen)?;
+                skip_value(w, t2)?;
+            },
+            11 => {
+                let n = w.i32()?;
+                let n = usize::try_from(n).ok()?;
+                w.exact(n.checked_mul(4)?)?;
+            }
+            12 => {
+                let n = w.i32()?;
+                let n = usize::try_from(n).ok()?;
+                w.exact(n.checked_mul(8)?)?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// Feed one value of wire type `t`; the stream is byte-identical to
+    /// feed(&Value) for the equivalent parsed value.
+    fn feed_value(w: &mut W, t: u8, h: &mut Xxh3) -> Option<()> {
+        match t {
+            1 => {
+                let x = w.u8()? as i8;
+                h.update(&[1]);
+                h.update(&x.to_le_bytes());
+            }
+            2 => {
+                let x = w.u16()? as i16;
+                h.update(&[2]);
+                h.update(&x.to_le_bytes());
+            }
+            3 => {
+                let x = w.i32()?;
+                h.update(&[3]);
+                h.update(&x.to_le_bytes());
+            }
+            4 => {
+                let x = w.i64()?;
+                h.update(&[4]);
+                h.update(&x.to_le_bytes());
+            }
+            5 => {
+                let x = w.i32()?; // f32 wire bits
+                h.update(&[5]);
+                h.update(&x.to_le_bytes());
+            }
+            6 => {
+                let x = w.i64()?; // f64 wire bits
+                h.update(&[6]);
+                h.update(&x.to_le_bytes());
+            }
+            7 => {
+                let n = w.i32()?;
+                let n = usize::try_from(n).ok()?;
+                let bytes = w.exact(n)?;
+                h.update(&[7]);
+                h.update(&(n as u64).to_le_bytes());
+                h.update(bytes);
+            }
+            8 => {
+                let n = w.u16()? as usize;
+                let bytes = w.exact(n)?;
+                if bytes.iter().any(|&c| c >= 0x80) {
+                    return None; // non-ASCII: modified UTF-8 parity not guaranteed
+                }
+                h.update(&[8]);
+                h.update(&(n as u64).to_le_bytes());
+                h.update(bytes);
+            }
+            9 => {
+                let et = w.u8()?;
+                let n = w.i32()?;
+                let n = usize::try_from(n).ok()?;
+                if n > 0 && et == 0 {
+                    return None; // non-empty list of TAG_End: not a real form
+                }
+                h.update(&[9]);
+                h.update(&(n as u64).to_le_bytes());
+                for _ in 0..n {
+                    feed_value(w, et, h)?;
+                }
+            }
+            10 => {
+                // body = everything up to (not including) the matching End
+                let start = w.b;
+                skip_value(w, 10)?;
+                let consumed = start.len() - w.b.len();
+                let body = start.get(..consumed.checked_sub(1)?)?;
+                feed_compound(body, h)?;
+            }
+            11 => {
+                let n = w.i32()?;
+                let n = usize::try_from(n).ok()?;
+                h.update(&[11]);
+                h.update(&(n as u64).to_le_bytes());
+                for _ in 0..n {
+                    let x = w.i32()?;
+                    h.update(&x.to_le_bytes());
+                }
+            }
+            12 => {
+                let n = w.i32()?;
+                let n = usize::try_from(n).ok()?;
+                h.update(&[12]);
+                h.update(&(n as u64).to_le_bytes());
+                for _ in 0..n {
+                    let x = w.i64()?;
+                    h.update(&x.to_le_bytes());
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// Feed a compound BODY (named entries, WITHOUT the terminating End) the
+    /// way feed() feeds a Value::Compound: [10][n], then sorted keys. The
+    /// body is walked twice: once to collect (name, type, offset) entries,
+    /// once to feed each value re-entering at its recorded offset.
+    fn feed_compound(body: &[u8], h: &mut Xxh3) -> Option<()> {
+        let mut w = W { b: body };
+        let mut entries: Vec<(&[u8], u8, usize)> = Vec::new();
+        loop {
+            // the body slice EXCLUDES the terminating End tag: exhaustion ==
+            // zero entries left (an empty compound has a zero-length body)
+            let t = if w.b.is_empty() { 0 } else { w.u8()? };
+            if t == 0 {
+                break;
+            }
+            let nlen = w.u16()? as usize;
+            let name = w.exact(nlen)?;
+            if name.iter().any(|&c| c >= 0x80) {
+                return None;
+            }
+            // absolute offset within the body slice: w.b is the REMAINING
+            // tail, so the value starts at body.len() - remaining.len()
+            entries.push((name, t, body.len() - w.b.len()));
+            skip_value(&mut w, t)?;
+        }
+        h.update(&[10]);
+        h.update(&(entries.len() as u64).to_le_bytes());
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, t, off) in &entries {
+            h.update(&((*name).len() as u64).to_le_bytes());
+            h.update(name);
+            let mut wv = W { b: &body[*off..] };
+            feed_value(&mut wv, *t, h)?;
+        }
+        Some(())
+    }
+
+    // root: [0x0A][u16 name][name][BODY][End] — feed ignores the root name
+    let mut w = W { b: payload };
+    let root_t = w.u8()?;
+    if root_t != 10 {
+        return None; // tails are chunk compounds; anything else bails
+    }
+    let nlen = w.u16()? as usize;
+    let name = w.exact(nlen)?;
+    if name.iter().any(|&c| c >= 0x80) {
+        return None;
+    }
+    let header = 1 + 2 + nlen;
+    let body = payload.get(header..payload.len().checked_sub(1)?)?;
+    if *payload.last()? != 0 {
+        return None; // the root must end with TAG_End
+    }
+    let mut h = Xxh3::new();
+    feed_compound(body, &mut h)?;
+    Some(h.digest128())
+}
+
 /// Order-free structural digest of an NBT value. Compounds are fed in sorted
 /// key order; strings/types/lengths are mixed in, so any semantic difference
 /// changes the hash and any re-serialization keeps it stable.
@@ -8095,6 +8369,81 @@ mod fused_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn structural_hash_wire_parity() {
+        use fastnbt::{ByteArray, IntArray, LongArray, Value};
+        use std::collections::HashMap as Map;
+        fn mk(m: Vec<(&str, Value)>) -> Value {
+            Value::Compound(m.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        }
+        let cases: Vec<Value> = vec![
+            mk(vec![]),
+            mk(vec![
+                ("a", Value::Byte(-3)),
+                ("b", Value::Short(700)),
+                ("c", Value::Int(1 << 30)),
+                ("l", Value::Long(-1i64 << 62)),
+                ("f", Value::Float(1.5)),
+                ("d", Value::Double(-2.25)),
+            ]),
+            mk(vec![
+                ("s", Value::String("hello".into())),
+                ("e", Value::String("".into())),
+            ]),
+            mk(vec![
+                ("ba", Value::ByteArray(ByteArray::new(vec![-1i8; 300]))),
+                ("ia", Value::IntArray(IntArray::new(vec![5, -6, 7]))),
+                ("la", Value::LongArray(LongArray::new(vec![1i64 << 40, -2]))),
+            ]),
+            mk(vec![(
+                "list",
+                Value::List(vec![Value::Int(1), Value::Int(-2), Value::Int(3)]),
+            )]),
+            mk(vec![(
+                "deep",
+                mk(vec![
+                    ("z", Value::Byte(1)),
+                    (
+                        "a",
+                        mk(vec![(
+                            "inner",
+                            Value::List(vec![
+                                mk(vec![("k", Value::String("x".into()))]),
+                                mk(vec![("k", Value::String("y".into()))]),
+                            ]),
+                        )]),
+                    ),
+                ]),
+            )]),
+            // key ORDER must not matter (sorted feed on both sides)
+            mk(vec![("b", Value::Int(2)), ("a", Value::Int(1))]),
+        ];
+        // sanity: order-free property of structural_hash itself
+        let flipped = mk(vec![("a", Value::Int(1)), ("b", Value::Int(2))]);
+        assert_eq!(structural_hash(&cases[6]), structural_hash(&flipped));
+        for v in &cases {
+            let bytes = to_bytes(v);
+            let got = structural_hash_wire(&bytes)
+                .unwrap_or_else(|| panic!("wire walk failed for {} bytes", bytes.len()));
+            assert_eq!(got, structural_hash(v), "parity broken for {bytes:?}");
+        }
+        // a Map-built compound with the same content hashes the same
+        let mut m: Map<String, Value> = Map::new();
+        m.insert("b".into(), Value::Int(2));
+        m.insert("a".into(), Value::Int(1));
+        assert_eq!(structural_hash(&Value::Compound(m)), structural_hash(&cases[6]));
+        // non-ASCII strings must BAIL (modified-UTF8 parity not guaranteed)
+        let bad = mk(vec![("s", Value::String("\u{43c}\u{438}\u{440}".into()))]);
+        assert_eq!(structural_hash_wire(&to_bytes(&bad)), None);
+        // truncated payload bails
+        let ok = to_bytes(&cases[1]);
+        assert_eq!(structural_hash_wire(&ok[..ok.len() - 1]), None);
+        // non-End trailing garbage bails
+        let mut junk = ok.clone();
+        junk.push(0xFFu8);
+        assert_eq!(structural_hash_wire(&junk), None);
+    }
+
     use super::*;
     use std::collections::HashMap as Map;
 

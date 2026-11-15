@@ -4193,9 +4193,12 @@ impl Store {
                     Some(&0xC7) | Some(&0xC8) | Some(&0xC9) => {
                         xxhash_rust::xxh3::xxh3_128(bytes)
                     }
-                    Some(&0x0A) => match fastnbt::from_bytes::<fastnbt::Value>(bytes) {
-                        Ok(v) => chunknbt::structural_hash(&v),
-                        Err(_) => xxhash_rust::xxh3::xxh3_128(bytes),
+                    Some(&0x0A) => match chunknbt::structural_hash_wire(bytes) {
+                        Some(h) => h,
+                        None => match fastnbt::from_bytes::<fastnbt::Value>(bytes) {
+                            Ok(v) => chunknbt::structural_hash(&v),
+                            Err(_) => xxhash_rust::xxh3::xxh3_128(bytes),
+                        },
                     },
                     _ => xxhash_rust::xxh3::xxh3_128(bytes),
                 };
@@ -4585,10 +4588,17 @@ impl Store {
                     // so relight re-saves of unchanged tails dedup-hit where
                     // the byte hash used to miss on key-order drift.
                     let tail_blob = if tail.len() >= self.cfg.tail_blob_min {
-                        let th = match fastnbt::from_bytes::<fastnbt::Value>(&tail) {
-                            Ok(v) => chunknbt::structural_hash(&v),
-                            Err(_) => chunknbt::hash_of(&tail),
-                        };
+                        // v0.9.92: structural_hash_wire walks the tail bytes
+                        // directly (no Value materialization — the parse-back
+                        // this replaces cost ~+15-20% import p50); parity
+                        // with structural_hash(&Value) is differential-tested
+                        // and non-ASCII strings bail to the parse-back.
+                        let th = chunknbt::structural_hash_wire(&tail).unwrap_or_else(|| {
+                            match fastnbt::from_bytes::<fastnbt::Value>(&tail) {
+                                Ok(v) => chunknbt::structural_hash(&v),
+                                Err(_) => chunknbt::hash_of(&tail),
+                            }
+                        });
                         Some((th, sections.len() >= HOT_SLAB_MIN_SECS))
                     } else {
                         None
