@@ -76,6 +76,31 @@ const SLAB_CODEC_LZMA2: u8 = 0xFE;
 /// stores decoding exactly as stored, and the block boundaries only trade
 /// a little ratio for N-way pack parallelism.
 const SLAB_CODEC_LZMA2_MT: u8 = 0xFD;
+/// v0.9.90: raw LZMA2 cold slab streams with the TUNED literal filter —
+/// preset 6|EXTREME plus explicit lc=4, lp=0, pb=0 (shipped 6|E is the
+/// preset-6 default lc=3 lp=0 pb=2). Measured on the JJ member stream
+/// (12 130 unique members, single 6.29 MiB slab group, 24 B entry rows):
+/// 904 466 B vs 915 488 B shipped = -1.20% at identical encode wall
+/// (4.1 s both). lc/pb are PART OF THE LZMA WIRE FORMAT, and the raw
+/// stream carries no properties — so the tuned config gets its own stamp
+/// and its own decoder branch; 0xFE streams keep decoding with the legacy
+/// preset-6 defaults forever. The dict size is untouched (preset-6 8 MiB
+/// on both stamps), so decode memory and the read-stage window are
+/// identical. CSAVES_LZMA_TUNE=0 mints legacy 0xFE streams again.
+const SLAB_CODEC_LZMA2_TUNE: u8 = 0xFC;
+/// Tuned literal coder bits for the 0xFC cold streams (encoder AND decoder
+/// must agree — lc+lp must stay <= 4).
+const LZMA2_COLD_LC: u32 = 4;
+const LZMA2_COLD_LP: u32 = 0;
+/// pb=0 beats the pb=2 default by -0.38% alone; combined with lc=4 the
+/// member stream lands at -1.20% (see SLAB_CODEC_LZMA2_TUNE docs).
+const LZMA2_COLD_PB: u32 = 0;
+/// Env opt-out for the tuned filter (ops lever): "0" keeps minting the
+/// legacy 0xFE config; every other value / unset uses the tuned 0xFC.
+fn cold_lzma_tuned() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("CSAVES_LZMA_TUNE").as_deref() != Ok("0"))
+}
 /// LZMA2 preset for cold slab streams (research probe point: -24.8% vs
 /// zstd-6 on the real corpus). FIXED on both encode and decode so the raw
 /// decoder's window always matches — CSAVES_COLD_LEVEL applies to the zstd
@@ -225,19 +250,30 @@ fn cold_codec_lzma2() -> bool {
 /// framing + CRC). Returns None on any error so the caller falls back to
 /// the zstd path with the correct per-record codec stamp (never silently
 /// mislabel a stream).
-fn lzma2_compress(data: &[u8]) -> Option<Vec<u8>> {
+fn lzma2_compress(data: &[u8]) -> Option<(u8, Vec<u8>)> {
     // v0.9.43: 6 | EXTREME — measured -2.70% on the real member stream for
     // 1.66x encode wall on the (parallel, background) pack path; the decode
     // side is untouched (see LZMA2_COLD_PRESET docs).
-    let opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
+    // v0.9.90: + explicit lc=4 lp=0 pb=0 under the 0xFC stamp (-1.20% on the
+    // same stream, identical encode wall); CSAVES_LZMA_TUNE=0 keeps the
+    // legacy 0xFE config. The stamp follows the ACTUAL config minted.
+    let mut opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
         .ok()?;
+    let stamp = if cold_lzma_tuned() {
+        opts.literal_context_bits(LZMA2_COLD_LC)
+            .literal_position_bits(LZMA2_COLD_LP)
+            .position_bits(LZMA2_COLD_PB);
+        SLAB_CODEC_LZMA2_TUNE
+    } else {
+        SLAB_CODEC_LZMA2
+    };
     let mut f = liblzma::stream::Filters::new();
     f.lzma2(&opts);
     let mut stream = liblzma::stream::Stream::new_raw_encoder(&f).ok()?;
     let mut out = Vec::with_capacity(data.len() / 3 + 64);
     stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
     stream.process_vec(&[], &mut out, liblzma::stream::Action::Finish).ok()?;
-    Some(out)
+    Some((stamp, out))
 }
 
 /// Multithreaded LZMA2 (blocked .xz container). The filter chain matches
@@ -246,16 +282,24 @@ fn lzma2_compress(data: &[u8]) -> Option<Vec<u8>> {
 /// every worker at least one block without cutting the 8 MiB preset dict
 /// more than necessary. Decode is the auto-detecting .xz stream decoder.
 /// Returns (codec stamp, bytes) — the stamp follows the ACTUAL wire form:
-/// small streams take the raw encoder (0xFE), big ones the blocked .xz
+/// small streams take the raw encoder (0xFE legacy / 0xFC tuned), big ones
+/// the blocked .xz
 /// container (0xFD). The caller must never stamp independently: a raw
 /// stream carrying the MT stamp would land in the .xz decoder and corrupt.
 fn lzma2_compress_maybe_mt(data: &[u8], threads: u32) -> Option<(u8, Vec<u8>)> {
     if threads < 2 || data.len() < 2 * 1024 * 1024 {
-        let c = lzma2_compress(data)?;
-        return Some((SLAB_CODEC_LZMA2, c));
+        return lzma2_compress(data);
     }
-    let opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
+    // v0.9.90: the MT .xz container is self-describing, so the tuned filter
+    // rides the same builder with no stamp change (old readers decode any
+    // lc/lp/pb the container declares).
+    let mut opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
         .ok()?;
+    if cold_lzma_tuned() {
+        opts.literal_context_bits(LZMA2_COLD_LC)
+            .literal_position_bits(LZMA2_COLD_LP)
+            .position_bits(LZMA2_COLD_PB);
+    }
     let mut f = liblzma::stream::Filters::new();
     f.lzma2(&opts);
     let mut b = liblzma::stream::MtStreamBuilder::new();
@@ -287,6 +331,23 @@ fn lzma2_mt_decompress(data: &[u8], raw_len: usize) -> Option<Vec<u8>> {
 /// dict size — see the const docs).
 fn lzma2_decompress(data: &[u8], raw_len: usize) -> Option<Vec<u8>> {
     let opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET).ok()?;
+    let mut f = liblzma::stream::Filters::new();
+    f.lzma2(&opts);
+    let mut stream = liblzma::stream::Stream::new_raw_decoder(&f).ok()?;
+    let mut out = Vec::with_capacity(raw_len);
+    stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
+    Some(out)
+}
+
+/// Decode a 0xFC raw LZMA2 slab stream: same preset-6 dict window as the
+/// legacy 0xFE branch, but the literal coder must mirror the tuned encoder
+/// exactly (lc=4 lp=0 pb=0 are wire-format parts; see SLAB_CODEC_LZMA2_TUNE).
+/// EXTREME stays encoder-only (search depth never reaches the wire).
+fn lzma2_decompress_tuned(data: &[u8], raw_len: usize) -> Option<Vec<u8>> {
+    let mut opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET).ok()?;
+    opts.literal_context_bits(LZMA2_COLD_LC)
+        .literal_position_bits(LZMA2_COLD_LP)
+        .position_bits(LZMA2_COLD_PB);
     let mut f = liblzma::stream::Filters::new();
     f.lzma2(&opts);
     let mut stream = liblzma::stream::Stream::new_raw_decoder(&f).ok()?;
@@ -3710,6 +3771,9 @@ impl Store {
         if dict_id == SLAB_CODEC_LZMA2 {
             return lzma2_decompress(data, raw_len as usize);
         }
+        if dict_id == SLAB_CODEC_LZMA2_TUNE {
+            return lzma2_decompress_tuned(data, raw_len as usize);
+        }
         if dict_id == SLAB_CODEC_LZMA2_MT {
             return lzma2_mt_decompress(data, raw_len as usize);
         }
@@ -6236,7 +6300,7 @@ impl Store {
                     }
                 } else {
                     match lzma2_compress(stream) {
-                        Some(c) => (SLAB_CODEC_LZMA2, c),
+                        Some((stamp, c)) => (stamp, c),
                         None => (0, bulk_compress(stream, level).1),
                     }
                 }
@@ -7279,12 +7343,68 @@ pub mod tests {
         // decoder and corrupt — the stamp decision lives inside the helper)
         let small: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
         let (stamp, sb) = lzma2_compress_maybe_mt(&small, 4).expect("small encode");
-        assert_eq!(stamp, SLAB_CODEC_LZMA2, "small stream keeps the raw stamp");
-        assert_eq!(lzma2_decompress(&sb, small.len()).unwrap(), small);
+        // v0.9.90: the tuned literal filter (lc=4 lp=0 pb=0) rides its own
+        // stamp; the legacy 0xFE config stays minted under CSAVES_LZMA_TUNE=0.
+        let want_small = if cold_lzma_tuned() { SLAB_CODEC_LZMA2_TUNE } else { SLAB_CODEC_LZMA2 };
+        assert_eq!(stamp, want_small, "small stream keeps the raw-stamp family");
+        // decode through the SAME dispatch the read path uses, both configs
+        assert_eq!(
+            match stamp {
+                SLAB_CODEC_LZMA2_TUNE => lzma2_decompress_tuned(&sb, small.len()),
+                _ => lzma2_decompress(&sb, small.len()),
+            }
+            .unwrap(),
+            small
+        );
         // big stream: MT container stamp + .xz decode
         let (stamp2, eb) = lzma2_compress_maybe_mt(&big, 4).expect("mt encode");
         assert_eq!(stamp2, SLAB_CODEC_LZMA2_MT, "big stream takes the MT stamp");
         assert_eq!(lzma2_mt_decompress(&eb, big.len()).unwrap(), big);
+    }
+
+    #[test]
+    fn lzma2_tune_stamp_separation() {
+        // v0.9.90: the tuned literal coder (0xFC) and the legacy preset-6
+        // default (0xFE) are DIFFERENT wire configs. Each must decode with
+        // its own branch, and each must be rejected by the other — lc/lp/pb
+        // are wire-format parts, so a config mismatch is silent corruption
+        // unless the stamps route it.
+        let data: Vec<u8> = (0..64 * 1024usize)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add((i / 512) as u8))
+            .collect();
+        // tuned encoder -> tuned decoder
+        let (st, c) = lzma2_compress(&data).expect("tuned encode");
+        if cold_lzma_tuned() {
+            assert_eq!(st, SLAB_CODEC_LZMA2_TUNE);
+            assert_eq!(lzma2_decompress_tuned(&c, data.len()).unwrap(), data);
+        } else {
+            assert_eq!(st, SLAB_CODEC_LZMA2);
+        }
+        // legacy encoder (shipped 0xFE config: preset 6|E, default lc3/lp0/pb2)
+        let legacy_opts =
+            liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
+                .unwrap();
+        let mut f = liblzma::stream::Filters::new();
+        f.lzma2(&legacy_opts);
+        let mut s = liblzma::stream::Stream::new_raw_encoder(&f).unwrap();
+        let mut legacy = Vec::with_capacity(data.len() / 3 + 64);
+        s.process_vec(&data, &mut legacy, liblzma::stream::Action::Run).unwrap();
+        s.process_vec(&[], &mut legacy, liblzma::stream::Action::Finish).unwrap();
+        // legacy bytes decode with the LEGACY decoder forever (old stores
+        // stay readable byte-for-byte as stored)
+        assert_eq!(lzma2_decompress(&legacy, data.len()).unwrap(), data);
+        // cross-decoding a tuned stream with the legacy decoder must not
+        // silently succeed when the configs differ (lc4/pb0 vs lc3/pb2):
+        // the stamp is what keeps them apart on the wire.
+        if cold_lzma_tuned() {
+            let tuned = lzma2_compress(&data).unwrap().1;
+            let legacy_decode = std::panic::catch_unwind(|| {
+                lzma2_decompress(&tuned, data.len())
+            });
+            if let Ok(Some(out)) = legacy_decode {
+                assert_eq!(out, data, "if the legacy decoder happens to succeed it must be correct");
+            }
+        }
     }
 
     #[test]
