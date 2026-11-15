@@ -620,7 +620,7 @@ jobs:
           check_stats 0 1
           no_mca
 
-          python3 -c "import re; lines=[l.strip() for l in open('stats-live.txt') if re.search(r\"'fn': (\d+)\", l)]; cands=[(int(re.search(r\"'fn': (\d+)\", l).group(1)), l) for l in lines]; best=max(cands)[1] if cands else ''; open('meters-live.txt','w').write(best+chr(10)); print('meters-live: fn=%d best of %d lines' % (max(cands)[0] if cands else -1, len(lines)))"
+          python3 -c "import re; lines=[l.strip() for l in open('stats-live.txt') if re.search(r'fn=(\d+)', l)]; cands=[(int(re.search(r'fn=(\d+)', l).group(1)), l) for l in lines]; best=max(cands)[1] if cands else [l.strip() for l in open('stats-live.txt')][-1]; open('meters-live.txt','w').write(best+chr(10)); print('meters-live: fn=%d best of %d stats lines' % (max(cands)[0] if cands else -1, len(cands)))"
 
           # ---- offline ground truth: the container holds the edit, zero .mca ----
           "$ROOT/native/target/release/examples/paper_probe" \
