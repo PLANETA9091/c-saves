@@ -6174,6 +6174,11 @@ impl Store {
             canon: GVar,
             /// (variant stream, reg_w: 1 = all-u8 gids, 2 = u16 present)
             glob: Option<(GVar, u8)>,
+            /// v0.9.97: the glob variant was built WITHOUT the 16 B hash
+            /// column — one decision for the row format AND the stamp (the
+            /// mismatch is what corrupts: a hashed stamp on a hashless tab
+            /// misparses at scan). glob_stable && slab_hashless().
+            glob_hashless: bool,
         }
         let _tb = std::time::Instant::now();
         let cores = std::thread::available_parallelism()
@@ -6241,11 +6246,21 @@ impl Store {
                 }
             }
         }
-        // stage 3 (parallel, pure)
+        // stage 3 (parallel, pure + ONE registry-read question per converted
+        // member). v0.9.97: the hashless-GLOB family returns under a pack-side
+        // stability gate — the worker runs the EXACT scan-side identity
+        // recompute (glob_any_to_section over the persistent registry -> the
+        // FULL canonical re-encode -> byte compare against the member bytes
+        // that would be stored). A member that passes it can drop its 16 B
+        // hash column: the scan re-derives the same identity from the same
+        // bytes. A member that fails it keeps the hashed wire. The registry
+        // lock is taken per member and only read — pack is offline, so the
+        // contention is bounded by the converted subset.
         let mut globs: Vec<Option<Vec<u8>>> = vec![None; total];
+        let mut stables: Vec<bool> = vec![true; total];
         {
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let outs: std::sync::Mutex<Vec<Option<Option<Vec<u8>>>>> =
+            let outs: std::sync::Mutex<Vec<Option<(Option<Vec<u8>>, bool)>>> =
                 std::sync::Mutex::new((0..total).map(|_| None).collect());
             let pres_ref = &pres;
             let pgids_ref = &pgids;
@@ -6262,12 +6277,32 @@ impl Store {
                             }
                             _ => None,
                         };
-                        outs.lock().unwrap()[j] = Some(r);
+                        let stable = match &r {
+                            Some(g) => {
+                                let reg = self.glob_reg.lock();
+                                match chunknbt::glob_any_to_section(g, &reg) {
+                                    Some(direct) => match chunknbt::canonical_reencode(&direct) {
+                                        Some(canon) => canon == flat_raws[j],
+                                        None => false,
+                                    },
+                                    // unresolvable reconstruction = keep hashes
+                                    None => false,
+                                }
+                            }
+                            // non-converting members store their canonical
+                            // bytes verbatim — the scan hashes those bytes,
+                            // which IS the write-time key by construction
+                            None => true,
+                        };
+                        outs.lock().unwrap()[j] = Some((r, stable));
                     });
                 }
             });
-            for (d, g) in outs.into_inner().unwrap().into_iter().zip(globs.iter_mut()) {
-                *g = d.flatten();
+            for (i, d) in outs.into_inner().unwrap().into_iter().enumerate() {
+                if let Some((g, s)) = d {
+                    globs[i] = g;
+                    stables[i] = s;
+                }
             }
         }
         drop(flat_raws);
@@ -6332,6 +6367,8 @@ impl Store {
                 // v0.9.33: converted bytes come from the parallel stage 3;
                 // the registry sweep already happened in stage 2.
                 let mut glob: Option<(GVar, u8)> = None;
+                let mut glob_stable = true;
+                let mut glob_hashless = false;
                 let _tg = std::time::Instant::now();
                 {
                     let base = offs[gi];
@@ -6342,6 +6379,7 @@ impl Store {
                         match globs[base + mi].take() {
                             Some(g) => {
                                 any = true;
+                                glob_stable &= stables[base + mi];
                                 glens.push(g.len());
                                 graws.push(g);
                             }
@@ -6354,7 +6392,14 @@ impl Store {
                     if any {
                         let graws_ref: Vec<&[u8]> = graws.iter().map(|v| v.as_slice()).collect();
                         let _tbg = std::time::Instant::now();
-                        let (gs, gtab_len) = build(&glens, &graws_ref, false);
+                        // v0.9.97: hashless rows ONLY when the whole group
+                        // passed the recompute gate AND the hashless wire is
+                        // enabled — the same predicate picks the stamp, so a
+                        // stream can never ride the wrong family (the 0xF7
+                        // scan rebuilds every identity from the stored
+                        // bytes; the hashed stamp must find its hash column)
+                        glob_hashless = glob_stable && slab_hashless();
+                        let (gs, gtab_len) = build(&glens, &graws_ref, glob_hashless);
                         PK_B_TAB_NS.fetch_add(_tbg.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let reg_w = if graws.iter().any(|g| chunknbt::glob_member_wide(g)) {
                             2u8
@@ -6369,6 +6414,7 @@ impl Store {
                     group,
                     canon: GVar { stream: canon_stream, tab_len: canon_tab_len, lens: canon_lens },
                     glob,
+                    glob_hashless,
                 }
             })
             .collect();
@@ -6426,19 +6472,20 @@ impl Store {
             (0u8, 0u8, 0u8)
         };
         let glob_triple: (u8, u8, u8) = {
-            // v0.9.95 RETIRED the hashless-GLOB family (0xF7/0xF6/0xF5 minting):
-            // the scan-side identity recompute needs the reconstruction to be
-            // BYTE-exact, and the glob form is semantic-lossless but NOT byte-
-            // lossless for light-bearing RLE-form sections (measured: canonical
-            // 3056 B vs reconstruction 2444 B on the synthetic tall-section
-            // class — glob_reconstruction_not_byte_exact pins it). A drifted
+            // v0.9.95 RETIRED unconditional hashless-GLOB minting: the glob
+            // form is semantic-lossless but NOT byte-lossless for members
+            // whose palette order differs from the voxel first-reference
+            // order (measured: canonical 3056 B vs reconstruction 2444 B —
+            // glob_reconstruction_not_byte_exact pins the class). A drifted
             // identity would silently miss dedup hits and strand recipe
-            // references after reopen. GLOB slabs keep the hashed 0xFC/0xFD
-            // wire on EVERY cold codec; the 0xF7/0xF6/0xF5 DECODE branches
-            // stay for containers minted during the 0.9.93 window (pack
-            // re-hashes them on the next drain). Hashless CANON slabs (0.9.91)
-            // are unaffected: their members hash their own stored bytes by
-            // construction.
+            // references after reopen.
+            // v0.9.97 the family returns GATED: a group whose every converted
+            // member passed the pack-side recompute check (the EXACT scan
+            // derivation: reconstruct -> canonical re-encode -> byte compare)
+            // stamps (0xF7, 0xF6, 0xF5) and drops the hash column; every
+            // other group keeps THIS hashed triple on every cold codec. The
+            // 0xF7/0xF6/0xF5 decode branches never left — they serve the
+            // 0.9.93-window containers and are the mint targets again.
             if lz {
                 (SLAB_CODEC_LZMA2_TUNE, SLAB_CODEC_LZMA2_MT, 0)
             } else {
@@ -6450,7 +6497,16 @@ impl Store {
             .flat_map(|b| {
                 let mut v = vec![canon_triple];
                 if b.glob.is_some() {
-                    v.push(glob_triple);
+                    v.push(if b.glob_hashless {
+                        // v0.9.97 gated hashless-GLOB: every member of this
+                        // group reproduces its write-time identity through
+                        // the scan's recompute, so the 16 B hash column is
+                        // dead weight — drop it (the 0.9.93 win, minus its
+                        // correctness hole)
+                        (SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH)
+                    } else {
+                        glob_triple
+                    });
                 }
                 v
             })
@@ -6610,7 +6666,7 @@ impl Store {
         // ---- Phase C (serial, group order): variant pick + append + blob
         // map updates, exactly the serial flow's decisions and byte layout.
         let mut task_at = 0usize;
-        for GBuild { group, canon, glob } in builds {
+        for GBuild { group, canon, glob, .. } in builds {
             let (cc_did, cc) = outs[task_at].take().expect("canon comp missing");
             task_at += 1;
             let cg = glob.as_ref().map(|_| {
@@ -8742,17 +8798,193 @@ pub(crate) mod glob_slab_test {
     }
 
     #[test]
+    fn glob_hashless_gated_divergent_class_stays_hashed() {
+        // v0.9.97: the pack-side stability gate. The sliding-window payload
+        // class (glob_chunk_payload) reconstructs byte-DIFFERENTLY (0/144 in
+        // glob_stable_probe) — every group containing it must KEEP the
+        // hashed glob wire (0xFC/0xFD). The hashless family (0xF7/0xF6/0xF5)
+        // must never mint for it, yet the store stays fully readable and
+        // the invariant scan clean.
+        let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_force_glob_for_tests(Some(true));
+        let dir = temp_dir("glob-gated-divergent");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let n = 24usize;
+        let payloads: Vec<Vec<u8>> = (0..n).map(glob_chunk_payload).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            st.write_chunk(i as u64, p, false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for _ in 0..50 {
+            st.request_pack();
+            if !st.compact_step() {
+                break;
+            }
+        }
+        let stamps: Vec<u8> = st
+            .blobs
+            .read()
+            .values()
+            .filter(|l| l.slab)
+            .map(|l| l.dict_id)
+            .collect();
+        assert!(
+            Store::glob_slab_count() > 0,
+            "no GLOB slabs were produced under CSAVES_FORCE_GLOB=1"
+        );
+        assert!(
+            stamps.iter().any(|d| *d == SLAB_CODEC_LZMA2_TUNE || *d == SLAB_CODEC_LZMA2_MT),
+            "the divergent class must mint HASHED glob slabs, stamps={stamps:?}"
+        );
+        assert!(
+            !stamps
+                .iter()
+                .any(|d| [SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH]
+                    .contains(d)),
+            "the gate leaked: a divergent group minted the hashless family, stamps={stamps:?}"
+        );
+        assert!(
+            st.slab_invariant_scan().is_empty(),
+            "invariant scan must stay clean on the hashed wire"
+        );
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable"));
+            assert!(chunk_semantic_glob(&got, p), "chunk {i} semantically wrong");
+        }
+        set_force_glob_for_tests(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The BYTE-EXACT class (glob_stable_probe variant 1: 144/144): the
+    /// palette order equals the voxel first-reference order, so the glob
+    /// reconstruction + canonical re-encode reproduce the stored member bit
+    /// for bit and the scan re-derives the write-time identity.
+    fn glob_chunk_payload_ordered(i: usize) -> Vec<u8> {
+        use chunknbt::dense_to_nostroddle;
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut sec_list = Vec::new();
+        for y in 0..24i32 {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = Vec::new();
+            for k in 0..20usize {
+                let mut c: Map<String, Value> = Map::new();
+                let id = (i * 7 + y as usize * 3 + k) % 200;
+                c.insert("Name".to_string(), Value::String(format!("minecraft:st_{id}")));
+                let mut props: Map<String, Value> = Map::new();
+                props.insert("f".to_string(), Value::String(format!("{}", k % 2)));
+                c.insert("Properties".to_string(), Value::Compound(props));
+                pal.push(Value::Compound(c));
+            }
+            bs.insert("palette".to_string(), Value::List(pal));
+            // voxel t references state t%20 IN THE LINEAR ORDER: the k-th
+            // distinct state the conversion's first-reference scan discovers
+            // is exactly palette entry k — the reconstruction's rebuilt
+            // palette order matches the original
+            let mut vox = [0u8; 4096];
+            for (t, v) in vox.iter_mut().enumerate() {
+                *v = (t % 20) as u8;
+            }
+            let vbits = ((20u32 - 1).ilog2() + 1).max(4);
+            let data = dense_to_nostroddle(&vox, 4096, 8, vbits);
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn glob_hashless_gated_stable_class_mints_and_survives_reopen() {
+        // v0.9.97: the other half of the gate. The first-reference-ordered
+        // payload class reconstructs BYTE-EXACTLY, so the whole group passes
+        // the recompute check and the glob slab drops its hash column
+        // (0xF7/0xF6/0xF5 family). End to end: mint -> reopen (scan
+        // recomputes identities through the persistent registry) ->
+        // invariant scan empty -> semantic reads -> a NEW chunk whose
+        // sections equal a stored one dedups against the SCAN-rebuilt
+        // identities (zero blob growth — the exact hole 0.9.95 retired the
+        // family for).
+        let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_force_glob_for_tests(Some(true));
+        let dir = temp_dir("glob-gated-stable");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let n = 24usize;
+        let payloads: Vec<Vec<u8>> = (0..n).map(glob_chunk_payload_ordered).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            st.write_chunk(i as u64, p, false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for _ in 0..50 {
+            st.request_pack();
+            if !st.compact_step() {
+                break;
+            }
+        }
+        let stamps: Vec<u8> = st
+            .blobs
+            .read()
+            .values()
+            .filter(|l| l.slab)
+            .map(|l| l.dict_id)
+            .collect();
+        assert!(
+            stamps
+                .iter()
+                .any(|d| [SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH]
+                    .contains(d)),
+            "the byte-exact class must mint the hashless family, stamps={stamps:?}"
+        );
+        drop(st);
+        // reopen: the scan rebuilds identities WITHOUT the hash column
+        let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let v = st2.slab_invariant_scan();
+        assert!(
+            v.is_empty(),
+            "scan identities must equal the write-time keys on the hashless wire: {v:?}"
+        );
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st2
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable post-reopen"));
+            assert!(chunk_semantic_glob(&got, p), "chunk {i} semantically wrong post-reopen");
+        }
+        // dedup through the reopened, hashless identities: a fresh chunk key
+        // whose sections equal chunk 0's must hit the existing members
+        let before = st2.blobs.read().len();
+        st2.write_chunk(99_999u64, &payloads[0], false).unwrap();
+        st2.sync();
+        let after = st2.blobs.read().len();
+        assert_eq!(
+            before, after,
+            "identity drift after reopen: a same-content write minted new blobs"
+        );
+        drop(st2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn glob_reconstruction_not_byte_exact() {
-        // v0.9.95: WHY the hashless-GLOB family stays retired. The scan-side
-        // identity recompute needs glob_any_to_section(stored) (or any
-        // re-encode of it) to reproduce the ORIGINAL canonical member bytes
-        // bit for bit. The JJ corpus's convertible dense subset DOES
-        // reconstruct exactly (glob_par: 2715/2715) — but light-bearing
-        // RLE-form sections do NOT: the reconstruction is semantically equal
+        // v0.9.95, v0.9.97 CONTEXT: the hashless-GLOB family (0xF7/0xF6/
+        // 0xF5) is minted ONLY for groups whose every converted member
+        // passes the pack-side recompute check (see flush_slab_cands stage
+        // 3). This test pins WHY the gate exists: the scan-side identity
+        // recompute needs glob_any_to_section(stored) (or any re-encode of
+        // it) to reproduce the ORIGINAL canonical member bytes bit for bit.
+        // The JJ corpus's convertible dense subset DOES
+        // reconstruct exactly (glob_par: 2715/2715) — but sliding-palette
+        // sections do NOT: the reconstruction is semantically equal
         // and byte-DIFFERENT (canonical 3056 B vs reconstruction 2444 B
-        // measured). This test pins that divergence class so nobody re-tries
-        // the hashless-GLOB identity recompute without solving the byte
-        // losslessness first.
+        // measured). The gate refuses those groups, keeping the hashed
+        // wire; this test makes sure the divergence class never silently
+        // vanishes from the suite.
         use chunknbt::{SecBytes, Split, StateRegistry};
         let mut reg = StateRegistry::new();
         let mut diverged = 0usize;
