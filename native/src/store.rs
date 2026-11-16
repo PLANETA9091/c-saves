@@ -2224,6 +2224,80 @@ impl Drop for Store {
     }
 }
 
+/// Hashless stamp families (row format has no 16 B hash column).
+fn slab_stamp_hashless(stamp: u8) -> bool {
+    matches!(
+        stamp,
+        SLAB_CODEC_LZMA2_NH
+            | SLAB_CODEC_LZMA2_MT_NH
+            | SLAB_CODEC_ZSTD_NH
+            | SLAB_CODEC_LZMA2_GNH
+            | SLAB_CODEC_LZMA2_GMT_NH
+            | SLAB_CODEC_ZSTD_GNH
+    )
+}
+
+/// Content-derived member class for the diagnostic walks (slab-only view;
+/// the same bytes the identity recompute dispatches on).
+fn slab_member_class(body: &[u8]) -> String {
+    match body.first().copied().unwrap_or(0) {
+        0xC7 => "csec3".into(),
+        0xC8 | 0xC9 => {
+            // v4: [magic][f1][f2][f3?][y]; data form from f2 order bits 4/5
+            // (bs) — dense (0), rle (1/3), rle-transposed (2). 0xC9 =
+            // shift-ref family. Light collapse bits: skylight uni=f1 bit4,
+            // skylight all-0=f1 bit5, blocklight uni=f1 bit0, blocklight
+            // all-0=f3 bit0 (v4).
+            let f1 = body.get(1).copied().unwrap_or(0);
+            let f2 = body.get(2).copied().unwrap_or(0);
+            let f3 = if body.first() == Some(&0xC8) {
+                body.get(3).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let mut cl = String::new();
+            if f1 & 0x10 != 0 || f1 & 0x20 != 0 {
+                cl.push_str("+sk");
+            }
+            if f1 & 0x01 != 0 || f3 & 0x01 != 0 {
+                cl.push_str("+bl");
+            }
+            if body.first() == Some(&0xC9) {
+                "shift".to_string() + &cl
+            } else {
+                let base = match (f2 >> 4) & 3 {
+                    0 => "c4_dense",
+                    2 => "c4_rleT",
+                    _ => "c4_rle",
+                };
+                base.to_string() + &cl
+            }
+        }
+        0xCB => "glob_g0".into(), // legacy wire: raw u8 stream
+        0xCC => {
+            // [0xCC][f1][f2c][f3][y][gform][payload] — gform at index 5
+            let gf = body.get(5).copied().unwrap_or(0);
+            format!("glob_g{gf}")
+        }
+        0x0A => "tail_nbt".into(),
+        _ => "other".into(),
+    }
+}
+
+/// One on-disk slab walked to member level (diagnostics only).
+struct SlabMemberWalk {
+    seg: u32,
+    off: u64,
+    stamp: u8,
+    comp_len: usize,
+    raw_total: u32,
+    n: usize,
+    /// real bytes the entry-table rows consumed (varints + hash columns)
+    table_len: usize,
+    failed: bool,
+    members: Vec<(String, Vec<u8>)>, // (class, body)
+}
+
 impl Store {
     pub fn open(dir: &Path, dict_enabled: bool) -> std::io::Result<Arc<Store>> {
         Self::open_cfg(dir, dict_enabled, Cfg::from_env())
@@ -4358,6 +4432,218 @@ impl Store {
         out
     }
 
+    /// DIAGNOSTIC: walk every on-disk slab to member level — decompress,
+    /// parse the entry table (varint rows, hash columns per stamp family),
+    /// slice member bodies and classify them. NO identity recompute: the
+    /// GLOB hashless identity path is expensive and the class walk only
+    /// needs the bytes. Slabs that fail to parse carry failed=true.
+    fn slab_disk_walk(&self) -> Vec<SlabMemberWalk> {
+        use std::collections::HashMap as Map;
+        let mut groups: Map<(u32, u64), ()> = Map::new();
+        {
+            let blobs = self.blobs.read();
+            for l in blobs.values() {
+                if l.slab {
+                    groups.insert((l.seg, l.off), ());
+                }
+            }
+        }
+        let segs = self.segs.read();
+        let mut out = Vec::with_capacity(groups.len());
+        for ((seg_id, off), ()) in groups.iter() {
+            let Some(seg) = segs.get(seg_id) else { continue };
+            let Some(hdr) = seg.read_at(*off, 13, false) else { continue };
+            let kind = hdr[0] & 0x3f;
+            if kind != 5 && kind != 8 {
+                continue;
+            }
+            let dict_id = hdr[1];
+            let hlen = if hdr[0] & 0x80 != 0 { 13usize } else { 12usize };
+            let cl = u32::from_le_bytes(hdr[2..6].try_into().unwrap()) as usize;
+            let raw_total = u32::from_le_bytes(hdr[6..10].try_into().unwrap());
+            let n = u16::from_le_bytes(hdr[10..12].try_into().unwrap()) as usize;
+            let Some(data) = seg.read_at(*off + hlen as u64, cl, false) else { continue };
+            let mut w = SlabMemberWalk {
+                seg: *seg_id,
+                off: *off,
+                stamp: dict_id,
+                comp_len: cl,
+                raw_total,
+                n,
+                table_len: 0,
+                failed: false,
+                members: Vec::new(),
+            };
+            let hashless = slab_stamp_hashless(dict_id);
+            let Some(raw) = self.decompress(dict_id, &data, raw_total) else {
+                w.failed = true;
+                out.push(w);
+                continue;
+            };
+            // phase 1: the contiguous entry table ([bid varint][rl varint]
+            // [+16 B hash when the stamp carries hashes]; bodies follow as
+            // one run — exactly parse_slab_v2's two-phase walk)
+            let mut p = 0usize;
+            let mut prev: i64 = 0;
+            let mut lens: Vec<u32> = Vec::with_capacity(n);
+            let mut ok = true;
+            for _ in 0..n {
+                let d = match get_u64(&raw, &mut p) {
+                    Some(d) => d,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                };
+                prev += unzigzag(d);
+                let rl = match get_u64(&raw, &mut p) {
+                    Some(v) => v as u32,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                };
+                if !hashless {
+                    if raw.len() < p + 16 {
+                        ok = false;
+                        break;
+                    }
+                    p += 16;
+                }
+                lens.push(rl);
+            }
+            if !ok {
+                w.failed = true;
+                out.push(w);
+                continue;
+            }
+            w.table_len = p;
+            let total_raw: u64 = lens.iter().map(|&r| r as u64).sum();
+            if raw.len() != p + total_raw as usize {
+                w.failed = true;
+                out.push(w);
+                continue;
+            }
+            // phase 2: bodies (prefix sums from the table end)
+            let mut q = p;
+            for rl in lens {
+                let end = q + rl as usize;
+                w.members
+                    .push((slab_member_class(&raw[q..end]), raw[q..end].to_vec()));
+                q = end;
+            }
+            out.push(w);
+        }
+        out
+    }
+
+    /// DIAGNOSTIC: per-class slab member byte attribution. Walks every
+    /// on-disk slab the way slab_invariant_scan does (header + entry table +
+    /// bodies, NO identity recompute — the cheap table walk only) and sums
+    /// each member's raw bytes under a content-derived class:
+    /// csec3/csec4 (by dense/RLE/RLE-transposed data form + light collapse
+    /// bits), glob by gform (0..5), shift-ref (0xC9), tail NBT (0x0A),
+    /// other. Also reports the REAL entry-table bytes (the varint rows the
+    /// walk consumed) and the compressed cost per stamp family.
+    pub fn slab_member_attribution_json(&self) -> String {
+        use std::collections::HashMap as Map;
+        let walks = self.slab_disk_walk();
+        let mut cls_raw: Map<&str, u64> = Map::new();
+        let mut cls_n: Map<&str, u64> = Map::new();
+        let mut stamps: Map<&str, u64> = Map::new();
+        let mut tab_bytes = (0u64, 0u64); // hashed, hashless
+        let mut slab_comp_total = 0u64;
+        let mut slab_raw_total = 0u64;
+        let mut unparseable = 0u64;
+        for w in &walks {
+            slab_comp_total += w.comp_len as u64;
+            slab_raw_total += w.raw_total as u64;
+            let hashless = slab_stamp_hashless(w.stamp);
+            if hashless {
+                tab_bytes.1 += w.table_len as u64;
+            } else {
+                tab_bytes.0 += w.table_len as u64;
+            }
+            let fam: &str = match w.stamp {
+                0xFE | 0xFD | 0xFC => "lzma_h",
+                0xFA | 0xF9 => "lzma_nh",
+                0xF7 | 0xF6 => "lzma_gh",
+                0xF5 => "zstd_gh",
+                0xF8 => "zstd_nh",
+                0x00 => "zstd_h",
+                _ => "other",
+            };
+            *stamps.entry(fam).or_default() += w.comp_len as u64;
+            if w.failed {
+                unparseable += 1;
+                continue;
+            }
+            for (cls, body) in &w.members {
+                *cls_raw.entry(cls.as_str()).or_default() += body.len() as u64;
+                *cls_n.entry(cls.as_str()).or_default() += 1;
+            }
+        }
+        let mut s = String::with_capacity(1024);
+        s.push('{');
+        let mut ks: Vec<_> = cls_raw.keys().collect();
+        ks.sort();
+        for k in &ks {
+            let r = cls_raw[*k];
+            let c = cls_n[*k];
+            let est = if slab_raw_total > 0 {
+                (r as f64 / slab_raw_total as f64 * slab_comp_total as f64) as u64
+            } else {
+                0
+            };
+            s.push_str(&format!(r#""{k}":{{"n":{c},"raw":{r},"est_comp":{est}}},"#));
+        }
+        s.push_str(&format!(r#""tab_hashed":{},"tab_hashless":{},"#, tab_bytes.0, tab_bytes.1));
+        let mut ss: Vec<_> = stamps.iter().map(|(k, v)| format!(r#""{k}":{v}"#)).collect();
+        ss.sort();
+        s.push_str(&format!(r#""stamp_comp":{{{}}},"#, ss.join(",")));
+        s.push_str(&format!(
+            r#""slab_comp":{slab_comp_total},"slab_raw":{slab_raw_total},"unparseable":{unparseable}}}"#
+        ));
+        s
+    }
+
+    /// DIAGNOSTIC: per-class member body streams (concatenated in slab
+    /// disk order). Same walk as slab_member_attribution_json; the caller
+    /// re-compresses a class independently to price its REAL compressed
+    /// cost (the proportional raw-share estimate misleads when classes
+    /// compress at different ratios).
+    pub fn slab_class_streams(&self) -> Vec<(String, Vec<u8>)> {
+        use std::collections::HashMap as Map;
+        let walks = self.slab_disk_walk();
+        let mut streams: Map<String, Vec<u8>> = Map::new();
+        for w in &walks {
+            if w.failed {
+                continue;
+            }
+            for (cls, body) in &w.members {
+                streams.entry(cls.clone()).or_default().extend_from_slice(body);
+            }
+        }
+        let mut out: Vec<(String, Vec<u8>)> = streams.into_iter().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// DIAGNOSTIC: every slab member individually, as (class, body). The
+    /// per-member view lets experiments train dictionaries on real member
+    /// boundaries (the class stream concat does not).
+    pub fn slab_members_by_class(&self) -> Vec<(String, Vec<u8>)> {
+        let walks = self.slab_disk_walk();
+        let mut out = Vec::new();
+        for w in &walks {
+            if w.failed {
+                continue;
+            }
+            out.extend(w.members.iter().cloned());
+        }
+        out
+    }
+
     /// Intern a recipe key name; persists it as a kind-6 record so scans
     /// rebuild the table in log order.
     fn intern_key(&self, key: &str) -> Result<u16, String> {
@@ -6138,6 +6424,46 @@ impl Store {
         if cands.is_empty() {
             return;
         }
+        // v0.9.98 CLASS PARTITION: tail members (0x0A fallback NBT) ride
+        // their own slab streams, sections theirs. Measured on the drained
+        // JJ corpus: the g0 marginal cost inside the mixed stream is +31 KB
+        // over standalone (745,784 vs 714,761 B — model pollution: LZMA2's
+        // literal contexts see two content families alternating), while the
+        // reverse pollution is negligible. The partition is a pure function
+        // of the member's first byte (self-describing by magic), so
+        // pack -> scan -> pack converges; the relative order inside each
+        // pool is preserved, and tails never touch the state registry (the
+        // glob conversion rejects non-CSEC members), so registry gid
+        // assignment order — and with it every stream byte — is unchanged
+        // for the section pool.
+        {
+            let mut any_tail = false;
+            let mut any_rest = false;
+            for c in cands.iter() {
+                if c.3.first() == Some(&0x0A) {
+                    any_tail = true;
+                } else {
+                    any_rest = true;
+                }
+                if any_tail && any_rest {
+                    break;
+                }
+            }
+            if any_tail && any_rest {
+                let mut tails: Vec<(Hash, u32, BlobLoc, Vec<u8>)> = Vec::new();
+                let mut rest: Vec<(Hash, u32, BlobLoc, Vec<u8>)> = Vec::new();
+                for c in cands.drain(..) {
+                    if c.3.first() == Some(&0x0A) {
+                        tails.push(c);
+                    } else {
+                        rest.push(c);
+                    }
+                }
+                self.flush_slab_cands(&mut rest, worst_id);
+                self.flush_slab_cands(&mut tails, worst_id);
+                return;
+            }
+        }
         // split into slab-sized groups
         let slab_raw_cap = if self.whole_mode.load(Ordering::Relaxed) {
             self.cfg.slab_max_raw_whole
@@ -6174,6 +6500,11 @@ impl Store {
             canon: GVar,
             /// (variant stream, reg_w: 1 = all-u8 gids, 2 = u16 present)
             glob: Option<(GVar, u8)>,
+            /// v0.9.98: the plain-TRANSPOSED twin of `glob` — identical
+            /// entry table and lens, payloads reordered y-fast (gform 6 on
+            /// the members whose base form was raw u8). Compressed alongside
+            /// the base variant; the smaller stream wins the window gate.
+            glob_t: Option<GVar>,
             /// v0.9.97: the glob variant was built WITHOUT the 16 B hash
             /// column — one decision for the row format AND the stamp (the
             /// mismatch is what corrupts: a hashed stamp on a hashless tab
@@ -6257,10 +6588,16 @@ impl Store {
         // lock is taken per member and only read — pack is offline, so the
         // contention is bounded by the converted subset.
         let mut globs: Vec<Option<Vec<u8>>> = vec![None; total];
+        let mut globs_t: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut stables: Vec<bool> = vec![true; total];
         {
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let outs: std::sync::Mutex<Vec<Option<(Option<Vec<u8>>, bool)>>> =
+            // v0.9.98: the worker produces BOTH glob variants per member —
+            // base (plain-order payloads) and T (plain-transposed payloads,
+            // gform 6). The identity-stability gate is variant-independent
+            // (the scan re-derives the canonical re-encode either way), so
+            // it runs once per member on the base bytes.
+            let outs: std::sync::Mutex<Vec<Option<(Option<Vec<u8>>, Option<Vec<u8>>, bool)>>> =
                 std::sync::Mutex::new((0..total).map(|_| None).collect());
             let pres_ref = &pres;
             let pgids_ref = &pgids;
@@ -6274,6 +6611,12 @@ impl Store {
                         let r = match (&pres_ref[j], &pgids_ref[j]) {
                             (Some(pre), Some(pgid)) => {
                                 chunknbt::section_glob_finish(flat_raws[j], pre, pgid)
+                            }
+                            _ => None,
+                        };
+                        let rt = match (&pres_ref[j], &pgids_ref[j]) {
+                            (Some(pre), Some(pgid)) => {
+                                chunknbt::section_glob_finish_as(flat_raws[j], pre, pgid, true)
                             }
                             _ => None,
                         };
@@ -6294,13 +6637,14 @@ impl Store {
                             // which IS the write-time key by construction
                             None => true,
                         };
-                        outs.lock().unwrap()[j] = Some((r, stable));
+                        outs.lock().unwrap()[j] = Some((r, rt, stable));
                     });
                 }
             });
             for (i, d) in outs.into_inner().unwrap().into_iter().enumerate() {
-                if let Some((g, s)) = d {
+                if let Some((g, gt, s)) = d {
                     globs[i] = g;
+                    globs_t[i] = gt;
                     stables[i] = s;
                 }
             }
@@ -6367,6 +6711,7 @@ impl Store {
                 // v0.9.33: converted bytes come from the parallel stage 3;
                 // the registry sweep already happened in stage 2.
                 let mut glob: Option<(GVar, u8)> = None;
+                let mut glob_t: Option<GVar> = None;
                 let mut glob_stable = true;
                 let mut glob_hashless = false;
                 let _tg = std::time::Instant::now();
@@ -6406,7 +6751,45 @@ impl Store {
                         } else {
                             1u8
                         };
+                        // v0.9.98 T twin: same table, same lens; payloads
+                        // from the transposed finish. Members whose base
+                        // form was RLE/wide produce IDENTICAL T bytes (the
+                        // t flag only flips the plain-u8 winner), so when
+                        // every member stayed non-raw the streams are equal
+                        // and the twin is dropped before compression.
+                        let mut glob_t_var: Option<GVar> = None;
+                        {
+                            let mut tlens = Vec::with_capacity(n);
+                            let mut traws: Vec<Vec<u8>> = Vec::with_capacity(n);
+                            let mut differs = false;
+                            for (mi, (_h, _id, _loc, raw)) in group.iter().enumerate() {
+                                match &globs_t[base + mi] {
+                                    Some(g) => {
+                                        tlens.push(g.len());
+                                        traws.push(g.clone());
+                                        if globs[base + mi].as_deref() != Some(g.as_slice()) {
+                                            differs = true;
+                                        }
+                                    }
+                                    None => {
+                                        tlens.push(raw.len());
+                                        traws.push(raw.clone());
+                                    }
+                                }
+                            }
+                            if differs {
+                                let traws_ref: Vec<&[u8]> =
+                                    traws.iter().map(|v| v.as_slice()).collect();
+                                let (gts, gttab) = build(&tlens, &traws_ref, glob_hashless);
+                                glob_t_var = Some(GVar {
+                                    stream: gts,
+                                    tab_len: gttab,
+                                    lens: tlens,
+                                });
+                            }
+                        }
                         glob = Some((GVar { stream: gs, tab_len: gtab_len, lens: glens }, reg_w));
+                        glob_t = glob_t_var;
                     }
                 }
                 PK_B_GLOB_NS.fetch_add(_tg.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -6414,6 +6797,7 @@ impl Store {
                     group,
                     canon: GVar { stream: canon_stream, tab_len: canon_tab_len, lens: canon_lens },
                     glob,
+                    glob_t,
                     glob_hashless,
                 }
             })
@@ -6443,6 +6827,9 @@ impl Store {
                 let mut v = vec![b.canon.stream.as_slice()];
                 if let Some((g, _)) = &b.glob {
                     v.push(g.stream.as_slice());
+                }
+                if let Some(gt) = &b.glob_t {
+                    v.push(gt.stream.as_slice());
                 }
                 v
             })
@@ -6503,6 +6890,16 @@ impl Store {
                         // the scan's recompute, so the 16 B hash column is
                         // dead weight — drop it (the 0.9.93 win, minus its
                         // correctness hole)
+                        (SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH)
+                    } else {
+                        glob_triple
+                    });
+                }
+                // v0.9.98: the T twin rides the SAME glob triple — its row
+                // format and codec family must match the base variant (only
+                // the payload order differs)
+                if b.glob_t.is_some() {
+                    v.push(if b.glob_hashless {
                         (SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH)
                     } else {
                         glob_triple
@@ -6666,7 +7063,7 @@ impl Store {
         // ---- Phase C (serial, group order): variant pick + append + blob
         // map updates, exactly the serial flow's decisions and byte layout.
         let mut task_at = 0usize;
-        for GBuild { group, canon, glob, .. } in builds {
+        for GBuild { group, canon, glob, mut glob_t, .. } in builds {
             let (cc_did, cc) = outs[task_at].take().expect("canon comp missing");
             task_at += 1;
             let cg = glob.as_ref().map(|_| {
@@ -6674,6 +7071,25 @@ impl Store {
                 task_at += 1;
                 (d, c)
             });
+            // v0.9.98: the T twin's compression — same triple, same table;
+            // only the payload ORDER differs. Whichever glob stream
+            // compressed smaller rides the window gate below. Owner-only
+            // fold: the losing variant is dropped, never cloned.
+            let cg_t = glob_t.as_ref().map(|_| {
+                let (d, c) = outs[task_at].take().expect("glob_t comp missing");
+                task_at += 1;
+                (d, c)
+            });
+            let use_t = match (&cg, &cg_t) {
+                (Some((_, gc)), Some((_, tc))) => tc.len() < gc.len(),
+                _ => false,
+            };
+            let mut glob = glob;
+            let mut cg = cg;
+            if use_t {
+                glob = glob_t.take().map(|gt| (gt, glob.as_ref().map(|(_, w)| *w).unwrap_or(1)));
+                cg = cg_t;
+            }
             let n = group.len();
             let (dict_id, comp, kind_byte, stream, tab_len, lens, gwide): (
                 u8,
@@ -9211,6 +9627,136 @@ pub(crate) mod glob_slab_test {
             );
         }
         set_force_glob_for_tests(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn class_partition_tails_own_their_slabs() {
+        // v0.9.98 class partition: every post-drain slab holds members of
+        // exactly ONE pool — tails (0x0A fallback NBT) or section members —
+        // because the mixed stream prices the g0 marginal +31 KB over
+        // standalone. The partition is a pure function of the first byte,
+        // so reopen + re-pack must converge (invariant scan stays clean).
+        // The payload's tail must clear tail_blob_min (512 B) — a fat
+        // block_entities list makes sure the tail becomes a slab member —
+        // AND the chunk must carry sections, so both pools exist.
+        let fat_tail_payload = |variant: u64| -> Vec<u8> {
+            let mut root: Map<String, Value> = Map::new();
+            root.insert("DataVersion".to_string(), Value::Int(4189));
+            let mut hm: Map<String, Value> = Map::new();
+            let la: Vec<i64> = (0..37).map(|i| (i as i64) * 7 + variant as i64).collect();
+            hm.insert("MOTION_BLOCKING".to_string(), Value::LongArray(fastnbt::LongArray::new(la)));
+            root.insert("Heightmaps".to_string(), Value::Compound(hm));
+            let mut be = Vec::new();
+            for b in 0..40usize {
+                let mut chest: Map<String, Value> = Map::new();
+                chest.insert("id".to_string(), Value::String("minecraft:chest".to_string()));
+                chest.insert("x".to_string(), Value::Int(b as i32));
+                chest.insert("y".to_string(), Value::Int(64));
+                chest.insert("z".to_string(), Value::Int((b * 7 + variant as usize) as i32));
+                let mut item: Map<String, Value> = Map::new();
+                item.insert("id".to_string(), Value::String("minecraft:diamond".to_string()));
+                item.insert("Count".to_string(), Value::Byte(b as i8));
+                chest.insert("Items".to_string(), Value::List(vec![Value::Compound(item)]));
+                be.push(Value::Compound(chest));
+            }
+            root.insert("block_entities".to_string(), Value::List(be));
+            let mut sec_list = Vec::new();
+            for y in 0..6i32 {
+                let mut sec: Map<String, Value> = Map::new();
+                sec.insert("Y".to_string(), Value::Byte(y as i8));
+                let mut bs: Map<String, Value> = Map::new();
+                bs.insert(
+                    "palette".to_string(),
+                    Value::List(vec![
+                        Value::String("minecraft:stone".to_string()),
+                        Value::String("minecraft:deepslate".to_string()),
+                        Value::String("minecraft:air".to_string()),
+                    ]),
+                );
+                // vanilla 4-bit packing over real 4096-voxel content — the
+                // canonical encoder accepts this (a wrong-length data array
+                // falls back to a 0x0A NBT member and the test premise dies)
+                let vox: Vec<u8> = (0..4096usize)
+                    .map(|i| {
+                        let x = (i / 256) as u64;
+                        let zz = ((i / 16) % 16) as u64;
+                        let yy = (i % 16) as u64;
+                        let r = (x * 31 + zz * 17 + yy * 7 + variant + y as u64) % 10;
+                        if r < 6 {
+                            0u8
+                        } else if r < 9 {
+                            1u8
+                        } else {
+                            2u8
+                        }
+                    })
+                    .collect();
+                bs.insert(
+                    "data".to_string(),
+                    Value::LongArray(fastnbt::LongArray::new(chunknbt::dense_to_nostroddle(
+                        &vox, 4096, 8, 4,
+                    ))),
+                );
+                sec.insert("block_states".to_string(), Value::Compound(bs));
+                sec_list.push(Value::Compound(sec));
+            }
+            root.insert("sections".to_string(), Value::List(sec_list));
+            fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+        };
+        let dir = temp_dir("cls-part");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for i in 0..60u64 {
+            st.write_chunk(i, &fat_tail_payload(i), false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for _ in 0..50 {
+            st.request_pack();
+            if !st.compact_step() {
+                break;
+            }
+        }
+        let walks = st.slab_disk_walk();
+        if walks.len() < 2 {
+            for w in &walks {
+                eprintln!(
+                    "[cls-part-dbg] slab seg={} off={} stamp={:02x} n={} failed={} classes={:?}",
+                    w.seg,
+                    w.off,
+                    w.stamp,
+                    w.members.len(),
+                    w.failed,
+                    w.members.iter().map(|(c, _)| c.as_str()).take(8).collect::<Vec<_>>()
+                );
+            }
+        }
+        assert!(walks.len() >= 2, "the partition must split the pools apart (walks={})", walks.len());
+        let mut saw_tail = false;
+        let mut saw_sec = false;
+        for w in &walks {
+            assert!(!w.failed, "slab failed to parse after the partition");
+            let tails = w.members.iter().filter(|(c, _)| c == "tail_nbt").count();
+            let secs = w.members.len() - tails;
+            assert!(
+                tails == 0 || secs == 0,
+                "slab mixes pools: {tails} tails + {secs} sections"
+            );
+            if tails > 0 {
+                saw_tail = true;
+            }
+            if secs > 0 {
+                saw_sec = true;
+            }
+        }
+        assert!(saw_tail && saw_sec, "both pools must exist on disk");
+        drop(st);
+        let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for i in 0..60u64 {
+            assert!(st2.read_chunk(i).is_some(), "chunk {i} missing post-reopen");
+        }
+        assert_eq!(st2.slab_invariant_scan().len(), 0, "invariants hold post-reopen");
+        drop(st2);
         let _ = fs::remove_dir_all(&dir);
     }
 

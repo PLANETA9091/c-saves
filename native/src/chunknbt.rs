@@ -7668,10 +7668,27 @@ pub fn section_glob_resolve(pre: &GlobPre, reg: &mut StateRegistry) -> Option<Ve
 }
 
 /// Stage 3 (PURE): gid map + raw materialization + RLE admission scans +
-/// winner + header + tail. Deterministic function of (csec, pre, pgid).
-/// `csec` must be the same bytes `pre` was parsed from (the tail after the
-/// dense stream is copied verbatim).
+/// winner + header + tail. Deterministic function of (csec, pre, pgid,
+/// t_variant). `csec` must be the same bytes `pre` was parsed from (the
+/// tail after the dense stream is copied verbatim).
+/// `t_variant` flips the plain-u8 winner to gform 6 — the y-fast
+/// transposed payload (same byte length, different order). The pack builds
+/// BOTH variants per group and keeps whichever compresses smaller at the
+/// cold tier (window-level gate, same policy as the canon-vs-glob choice;
+/// measured −2.17% on the g0 stream of the JJ corpus, while per-member
+/// structural picks lost — run-count proxies do not predict LZMA2). The
+/// transpose is an involution, so the decoder restores vanilla order with
+/// one application.
 pub fn section_glob_finish(csec: &[u8], pre: &GlobPre, pgid: &[u32]) -> Option<Vec<u8>> {
+    section_glob_finish_as(csec, pre, pgid, false)
+}
+
+pub fn section_glob_finish_as(
+    csec: &[u8],
+    pre: &GlobPre,
+    pgid: &[u32],
+    t_variant: bool,
+) -> Option<Vec<u8>> {
     let n = pre.n;
     // gid stream: one gid per voxel. The registry may cross the 256-state
     // line MID-CONVERSION (earlier sections in the same pack wave insert
@@ -7767,6 +7784,12 @@ pub fn section_glob_finish(csec: &[u8], pre: &GlobPre, pgid: &[u32]) -> Option<V
             }
         } else if b_ok {
             (2, rle_encode_stream(&transpose_fast_y(&raw, 16)))
+        } else if t_variant {
+            // plain-transposed u8: same bytes reordered y-fast. The RLE
+            // admission above keeps its own transposed winner (gform 2);
+            // gform 6 is the NO-RLE transpose for streams whose runs are
+            // too short for RLE but whose vertical structure helps LZMA2.
+            (6, transpose_fast_y(&raw, 16))
         } else {
             (0, raw)
         }
@@ -8051,6 +8074,15 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
             p += 8192;
             for c in s.chunks_exact(2) {
                 gids.push(u16::from_le_bytes(c.try_into().ok()?) as u32);
+            }
+        }
+        6 => {
+            // plain-transposed u8 (no RLE): same involution as gform 2's
+            // un-transpose, without the run decode
+            let s = glob.get(p..p + 4096)?;
+            p += 4096;
+            for g in transpose_fast_y(s, 16) {
+                gids.push(g as u32);
             }
         }
         4 | 5 => {
@@ -9670,6 +9702,44 @@ mod glob_tests {
         let glob_n = section_to_glob(&canon_n, &mut reg).expect("glob noisy");
         assert_eq!(glob_n[0], GLOB_MAGIC, "noisy gid stream stays 0xCB");
         assert_eq!(glob_any_to_section(&glob_n, &reg).unwrap(), canon_n);
+        crate::chunknbt::set_gid_rle_div_for_tests(None);
+    }
+
+    #[test]
+    fn glob_g6_plain_transposed_roundtrip_byte_identical() {
+        // v0.9.98 gform 6: the T variant flips ONLY the plain-u8 winner to
+        // the y-fast transposed payload. Noisy content (RLE never admitted)
+        // takes gform 0 in the base variant and gform 6 in the T variant —
+        // same byte length, reordered; both decode byte-identically through
+        // the scan-side chain (glob_any_to_section -> canonical_reencode).
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        let noisy = glob_section(6, 0xFEED, 16);
+        let canon = section_encode(&noisy).expect("encode");
+        let mut reg = StateRegistry::new();
+        let pre = section_glob_pre(&canon).expect("glob pre");
+        let pgid = section_glob_resolve(&pre, &mut reg).expect("resolve");
+        let base = section_glob_finish_as(&canon, &pre, &pgid, false).expect("finish base");
+        let t = section_glob_finish_as(&canon, &pre, &pgid, true).expect("finish T");
+        assert_eq!(base[0], GLOB_MAGIC, "noisy gid stream stays 0xCB in base");
+        assert_eq!(t[0], GLOB2_MAGIC, "T variant carries 0xCC");
+        assert_eq!(t[5], 6, "T variant flips the plain-u8 winner to gform 6");
+        // the 0xCC wire carries one extra byte vs the legacy 0xCB wire (the
+        // gform field); the PAYLOAD is the same length (pure permutation)
+        assert_eq!(t.len(), base.len() + 1, "0xCC header = 0xCB header + gform");
+        for back in [&base, &t] {
+            let direct = glob_any_to_section(back, &reg).expect("decode");
+            let recanon = canonical_reencode(&direct).expect("re-encode");
+            assert_eq!(
+                recanon, canon,
+                "identity recompute chain must reproduce the canonical bytes"
+            );
+        }
+        // the involution sanity: transpose of the T payload restores the
+        // base variant's raw u8 stream (0xCB wire: payload at byte 5;
+        // 0xCC T wire: payload at byte 6)
+        let t_payload = &t[6..6 + 4096];
+        let back = transpose_fast_y(t_payload, 16);
+        assert_eq!(back.as_slice(), &base[5..5 + 4096], "involution");
         crate::chunknbt::set_gid_rle_div_for_tests(None);
     }
 

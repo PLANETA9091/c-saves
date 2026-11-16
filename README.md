@@ -103,6 +103,40 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.98 — class-partitioned slab streams + the plain-transposed glob form (gform 6)
+
+The drained JJ corpus dropped 1 046 887 -> **1 016 400 B (-2.91% this tick,
+-6.87% over the two weight ticks)**. Two levers, both measured end to end:
+
+**Class partition.** The pack previously packed every slab candidate into
+one mixed stream per group: raw-gid section bytes and tail NBT alternating.
+LZMA2 prices that badly — the g0 (raw u8 gid) marginal cost inside the
+mixed stream is +31 KB over standalone (745 784 vs 714 761 B measured: the
+literal contexts see two content families alternating). `flush_slab_cands`
+now splits candidates by the member's first byte (0x0A tails vs sections)
+before grouping — a pure function of content, so pack -> scan -> pack
+converges, tails never touch the state registry, and the section pool's
+stream bytes are unchanged. Tails ride their own 0xFA-stamped hashless
+slabs; the per-slab class purity is pinned by a regression test.
+
+**gform 6 — plain-transposed gid streams.** The gid form table had RLE and
+RLE+transposed but no PLAIN transposed u8 form, so wide-palette/short-run
+sections never got the y-fast reorder. The glob finish now emits BOTH
+payload orders per member (same byte length — a pure permutation), and the
+pack compresses both streams per group, keeping the smaller (the
+window-level gate, same policy as the canon-vs-glob choice). Measured:
+pure transposed -2.17% on the g0 stream; per-member run-count picks lost
+(-0.36%) — run-count proxies do not predict LZMA2, so the honest window
+comparison is the only admission. The transpose is an involution, and the
+scan-side identity recompute (glob_any_to_section -> canonical re-encode)
+reproduces the write-time dedup key for BOTH forms — the 0.9.97 hashless
+gate covers g6 unchanged; the drained corpus is 100% hashless rows.
+
+99/99 tests (two new: the g6 byte-identity roundtrip through the recompute
+chain + the involution; the per-slab class purity + reopen convergence),
+enc_fp EXACT (6d240d7166cdda99/12130/9971843), verify 946+728+218 bad=0,
+invariant scan 0 violations, import speed unchanged (123.9 MB/s same-run).
+
 ## v0.9.11 — zero-copy scan split: no full-tree parse, no tail re-serialization
 
 The import split path parsed the WHOLE chunk payload into a fastnbt Value
