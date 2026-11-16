@@ -52,8 +52,29 @@ pub fn elide_legacy_poi(poi_dir: &Path) -> (usize, u64) {
     (files, bytes)
 }
 
-/// Import only when: legacy dir exists, and the container is fresh or a
-/// previous import was interrupted (resumable: present chunks are skipped).
+/// v0.9.96: the legacy .mca drain is OPT-IN. Default operation is
+/// native-only: the container is the world from the first byte, and no
+/// background Anvil conversion runs at attach. The drain (which used to
+/// start automatically on every attach with a legacy <world>/<kind> dir —
+/// read every .mca, write the chunks into the container, delete the files
+/// once clean) restores with CSAVES_IMPORT=1.
+pub fn import_enabled() -> bool {
+    std::env::var("CSAVES_IMPORT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Does the legacy dir still hold region files? Shared by the native-only
+/// gate's operator log and the resumable-import check.
+pub fn legacy_has_mca(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|d| d.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().ends_with(".mca")))
+        .unwrap_or(false)
+}
+
+/// Import only when: the operator opted in (CSAVES_IMPORT=1), the legacy dir
+/// exists, and the container is fresh or a previous import was interrupted
+/// (resumable: present chunks are skipped).
 pub fn maybe_spawn_import(
     store: Arc<Store>,
     container_dir: &str,
@@ -85,14 +106,23 @@ pub fn maybe_spawn_import(
             .ok();
         return;
     }
-    // fresh container OR resumable partial import (legacy still present)
-    if existing_chunks > 0 {
-        let has_mca = std::fs::read_dir(&legacy)
-            .map(|d| d.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().ends_with(".mca")))
-            .unwrap_or(false);
-        if !has_mca {
-            return;
+    // v0.9.96 NATIVE-ONLY GATE: without CSAVES_IMPORT=1 no drain thread is
+    // ever spawned. The legacy region dir stays INERT: read_chunk answers
+    // from the container only (no Anvil fallback exists on the live path),
+    // a chunk the container does not know regenerates (vanilla worldgen),
+    // and the .mca files are left untouched on disk. One log line names the
+    // state so the operator is never surprised by a regenerating world.
+    if !import_enabled() {
+        if legacy_has_mca(&legacy) {
+            eprintln!(
+                "[c-saves] native-only: legacy {kind}/*.mca present, background drain is OFF (CSAVES_IMPORT=1 opts in) — the container is the world; chunks it does not know regenerate"
+            );
         }
+        return;
+    }
+    // fresh container OR resumable partial import (legacy still present)
+    if existing_chunks > 0 && !legacy_has_mca(&legacy) {
+        return;
     }
     let kind_owned = kind.to_string();
     std::thread::Builder::new()
@@ -126,6 +156,37 @@ pub fn maybe_spawn_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_only_gate_predicates() {
+        // legacy_has_mca: an unrelated file does not count, a .mca does.
+        let d = std::env::temp_dir().join(format!(
+            "csaves-test-import-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let region = d.join("region");
+        std::fs::create_dir_all(&region).unwrap();
+        std::fs::write(region.join("level.dat"), b"x").unwrap();
+        assert!(!legacy_has_mca(&region), "non-.mca files are not region files");
+        std::fs::write(region.join("r.0.0.mca"), vec![0u8; 8192]).unwrap();
+        assert!(legacy_has_mca(&region), "a .mca file is detected");
+
+        // the gate predicate: default OFF (native-only), opt-in forms ON.
+        std::env::remove_var("CSAVES_IMPORT");
+        assert!(!import_enabled(), "native-only is the default");
+        std::env::set_var("CSAVES_IMPORT", "1");
+        assert!(import_enabled(), "CSAVES_IMPORT=1 restores the drain");
+        std::env::set_var("CSAVES_IMPORT", "true");
+        assert!(import_enabled());
+        std::env::set_var("CSAVES_IMPORT", "0");
+        assert!(!import_enabled());
+        std::env::remove_var("CSAVES_IMPORT");
+        assert!(!import_enabled(), "removal restores the default");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn poi_elide_legacy_dir_named_and_removed() {

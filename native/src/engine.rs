@@ -63,6 +63,10 @@ impl Registry {
         // tail (container fp99 738 us vs anvil 179 us; warm reads sit at
         // p99 ~= 13 us). Boot takes seconds; the warm-up takes tens of ms.
         spawn_prefetch(store.clone());
+        // v0.9.96: the legacy .mca drain is OPT-IN (CSAVES_IMPORT=1) — the
+        // default is native-only: the container is the world, no Anvil
+        // conversion runs at attach. anvil_import::maybe_spawn_import logs
+        // the one operator line when legacy region files are present.
         crate::anvil_import::maybe_spawn_import(store.clone(), container_dir, kind, chunk_count);
         idx
     }
