@@ -4829,6 +4829,10 @@ pub enum Split {
         /// otherwise. Shared variants come from the encode cache.
         sections: Vec<(Hash, SecBytes)>,
         tail: Vec<u8>,
+        /// v0.9.102: the key-verified xPos/zPos pair was stripped from the
+        /// tail (position-free). The read path reinserts from the chunk key
+        /// exactly when this is set — explicit, no content guessing.
+        pos_from_key: bool,
     },
     /// Whole-mode field split: one part per top-level key.
     Fields {
@@ -5253,7 +5257,7 @@ pub fn split(
     let strip = strip && !keep_light();
     if !no_scan() {
         let t_scan = std::time::Instant::now();
-        let r = scan_split(payload, strip);
+        let r = scan_split(payload, strip, pos_hint);
         SPLT_SCAN.0.fetch_add(t_scan.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_SCAN.1.fetch_add(1, Ordering::Relaxed);
         if let Some(sp) = r {
@@ -6077,7 +6081,7 @@ fn parse_sections_direct_from<'a>(
 
 /// Fast-path split: raw tail + sections-only parse. None = fall back to the
 /// full parse (any structural doubt, non-compound root, missing sections...).
-fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
+fn scan_split(payload: &[u8], strip: bool, pos_hint: Option<(i32, i32)>) -> Option<Split> {
     let t_scanr = std::time::Instant::now();
     let Some(mut out) = scan_root(payload, strip) else {
         if std::env::var("CSAVES_SCAN_DEBUG").as_deref() == Ok("1") {
@@ -6141,9 +6145,19 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
         shift_stage(&mut sections, &SecListSrc::Lite(&litelist, strip), &cache_hit, &mut facts);
         let t_tailb = std::time::Instant::now();
         let tail = build_scan_tail(payload, &out)?;
+        // v0.9.102 position-free tails: cut the key-verified xPos/zPos pair
+        // so identical terrain at different coordinates shares one tail blob
+        // (and with it the whole recipe). The emitter reinserts from the key.
+        let (tail, pos_from_key) = match pos_hint {
+            Some(p) => match strip_pos_entries(&tail, p) {
+                Some(t) => (t, true),
+                None => (tail, false),
+            },
+            None => (tail, false),
+        };
         SPLT_TAILB.0.fetch_add(t_tailb.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_TAILB.1.fetch_add(1, Ordering::Relaxed);
-        return Some(Split::Split { sections, tail });
+        return Some(Split::Split { sections, tail, pos_from_key });
     }
     let t_sp3 = std::time::Instant::now();
     let mut buf = Vec::with_capacity(6 + (sp1 - sp0));
@@ -6164,9 +6178,72 @@ fn scan_split(payload: &[u8], strip: bool) -> Option<Split> {
     shift_stage(&mut sections, &SecListSrc::Values(&list), &cache_hit, &mut facts);
     let t_tailb = std::time::Instant::now();
     let tail = build_scan_tail(payload, &out)?;
+    let (tail, pos_from_key) = match pos_hint {
+        Some(p) => match strip_pos_entries(&tail, p) {
+            Some(t) => (t, true),
+            None => (tail, false),
+        },
+        None => (tail, false),
+    };
     SPLT_TAILB.0.fetch_add(t_tailb.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_TAILB.1.fetch_add(1, Ordering::Relaxed);
-    Some(Split::Split { sections, tail })
+    Some(Split::Split { sections, tail, pos_from_key })
+}
+
+/// v0.9.102: cut a key-verified `xPos`/`zPos` Int pair out of a wire-format
+/// tail (the scan-split path builds tails as raw payload slices, so the
+/// strip is byte-level). Returns None when either entry is absent or any
+/// value mismatches the key — the tail then keeps its coordinates verbatim
+/// (the safe side, same rule as the whole_split Position check). The read
+/// path reinserts both ints from the chunk key whenever the stored tail
+/// lacks the pair, so stripped and legacy tails decode identically.
+fn strip_pos_entries(tail: &[u8], pos: (i32, i32)) -> Option<Vec<u8>> {
+    if tail.first() != Some(&0x0A) {
+        return None;
+    }
+    let rnl = u16::from_be_bytes(tail.get(1..3)?.try_into().ok()?) as usize;
+    let mut p = 3 + rnl;
+    let mut have_x = false;
+    let mut have_z = false;
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    loop {
+        let start = p;
+        let tag = *tail.get(p)?;
+        p += 1;
+        if tag == 0 {
+            break;
+        }
+        let nl = u16::from_be_bytes(tail.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let name = core::str::from_utf8(tail.get(p..p + nl)?).ok()?;
+        p += nl;
+        let val0 = p;
+        nbt_skip(tail, &mut p, tag, 1)?;
+        let hit = match name {
+            "xPos" => &mut have_x,
+            "zPos" => &mut have_z,
+            _ => continue,
+        };
+        if tag == 3 && p - val0 == 4 {
+            let v = i32::from_be_bytes(tail[val0..val0 + 4].try_into().ok()?);
+            let want = if name == "xPos" { pos.0 } else { pos.1 };
+            if v == want {
+                *hit = true;
+                cuts.push((start, p));
+            }
+        }
+    }
+    if !have_x || !have_z {
+        return None;
+    }
+    let mut out = Vec::with_capacity(tail.len());
+    let mut c = 0usize;
+    for (s, e) in &cuts {
+        out.extend_from_slice(&tail[c..*s]);
+        c = *e;
+    }
+    out.extend_from_slice(&tail[c..]);
+    Some(out)
 }
 
 /// tail = payload minus the sections range, with the heightmap/isLightOn
@@ -6300,9 +6377,25 @@ fn split_parsed(
     // tail = parsed root minus sections, CONSUMED (the old map.clone() of
     // the whole tree cost ~100 us/chunk of import wall time)
     let mut root = root;
+    let mut pos_stripped = false;
     let tail = match &mut root {
         Value::Compound(m) => {
             m.remove("sections");
+            // v0.9.102 position-free tails: cut the key-verified xPos/zPos
+            // Int pair so identical terrain at different coordinates shares
+            // one tail blob and one recipe. The read path reinserts from the
+            // key exactly when the recipe's pos flag says so — explicit, no
+            // content guessing (coordinate-less synthetic payloads keep
+            // their shape verbatim).
+            if let Some((cx, cz)) = pos_hint {
+                let has_x = matches!(m.get("xPos"), Some(Value::Int(x)) if *x == cx);
+                let has_z = matches!(m.get("zPos"), Some(Value::Int(z)) if *z == cz);
+                if has_x && has_z {
+                    m.remove("xPos");
+                    m.remove("zPos");
+                    pos_stripped = true;
+                }
+            }
             if strip {
                 // relight trigger: isLightOn=0 makes the server recompute
                 // light for this chunk on load (vanilla standard for fresh
@@ -6318,7 +6411,7 @@ fn split_parsed(
     SPLT_TAIL.0.fetch_add(t_sh.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_TAIL.1.fetch_add(1, Ordering::Relaxed);
 
-    Ok(Split::Split { sections, tail })
+    Ok(Split::Split { sections, tail, pos_from_key: pos_stripped })
 }
 
 /// Whole-mode field split: a compound payload is split per top-level key so
@@ -6431,7 +6524,7 @@ fn vanillify_section_value(sec: &mut Value) {
     }
 }
 
-pub fn join(sections: &[Vec<u8>], tail: &[u8]) -> Result<Vec<u8>, String> {
+pub fn join(sections: &[Vec<u8>], tail: &[u8], pos: Option<(i32, i32)>) -> Result<Vec<u8>, String> {
     let tail_val: Value = fastnbt::from_bytes(tail).map_err(|e| format!("tail parse: {e}"))?;
     let Value::Compound(mut map) = tail_val else {
         return Err("tail is not a compound".into());
@@ -6440,6 +6533,18 @@ pub fn join(sections: &[Vec<u8>], tail: &[u8]) -> Result<Vec<u8>, String> {
         let mut tv = Value::Compound(std::mem::take(&mut map));
         tail_decode(&mut tv);
         map = match tv { Value::Compound(m) => m, _ => unreachable!() };
+    }
+    // v0.9.102: position-free tails reinsert the key-redundant root coords
+    // (see split_parsed); legacy tails and entity-style Position markers
+    // keep their own coordinate form verbatim.
+    if let Some((cx, cz)) = pos {
+        if map.get("xPos").is_none()
+            && map.get("zPos").is_none()
+            && map.get("Position").is_none()
+        {
+            map.insert("xPos".to_string(), Value::Int(cx));
+            map.insert("zPos".to_string(), Value::Int(cz));
+        }
     }
     let mut list = Vec::with_capacity(sections.len());
     for s in sections {
@@ -6893,7 +6998,7 @@ pub struct SecSrc<'a> {
 /// Fused join: emit the full chunk NBT directly from CSEC section streams +
 /// the decoded tail. Returns None when any section is not a CSEC-v3 stream
 /// (or the shape is unexpected) — the caller then uses the generic join.
-pub fn join_fused(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
+pub fn join_fused(sections: &[SecSrc], tail: &[u8], pos: Option<(i32, i32)>) -> Option<Vec<u8>> {
     for (si, s) in sections.iter().enumerate() {
         if !is_csec4(s.b.first()) {
             fdbg!("fused: section {si} not CSEC3/4 (first={:02x})", s.b.first().copied().unwrap_or(0));
@@ -6907,15 +7012,15 @@ pub fn join_fused(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
     // to_bytes output) — splice it verbatim and only transform the
     // heightmap dense arrays back to LongArrays. No Value tree, no
     // re-serialization. Falls back to the Value path on any surprise.
-    if emit_tail_direct(tail, sections, &mut out).is_none() {
+    if emit_tail_direct(tail, sections, &mut out, pos).is_none() {
         fdbg!("fused: direct tail failed, using Value path");
-        return join_fused_tail_value(sections, tail);
+        return join_fused_tail_value(sections, tail, pos);
     }
     Some(out)
 }
 
 /// Value-tree fallback (pre-v0.5 tail path): parse + tail_decode + emit.
-fn join_fused_tail_value(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
+fn join_fused_tail_value(sections: &[SecSrc], tail: &[u8], pos: Option<(i32, i32)>) -> Option<Vec<u8>> {
     let tail_val: Value = fastnbt::from_bytes(tail).ok()?;
     let Value::Compound(mut map) = tail_val else {
         fdbg!("fused: tail not compound");
@@ -6925,6 +7030,19 @@ fn join_fused_tail_value(sections: &[SecSrc], tail: &[u8]) -> Option<Vec<u8>> {
         let mut tv = Value::Compound(std::mem::take(&mut map));
         tail_decode(&mut tv);
         map = match tv { Value::Compound(m) => m, _ => unreachable!() };
+    }
+    // v0.9.102: key-redundant root coords reinsert from the chunk key when
+    // the stored tail carries none (position-free tails share one blob
+    // across coordinates; legacy tails keep theirs and are left verbatim;
+    // an entity-style Position marker keeps its own coordinate form).
+    if let Some((cx, cz)) = pos {
+        if map.get("xPos").is_none()
+            && map.get("zPos").is_none()
+            && map.get("Position").is_none()
+        {
+            map.insert("xPos".to_string(), Value::Int(cx));
+            map.insert("zPos".to_string(), Value::Int(cz));
+        }
     }
     let mut out = Vec::with_capacity((1 << 16).max(sections.len() * 8200));
     out.push(0x0A); // root compound, name ""
@@ -7018,15 +7136,79 @@ fn nbt_skip(b: &[u8], p: &mut usize, tag: u8, depth: u32) -> Option<()> {
     Some(())
 }
 
+/// v0.9.102: true when the wire-format tail carries NEITHER xPos nor zPos
+/// at the root level (the injection condition for position-free tails).
+/// An entity-style Position marker also suppresses injection — hybrid
+/// payloads keep their own coordinate form verbatim.
+fn tail_lacks_pos(tail: &[u8]) -> bool {
+    if tail.first() != Some(&0x0A) {
+        return false; // not our shape: no injection (emit will refuse anyway)
+    }
+    let rnl = u16::from_be_bytes(tail.get(1..3).unwrap_or(&[0, 0]).try_into().unwrap_or([0, 0])) as usize;
+    let mut p = 3 + rnl;
+    let mut have_x = false;
+    let mut have_z = false;
+    let mut have_pos = false;
+    loop {
+        let tag = match tail.get(p) {
+            Some(&t) => t,
+            None => return false,
+        };
+        p += 1;
+        if tag == 0 {
+            break;
+        }
+        let nl = match tail.get(p..p + 2).map(|s| u16::from_be_bytes(s.try_into().unwrap_or([0, 0]))) {
+            Some(v) => v as usize,
+            None => return false,
+        };
+        p += 2;
+        let name = match core::str::from_utf8(tail.get(p..p + nl).unwrap_or(&[])) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        p += nl;
+        match name {
+            "xPos" => have_x = true,
+            "zPos" => have_z = true,
+            "Position" => have_pos = true,
+            _ => {}
+        }
+        if nbt_skip(tail, &mut p, tag, 1).is_none() {
+            return false;
+        }
+    }
+    !have_x && !have_z && !have_pos
+}
+
 /// Emit the stored tail verbatim, transforming only dense heightmaps back
 /// into LongArrays, with the sections list spliced at its sorted position.
-fn emit_tail_direct(tail: &[u8], sections: &[SecSrc], out: &mut Vec<u8>) -> Option<()> {
+fn emit_tail_direct(
+    tail: &[u8],
+    sections: &[SecSrc],
+    out: &mut Vec<u8>,
+    pos: Option<(i32, i32)>,
+) -> Option<()> {
     if tail.first() != Some(&0x0A) {
         return None;
     }
     let nl = u16::from_be_bytes(tail.get(1..3)?.try_into().ok()?) as usize;
     if nl != 0 {
         return None; // our own tails always have an empty root name
+    }
+    // v0.9.102: position-free tails — reinsert the key-redundant root
+    // coords when the stored tail carries none. Legacy tails (coords
+    // inside) copy verbatim; partial presence stays verbatim too (the
+    // safe side). Name order inside the compound is semantically free.
+    if let Some((cx, cz)) = pos {
+        if tail_lacks_pos(tail) {
+            out.push(3u8);
+            out.extend_from_slice(b"\x00\x04xPos");
+            out.extend_from_slice(&cx.to_be_bytes());
+            out.push(3u8);
+            out.extend_from_slice(b"\x00\x04zPos");
+            out.extend_from_slice(&cz.to_be_bytes());
+        }
     }
     let mut p = 3usize;
     let mut sections_done = false;
@@ -8714,8 +8896,8 @@ mod fused_tests {
             .iter()
             .map(|s| SecSrc { h: hash_of(s), b: s.as_slice() })
             .collect();
-        let fused = join_fused(&sources, &tail).expect("join_fused failed");
-        let legacy = join(&sections_enc, &tail).expect("legacy join failed");
+        let fused = join_fused(&sources, &tail, None).expect("join_fused failed");
+        let legacy = join(&sections_enc, &tail, None).expect("legacy join failed");
         let a: Value = fastnbt::from_bytes(&fused).unwrap();
         let b: Value = fastnbt::from_bytes(&legacy).unwrap();
         assert_eq!(a, b, "fused output differs semantically");
@@ -9085,10 +9267,10 @@ mod tests {
     fn roundtrip_semantic_equality() {
         let payload = sample_chunk(6, "Test");
         let s = split(&payload, false, Some((3, 7)), false).unwrap();
-        let Split::Split { sections, tail } = &s else { panic!("expected split") };
+        let Split::Split { sections, tail, .. } = &s else { panic!("expected split") };
         assert_eq!(sections.len(), 6);
         let sec_bytes: Vec<Vec<u8>> = sections.iter().map(|(_, b)| b.as_slice().to_vec()).collect();
-        let joined = join(&sec_bytes, tail).unwrap();
+        let joined = join(&sec_bytes, tail, None).unwrap();
         let a: Value = fastnbt::from_bytes(&payload).unwrap();
         let b: Value = fastnbt::from_bytes(&joined).unwrap();
         assert_eq!(a, b, "semantic round-trip must be equal");
@@ -9621,7 +9803,7 @@ mod codec_tests {
             let payload = shift_structured_chunk(k, extra);
             let split = split(&payload, false, Some((3, 4)), false).unwrap();
             let (sections, tail) = match &split {
-                Split::Split { sections, tail } => (sections, tail),
+                Split::Split { sections, tail, .. } => (sections, tail),
                 _ => panic!("expected split"),
             };
             assert_eq!(sections.len(), 2);
@@ -9651,7 +9833,7 @@ mod codec_tests {
                     None => sb.as_slice().to_vec(),
                 })
                 .collect();
-            assert!(join(&expanded, tail).is_ok());
+            assert!(join(&expanded, tail, None).is_ok());
         }
     }
 
@@ -9956,7 +10138,10 @@ mod glob_tests {
         // and the rebuild must un-transpose back to byte-identical canon.
         // v0.9.99: the admission is OFF by default (the split+transposed
         // streams make RLE a net loss on the corpus) — this test pins the
-        // MECHANISM, so it opts in explicitly.
+        // MECHANISM, so it opts in explicitly. The knob is process-global:
+        // hold the glob lock like every other knob user, or a parallel
+        // glob test's reset flips the admission mid-flight (flake).
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
         crate::chunknbt::set_gid_rle_div_for_tests(Some(4));
         let mut sec: Map<String, Value> = Map::new();
         sec.insert("Y".to_string(), Value::Byte(9));

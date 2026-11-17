@@ -103,7 +103,7 @@ fn main() {
     let mut raw_total = 0u64;
     for (cx, cz, p) in &chunks {
         let split = chunknbt::split(p, false, Some((*cx, *cz)), false).unwrap();
-        if let chunknbt::Split::Split { sections, tail } = split {
+        if let chunknbt::Split::Split { sections, tail, .. } = split {
             let mut bytes = Vec::with_capacity(sections.len());
             for (_, b) in sections {
                 let b = b.as_slice().to_vec();

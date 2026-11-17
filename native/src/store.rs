@@ -1027,6 +1027,9 @@ struct BatchJob {
     keys: Vec<u64>,
     arcs: Vec<Arc<Vec<u8>>>,
     starts: Vec<u32>,
+    /// v0.9.102: number of UNIQUE bodies in the stream (body dedup —
+    /// identical recipes share one slice; pregen oceans collapse).
+    m: u32,
     stream: Arc<Vec<u8>>,
 }
 
@@ -1087,23 +1090,35 @@ fn batcher_loop(weak: std::sync::Weak<Store>, ctl: Arc<BatchCtl>) {
             }
         };
         match weak.upgrade() {
-            Some(st) => match st.commit_batch_job(&job) {
-                Ok(()) => done(),
-                Err(e) => {
-                    done();
-                    let mut q = ctl.q.lock();
-                    q.push_front(job);
-                    drop(q);
-                    ctl.cv.notify_all();
-                    if ctl.stop.load(Ordering::Acquire) {
-                        ctl.exited.store(true, Ordering::Release);
+            Some(st) => {
+                let res = st.commit_batch_job(&job);
+                // v0.9.102 FIX (latent 0.9.72 race): the strong Arc MUST be
+                // released BEFORE done() notifies. done() sets inflight=false
+                // and wakes a flush_recipe_batch waiter; if the Arc outlived
+                // the notify, a waiter that immediately drops the LAST
+                // external Arc<Store> decremented 2 -> 1 and Store::drop —
+                // the flush of the writer buffer — NEVER RAN (empty segment
+                // file, silent data loss on the tick-durability path). The
+                // error arm re-queues while holding no Arc either.
+                drop(st);
+                match res {
+                    Ok(()) => done(),
+                    Err(e) => {
+                        done();
+                        let mut q = ctl.q.lock();
+                        q.push_front(job);
+                        drop(q);
                         ctl.cv.notify_all();
-                        return;
+                        if ctl.stop.load(Ordering::Acquire) {
+                            ctl.exited.store(true, Ordering::Release);
+                            ctl.cv.notify_all();
+                            return;
+                        }
+                        eprintln!("[c-saves] batcher: commit failed ({e}) — retrying");
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
-                    eprintln!("[c-saves] batcher: commit failed ({e}) — retrying");
-                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-            },
+            }
             None => {
                 // the store is dropping: restore the job, exit, and let the
                 // Drop drain commit the queue inline
@@ -1278,6 +1293,33 @@ impl Recipe {
                 let tail = parse_tail(&mut p)?;
                 Some(Recipe { whole: None, sections, tail, ..EMPTY })
             }
+            8 => {
+                // v0.9.102: mode 2 + [flags] — pos-aware split recipe. The
+                // xPos/zPos pair was key-verified at split and stripped from
+                // the tail; the read path reinserts both ints from the key.
+                let flags = *b.get(p)?;
+                p += 1;
+                let n = *b.get(p)? as usize;
+                p += 1;
+                let mut sections = Vec::with_capacity(n);
+                let mut prev: i64 = 0;
+                for _ in 0..n {
+                    let d = unzigzag(get_u64(b, &mut p)?);
+                    prev += d;
+                    match id2h.get(&(prev as u32)) {
+                        Some(h) => sections.push(*h),
+                        None => return None,
+                    }
+                }
+                let tail = parse_tail(&mut p)?;
+                Some(Recipe {
+                    whole: None,
+                    sections,
+                    tail,
+                    pos_from_key: flags & 1 != 0,
+                    ..EMPTY
+                })
+            }
             3 => {
                 let id = get_u64(b, &mut p)? as u32;
                 Some(Recipe {
@@ -1355,6 +1397,40 @@ impl Recipe {
                 }
                 let tail = parse_tail(&mut p)?;
                 Some(Recipe { whole: None, sections, tail, ..EMPTY })
+            }
+            10 => {
+                // v0.9.102: mode 6 + [flags] — the run-length pos-aware form.
+                let flags = *b.get(p)?;
+                p += 1;
+                let n = *b.get(p)? as usize;
+                p += 1;
+                let mut sections = Vec::with_capacity(n.min(255));
+                let mut prev: i64 = 0;
+                let mut total = 0usize;
+                while total < n {
+                    let d = unzigzag(get_u64(b, &mut p)?);
+                    let run = get_u64(b, &mut p)? as usize;
+                    if run == 0 || total + run > n {
+                        return None;
+                    }
+                    prev += d;
+                    let h = match id2h.get(&(prev as u32)) {
+                        Some(h) => *h,
+                        None => return None,
+                    };
+                    for _ in 0..run {
+                        sections.push(h);
+                    }
+                    total += run;
+                }
+                let tail = parse_tail(&mut p)?;
+                Some(Recipe {
+                    whole: None,
+                    sections,
+                    tail,
+                    pos_from_key: flags & 1 != 0,
+                    ..EMPTY
+                })
             }
             7 => {
                 // v0.9.44 pristine regeneration contract: [7][hash 16B].
@@ -1437,9 +1513,21 @@ impl Recipe {
         let can_id = ids.is_some();
         match (can_id, ids, &self.tail) {
             (true, Some(ids), tail) => {
-                // mode 2: zigzag-delta id per section
-                let mut m2 = Vec::with_capacity(2 + ids.len() * 2 + 16);
-                m2.push(2u8);
+                // v0.9.102: a position-free tail (key-verified xPos/zPos
+                // stripped at split) MUST ride a flags-carrying mode — the
+                // read path reinserts coords from the key exactly when the
+                // flag says so. Modes 8/10 are the pos-aware analogs of 2/6
+                // ([flags][n][ids...]/runs + tail); +1 byte per recipe, and
+                // the whole recipe becomes coordinate-invariant so identical
+                // chunks share one batch body. Modes 2/6 keep their LEGACY
+                // bytes (no flags) so old containers parse forever.
+                let mut m2 = Vec::with_capacity(3 + ids.len() * 2 + 16);
+                if self.pos_from_key {
+                    m2.push(8u8);
+                    m2.push(1u8);
+                } else {
+                    m2.push(2u8);
+                }
                 m2.push(self.sections.len() as u8);
                 let mut prev: i64 = 0;
                 for id in &ids {
@@ -1447,10 +1535,15 @@ impl Recipe {
                     prev = *id as i64;
                 }
                 push_tail(&mut m2, tail, &id_of);
-                // mode 6: run-length encode the same stream (repeated id =>
+                // run-length form of the same stream (repeated id =>
                 // (delta, run) pairs). Smaller wins, deterministic.
-                let mut m6 = Vec::with_capacity(2 + ids.len() / 2 + 16);
-                m6.push(6u8);
+                let mut m6 = Vec::with_capacity(3 + ids.len() / 2 + 16);
+                if self.pos_from_key {
+                    m6.push(10u8);
+                    m6.push(1u8);
+                } else {
+                    m6.push(6u8);
+                }
                 m6.push(self.sections.len() as u8);
                 let mut prev: i64 = 0;
                 let mut i = 0usize;
@@ -3234,6 +3327,110 @@ impl Store {
                                 }
                             }
                         }
+                        0x0B => {
+                            // v0.9.102 body-dedup batch:
+                            // [0x0B][u32 n][u32 m][u32 cl][u32 raw]{stream}
+                            // stream = [u64 key]×n ++ [u32 body_idx]×n ++
+                            // [u16 len]×m ++ concat(unique bodies).
+                            if body.len() < 17 {
+                                false
+                            } else {
+                                let n = u32::from_le_bytes(body[1..5].try_into().unwrap()) as usize;
+                                let m = u32::from_le_bytes(body[5..9].try_into().unwrap()) as usize;
+                                let cl = u32::from_le_bytes(body[9..13].try_into().unwrap()) as usize;
+                                let raw_total =
+                                    u32::from_le_bytes(body[13..17].try_into().unwrap()) as usize;
+                                if body.len() < 17 + cl || n == 0 {
+                                    false
+                                } else {
+                                    match self.decompress(0, &body[17..17 + cl], raw_total as u32) {
+                                        Some(raw) if raw.len() == raw_total => {
+                                            let raw = Arc::new(raw);
+                                            let mut ok = true;
+                                            let mut keys = Vec::with_capacity(n);
+                                            let mut idxs = Vec::with_capacity(n);
+                                            let mut lens = Vec::with_capacity(m.min(n));
+                                            let mut p = 0usize;
+                                            for _ in 0..n {
+                                                if p + 8 > raw.len() {
+                                                    ok = false;
+                                                    break;
+                                                }
+                                                keys.push(u64::from_le_bytes(
+                                                    raw[p..p + 8].try_into().unwrap(),
+                                                ));
+                                                p += 8;
+                                            }
+                                            if ok {
+                                                for _ in 0..n {
+                                                    if p + 4 > raw.len() {
+                                                        ok = false;
+                                                        break;
+                                                    }
+                                                    idxs.push(u32::from_le_bytes(
+                                                        raw[p..p + 4].try_into().unwrap(),
+                                                    ));
+                                                    p += 4;
+                                                }
+                                            }
+                                            if ok {
+                                                for _ in 0..m {
+                                                    if p + 2 > raw.len() {
+                                                        ok = false;
+                                                        break;
+                                                    }
+                                                    lens.push(u16::from_le_bytes(
+                                                        raw[p..p + 2].try_into().unwrap(),
+                                                    ) as usize);
+                                                    p += 2;
+                                                }
+                                            }
+                                            if ok {
+                                                let base = off + 8;
+                                                let mut bidx = self.batch_idx.lock();
+                                                let mut ch = self.chunks.write();
+                                                // per-body stream offsets: prefix sums
+                                                let mut soffs = Vec::with_capacity(m);
+                                                let mut so = p as u32; // header zone just walked
+                                                for l in &lens {
+                                                    soffs.push(so);
+                                                    so += *l as u32;
+                                                }
+                                                for (i, k) in keys.iter().enumerate() {
+                                                    let ix = idxs[i] as usize;
+                                                    if ix >= lens.len() {
+                                                        ok = false;
+                                                        break;
+                                                    }
+                                                    let rl = lens[ix];
+                                                    if rl < 2 || soffs[ix] as usize + rl > raw.len()
+                                                        || raw[soffs[ix] as usize] != 0xFF
+                                                    {
+                                                        ok = false;
+                                                        break;
+                                                    }
+                                                    ch.insert(*k, (id, base, BATCHED));
+                                                    bidx.insert(
+                                                        *k,
+                                                        (base, soffs[ix], rl as u32),
+                                                    );
+                                                }
+                                                if ok && so as usize != raw.len() {
+                                                    ok = false;
+                                                }
+                                                if ok {
+                                                    self.slab_cache
+                                                        .lock()
+                                                        .put((id, base | (1u64 << 63)), raw);
+                                                }
+                                            }
+                                            ok
+                                        }
+                                        _ => false,
+                                    }
+                                }
+                            }
+                        }
                         3 => {
                             if body.len() < 9 {
                                 false
@@ -3349,13 +3546,18 @@ impl Store {
             let e = cached.get(soff as usize..(soff + rl) as usize)?;
             return self.parse_recipe_body(e);
         }
-        let hdr = self.seg_read_body(seg, boff, 13)?;
-        if hdr.first() != Some(&9) {
-            return None;
-        }
-        let cl = u32::from_le_bytes(hdr[5..9].try_into().ok()?) as usize;
-        let raw_total = u32::from_le_bytes(hdr[9..13].try_into().ok()?) as usize;
-        let data = self.seg_read_body(seg, boff + 13, cl)?;
+        let kind = *self.seg_read_body(seg, boff, 1)?.first()?;
+        // header widths: kind 9 = [n][cl][raw] (13 B), kind 0x0B adds [m]
+        // (17 B). Both streams slice identically per (soff, rl).
+        let hlen = match kind {
+            9 => 13usize,
+            0x0B => 17usize,
+            _ => return None,
+        };
+        let hdr = self.seg_read_body(seg, boff, hlen)?;
+        let cl = u32::from_le_bytes(hdr[hlen - 8..hlen - 4].try_into().ok()?) as usize;
+        let raw_total = u32::from_le_bytes(hdr[hlen - 4..hlen].try_into().ok()?) as usize;
+        let data = self.seg_read_body(seg, boff + hlen as u64, cl)?;
         let raw = self.decompress(0, &data, raw_total as u32)?;
         let e = raw.get(soff as usize..(soff + rl) as usize)?;
         let out = self.parse_recipe_body(e);
@@ -3465,25 +3667,62 @@ impl Store {
                 .into_iter()
                 .map(|group| {
                     let n = group.len();
+                    // v0.9.102 body dedup: identical recipe wires (same
+                    // sections + same position-free tail = the SAME chunk
+                    // content at different coordinates) are stored ONCE —
+                    // entries reference the shared slice. Keys stay per-entry
+                    // (the emitter reinserts coords from the key), so this is
+                    // the run lever for pregen worlds at zero read cost.
+                    // kind-0x0B stream: [u64 key]×n ++ [u32 body_idx]×n ++
+                    // [u16 len]×m ++ concat(unique [0xFF][recipe]).
+                    let mut uniq: Vec<(u128, u16)> = Vec::with_capacity(n); // (body hash, len)
+                    let mut seen: HashMap<u128, u32> = HashMap::with_capacity(n);
+                    let mut idxs: Vec<u32> = Vec::with_capacity(n);
+                    for (_, a) in &group {
+                        let h = chunknbt::hash_of(a);
+                        let ix = match seen.get(&h) {
+                            Some(&ix) => ix,
+                            None => {
+                                let ix = uniq.len() as u32;
+                                uniq.push((h, a.len() as u16));
+                                seen.insert(h, ix);
+                                ix
+                            }
+                        };
+                        idxs.push(ix);
+                    }
+                    let m = uniq.len();
+                    let header_zone = (8 * n + 4 * n + 2 * m) as u32;
+                    let mut soffs = Vec::with_capacity(m);
+                    let mut so = header_zone;
+                    for (_, l) in &uniq {
+                        soffs.push(so);
+                        so += *l as u32;
+                    }
                     let mut stream = Vec::with_capacity(BATCH_BYTES + 4096);
                     for (k, _) in &group {
                         stream.extend_from_slice(&k.to_le_bytes());
                     }
-                    for (_, a) in &group {
-                        stream.extend_from_slice(&(a.len() as u16).to_le_bytes());
+                    for ix in &idxs {
+                        stream.extend_from_slice(&ix.to_le_bytes());
+                    }
+                    for (_, l) in &uniq {
+                        stream.extend_from_slice(&l.to_le_bytes());
                     }
                     let mut starts = Vec::with_capacity(n);
-                    let mut so = (8 * n + 2 * n) as u32;
                     let mut keys = Vec::with_capacity(n);
                     let mut arcs = Vec::with_capacity(n);
-                    for (k, a) in group {
-                        starts.push(so);
-                        stream.extend_from_slice(&a);
-                        so += a.len() as u32;
+                    let mut written = vec![false; m];
+                    for ((k, a), ix) in group.into_iter().zip(idxs.iter()) {
+                        starts.push(soffs[*ix as usize]);
+                        if !written[*ix as usize] {
+                            stream.extend_from_slice(&a);
+                            written[*ix as usize] = true;
+                        }
                         keys.push(k);
                         arcs.push(a);
                     }
-                    BatchJob { keys, arcs, starts, stream: Arc::new(stream) }
+                    BatchJob { keys, arcs, starts, m: m as u32, stream: Arc::new(stream) }
                 })
                 .collect()
         };
@@ -3513,9 +3752,13 @@ impl Store {
         let (dict_id, comp) =
             self.compress_tier_level(&job.stream, self.cfg.recipe_level);
         debug_assert_eq!(dict_id, 0);
-        let mut body = Vec::with_capacity(13 + comp.len());
-        body.push(9u8);
+        // v0.9.102: kind-0x0B record — the body-dedup batch wire.
+        // [0x0B][u32 n][u32 m][u32 cl][u32 raw]{stream}; kind 9 (per-entry
+        // bodies) stays valid forever, old containers decode unchanged.
+        let mut body = Vec::with_capacity(17 + comp.len());
+        body.push(0x0Bu8);
         body.extend_from_slice(&(n as u32).to_le_bytes());
+        body.extend_from_slice(&job.m.to_le_bytes());
         body.extend_from_slice(&(comp.len() as u32).to_le_bytes());
         body.extend_from_slice(&raw_total.to_le_bytes());
         body.extend_from_slice(&comp);
@@ -4922,7 +5165,7 @@ impl Store {
                 }
                 Recipe { whole: None, sections: Vec::new(), tail: Tail::None, fields, pos_from_key, pristine: None, pristine_canon: None }
             }
-            Split::Split { sections, tail } => {
+            Split::Split { sections, tail, pos_from_key } => {
                 if sections.len() > MAX_SECTIONS {
                     let h = chunknbt::hash_of(payload);
                     self.ensure_blob(h, payload, false)?;
@@ -4998,7 +5241,7 @@ impl Store {
                             Tail::Inline { dict: tdict, comp: tcomp, raw: tail.len() as u32 }
                         }
                     };
-                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key: false, pristine: None, pristine_canon: None }
+                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key, pristine: None, pristine_canon: None }
                 }
             }
             };
@@ -5505,7 +5748,14 @@ impl Store {
                     .map(|(h, s)| chunknbt::SecSrc { h: *h, b: s })
                     .collect();
                 let t_join = std::time::Instant::now();
-                let fused = chunknbt::join_fused(&sources, &tail);
+                // v0.9.102: coords reinsert ONLY for flagged pos-free recipes
+                // (modes 8/10) — explicit, no content guessing.
+                let pos = if rec.pos_from_key {
+                    Some(((key >> 32) as i32, (key & 0xffff_ffff) as i32))
+                } else {
+                    None
+                };
+                let fused = chunknbt::join_fused(&sources, &tail, pos);
                 {
                     let el = t_join.elapsed().as_nanos() as u64;
                     ST_JOIN_FUSED.0.fetch_add(el, Ordering::Relaxed);
@@ -5520,7 +5770,7 @@ impl Store {
                 } else {
                     let t_leg = std::time::Instant::now();
                     let sec_bytes: Vec<Vec<u8>> = slices.iter().map(|s| s.to_vec()).collect();
-                    let r = match chunknbt::join(&sec_bytes, &tail) {
+                    let r = match chunknbt::join(&sec_bytes, &tail, pos) {
                         Ok(v) => Some(v),
                         Err(e) => fail(&format!("join: {e}")),
                     };
@@ -5859,19 +6109,23 @@ impl Store {
         let segs = self.segs.read();
         let s = segs.get(&seg)?;
         let sealed = !is_writer;
-        let hdr = s.read_at(boff, 13, sealed)?;
-        if hdr.first() != Some(&9) {
-            return None;
-        }
-        let cl = u32::from_le_bytes(hdr[5..9].try_into().ok()?) as usize;
-        let raw_total = u32::from_le_bytes(hdr[9..13].try_into().ok()?) as usize;
+        // v0.9.102: kind dispatch — kind 9 header 13 B, kind 0x0B 17 B.
+        let kindb = s.read_at(boff, 1, sealed)?;
+        let hlen = match kindb.first().copied()? {
+            9 => 13usize,
+            0x0B => 17usize,
+            _ => return None,
+        };
+        let hdr = s.read_at(boff, hlen, sealed)?;
+        let cl = u32::from_le_bytes(hdr[hlen - 8..hlen - 4].try_into().ok()?) as usize;
+        let raw_total = u32::from_le_bytes(hdr[hlen - 4..hlen].try_into().ok()?) as usize;
         // v0.9.78/79: same writer-segment read-through rule as
         // prefetch_slab_body — disk pread below the boundary, append-state
         // read-through above it
         let data = if is_writer {
-            self.seg_read_body(seg, boff + 13, cl)
+            self.seg_read_body(seg, boff + hlen as u64, cl)
         } else {
-            s.read_at(boff + 13, cl, true)
+            s.read_at(boff + hlen as u64, cl, true)
         }?;
         self.decompress(0, &data, raw_total as u32).map(Arc::new)
     }
@@ -7787,14 +8041,31 @@ impl Store {
                 }
                 let segs = self.segs.read();
                 let Some(seg) = segs.get(&worst_id) else { continue };
-                let Some(hdr) = seg.read_at(boff, 13, !is_writer) else {
+                // v0.9.102: kind dispatch — kind 9 header is 13 B
+                // ([n][cl][raw]), kind 0x0B adds [m] (17 B).
+                let Some(kindb) = seg.read_at(boff, 1, !is_writer) else {
                     eprintln!("[c-saves] LEAK: hdr read fail key={key:016x} boff={boff}");
                     mark_broken();
                     continue;
                 };
-                let cl = u32::from_le_bytes(hdr[5..9].try_into().unwrap()) as usize;
-                let raw_total = u32::from_le_bytes(hdr[9..13].try_into().unwrap());
-                let Some(data) = seg.read_at(boff + 13, cl, !is_writer) else {
+                let hlen = match kindb.first().copied().unwrap_or(0) {
+                    9 => 13usize,
+                    0x0B => 17usize,
+                    k => {
+                        eprintln!("[c-saves] LEAK: unknown batch kind {k} key={key:016x}");
+                        mark_broken();
+                        continue;
+                    }
+                };
+                let Some(hdr) = seg.read_at(boff, hlen, !is_writer) else {
+                    eprintln!("[c-saves] LEAK: hdr read fail key={key:016x} boff={boff}");
+                    mark_broken();
+                    continue;
+                };
+                let cl = u32::from_le_bytes(hdr[hlen - 8..hlen - 4].try_into().unwrap()) as usize;
+                let raw_total =
+                    u32::from_le_bytes(hdr[hlen - 4..hlen].try_into().unwrap());
+                let Some(data) = seg.read_at(boff + hlen as u64, cl, !is_writer) else {
                     eprintln!("[c-saves] LEAK: body read fail key={key:016x} cl={cl}");
                     mark_broken();
                     continue;
@@ -8711,6 +8982,101 @@ pub mod tests {
         assert!(st.dedup_hits.load(Ordering::Relaxed) > 0, "sections must dedup");
         // blobs got ids
         assert!(!st.ids.read().is_empty(), "blob ids must be assigned");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.102: a real region-chunk payload (xPos/zPos Ints at the root —
+    /// the Paper shape) at two coordinate keys. The strip removes the
+    /// key-verified coordinate pair, so both chunks produce IDENTICAL
+    /// recipes (mode 8/10 + shared tail blob); the kind-0x0B batch stores
+    /// the body once and both keys decode with their own coords back.
+    fn coord_chunk_payload() -> Vec<u8> {
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut hm: Map<String, Value> = Map::new();
+        let la: Vec<i64> = (0..37).map(|i| 900i64 + i as i64 * 13).collect();
+        hm.insert("MOTION_BLOCKING".to_string(), Value::LongArray(fastnbt::LongArray::new(la)));
+        root.insert("Heightmaps".to_string(), Value::Compound(hm));
+        let mut sec_list = Vec::new();
+        for y in 0..6i32 {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = Vec::new();
+            pal.push(Value::String("minecraft:stone".to_string()));
+            pal.push(Value::String("minecraft:water".to_string()));
+            pal.push(Value::String("minecraft:air".to_string()));
+            bs.insert("palette".to_string(), Value::List(pal));
+            let data: Vec<i64> = (0..64).map(|i| (i as i64) * 77 + y as i64).collect();
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        root.insert("block_entities".to_string(), Value::List(vec![]));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn posfree_tails_dedup_identical_chunks() {
+        let dir = temp_dir("posfree");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        // same terrain, different coordinates: the payloads differ ONLY in
+        // xPos/zPos (real Paper region-chunk shape)
+        let mk = |cx: i32, cz: i32| {
+            let mut root: Value =
+                fastnbt::from_bytes::<Value>(&coord_chunk_payload()).unwrap();
+            if let Value::Compound(m) = &mut root {
+                m.insert("xPos".to_string(), Value::Int(cx));
+                m.insert("zPos".to_string(), Value::Int(cz));
+            }
+            fastnbt::to_bytes(&root).unwrap()
+        };
+        let p0 = mk(10, 20);
+        let p1 = mk(11, 21);
+        assert_ne!(p0, p1, "payloads differ in coords only");
+        s.write_chunk(key(10, 20), &p0, false).unwrap();
+        s.durability_tick();
+        let d1 = s.disk_bytes();
+        // the marginal cost of an IDENTICAL chunk at a different key: one
+        // batch body ref (the recipe is shared) + pointers — nothing else.
+        s.write_chunk(key(11, 21), &p1, false).unwrap();
+        s.durability_tick();
+        let d2 = s.disk_bytes();
+        let marginal = d2 - d1;
+        assert!(
+            marginal < 400,
+            "identical chunk must add only a recipe ref: marginal={marginal} B"
+        );
+        // batch-path reads (kind-0x0B shared body, per-key coords back)
+        assert!(semantic(&s.read_chunk(key(10, 20)).unwrap(), &p0));
+        assert!(semantic(&s.read_chunk(key(11, 21)).unwrap(), &p1));
+        drop(s);
+        // reopen: scan rebuilds batch_idx from the dedup record
+        let s2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        assert_eq!(s2.chunk_count(), 2);
+        assert!(semantic(&s2.read_chunk(key(10, 20)).unwrap(), &p0));
+        assert!(semantic(&s2.read_chunk(key(11, 21)).unwrap(), &p1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn posfree_mismatched_coords_stay_verbatim() {
+        // a payload whose coordinates do NOT match the chunk key must keep
+        // them verbatim (the safe side of the exact-shape strip) and read
+        // back byte-faithfully.
+        let dir = temp_dir("posfree-safe");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let mut root: Value = fastnbt::from_bytes::<Value>(&coord_chunk_payload()).unwrap();
+        if let Value::Compound(m) = &mut root {
+            m.insert("xPos".to_string(), Value::Int(999));
+            m.insert("zPos".to_string(), Value::Int(888));
+        }
+        let p = fastnbt::to_bytes(&root).unwrap();
+        s.write_chunk(key(1, 2), &p, false).unwrap();
+        s.durability_tick();
+        let got = s.read_chunk(key(1, 2)).unwrap();
+        assert!(semantic(&got, &p), "mismatched coords must not be touched");
         let _ = fs::remove_dir_all(&dir);
     }
 
