@@ -4833,6 +4833,10 @@ pub enum Split {
         /// tail (position-free). The read path reinserts from the chunk key
         /// exactly when this is set — explicit, no content guessing.
         pos_from_key: bool,
+        /// v0.9.105: the key-verified chunkX/chunkZ pairs were stripped from
+        /// EVERY structure start (vanilla stores a start in its owning
+        /// chunk). The read path reinserts them before join.
+        starts_from_key: bool,
     },
     /// Whole-mode field split: one part per top-level key.
     Fields {
@@ -6148,6 +6152,9 @@ fn scan_split(payload: &[u8], strip: bool, pos_hint: Option<(i32, i32)>) -> Opti
         // v0.9.102 position-free tails: cut the key-verified xPos/zPos pair
         // so identical terrain at different coordinates shares one tail blob
         // (and with it the whole recipe). The emitter reinserts from the key.
+        // v0.9.105: structure starts' chunkX/chunkZ are the same kind of
+        // key-redundant pair — cut them too so jigsaw-carrying chunks
+        // (shipwrecks, ruins, villages) stop being tail-unique.
         let (tail, pos_from_key) = match pos_hint {
             Some(p) => match strip_pos_entries(&tail, p) {
                 Some(t) => (t, true),
@@ -6155,9 +6162,23 @@ fn scan_split(payload: &[u8], strip: bool, pos_hint: Option<(i32, i32)>) -> Opti
             },
             None => (tail, false),
         };
+        let (tail, starts_from_key) = if pos_from_key {
+            match pos_hint {
+                Some(p) => match strip_start_coords(&tail, p) {
+                    Some(t) => {
+                        let stripped = t.len() != tail.len();
+                        (t, stripped)
+                    }
+                    None => (tail, false),
+                },
+                None => (tail, false),
+            }
+        } else {
+            (tail, false)
+        };
         SPLT_TAILB.0.fetch_add(t_tailb.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_TAILB.1.fetch_add(1, Ordering::Relaxed);
-        return Some(Split::Split { sections, tail, pos_from_key });
+        return Some(Split::Split { sections, tail, pos_from_key, starts_from_key });
     }
     let t_sp3 = std::time::Instant::now();
     let mut buf = Vec::with_capacity(6 + (sp1 - sp0));
@@ -6185,9 +6206,24 @@ fn scan_split(payload: &[u8], strip: bool, pos_hint: Option<(i32, i32)>) -> Opti
         },
         None => (tail, false),
     };
+    // v0.9.105: structure starts strip (same rule as the lite path)
+    let (tail, starts_from_key) = if pos_from_key {
+        match pos_hint {
+            Some(p) => match strip_start_coords(&tail, p) {
+                Some(t) => {
+                    let stripped = t.len() != tail.len();
+                    (t, stripped)
+                }
+                None => (tail, false),
+            },
+            None => (tail, false),
+        }
+    } else {
+        (tail, false)
+    };
     SPLT_TAILB.0.fetch_add(t_tailb.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_TAILB.1.fetch_add(1, Ordering::Relaxed);
-    Some(Split::Split { sections, tail, pos_from_key })
+    Some(Split::Split { sections, tail, pos_from_key, starts_from_key })
 }
 
 /// v0.9.102: cut a key-verified `xPos`/`zPos` Int pair out of a wire-format
@@ -6244,6 +6280,278 @@ fn strip_pos_entries(tail: &[u8], pos: (i32, i32)) -> Option<Vec<u8>> {
     }
     out.extend_from_slice(&tail[c..]);
     Some(out)
+}
+
+/// v0.9.105: cut key-verified `chunkX`/`chunkZ` Int pairs from EVERY
+/// structure start inside `Structures.starts`. Vanilla stores each start in
+/// its OWNING chunk, so a start's coords always equal the chunk key — the
+/// same key-redundancy the root xPos/zPos pair has (v0.9.102). Shipwrecks,
+/// ruins, villages and every other jigsaw-carrying pregen chunk stop being
+/// tail-unique by construction; identical starts at different coordinates
+/// share one tail blob and one batch body.
+///
+/// Byte-level, verbatim-preserving: returns None when any start carries
+/// mismatched coords or the walk surprises (the tail then keeps everything
+/// verbatim — the safe side). Absent/empty `starts` return the tail
+/// unchanged (nothing to strip; the root coords strip already ran).
+fn strip_start_coords(tail: &[u8], pos: (i32, i32)) -> Option<Vec<u8>> {
+    // locate the Structures compound entry span in the root
+    if tail.first() != Some(&0x0A) {
+        return None;
+    }
+    let rnl = u16::from_be_bytes(tail.get(1..3)?.try_into().ok()?) as usize;
+    let mut p = 3 + rnl;
+    let mut structures_body: Option<(usize, usize)> = None; // value span
+    loop {
+        let tag = *tail.get(p)?;
+        p += 1;
+        if tag == 0 {
+            break;
+        }
+        let nl = u16::from_be_bytes(tail.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let name = core::str::from_utf8(tail.get(p..p + nl)?).ok()?;
+        p += nl;
+        let val0 = p;
+        nbt_skip(tail, &mut p, tag, 1)?;
+        if name == "Structures" && tag == 0x0A {
+            structures_body = Some((val0, p)); // p = past the end sentinel
+        }
+    }
+    let (s0, s1) = structures_body?;
+    // inside Structures: find the starts compound
+    let mut q = s0;
+    let mut starts_span: Option<(usize, usize)> = None;
+    loop {
+        let tag = *tail.get(q)?;
+        q += 1;
+        if tag == 0 {
+            break;
+        }
+        let nl = u16::from_be_bytes(tail.get(q..q + 2)?.try_into().ok()?) as usize;
+        q += 2;
+        let name = core::str::from_utf8(tail.get(q..q + nl)?).ok()?;
+        q += nl;
+        let val0 = q;
+        nbt_skip(tail, &mut q, tag, 1)?;
+        if name == "starts" && tag == 0x0A {
+            starts_span = Some((val0, q));
+        }
+    }
+    let (st0, st1) = starts_span?;
+    // inside starts: every named entry is a start compound; cut its
+    // key-verified chunkX/chunkZ Int entries
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut n_starts = 0usize;
+    let mut q = st0;
+    loop {
+        let tag = *tail.get(q)?;
+        q += 1;
+        if tag == 0 {
+            break;
+        }
+        let nl = u16::from_be_bytes(tail.get(q..q + 2)?.try_into().ok()?) as usize;
+        q += 2;
+        let _name = tail.get(q..q + nl)?;
+        q += nl;
+        if tag != 0x0A {
+            nbt_skip(tail, &mut q, tag, 1)?;
+            continue;
+        }
+        n_starts += 1;
+        let mut r = q; // start compound body begins here (name already consumed)
+        loop {
+            let itag = *tail.get(r)?;
+            r += 1;
+            if itag == 0 {
+                break;
+            }
+            let inl = u16::from_be_bytes(tail.get(r..r + 2)?.try_into().ok()?) as usize;
+            r += 2;
+            let iname = core::str::from_utf8(tail.get(r..r + inl)?).ok()?;
+            r += inl;
+            let val0 = r;
+            nbt_skip(tail, &mut r, itag, 1)?;
+            if (iname == "chunkX" || iname == "chunkZ") && itag == 3 && r - val0 == 4 {
+                let v = i32::from_be_bytes(tail[val0..val0 + 4].try_into().ok()?);
+                let want = if iname == "chunkX" { pos.0 } else { pos.1 };
+                if v != want {
+                    return None; // not the owning chunk: keep verbatim
+                }
+                // entry spans the tag byte + name + value
+                let entry_start = val0 - 3 - inl;
+                cuts.push((entry_start, r));
+            }
+        }
+        q = r;
+    }
+    if n_starts == 0 || cuts.is_empty() {
+        return Some(tail.to_vec()); // nothing cut: unchanged (still Some — the
+                                    // caller distinguishes by content)
+    }
+    let mut out = Vec::with_capacity(tail.len());
+    let mut c = 0usize;
+    for (s, e) in &cuts {
+        out.extend_from_slice(&tail[c..*s]);
+        c = *e;
+    }
+    out.extend_from_slice(&tail[c..]);
+    Some(out)
+}
+
+/// v0.9.105: reinsert every start's chunkX/chunkZ pair from the chunk key
+/// (the exact inverse of strip_start_coords). Total: any walk surprise
+/// returns the tail unchanged. Runs BEFORE join in the read path, so all
+/// three join paths (fused direct, fused Value, legacy) see a complete tail.
+pub fn reinsert_start_coords(tail: &[u8], pos: (i32, i32)) -> Vec<u8> {
+    // locate Structures / starts the same way the strip does
+    let walk = |t: &[u8]| -> Option<(usize, usize, usize, usize)> {
+        if t.first() != Some(&0x0A) {
+            return None;
+        }
+        let rnl = u16::from_be_bytes(t.get(1..3)?.try_into().ok()?) as usize;
+        let mut p = 3 + rnl;
+        let mut structures_body: Option<(usize, usize)> = None;
+        loop {
+            let tag = *t.get(p)?;
+            p += 1;
+            if tag == 0 {
+                break;
+            }
+            let nl = u16::from_be_bytes(t.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2;
+            let name = core::str::from_utf8(t.get(p..p + nl)?).ok()?;
+            p += nl;
+            let val0 = p;
+            nbt_skip(t, &mut p, tag, 1)?;
+            if name == "Structures" && tag == 0x0A {
+                structures_body = Some((val0, p));
+            }
+        }
+        let (s0, s1) = structures_body?;
+        let mut q = s0;
+        let mut starts_span: Option<(usize, usize)> = None;
+        loop {
+            let tag = *t.get(q)?;
+            q += 1;
+            if tag == 0 {
+                break;
+            }
+            let nl = u16::from_be_bytes(t.get(q..q + 2)?.try_into().ok()?) as usize;
+            q += 2;
+            let name = core::str::from_utf8(t.get(q..q + nl)?).ok()?;
+            q += nl;
+            let val0 = q;
+            nbt_skip(t, &mut q, tag, 1)?;
+            if name == "starts" && tag == 0x0A {
+                starts_span = Some((val0, q));
+            }
+        }
+        starts_span.map(|(a, b)| (a, b, s0, s1))
+    };
+    let Some((st0, _st1, _s0, _s1)) = walk(tail) else {
+        return tail.to_vec();
+    };
+    // per start compound: collect (insert_before_offset) for compounds that
+    // lack chunkX/chunkZ; build the output with the pair inserted before the
+    // compound's 0x00 terminator
+    let mut out: Vec<u8> = Vec::with_capacity(tail.len() + 64);
+    let mut copied = 0usize;
+    let mut q = st0;
+    loop {
+        // copy up to the entry start
+        let e_start = q;
+        let tag = match tail.get(q) {
+            Some(&t) => t,
+            None => return tail.to_vec(),
+        };
+        q += 1;
+        if tag == 0 {
+            // copy the rest verbatim (ends of starts + Structures + root)
+            out.extend_from_slice(&tail[copied..]);
+            return out;
+        }
+        let nl = match tail.get(q..q + 2).and_then(|b| b.try_into().ok()) {
+            Some(b) => u16::from_be_bytes(b) as usize,
+            None => return tail.to_vec(),
+        };
+        q += 2;
+        let _name = match tail.get(q..q + nl) {
+            Some(b) => b,
+            None => return tail.to_vec(),
+        };
+        q += nl;
+        if tag != 0x0A {
+            if nbt_skip(tail, &mut q, tag, 1).is_none() {
+                return tail.to_vec();
+            }
+            continue;
+        }
+        // a start compound: does it lack chunkX/chunkZ?
+        let body0 = q;
+        let mut r = q;
+        let (mut have_x, mut have_z) = (false, false);
+        let mut ok_walk = true;
+        loop {
+            let itag = match tail.get(r) {
+                Some(&t) => t,
+                None => {
+                    ok_walk = false;
+                    break;
+                }
+            };
+            r += 1;
+            if itag == 0 {
+                break;
+            }
+            let inl = match tail.get(r..r + 2).and_then(|b| b.try_into().ok()) {
+                Some(b) => u16::from_be_bytes(b) as usize,
+                None => {
+                    ok_walk = false;
+                    break;
+                }
+            };
+            r += 2;
+            let iname = match core::str::from_utf8(tail.get(r..r + inl).unwrap_or(&[])) {
+                Ok(s) => s,
+                Err(_) => {
+                    ok_walk = false;
+                    break;
+                }
+            };
+            r += inl;
+            if nbt_skip(tail, &mut r, itag, 1).is_none() {
+                ok_walk = false;
+                break;
+            }
+            if iname == "chunkX" || iname == "chunkZ" {
+                if iname == "chunkX" {
+                    have_x = true;
+                } else {
+                    have_z = true;
+                }
+            }
+        }
+        if !ok_walk {
+            return tail.to_vec();
+        }
+        q = r; // past this start compound (its 0x00 consumed by the loop above? no:
+               // the loop broke on itag==0 with r PAST the 0x00)
+        if !have_x || !have_z {
+            // insert the pair before the compound's terminating 0x00 (r-1)
+            let insert_at = r - 1;
+            out.extend_from_slice(&tail[copied..insert_at]);
+            out.push(3u8);
+            out.extend_from_slice(b"\x00\x06chunkX");
+            out.extend_from_slice(&pos.0.to_be_bytes());
+            out.push(3u8);
+            out.extend_from_slice(b"\x00\x06chunkZ");
+            out.extend_from_slice(&pos.1.to_be_bytes());
+            copied = insert_at;
+        }
+        let _ = body0;
+        let _ = e_start;
+    }
 }
 
 /// tail = payload minus the sections range, with the heightmap/isLightOn
@@ -6378,6 +6686,7 @@ fn split_parsed(
     // the whole tree cost ~100 us/chunk of import wall time)
     let mut root = root;
     let mut pos_stripped = false;
+    let mut starts_stripped = false;
     let tail = match &mut root {
         Value::Compound(m) => {
             m.remove("sections");
@@ -6395,6 +6704,37 @@ fn split_parsed(
                     m.remove("zPos");
                     pos_stripped = true;
                 }
+                // v0.9.105: structure starts' chunkX/chunkZ — the same
+                // key-redundant pair one level deeper (Value path)
+                if pos_stripped {
+                    if let Some(Value::Compound(structs)) = m.get_mut("Structures") {
+                        if let Some(Value::Compound(starts)) = structs.get_mut("starts") {
+                            let mut all_owned = !starts.is_empty();
+                            for (_sid, sv) in starts.iter() {
+                                let owned = match sv {
+                                    Value::Compound(sc) => {
+                                        matches!(sc.get("chunkX"), Some(Value::Int(x)) if *x == cx)
+                                            && matches!(sc.get("chunkZ"), Some(Value::Int(z)) if *z == cz)
+                                    }
+                                    _ => false,
+                                };
+                                if !owned {
+                                    all_owned = false;
+                                    break;
+                                }
+                            }
+                            if all_owned {
+                                for (_sid, sv) in starts.iter_mut() {
+                                    if let Value::Compound(sc) = sv {
+                                        sc.remove("chunkX");
+                                        sc.remove("chunkZ");
+                                    }
+                                }
+                                starts_stripped = true;
+                            }
+                        }
+                    }
+                }
             }
             if strip {
                 // relight trigger: isLightOn=0 makes the server recompute
@@ -6411,7 +6751,7 @@ fn split_parsed(
     SPLT_TAIL.0.fetch_add(t_sh.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_TAIL.1.fetch_add(1, Ordering::Relaxed);
 
-    Ok(Split::Split { sections, tail, pos_from_key: pos_stripped })
+    Ok(Split::Split { sections, tail, pos_from_key: pos_stripped, starts_from_key: starts_stripped })
 }
 
 /// Whole-mode field split: a compound payload is split per top-level key so

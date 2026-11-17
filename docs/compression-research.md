@@ -1608,3 +1608,31 @@ big-window LZ2 eat; the pixel-noise corpus OVERSTATED the marginal cost of
 mountain terrain by ~1.6x. 20k x 20k extrapolation: ~= 11.5 GiB vs Anvil
 ~= 1.49 TiB (x133). The remaining mass: csec3 209 KB est (mountain strata,
 still ~2 unique members per ridge chunk) + tails 48 KB est (wreck starts).
+
+## v0.9.105 — position-free structure starts (2026-11-17)
+
+Vanilla stores each jigsaw start in its OWNING chunk — a start's
+chunkX/chunkZ always equals the chunk key. The pos-free strip now walks
+`Structures.starts` (byte-level on scan-split tails; the Value path on the
+parse fallback) and cuts every key-verified pair; modes 8/10 flags bit1
+carries the decision; the read path reinserts before join (one site covers
+the fused direct, fused Value, and legacy paths). Mismatched start coords
+keep the tail verbatim. Identical structures at different coordinates now
+share one tail blob and one batch body — the run lever for jigsaw-heavy
+pregen (villages, ruins, wrecks over shared terrain).
+
+On the Tectonic corpus the win is small (-61 B) because the wreck tails'
+uniqueness rides their per-wreck heightmap overrides — honest vanilla
+behavior. The strip's real payoff lands where structures sit on shared
+terrain.
+
+Corpus realism: the mountain sections went from per-column hash noise to
+integer-gradient strata (465,913 -> 285,525 B = 31.0 B/chunk, x132.47 vs
+Anvil zlib-9; 20k x 20k ~= 11.5 GiB vs ~1.49 TiB) — pixel noise overstated
+the mountain marginal cost ~1.6x.
+
+The heightmap columnar tier is PARKED (negative): the probe's unique-wire
+count was inflated by per-Map serialization order (984 counted vs ~300
+real); real post-dedup wires are singletons (alignment buys nothing), and
+the NOHM A/B leg drains LARGER than the inline treatment (526,614 vs
+478,085 B post-GC-fix) — blob dedup + the shared tail window already win.

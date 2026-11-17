@@ -488,7 +488,7 @@ impl Builder {
         Builder { cache: Map::new(), cx_w }
     }
 
-    fn classify(&self, cx: i32, cz: i32) -> (Class, u64) {
+    pub fn classify(&self, cx: i32, cz: i32) -> (Class, u64) {
         if cx < (self.cx_w * 5) / 8 {
             let h = h2(cx, cz, 1);
             let r = h % 1000;

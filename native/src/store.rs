@@ -1171,6 +1171,10 @@ struct Recipe {
     fields: Vec<(u16, FieldVal)>,
     /// Mode-5: the Position marker was key-redundant and stripped.
     pos_from_key: bool,
+    /// v0.9.105: the key-verified chunkX/chunkZ pairs were stripped from
+    /// EVERY structure start (vanilla stores a start in its owning chunk).
+    /// The read path reinserts them before join (modes 8/10 flags bit1).
+    starts_from_key: bool,
     /// Mode 7 (v0.9.44): pristine regeneration contract — the payload hash
     /// of a first-ever write under cfg.pristine. ZERO blobs (blob_hashes
     /// stays empty, so chunk_intact is trivially true), read_chunk returns
@@ -1216,6 +1220,7 @@ impl Recipe {
             tail: Tail::None,
             fields: Vec::new(),
             pos_from_key: false,
+            starts_from_key: false,
             pristine: None,
             pristine_canon: None,
         };
@@ -1329,6 +1334,7 @@ impl Recipe {
                     sections,
                     tail,
                     pos_from_key: flags & 1 != 0,
+                    starts_from_key: flags & 2 != 0,
                     ..EMPTY
                 })
             }
@@ -1441,6 +1447,7 @@ impl Recipe {
                     sections,
                     tail,
                     pos_from_key: flags & 1 != 0,
+                    starts_from_key: flags & 2 != 0,
                     ..EMPTY
                 })
             }
@@ -1534,9 +1541,11 @@ impl Recipe {
                 // chunks share one batch body. Modes 2/6 keep their LEGACY
                 // bytes (no flags) so old containers parse forever.
                 let mut m2 = Vec::with_capacity(3 + ids.len() * 2 + 16);
-                if self.pos_from_key {
+                // v0.9.105: bit1 = starts_from_key (the structure starts'
+                // chunkX/chunkZ pairs were key-verified and stripped)
+                if self.pos_from_key || self.starts_from_key {
                     m2.push(8u8);
-                    m2.push(1u8);
+                    m2.push((self.pos_from_key as u8) | ((self.starts_from_key as u8) << 1));
                 } else {
                     m2.push(2u8);
                 }
@@ -1550,9 +1559,9 @@ impl Recipe {
                 // run-length form of the same stream (repeated id =>
                 // (delta, run) pairs). Smaller wins, deterministic.
                 let mut m6 = Vec::with_capacity(3 + ids.len() / 2 + 16);
-                if self.pos_from_key {
+                if self.pos_from_key || self.starts_from_key {
                     m6.push(10u8);
-                    m6.push(1u8);
+                    m6.push((self.pos_from_key as u8) | ((self.starts_from_key as u8) << 1));
                 } else {
                     m6.push(6u8);
                 }
@@ -5169,12 +5178,13 @@ impl Store {
                 tail: Tail::None,
                 fields: Vec::new(),
                 pos_from_key: false,
+                starts_from_key: false,
                 pristine: Some(hash),
                 pristine_canon: canon,
             }
         } else if whole_mode && payload.len() > 1024 {
             self.ensure_blob(hash, payload, false)?;
-            Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None, pristine_canon: None }
+            Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, starts_from_key: false, pristine: None, pristine_canon: None }
         } else {
             let split = chunknbt::split(payload, whole_mode, pos_hint, strip)?;
             WST_SPLIT.0.fetch_add(t0w.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -5183,7 +5193,7 @@ impl Store {
             let r = match split {
             Split::Whole { hash } => {
                 self.ensure_blob(hash, payload, false)?;
-                Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None, pristine_canon: None }
+                Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, starts_from_key: false, pristine: None, pristine_canon: None }
             }
             Split::Fields { parts, pos_from_key } => {
                 let mut fields = Vec::with_capacity(parts.len());
@@ -5195,13 +5205,13 @@ impl Store {
                         fields.push((self.intern_key(&p.key)?, FieldVal::Hash(p.hash)));
                     }
                 }
-                Recipe { whole: None, sections: Vec::new(), tail: Tail::None, fields, pos_from_key, pristine: None, pristine_canon: None }
+                Recipe { whole: None, sections: Vec::new(), tail: Tail::None, fields, pos_from_key, starts_from_key: false, pristine: None, pristine_canon: None }
             }
-            Split::Split { sections, tail, pos_from_key } => {
+            Split::Split { sections, tail, pos_from_key, starts_from_key } => {
                 if sections.len() > MAX_SECTIONS {
                     let h = chunknbt::hash_of(payload);
                     self.ensure_blob(h, payload, false)?;
-                    Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, pristine: None, pristine_canon: None }
+                    Recipe { whole: Some(h), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, starts_from_key: false, pristine: None, pristine_canon: None }
                 } else {
                     let mut hashes = Vec::with_capacity(sections.len());
                     // v0.9.39: a blob-eligible tail (>= tail_blob_min) rides
@@ -5273,7 +5283,7 @@ impl Store {
                             Tail::Inline { dict: tdict, comp: tcomp, raw: tail.len() as u32 }
                         }
                     };
-                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key, pristine: None, pristine_canon: None }
+                    Recipe { whole: None, sections: hashes, tail: tail_ref, fields: Vec::new(), pos_from_key, starts_from_key, pristine: None, pristine_canon: None }
                 }
             }
             };
@@ -5685,7 +5695,17 @@ impl Store {
                 }
             }
             None => {
-                let tail = tail_bytes.or_else(|| fail("tail"))?;
+                let mut tail = tail_bytes.or_else(|| fail("tail"))?;
+                // v0.9.105: reinsert the structure starts' chunkX/chunkZ pairs
+                // from the chunk key BEFORE join — one byte-level pass covers
+                // all three join paths (fused direct, fused Value, legacy).
+                // Total: any walk surprise keeps the tail unchanged.
+                if rec.starts_from_key {
+                    tail = chunknbt::reinsert_start_coords(
+                        &tail,
+                        ((key >> 32) as i32, (key & 0xffff_ffff) as i32),
+                    );
+                }
                 let t_sec = std::time::Instant::now();
                 let blobs = self.blobs.read();
                 let mut locs = Vec::with_capacity(rec.sections.len());
@@ -7655,6 +7675,7 @@ impl Store {
                 tail: Tail::None,
                 fields: new_fields,
                 pos_from_key: rec.pos_from_key,
+                starts_from_key: rec.starts_from_key,
                 pristine: None,
                 pristine_canon: None,
             };
@@ -9128,6 +9149,87 @@ pub mod tests {
         s.durability_tick();
         let got = s.read_chunk(key(1, 2)).unwrap();
         assert!(semantic(&got, &p), "mismatched coords must not be touched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.105: a structure-carrying chunk (Structures.starts with the
+    /// vanilla chunkX/chunkZ pair). The starts' coords equal the OWNING
+    /// chunk's key, so the strip removes them and two identical structures
+    /// at different coordinates share ONE recipe body — the run lever for
+    /// jigsaw-heavy pregen worlds (villages, ruins, wrecks on shared terrain).
+    fn starts_chunk_payload(cx: i32, cz: i32) -> Vec<u8> {
+        let mut root: Value = fastnbt::from_bytes::<Value>(&coord_chunk_payload()).unwrap();
+        if let Value::Compound(m) = &mut root {
+            m.insert("xPos".to_string(), Value::Int(cx));
+            m.insert("zPos".to_string(), Value::Int(cz));
+            let mut start: Map<String, Value> = Map::new();
+            start.insert("id".to_string(), Value::String("minecraft:shipwreck".to_string()));
+            start.insert("chunkX".to_string(), Value::Int(cx));
+            start.insert("chunkZ".to_string(), Value::Int(cz));
+            start.insert("Biome".to_string(), Value::String("minecraft:ocean".to_string()));
+            let mut starts: Map<String, Value> = Map::new();
+            starts.insert("minecraft:shipwreck".to_string(), Value::Compound(start));
+            let mut structs: Map<String, Value> = Map::new();
+            structs.insert("starts".to_string(), Value::Compound(starts));
+            structs.insert("References".to_string(), Value::Compound(Map::new()));
+            m.insert("Structures".to_string(), Value::Compound(structs));
+        }
+        fastnbt::to_bytes(&root).unwrap()
+    }
+
+    #[test]
+    fn starts_strip_dedup_identical_structure_chunks() {
+        let dir = temp_dir("starts-free");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let p0 = starts_chunk_payload(30, 40);
+        let p1 = starts_chunk_payload(31, 41);
+        assert_ne!(p0, p1, "payloads differ in coords only (root + starts)");
+        s.write_chunk(key(30, 40), &p0, false).unwrap();
+        s.durability_tick();
+        let d1 = s.disk_bytes();
+        s.write_chunk(key(31, 41), &p1, false).unwrap();
+        s.durability_tick();
+        let marginal = s.disk_bytes() - d1;
+        assert!(
+            marginal < 400,
+            "identical structure chunk must add only a recipe ref: marginal={marginal} B"
+        );
+        assert!(semantic(&s.read_chunk(key(30, 40)).unwrap(), &p0));
+        assert!(semantic(&s.read_chunk(key(31, 41)).unwrap(), &p1));
+        drop(s);
+        let s2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        assert_eq!(s2.chunk_count(), 2);
+        assert!(semantic(&s2.read_chunk(key(30, 40)).unwrap(), &p0));
+        assert!(semantic(&s2.read_chunk(key(31, 41)).unwrap(), &p1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn starts_mismatched_coords_stay_verbatim() {
+        // a start whose chunkX does NOT match the owning key must keep the
+        // whole tail verbatim (the safe side of the exact-shape strip).
+        let dir = temp_dir("starts-safe");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let mut root: Value = fastnbt::from_bytes::<Value>(&starts_chunk_payload(999, 888)).unwrap();
+        // keep the root coords matching the key so the pos strip engages, but
+        // the start's coords stay foreign
+        if let Value::Compound(m) = &mut root {
+            m.insert("xPos".to_string(), Value::Int(1));
+            m.insert("zPos".to_string(), Value::Int(2));
+            if let Some(Value::Compound(st)) = m.get_mut("Structures") {
+                if let Some(Value::Compound(starts)) = st.get_mut("starts") {
+                    if let Some(Value::Compound(sc)) = starts.get_mut("minecraft:shipwreck") {
+                        sc.insert("chunkX".to_string(), Value::Int(777));
+                        sc.insert("chunkZ".to_string(), Value::Int(778));
+                    }
+                }
+            }
+        }
+        let p = fastnbt::to_bytes(&root).unwrap();
+        s.write_chunk(key(1, 2), &p, false).unwrap();
+        s.durability_tick();
+        let got = s.read_chunk(key(1, 2)).unwrap();
+        assert!(semantic(&got, &p), "mismatched start coords must not be touched");
         let _ = fs::remove_dir_all(&dir);
     }
 
