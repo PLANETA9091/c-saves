@@ -103,6 +103,22 @@ push): TOTAL x2.92, entities x3.13, `verify ok=946 bad=0` (v0.7.0: 8 MiB
 slab frames + shift-ref section codec). Survival-shaped corpus (chests,
 farms, skylight): TOTAL **x4.00**, entities x1.94 (v0.7.1 compact fix).
 
+## v0.9.99 — gid-RLE admission retired by default (div 8 -> 0)
+
+Another **-1.02%** on the drained corpus (1 016 400 -> 1 006 097 B;
+**-7.81% over the three weight ticks** vs 0.9.89). The RLE admission
+verdict ("RLE wins through cross-section byte alignment; div=4 regresses
+x2.99 vs x3.08") predates the two 0.9.98 pack-shape changes: the class
+partition now separates sections from tails, and the gform-6 window gate
+already captures the vertical-coherence win RLE was chasing. Fresh sweep
+on the current pipeline: div=0 1 006 061 < div=8 1 016 400 < div=4
+1 073 248 < div=2 1 082 832 — RLE members now COST bytes (their run
+boundaries break the transposed stream's uniformity, and their own bytes
+compress worse than the gid zeros they replace). div=0 also skips the
+per-section RLE size scans. The `CSAVES_GID_RLE_DIV` knob stays for
+corpora whose shape disagrees (modded registries, u16 streams); the RLE
+mechanism tests opt in explicitly.
+
 ## v0.9.98 — class-partitioned slab streams + the plain-transposed glob form (gform 6)
 
 The drained JJ corpus dropped 1 046 887 -> **1 016 400 B (-2.91% this tick,

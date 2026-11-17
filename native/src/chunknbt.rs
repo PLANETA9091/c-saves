@@ -186,7 +186,22 @@ fn gid_rle_div() -> u64 {
         std::env::var("CSAVES_GID_RLE_DIV")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
+            // v0.9.99: gid RLE is RETIRED by default. The original admission
+            // (div=8) argued the raw gid stream wins slabs through
+            // CROSS-SECTION byte alignment, and div=4 regressed the corpus
+            // to x2.99 vs x3.08 — but that verdict predates two pack-shape
+            // changes: the 0.9.98 class partition (sections no longer share
+            // their stream with tails) and the gform-6 window gate (the
+            // transposed twin already captures the vertical-coherence win
+            // RLE was chasing). Measured on the drained JJ corpus with the
+            // current pipeline: div=0 1 006 061 B < div=8 1 016 400 <
+            // div=4 1 073 248 < div=2 1 082 832 — RLE members now COST
+            // bytes (their run boundaries break the transposed stream's
+            // uniformity, and their own bytes compress worse than the gid
+            // zeros they replace). div=0 also skips the RLE size scans.
+            // The knob stays: div>0 re-enables admission for corpora whose
+            // shape disagrees (modded registries, u16 streams).
+            .unwrap_or(0)
     })
 }
 static GLOB_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9641,7 +9656,11 @@ mod glob_tests {
         // vertical-wall content: state varies with x, constant along y —
         // vanilla-order RLE has runs of 1 (never admitted), the y-fast
         // transposed order has runs of 16 (admitted) -> gform must be 2,
-        // and the rebuild must un-transpose back to byte-identical canon
+        // and the rebuild must un-transpose back to byte-identical canon.
+        // v0.9.99: the admission is OFF by default (the split+transposed
+        // streams make RLE a net loss on the corpus) — this test pins the
+        // MECHANISM, so it opts in explicitly.
+        crate::chunknbt::set_gid_rle_div_for_tests(Some(4));
         let mut sec: Map<String, Value> = Map::new();
         sec.insert("Y".to_string(), Value::Byte(9));
         let mut bs: Map<String, Value> = Map::new();
@@ -9671,6 +9690,7 @@ mod glob_tests {
         assert_eq!(glob[5], 2, "transposed rle form must win for wall content");
         let back = glob_any_to_section(&glob, &reg).expect("decode");
         assert_eq!(back, canon, "gform 2 roundtrip must be byte-identical");
+        crate::chunknbt::set_gid_rle_div_for_tests(None);
     }
 
     #[test]
