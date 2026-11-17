@@ -1568,3 +1568,17 @@ the container) — real, but it interacts with the blob-eligibility boundary
 fixes), so it ships only behind its own A/B next tick. Unique-heightmap
 wire counts in the probe are inflated by per-Map serialization order; the
 store's structural hashes are order-free.
+
+## v0.9.104 — sorted batch keys (2026-11-17)
+
+The pending-recipe map iterates in HashMap order; the kind-0x0B batch
+stream's key column was a scrambled u64 sequence (zstd ~8-9 B/key
+effective) with body indices scattered. Batch groups are now key-sorted:
+on a pregen import the sorted column is a delta stream (consecutive keys
+differ by 1 in the low word) and identical bodies cluster into constant
+index runs. Tectonic corpus -12,034 B (-2.52%); JJ region -1,846 B;
+bench_size region -24 KB, entities -11.5 KB. The container becomes
+deterministic across processes — HashMap iteration order is not (the
+virtual-live credit, body dedup, and read paths are order-independent by
+construction; the sorted stream only changes WRITE layout). Kill-switch
+CSAVES_BATCH_SORT=0.

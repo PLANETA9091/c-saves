@@ -3676,6 +3676,20 @@ impl Store {
             if !cur.is_empty() {
                 groups.push(cur);
             }
+            // v0.9.104: sort each batch group by chunk key. The pending map
+            // iterates in HashMap order — a scrambled key column that zstd
+            // cannot delta-compress (~8-9 B/key effective) and scattered
+            // body indices. Key-sorted batches make the key column a delta
+            // stream (consecutive keys on a pregen import differ by 1 in the
+            // low word) and cluster identical bodies into constant index
+            // runs — measured on the Tectonic corpus; kill-switch
+            // CSAVES_BATCH_SORT=0. Also makes the drained container
+            // deterministic across processes (HashMap order is not).
+            if std::env::var("CSAVES_BATCH_SORT").as_deref() != Ok("0") {
+                for g in groups.iter_mut() {
+                    g.sort_by_key(|(k, _)| *k);
+                }
+            }
             groups
                 .into_iter()
                 .map(|group| {
