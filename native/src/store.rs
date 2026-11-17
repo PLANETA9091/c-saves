@@ -874,6 +874,18 @@ struct Seg {
     mmap: std::sync::OnceLock<Option<Arc<Mmap>>>,
     total: AtomicU64,
     live: AtomicU64,
+    /// v0.9.103: the batch-commit VIRTUAL credit (kind-9/0x0B records credit
+    /// live with the per-entry logical bytes Σ(8+rl) minus the record's
+    /// physical size — per-entry supersedes retire exactly that amount).
+    /// Fat inline-tail bodies make the credit EXCEED the segment's physical
+    /// total, the dead-ratio went NEGATIVE and dead-ratio compaction never
+    /// fired again: a Tectonic-shaped 9216-chunk import retained ~964 KB of
+    /// dead per-blob section records for the whole container life (the
+    /// huge-world import path's weight bug). The credit is tracked here and
+    /// added to the denominator of the dead-ratio — logical dead bytes then
+    /// compare against the logical total and compaction fires exactly when
+    /// the physically-dead share crosses the threshold.
+    virt_extra: AtomicU64,
     /// Set when a full-rewrite pack had to skip unreadable victims: the
     /// segment is then NEVER removed (removal would turn those victims into
     /// permanent dangling references — the 23,380-chunk bigworld loss class).
@@ -2952,6 +2964,7 @@ impl Store {
                 mmap: std::sync::OnceLock::new(),
                 total: AtomicU64::new(0),
                 live: AtomicU64::new(0),
+                virt_extra: AtomicU64::new(0),
                 pack_broken: AtomicBool::new(false),
             }),
         );
@@ -3802,6 +3815,11 @@ impl Store {
                 sg.live.fetch_sub(phys - virt, Ordering::Relaxed);
             } else {
                 sg.live.fetch_add(virt - phys, Ordering::Relaxed);
+                // v0.9.103: the virtual credit is tracked per segment so the
+                // dead-ratio denominator can include it (see Seg::virt_extra)
+                // — otherwise fat bodies push live above total and compaction
+                // stalls forever on import-heavy workloads.
+                sg.virt_extra.fetch_add(virt - phys, Ordering::Relaxed);
             }
         }
         Ok(())
@@ -7705,7 +7723,20 @@ impl Store {
                 let total = s.total.load(Ordering::Relaxed);
                 let live = s.live.load(Ordering::Relaxed);
                 if total > self.cfg.compact_min {
-                    let r = 1.0 - live as f64 / total as f64;
+                    // v0.9.103: the denominator includes the segment's batch
+                    // virtual credit — live may legitimately exceed the
+                    // physical total (fat inline-tail bodies), and comparing
+                    // logical live against physical total made the ratio go
+                    // negative and stalled dead-ratio compaction forever on
+                    // import-heavy workloads.
+                    let denom = total + s.virt_extra.load(Ordering::Relaxed);
+                    let r = 1.0 - live as f64 / denom as f64;
+                    if std::env::var("CSAVES_GC_DEBUG").as_deref() == Ok("1") {
+                        eprintln!(
+                            "[c-saves] gc-cand seg-{id:05} total={total} live={live} virt={} dead={r:.3}",
+                            s.virt_extra.load(Ordering::Relaxed)
+                        );
+                    }
                     if worst.map(|w| r > w.1).unwrap_or(true) {
                         worst = Some((*id, r));
                     }
@@ -7715,8 +7746,14 @@ impl Store {
         };
         if let Some((worst_id, ratio)) = worst {
             if ratio >= self.cfg.compact_ratio {
+                if std::env::var("CSAVES_GC_DEBUG").as_deref() == Ok("1") {
+                    eprintln!("[c-saves] gc-fire seg-{worst_id:05} dead={ratio:.3}");
+                }
                 return self.pack_segment(worst_id, true);
             }
+        }
+        if std::env::var("CSAVES_GC_DEBUG").as_deref() == Ok("1") {
+            eprintln!("[c-saves] gc-fallback writer={writer_id}");
         }
         self.pack_fallback(writer_id)
     }

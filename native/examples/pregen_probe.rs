@@ -202,6 +202,46 @@ fn main() {
         "A) recipe identity (pos+hmap+sec free): unique {uniq_rec}/{n} -> {dup_rec} duplicate recipes (~{} B raw recipe mass at ~104 B each)",
         dup_rec * 104
     );
+    // honest baselines: dedup-by-hash (what Tail::Blob already does) vs
+    // the columnar tier (unique members laid out in key order under one
+    // big window). unique wires in first-appearance key order:
+    let mut uniq_seen: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut uniq_order: Vec<Vec<u8>> = Vec::new();
+    let mut uniq_z_sum = 0usize;
+    // second pass would need the wires kept; re-walk is cheap enough:
+    // rebuild from the map of first appearances we collected above
+    // (hm_uniq counted per-wire; re-scan keys in order)
+    let mut uniq_seen2: HashMap<u64, ()> = HashMap::new();
+    for k in &keys {
+        let Some(p) = st.read_chunk(*k) else { continue };
+        let Ok(mut root) = fastnbt::from_bytes::<Value>(&p) else { continue };
+        let Value::Compound(map) = &mut root else { continue };
+        let hm = map.remove("Heightmaps");
+        if let Some(hm) = hm {
+            if let Ok(b) = fastnbt::to_bytes(&hm) {
+                let h = fold(&b);
+                if !uniq_seen2.contains_key(&h) {
+                    uniq_seen2.insert(h, ());
+                    uniq_z_sum += zstd_of(&b);
+                    uniq_order.push(b);
+                }
+            }
+        }
+    }
+    let mut uniq_col: Vec<u8> = Vec::new();
+    for w in &uniq_order {
+        uniq_col.extend_from_slice(w);
+    }
+    let uniq_col_lz = lzma2_raw(&uniq_col).map(|b| b.len()).unwrap_or(usize::MAX);
+    println!(
+        "B2) unique-only: {} wires, sum z19 {} B vs unique-columnar lzma2 {} B (+ refs {} B -> {} B total) ({:.2}x vs z19-sum)",
+        uniq_order.len(),
+        uniq_z_sum,
+        uniq_col_lz,
+        4 * hm_n,
+        uniq_col_lz + 4 * hm_n,
+        uniq_z_sum as f64 / (uniq_col_lz + 4 * hm_n).max(1) as f64
+    );
     let col_lz = lzma2_raw(&hm_col).map(|b| b.len()).unwrap_or(usize::MAX);
     println!(
         "B) heightmaps: {hm_n} chunks carry them, {raw} B raw; unique {uq}/{n}; per-chunk z19 {hm_per_chunk_z} B vs columnar lzma2 {col_lz} B ({ratio:.2}x)",

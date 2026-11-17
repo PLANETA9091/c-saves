@@ -1519,3 +1519,52 @@ wraps, `-Dcsaves.probe`) is now part of the agent's toolbox — body
 replacement cannot wrap an original; this can.
 
 **84/84 tests green.** The CI matrix stays 12 jobs.
+
+## v0.9.103 — the huge-world GC fix + the Tectonic corpus (2026-11-17)
+
+**The corpus.** `tectonic_probe` builds a Tectonic-shaped STRUCTURAL corpus
+(the ask: "even a 20k x 20k chunk world must weigh very little" for a
+Tectonic pregen, with the community seed-regen approach explicitly rejected
+— the weight must come from honest storage). 96x96 = 9216 chunks: 43.9%
+bare-ocean fields byte-identical modulo the xPos/zPos pair (what 0.9.102's
+pos-free tails eat), 16.6% kelp variants that REPEAT across coordinates the
+way real feature placement does, 2.1% shipwreck starts whose tail NBT
+carries chunkX/chunkZ (recipe identity honestly broken, vanilla-style), 8.3%
+mountain ridges whose full band sections repeat while surface bands and
+heightmaps are unique, plus beach/plains/flower/tree/river variants.
+Measured on disk, not estimated: Anvil = real .mca region files of the same
+payloads at zlib-9 (36.07 MiB, 4104 B/chunk); c-saves = the production
+import path under the DEFAULT config (real storage; pristine/contract
+regeneration stays off by operator directive).
+
+**The numbers.** Drained container 478,085 B = 51.9 B/chunk, x79.11 vs
+Anvil; import 554 MiB/s; drain 8.3 s; 9216/9216 semantic verify (the CI
+comparator: palette-permutation-safe sections + plain compound fields; raw
+NBT Value equality is NOT the contract — the canonical CSEC re-encode
+reorders palettes by frequency). Tails: 9216 chunks -> 262 unique tail
+members (pos-free strip + structural-hash blob dedup; 11.5 MB raw -> 370
+KB). Sections: 1714 unique members for ~83k section instances. Linear
+extrapolation to 20k x 20k = 400M chunks: ~= 19.3 GiB vs Anvil ~= 1.49 TiB.
+
+**The weight bug the corpus exposed.** The batch commit credits its
+segment's live counter with the VIRTUAL per-entry bytes (Sigma(8+rl) minus
+the record's physical size) so per-entry supersedes retire exactly what was
+credited. With fat recipe bodies (inline compressed tails — the NOHM A/B
+leg where Heightmaps are absent makes tails < tail_blob_min) the credit
+EXCEEDED the segment's physical total: dead-ratio = 1 - live/total went
+NEGATIVE, dead-ratio compaction never fired again, and the drained container
+kept ~964 KB of dead per-blob section records (1,468,761 B vs 526,614 B
+after the fix, -64%). Import-heavy pregen worlds are exactly this workload.
+Fix: the credit is tracked per segment (`Seg::virt_extra`) and added to the
+dead-ratio DENOMINATOR — logical dead bytes compare against the logical
+total. The JJ container is byte-identical (its bodies are lean; no stall
+existed). GC candidate dumps behind CSAVES_GC_DEBUG=1.
+
+**Probes (negative, priced, parked).** The heightmap COLUMNAR tier on the
+corpus: tails-with vs tails-without under one big LZMA2 window +
+unique-wire columnar + 4 B refs = -24.4% of the tail-stream mass (~-11% of
+the container) — real, but it interacts with the blob-eligibility boundary
+(stripped tails go inline -> fat bodies -> the GC class of bug this tick
+fixes), so it ships only behind its own A/B next tick. Unique-heightmap
+wire counts in the probe are inflated by per-Map serialization order; the
+store's structural hashes are order-free.
