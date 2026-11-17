@@ -1990,3 +1990,30 @@ chunks now LOAD from the container; the CI session is back to the spawn
 edit and it survives restarts byte-exact. Regression tests pin the width
 table; 84/84 tests green; the matrix stays 12 jobs. The enc_fp needle is
 untouched.
+
+**v0.9.100 — uniform fill forms (gform 7/8) + rebuild narrow-bit parity.** The
+web-research pass on voxel world storage (Linear region zstd streams, Slime/Polar
+single-file formats, Luanti mapblocks, Sponge schematics, the 2026 measured
+chunk-layout benchmark) converged on one missing primitive in our GLOB family:
+a FILL representation — uniform sections stored as the state id alone. The
+canonical uniform section is the no-data form (1-state palette, no voxel
+stream, f1 bit1 clear); `section_glob_pre` now admits it (plus the single-run
+RLE uniform shape, `[idx][varint 4096]`), and `section_glob_finish_as` emits
+`0xCC [flags][gform 7][gid]` (u8) / `gform 8` (u16 LE) — 8 bytes replacing the
+~30-90 byte palette header, with the rebuild keeping the member's own
+no-data/data shape so the pack stability gate passes and the hash column
+drops. Second fix: the glob rebuilds set the narrow marker on RLE-form
+rebuilds while the canonical encoder sets it ONLY on the dense arm — n<16
+RLE-able content silently failed the stability gate and kept 16 B hashes;
+both rebuilds now match the encoder exactly. Honest corpus verdict: fill is
+~neutral HERE (A/B drained 1,007,111 -> 1,007,089 B, -22..-46 B = -0.005%):
+the no-data uniform members (~7.9k converted) were already collapsing to
+noise inside the mixed LZMA2 window — the 2026 benchmark's "compression
+erases the layout" confirmed on our own data. Kept as default-on with
+CSAVES_GLOB_FILL=0: the win scales with unique uniform members (diverse
+tails/biomes break cross-member matching on modded/survival corpora), and
+the representation is the one primitive every modern format carries. Gates:
+103/103 tests (4 new fill roundtrips incl. wide-gid gform 8 + the rewritten
+single-state contract), enc_fp EXACT 6d240d7166cdda99/12130/9971843, jj
+verify 946/946 x4.51, invariant scan 0, bench_size compact x0.06. The enc_fp
+needle is untouched.

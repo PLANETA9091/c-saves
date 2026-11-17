@@ -204,6 +204,35 @@ fn gid_rle_div() -> u64 {
             .unwrap_or(0)
     })
 }
+/// v0.9.100: uniform-content fill form (gform 7 u8 / 8 u16). On by default;
+/// CSAVES_GLOB_FILL=0 opts out.
+static GLOB_FILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(test)]
+static GLOB_FILL_OVR: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
+#[cfg(test)]
+pub(crate) fn set_glob_fill_for_tests(v: Option<bool>) {
+    match v {
+        Some(v) => {
+            GLOB_FILL_OVR.1.store(v as u64, Ordering::Relaxed);
+            GLOB_FILL_OVR.0.store(true, Ordering::Relaxed);
+        }
+        None => GLOB_FILL_OVR.0.store(false, Ordering::Relaxed),
+    }
+}
+fn glob_fill_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if GLOB_FILL_OVR.0.load(Ordering::Relaxed) {
+            return GLOB_FILL_OVR.1.load(Ordering::Relaxed) != 0;
+        }
+    }
+    *GLOB_FILL.get_or_init(|| {
+        std::env::var("CSAVES_GLOB_FILL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(true)
+    })
+}
 static GLOB_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 #[cfg(test)]
 static GLOB_DEBUG_OVR: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
@@ -7600,13 +7629,6 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
     }
     let y = *csec.get(p)?;
     p += 1;
-    // block_states present AND has data; dense form only (f2 order bits 4/5)
-    if f1 & 3 != 3 || f2 & 48 != 0 {
-        if glob_debug() {
-            eprintln!("glob: skip f1={f1:02x} f2={f2:02x} (f1&3={}, f2&48={})", f1 & 3, f2 & 48);
-        }
-        return None;
-    }
     let n = u16::from_le_bytes(csec.get(p..p + 2)?.try_into().ok()?) as usize;
     p += 2;
     if n == 0 || n > 65535 {
@@ -7621,6 +7643,74 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
             return None;
         };
         states.push(st);
+    }
+    // v0.9.100: NO-DATA uniform route — block_states present without a data
+    // stream is the canonical uniform-section form (vanilla drops the voxel
+    // array when the palette has one entry; enc_pal_data_canon's data=None
+    // path emits palette-only). One state fills all 4096 voxels; the tail
+    // (biomes / light / sl-bl bytes) starts right after the palette. Fill
+    // admission: exactly one state, no block stream-order flags, fill form
+    // enabled.
+    if f1 & 3 == 1 {
+        if n != 1 || f2 & (4 | 16 | 32) != 0 || !glob_fill_enabled() {
+            if glob_debug() {
+                eprintln!("glob: skip no-data f1={f1:02x} f2={f2:02x} n={n}");
+            }
+            return None;
+        }
+        return Some(GlobPre {
+            states,
+            vox: vec![0u32; 4096],
+            ref_order: vec![0],
+            y,
+            f1,
+            f2c: f2 & !4 & !16 & !32,
+            f3,
+            out_bits: 4,
+            n,
+            tail_off: p,
+        });
+    }
+    if f1 & 3 != 3 {
+        if glob_debug() {
+            eprintln!("glob: skip f1={f1:02x} f2={f2:02x} (f1&3={}, no data)", f1 & 3);
+        }
+        return None;
+    }
+    // v0.9.100: single-run RLE route — a uniform section whose source data
+    // array WAS present encodes as ONE [idx][varint 4096] run (the RLE
+    // admission always wins for uniform content, and the transposed order
+    // folds to the same single run). Convert it to the fill form exactly
+    // like the no-data route above.
+    if f2 & 48 != 0 {
+        if !glob_fill_enabled() {
+            if glob_debug() {
+                eprintln!("glob: skip rle f1={f1:02x} f2={f2:02x} (fill off)");
+            }
+            return None;
+        }
+        let mut q = p;
+        let idx = *csec.get(q)?;
+        q += 1;
+        let run = read_uvarint(csec, &mut q)? as usize;
+        if (idx as usize) >= n || run != 4096 {
+            if glob_debug() {
+                eprintln!("glob: skip rle idx={idx} run={run} n={n} (not single-run uniform)");
+            }
+            return None;
+        }
+        return Some(GlobPre {
+            states,
+            vox: vec![idx as u32; 4096],
+            ref_order: vec![idx as u32],
+            y,
+            f1,
+            f2c: f2 & !4 & !16 & !32,
+            f3,
+            out_bits: 4,
+            n,
+            tail_off: q,
+        });
     }
     // dense stream width: narrow (f2 bit2) packs at bits_for(n), else the
     // vanilla max(4, bits_for(n)) clamp
@@ -7723,6 +7813,35 @@ pub fn section_glob_finish_as(
         gids.push(g);
     }
     let wide = max_gid > 255;
+    // v0.9.100: uniform-content FILL — all 4096 voxels resolve to ONE gid;
+    // the payload collapses to the gid alone (gform 7 u8 / 8 u16 LE). The
+    // decoder rebuilds the canonical section, keeping the member's own
+    // no-data/data shape from f1 (bit1). Strictly the smallest form; byte
+    // identity is enforced by the pack stability gate (canonical re-encode
+    // compare), which fails foreign members (e.g. unused palette states)
+    // back onto the hashed wire.
+    if glob_fill_enabled() && gids.iter().all(|&g| g == gids[0]) {
+        let g = gids[0];
+        let (gform, payload): (u8, Vec<u8>) = if g > 255 {
+            (8, (g as u16).to_le_bytes().to_vec())
+        } else {
+            (7, vec![g as u8])
+        };
+        let mut out = Vec::with_capacity(pre.tail_off + payload.len() + 8);
+        out.push(GLOB2_MAGIC);
+        out.push(pre.f1);
+        out.push(pre.f2c);
+        out.push(pre.f3);
+        out.push(pre.y);
+        out.push(gform);
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&csec[pre.tail_off..]);
+        ST_GLOB_ENC.fetch_add(1, Ordering::Relaxed);
+        if glob_debug() {
+            eprintln!("glob: fill ok n={n} gid={g} canon={} glob={}", csec.len(), out.len());
+        }
+        return Some(out);
+    }
     // GID-RLE admission divisor: the raw gid stream wins slabs through
     // CROSS-SECTION byte alignment (identical geology -> identical streams);
     // RLE destroys that alignment (run boundaries differ). The uncompressed
@@ -7947,7 +8066,9 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     out.push(magic);
     out.push(f1);
     let mut f2n = f2 & !4 & !16 & !32;
-    if narrow {
+    if narrow && best.is_none() {
+        // v0.9.100: narrow marker only on the dense arm (encoder parity —
+        // see glob2_to_section).
         f2n |= 4;
     }
     out.push(f2n);
@@ -8049,8 +8170,11 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     let y = *glob.get(4)?;
     let gform = *glob.get(5)?;
     let mut p = 6usize;
-    if f1 & 3 != 3 {
-        return None; // never globbed without a data stream
+    // v0.9.100: bit0 (block_states present) must be set; bit1 (data stream)
+    // is optional — no-data fill members (f1 & 3 == 1) carry no voxel stream
+    // and rebuild through the palette-only branch below.
+    if f1 & 1 != 1 {
+        return None; // never globbed without block_states
     }
     // decode the gid payload: one u32 gid per voxel
     let mut gids: Vec<u32> = Vec::with_capacity(4096);
@@ -8122,6 +8246,19 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
                 gids.extend(raw);
             }
         }
+        7 => {
+            // v0.9.100 uniform fill: one u8 gid spans all 4096 voxels
+            let g = *glob.get(p)?;
+            p += 1;
+            gids.resize(4096, g as u32);
+        }
+        8 => {
+            // uniform fill with a wide gid: one u16 LE gid
+            let c = glob.get(p..p + 2)?;
+            p += 2;
+            let g = u16::from_le_bytes(c.try_into().ok()?) as u32;
+            gids.resize(4096, g);
+        }
         _ => return None,
     }
     if gids.len() != 4096 {
@@ -8160,6 +8297,30 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         return None;
     }
     let magic = if f3 != 0 { CSEC4_MAGIC } else { CSEC3_MAGIC };
+    // v0.9.100: fill member sourced from a NO-DATA uniform section (f1 bit1
+    // clear) — the canonical form carries palette-only block_states with no
+    // voxel stream, so the rebuild reproduces exactly that shape instead of
+    // the data-carrying form below (which would break byte-identity and
+    // push every no-data fill member onto the hashed wire).
+    if f1 & 3 == 1 {
+        if n != 1 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(16 + tail.len());
+        out.push(magic);
+        out.push(f1);
+        out.push(f2 & !4 & !16 & !32);
+        if magic == CSEC4_MAGIC {
+            out.push(f3);
+        }
+        out.push(y);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        let st = reg.get(used[0].1)?;
+        glob_put_entry(&mut out, st);
+        out.extend_from_slice(tail);
+        ST_GLOB_DEC.fetch_add(1, Ordering::Relaxed);
+        return Some(out);
+    }
     let mut gid2canon = vec![0u16; max_gid + 1];
     for (i, (_, g)) in used.iter().enumerate() {
         gid2canon[*g as usize] = i as u16;
@@ -8216,7 +8377,12 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
     }
     let mut f2n = f2 & !4 & !16 & !32;
-    if narrow {
+    if narrow && best.is_none() {
+        // v0.9.100: the canonical encoder sets the narrow marker ONLY on the
+        // dense arm — the RLE wire carries byte indices and needs no width.
+        // Matching that exactly is what lets n<16 RLE-able content pass the
+        // pack stability gate as hashless (previously it silently kept the
+        // 16 B hash column).
         f2n |= 4;
     }
     out.push(magic);
@@ -8299,6 +8465,131 @@ mod fused_tests {
         let Value::Compound(m) = v else { panic!() };
         let Some(Value::List(l)) = m.get("sections") else { panic!() };
         assert!(sections_semantically_equal(&l[0], &sec), "semantic mismatch");
+    }
+
+    #[test]
+    fn glob_fill_no_data_uniform_roundtrip() {
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        // uniform section, 1-state palette, NO data array — the canonical
+        // no-data form. section_to_glob must emit the 0xCC fill (gform 7)
+        // and the decode must rebuild the canonical bytes byte-for-byte.
+        let sec = compound(vec![
+            ("Y", Value::Byte(-2)),
+            (
+                "block_states",
+                compound(vec![(
+                    "palette",
+                    Value::List(vec![compound(vec![("Name", Value::String("minecraft:stone".into()))])]),
+                )]),
+            ),
+        ]);
+        let enc = section_encode(&sec).expect("encode");
+        let mut out = Vec::new();
+        section_emit_csec3(&enc, &mut out).expect("emit");
+        let mut reg = StateRegistry::new();
+        let glob = section_to_glob(&enc, &mut reg).expect("glob convert");
+        assert_eq!(glob.first(), Some(&GLOB2_MAGIC), "fill members take 0xCC");
+        assert_eq!(glob[5], 7, "gform 7 (u8 fill)");
+        assert_eq!(glob[6], 0, "gid 0 = minecraft:stone (first registered)");
+        let rebuilt = glob_any_to_section(&glob, &reg).expect("decode");
+        assert_eq!(rebuilt, enc, "no-data fill roundtrip must be byte-identical");
+    }
+
+    #[test]
+    fn glob_fill_uniform_with_data_roundtrip() {
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        // 1-state palette WITH a voxel data array (all zeros): the uniform
+        // fill collapses it to gform 7; the rebuild re-chooses the RLE
+        // single-run form exactly like the canonical encoder does.
+        let sec = compound(vec![
+            ("Y", Value::Byte(3)),
+            (
+                "block_states",
+                compound(vec![
+                    (
+                        "palette",
+                        Value::List(vec![compound(vec![(
+                            "Name",
+                            Value::String("minecraft:deepslate".into()),
+                        )])]),
+                    ),
+                    ("data", Value::LongArray(fastnbt::LongArray::new(vec![0i64; 256]))),
+                ]),
+            ),
+        ]);
+        let enc = section_encode(&sec).expect("encode");
+        let mut out = Vec::new();
+        section_emit_csec3(&enc, &mut out).expect("emit");
+        let mut reg = StateRegistry::new();
+        let glob = section_to_glob(&enc, &mut reg).expect("glob convert");
+        assert_eq!(glob.first(), Some(&GLOB2_MAGIC));
+        assert_eq!(glob[5], 7, "gform 7 (u8 fill)");
+        let rebuilt = glob_any_to_section(&glob, &reg).expect("decode");
+        assert_eq!(rebuilt, enc, "data-carrying uniform fill must roundtrip byte-identically");
+    }
+
+    #[test]
+    fn glob_fill_wide_gid_gform8_roundtrip() {
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        // registry with >256 states: the uniform section's state lands on
+        // gid 300 -> the fill payload is u16 LE (gform 8).
+        let sec = compound(vec![
+            ("Y", Value::Byte(1)),
+            (
+                "block_states",
+                compound(vec![(
+                    "palette",
+                    Value::List(vec![compound(vec![(
+                        "Name",
+                        Value::String("minecraft:wide_block".into()),
+                    )])]),
+                )]),
+            ),
+        ]);
+        let enc = section_encode(&sec).expect("encode");
+        let mut out = Vec::new();
+        section_emit_csec3(&enc, &mut out).expect("emit");
+        let mut reg = StateRegistry::new();
+        for i in 0..300 {
+            reg.get_or_insert(GlobState {
+                plain: true,
+                name: format!("minecraft:filler{i}"),
+                props: vec![],
+            });
+        }
+        let glob = section_to_glob(&enc, &mut reg).expect("glob convert");
+        assert_eq!(glob.first(), Some(&GLOB2_MAGIC));
+        assert_eq!(glob[5], 8, "gform 8 (u16 fill)");
+        assert_eq!(&glob[6..8], &300u16.to_le_bytes());
+        let rebuilt = glob_any_to_section(&glob, &reg).expect("decode");
+        assert_eq!(rebuilt, enc, "wide-gid fill must roundtrip byte-identically");
+    }
+
+    #[test]
+    fn glob_fill_disabled_keeps_no_data_canonical() {
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        // CSAVES_GLOB_FILL=0: no-data uniform members stay canonical (the
+        // pre refuses them), so the pack shape is the 0.9.99 baseline.
+        set_glob_fill_for_tests(Some(false));
+        let sec = compound(vec![
+            ("Y", Value::Byte(-2)),
+            (
+                "block_states",
+                compound(vec![(
+                    "palette",
+                    Value::List(vec![compound(vec![("Name", Value::String("minecraft:stone".into()))])]),
+                )]),
+            ),
+        ]);
+        let enc = section_encode(&sec).expect("encode");
+        let mut out = Vec::new();
+        section_emit_csec3(&enc, &mut out).expect("emit");
+        let mut reg = StateRegistry::new();
+        assert!(
+            section_to_glob(&enc, &mut reg).is_none(),
+            "no-data members must not convert with fill disabled"
+        );
+        set_glob_fill_for_tests(None);
     }
 
     #[test]
@@ -9579,9 +9870,11 @@ mod glob_tests {
     }
 
     #[test]
-    fn glob_rejects_rle_and_single_state_sections() {
+    fn glob_single_state_fills_multirun_rle_still_rejected() {
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
         let mut reg = StateRegistry::new();
-        // single-state section (no data)
+        // single-state section (no data): v0.9.100 converts it to the fill
+        // form (gform 7) and the rebuild is byte-identical
         let mut sec: Map<String, Value> = Map::new();
         sec.insert("Y".to_string(), Value::Byte(3));
         let mut bs: Map<String, Value> = Map::new();
@@ -9591,7 +9884,11 @@ mod glob_tests {
         );
         sec.insert("block_states".to_string(), Value::Compound(bs));
         let canon = section_encode(&Value::Compound(sec)).expect("encode");
-        assert!(section_to_glob(&canon, &mut reg).is_none(), "single-state must not glob");
+        let glob = section_to_glob(&canon, &mut reg).expect("single-state fills now");
+        assert_eq!(glob.first(), Some(&GLOB2_MAGIC));
+        assert_eq!(glob[5], 7, "gform 7 (u8 fill)");
+        let back = glob_any_to_section(&glob, &reg).expect("fill decode");
+        assert_eq!(back, canon, "single-state fill roundtrip");
         // RLE-friendly section: one horizontal stratum plane -> rle_van wins
         let mut sec2: Map<String, Value> = Map::new();
         sec2.insert("Y".to_string(), Value::Byte(1));
