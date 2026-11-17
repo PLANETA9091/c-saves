@@ -1582,3 +1582,29 @@ deterministic across processes — HashMap iteration order is not (the
 virtual-live credit, body dedup, and read paths are order-independent by
 construction; the sorted stream only changes WRITE layout). Kill-switch
 CSAVES_BATCH_SORT=0.
+
+**The columnar tier verdict (negative, parked before implementation).** The
+-24.4% model was an artifact: the probe's "unique" heightmap wires were
+inflated by per-Map serialization ORDER variance (984 counted vs ~300 real),
+so the columnar pricing matched repeated copies of the same content. The
+real post-dedup wires are singletons (bare-ocean = 1 wire, mountains = ~65
+constant-value wires, wrecks ~189) — LZMA2 cannot match what appears once,
+so stream alignment buys nothing; the framing-prefix matching the columnar
+form would add is already caught by the tail stream's shared window. The
+post-GC-fix A/B confirms it from the other side: the NOHM leg (heights gone
+entirely) drained to 526,614 B vs 478,085 B WITH heights inline — the
+current inline-in-tail treatment (blob dedup + shared window) BEATS a
+columnar layout before refs are even counted. Parked.
+
+**Corpus realism fix — the smooth-ridge correction.** The first corpus drew
+mountain band/surface boundaries from per-column hashes (pixel noise) —
+real Tectonic ridges are SMOOTH (stratified geology = long runs). With
+integer-gradient boundaries (ridge_gradient: coherent drift across x/z, the
+terrain continuing across neighboring chunks) the mountain sections become
+stratified-row content: the drained container dropped 465,913 -> 285,525 B
+(31.0 B/chunk, x132.47 vs Anvil zlib-9; verify 9216/9216). The stratified
+rows are exactly the structure the RLE/transpose section forms and the
+big-window LZ2 eat; the pixel-noise corpus OVERSTATED the marginal cost of
+mountain terrain by ~1.6x. 20k x 20k extrapolation: ~= 11.5 GiB vs Anvil
+~= 1.49 TiB (x133). The remaining mass: csec3 209 KB est (mountain strata,
+still ~2 unique members per ridge chunk) + tails 48 KB est (wreck starts).

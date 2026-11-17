@@ -372,31 +372,52 @@ fn tree_section(tv: u64) -> Value {
     )
 }
 
-/// mountain mid band: stone/andesite/gravel noise (unique per chunk — the
-/// near-identical-band frontier)
+/// mountain mid band: stone/andesite/gravel bands over a SMOOTH gradient
+/// (real Tectonic ridges are smooth — the band pattern runs in long rows;
+/// per-column hash noise would overstate section uniqueness)
 fn mountain_band_section(y: i32, cx: i32, cz: i32) -> Value {
+    let (gx, gz) = ridge_gradient(cx, cz);
     let mut vals = vec![0u8; 4096];
     for (i, v) in vals.iter_mut().enumerate() {
         let x = (i & 15) as i32;
         let z = ((i >> 4) & 15) as i32;
         let yy = (i >> 8) as i32;
-        let r = h2(cx * 16 + x, cz * 16 + z, 0xB0 ^ ((y as u64) << 8) ^ (yy as u64)) % 100;
-        *v = if r < 88 { 0 } else if r < 96 { 1 } else { 2 };
+        // band boundary drifts smoothly across the section; rare deterministic
+        // intrusions (gravel pockets) stay sparse like real mountain rock
+        let band = yy * 4 + ((x - 8) * gx + (z - 8) * gz) / 4;
+        let r = h2(cx * 16 + x, cz * 16 + z, 0xB1 + yy as u64) % 100;
+        *v = if r < 4 {
+            2 // sparse gravel pocket
+        } else if band % 7 < 2 {
+            1 // andesite stratum
+        } else {
+            0 // stone
+        };
     }
     sec_mixed(y, &["minecraft:stone", "minecraft:andesite", "minecraft:gravel"], &vals)
 }
 
-/// mountain surface section: ridge top at row `top` (±1 per-column noise);
-/// snow cap above y=144.
+/// integer gradient of the ridge at a chunk: smooth across neighbors, small
+/// deterministic variation per chunk — the terrain continues coherently.
+fn ridge_gradient(cx: i32, cz: i32) -> (i32, i32) {
+    let h = h2(cx, cz, 0x610);
+    ((h % 5) as i32 - 2, ((h >> 8) % 5) as i32 - 2)
+}
+
+/// mountain surface section: ridge top at row `top`; the top boundary
+/// drifts SMOOTHLY across x/z (integer gradient — real ridges are smooth
+/// lines, not per-column noise); snow cap above y=144.
 fn mountain_surface_section(y: i32, cx: i32, cz: i32, top: usize, snow: bool) -> Value {
     let top = top as i32;
+    let (gx, gz) = ridge_gradient(cx, cz);
     let mut vals = vec![3u8; 4096]; // air above the ridge
     for (i, v) in vals.iter_mut().enumerate() {
         let x = (i & 15) as i32;
         let z = ((i >> 4) & 15) as i32;
         let yy = (i >> 8) as i32;
-        let d = (h2(cx * 16 + x, cz * 16 + z, 0x51F) % 3) as i32;
-        let t = top + d - 1;
+        // smooth boundary drift across the section + rare deterministic dips
+        let d = ((x - 8) * gx + (z - 8) * gz) / 6 + if h2(cx * 16 + x, cz * 16 + z, 0x51F) % 100 < 8 { -1 } else { 0 };
+        let t = top + d;
         *v = if yy > t {
             3
         } else if yy == t {
