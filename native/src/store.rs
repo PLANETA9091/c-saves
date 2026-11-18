@@ -5182,7 +5182,13 @@ impl Store {
     /// `write_chunk_fresh` — the entry the JNI boundary uses, where Paper's
     /// chunk tag is in hand (v0.9.47).
     pub fn write_chunk(&self, key: u64, payload: &[u8], whole_mode: bool) -> Result<(), String> {
-        self.write_chunk_mode(key, payload, whole_mode, false, true)
+        // v0.9.109: the LIVE path strips its own coordinates too — the
+        // key-verified xPos/zPos cut is exact-shape-gated (mismatched coords
+        // stay verbatim) and the read path reinserts from the key, so the
+        // roundtrip is byte-exact. The live path was kept conservative in
+        // 0.9.102; the measured JJ delta is -48.5 KB of 951,961 (-5.1%) —
+        // the biggest live-path lever since the lex walk.
+        self.write_chunk_mode(key, payload, whole_mode, false, true, true)
     }
 
     /// v0.9.47: explicit-evidence live write — the JNI boundary passes the
@@ -5200,7 +5206,7 @@ impl Store {
         whole_mode: bool,
         fresh: bool,
     ) -> Result<(), String> {
-        self.write_chunk_mode(key, payload, whole_mode, false, fresh)
+        self.write_chunk_mode(key, payload, whole_mode, false, fresh, true)
     }
 
     /// Import-path write: strips derived light (the server relights from
@@ -5214,24 +5220,34 @@ impl Store {
         // fresh=true: pregen worlds carry no runtime tag evidence — import
         // contracts stay operator-asserted (cfg.pristine_import), the
         // v0.9.47 shim-evidence gate is a live-path mechanism by design.
-        self.write_chunk_mode(key, payload, false, true, true)
+        self.write_chunk_mode(key, payload, false, true, true, true)
     }
 
     /// Bench/import-model write with an explicit strip decision (models
     /// write_chunk_import while letting benchmarks toggle the mode). Under
     /// cfg.pristine_import a strip write can form a regeneration contract
-    /// exactly like write_chunk_import.
+    /// exactly like write_chunk_import. The flag drives BOTH the pristine
+    /// class (import-asserted contracts) and the pos-strip — its pre-0.9.109
+    /// double duty, preserved for the A/B benches.
     pub fn write_chunk_stripped(&self, key: u64, payload: &[u8], strip: bool) -> Result<(), String> {
-        self.write_chunk_mode(key, payload, false, strip, true)
+        self.write_chunk_mode(key, payload, false, strip, true, strip)
     }
 
+    /// v0.9.109: the `import` flag is the pristine-contract class the old
+    /// `strip` param carried (operator-asserted seed-reproducibility);
+    /// `pos_strip` is the key-verified xPos/zPos cut of the tail. They are
+    /// ORTHOGONAL now: the live path strips coordinates (every vanilla
+    /// chunk carries its own, exact-shape-gated) without becoming an
+    /// import-asserted write.
+    #[allow(clippy::too_many_arguments)]
     fn write_chunk_mode(
         &self,
         key: u64,
         payload: &[u8],
         whole_mode: bool,
-        strip: bool,
+        import: bool,
         fresh: bool,
+        pos_strip: bool,
     ) -> Result<(), String> {
         // v0.9.53 POI elision: the write is ACKed, held in the bounded
         // session scratchpad and NEVER persisted. Short-circuits before any
@@ -5310,7 +5326,7 @@ impl Store {
                         // "what the elision chose not to risk" surface
                         // §12 promised the operator.
                         self.pristine_flips.fetch_add(1, Ordering::Relaxed);
-                    } else if !strip && self.region_assert_has(key) {
+                    } else if !import && self.region_assert_has(key) {
                         // v0.9.52: a region-asserted key has NO per-chunk
                         // legend to match, so an identical re-save cannot
                         // be verified O(1) — ANY live write of a covered
@@ -5336,7 +5352,7 @@ impl Store {
         // re-import recovers. A repeated import of an already-asserted
         // key hits the same early return (idempotent). Live writes of
         // covered keys are handled by the flip branch above.
-        if strip && self.region_enabled()
+        if import && self.region_enabled()
             && !self.chunks.read().contains_key(&key)
             && self.recipe_batch.lock().get(key).is_none()
             && !self.region_assert_has(key)
@@ -5367,13 +5383,13 @@ impl Store {
         // is exempt (operator-asserted mode, no tag evidence exists).
         let pristine_cand = self.cfg.pristine
             && !whole_mode
-            && (!strip || self.cfg.pristine_import)
+            && (!import || self.cfg.pristine_import)
             && !self.whole_mode.load(Ordering::Relaxed)
             && !self.chunks.read().contains_key(&key)
             && self.recipe_batch.lock().get(key).is_none()
             && !self.region_assert_has(key)
-            && (strip || !self.cfg.pristine_fresh || fresh);
-        if self.cfg.pristine && !whole_mode && !strip && self.cfg.pristine_fresh && !fresh {
+            && (import || !self.cfg.pristine_fresh || fresh);
+        if self.cfg.pristine && !whole_mode && !import && self.cfg.pristine_fresh && !fresh {
             // observability for the audit story: a live first write that
             // WOULD have contracted under 0.9.44-0.9.46 semantics but was
             // stored honestly because the shim's evidence said not-fresh.
@@ -5404,7 +5420,10 @@ impl Store {
             self.ensure_blob(hash, payload, false)?;
             Recipe { whole: Some(hash), sections: Vec::new(), tail: Tail::None, fields: Vec::new(), pos_from_key: false, starts_from_key: false, pristine: None, pristine_canon: None }
         } else {
-            let split = chunknbt::split(payload, whole_mode, pos_hint, strip)?;
+            // v0.9.109: the light axis follows the IMPORT class (live
+            // writes keep Paper's relit light verbatim); the pos axis is the
+            // key-verified byte-restoring cut.
+            let split = chunknbt::split_pos(payload, whole_mode, pos_hint, import, pos_strip)?;
             WST_SPLIT.0.fetch_add(t0w.elapsed().as_nanos() as u64, Ordering::Relaxed);
             WST_SPLIT.1.fetch_add(1, Ordering::Relaxed);
             let t1w = std::time::Instant::now();
@@ -9514,6 +9533,64 @@ pub mod tests {
         assert_eq!(s2.chunk_count(), 2);
         assert!(semantic(&s2.read_chunk(key(10, 20)).unwrap(), &p0));
         assert!(semantic(&s2.read_chunk(key(11, 21)).unwrap(), &p1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_write_strips_coords_but_keeps_light() {
+        // v0.9.109: the LIVE path strips its own key-verified coordinates
+        // (identical terrain at different keys shares the tail blob; the
+        // read reinserts from the key) while the DERIVED LIGHT stays
+        // verbatim (light_strip=false — Paper hands back relit light and
+        // the store keeps it; no isLightOn=0 trigger is inserted).
+        let dir = temp_dir("live-posfree");
+        let s = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let mk = |cx: i32, cz: i32, salt: i64| {
+            let mut root: Map<String, Value> = Map::new();
+            root.insert("DataVersion".to_string(), Value::Int(4189));
+            root.insert("xPos".to_string(), Value::Int(cx));
+            root.insert("zPos".to_string(), Value::Int(cz));
+            let mut hm: Map<String, Value> = Map::new();
+            let la: Vec<i64> = (0..37).map(|i| 900 + i * 13 + salt).collect();
+            hm.insert("MOTION_BLOCKING".to_string(), Value::LongArray(fastnbt::LongArray::new(la)));
+            root.insert("Heightmaps".to_string(), Value::Compound(hm));
+            let mut sec_list = Vec::new();
+            for y in 0..6i32 {
+                let mut sec: Map<String, Value> = Map::new();
+                sec.insert("Y".to_string(), Value::Byte(y as i8));
+                sec.insert("SkyLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![15i8; 64])));
+                sec.insert("BlockLight".to_string(), Value::ByteArray(fastnbt::ByteArray::new(vec![salt as i8; 64])));
+                let mut bs: Map<String, Value> = Map::new();
+                bs.insert("palette".to_string(), Value::List(vec![
+                    Value::String("minecraft:stone".to_string()),
+                    Value::String("minecraft:water".to_string()),
+                    Value::String("minecraft:air".to_string()),
+                ]));
+                let data: Vec<i64> = (0..64).map(|i| (i as i64) * 77 + y as i64 + salt).collect();
+                bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+                sec.insert("block_states".to_string(), Value::Compound(bs));
+                sec_list.push(Value::Compound(sec));
+            }
+            root.insert("sections".to_string(), Value::List(sec_list));
+            fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+        };
+        let p0 = mk(10, 20, 1);
+        s.write_chunk(key(10, 20), &p0, false).unwrap();
+        // identical terrain one key over: the stripped recipe collapses to
+        // the same body — the marginal disk cost is a pointer + key row
+        let p1 = mk(11, 21, 1);
+        let before = s.disk_bytes();
+        s.write_chunk(key(11, 21), &p1, false).unwrap();
+        s.durability_tick();
+        let marginal = s.disk_bytes() - before;
+        assert!(marginal < 400, "live identical terrain must share the body: marginal={marginal} B");
+        // reads reinsert coords AND keep the light arrays; no isLightOn
+        let got = s.read_chunk(key(10, 20)).unwrap();
+        assert!(semantic(&got, &p0), "live roundtrip must be semantically exact");
+        let Value::Compound(m) = fastnbt::from_bytes::<Value>(&got).unwrap() else { panic!() };
+        assert!(m.contains_key("SkyLight") || m.contains_key("sections"), "light must survive");
+        let got1 = s.read_chunk(key(11, 21)).unwrap();
+        assert!(semantic(&got1, &p1), "second key roundtrip");
         let _ = fs::remove_dir_all(&dir);
     }
 

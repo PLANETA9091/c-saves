@@ -5255,13 +5255,33 @@ pub fn split(
     pos_hint: Option<(i32, i32)>,
     strip: bool,
 ) -> Result<Split, String> {
+    // legacy 4-arg form: one flag drove BOTH the derived-light strip (import
+    // semantics: the server relights from isLightOn=0) and the pos strip.
+    split_pos(payload, whole_mode, pos_hint, strip, strip)
+}
+
+/// v0.9.109: the two strip axes are ORTHOGONAL.
+/// `light_strip` = the import path's derived-light treatment (section light
+/// arrays dropped + the isLightOn=0 relight trigger inserted) — a LIVE write
+/// must keep false: Paper hands back relit light and the store keeps it.
+/// `pos_strip` = the key-verified xPos/zPos (+ starts chunkX/chunkZ) cut —
+/// byte-RESTORING on read (the emitter reinserts from the key), so every
+/// write path takes true; mismatched coords refuse and stay verbatim.
+pub fn split_pos(
+    payload: &[u8],
+    whole_mode: bool,
+    pos_hint: Option<(i32, i32)>,
+    light_strip: bool,
+    pos_strip: bool,
+) -> Result<Split, String> {
     if whole_mode {
         return whole_split(payload, pos_hint);
     }
-    let strip = strip && !keep_light();
+    let strip = light_strip && !keep_light();
+    let pos_strip = pos_strip && !keep_light();
     if !no_scan() {
         let t_scan = std::time::Instant::now();
-        let r = scan_split(payload, strip, pos_hint);
+        let r = scan_split(payload, strip, pos_strip, pos_hint);
         SPLT_SCAN.0.fetch_add(t_scan.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_SCAN.1.fetch_add(1, Ordering::Relaxed);
         if let Some(sp) = r {
@@ -5274,7 +5294,7 @@ pub fn split(
     let root: Value = fastnbt::from_bytes(payload).map_err(|e| format!("nbt parse: {e}"))?;
     SPLT_PARSE.0.fetch_add(t_sp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     SPLT_PARSE.1.fetch_add(1, Ordering::Relaxed);
-    split_parsed(payload, pos_hint, root, strip)
+    split_parsed(payload, pos_hint, root, strip, pos_strip)
 }
 
 /// Section encode + dedup-cache lookup, shared by the scan-split fast path
@@ -6085,7 +6105,12 @@ fn parse_sections_direct_from<'a>(
 
 /// Fast-path split: raw tail + sections-only parse. None = fall back to the
 /// full parse (any structural doubt, non-compound root, missing sections...).
-fn scan_split(payload: &[u8], strip: bool, pos_hint: Option<(i32, i32)>) -> Option<Split> {
+fn scan_split(
+    payload: &[u8],
+    strip: bool,
+    pos_strip: bool,
+    pos_hint: Option<(i32, i32)>,
+) -> Option<Split> {
     let t_scanr = std::time::Instant::now();
     let Some(mut out) = scan_root(payload, strip) else {
         if std::env::var("CSAVES_SCAN_DEBUG").as_deref() == Ok("1") {
@@ -6155,12 +6180,16 @@ fn scan_split(payload: &[u8], strip: bool, pos_hint: Option<(i32, i32)>) -> Opti
         // v0.9.105: structure starts' chunkX/chunkZ are the same kind of
         // key-redundant pair — cut them too so jigsaw-carrying chunks
         // (shipwrecks, ruins, villages) stop being tail-unique.
-        let (tail, pos_from_key) = match pos_hint {
-            Some(p) => match strip_pos_entries(&tail, p) {
-                Some(t) => (t, true),
+        let (tail, pos_from_key) = if pos_strip {
+            match pos_hint {
+                Some(p) => match strip_pos_entries(&tail, p) {
+                    Some(t) => (t, true),
+                    None => (tail, false),
+                },
                 None => (tail, false),
-            },
-            None => (tail, false),
+            }
+        } else {
+            (tail, false)
         };
         let (tail, starts_from_key) = if pos_from_key {
             match pos_hint {
@@ -6647,7 +6676,8 @@ fn split_parsed(
     payload: &[u8],
     pos_hint: Option<(i32, i32)>,
     mut root: Value,
-    strip: bool,
+    light_strip: bool,
+    pos_strip: bool,
 ) -> Result<Split, String> {
     let has_sections = match &root {
         Value::Compound(map) => matches!(map.get("sections"), Some(Value::List(_))),
@@ -6659,7 +6689,8 @@ fn split_parsed(
 
     let t_ss = std::time::Instant::now();
     let mut sections;
-    let strip = strip && !keep_light();
+    let strip = light_strip && !keep_light();
+    let pos_strip = pos_strip && !keep_light();
     {
         let Value::Compound(map) = &mut root else { unreachable!("checked above") };
         let Some(Value::List(list)) = map.get_mut("sections") else {
@@ -6697,6 +6728,7 @@ fn split_parsed(
             // content guessing (coordinate-less synthetic payloads keep
             // their shape verbatim).
             if let Some((cx, cz)) = pos_hint {
+                if pos_strip {
                 let has_x = matches!(m.get("xPos"), Some(Value::Int(x)) if *x == cx);
                 let has_z = matches!(m.get("zPos"), Some(Value::Int(z)) if *z == cz);
                 if has_x && has_z {
@@ -6734,6 +6766,7 @@ fn split_parsed(
                             }
                         }
                     }
+                }
                 }
             }
             if strip {

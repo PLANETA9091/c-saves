@@ -258,6 +258,16 @@ fn main() {
         rounds,
         false,
     );
+    let (_, _) = run_leg(
+        "tect live",
+        &out.join("store_batch_live"),
+        &payloads,
+        &keys,
+        &by_key,
+        Cfg::from_env(),
+        1,
+        true,
+    );
 
     // ---------- tail_blob_min A/B (Tectonic) ----------
     println!("== tail_blob_min A/B (Tectonic) ==");
