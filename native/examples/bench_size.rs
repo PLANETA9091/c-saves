@@ -268,6 +268,14 @@ fn main() {
         disk_final as f64 / logical_region.max(1) as f64,
         disk_ent_final as f64 / 1048576.0,
     );
+    // v0.9.107: the honest shipped weight — segments + dict/state files
+    // (the dict prunes at close, but a live store still carries it)
+    println!(
+        "C full weight: region {:.1} MiB | entities {:.1} MiB | total {:.1} MiB",
+        region_store.full_disk_bytes() as f64 / 1048576.0,
+        entity_store.full_disk_bytes() as f64 / 1048576.0,
+        (region_store.full_disk_bytes() + entity_store.full_disk_bytes()) as f64 / 1048576.0,
+    );
 
     // ---- Phase D: verification (semantic) ----
     let t3 = Instant::now();
