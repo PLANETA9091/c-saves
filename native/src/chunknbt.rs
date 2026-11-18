@@ -8026,6 +8026,42 @@ impl StateRegistry {
         }
         Some(reg)
     }
+
+    /// v0.9.107: the ON-DISK container for the persisted registry file
+    /// (states-N.bin). The GSV1 wire above is the inner format; real-world
+    /// registries are dominated by repetitive "minecraft:...[k=v,...]"
+    /// strings, so the raw form pays its own length twice (measured: JJ
+    /// 15.5 KB raw -> ~3 KB; a modded registry scales the same way). The
+    /// container picks whichever side is smaller, so a tiny registry stays
+    /// raw GSV1 and old files parse forever:
+    ///   GSV1 = the wire verbatim,
+    ///   GSV2 = [b'G'][b'S'][b'V'][b'2'][u32 raw_len][zstd-19 wire].
+    pub fn encode_container(&self) -> Vec<u8> {
+        let raw = self.to_bytes();
+        let comp = zstd::bulk::compress(&raw, 19).unwrap_or_else(|_| raw.clone());
+        if comp.len() + 12 < raw.len() {
+            let mut out = Vec::with_capacity(8 + comp.len());
+            out.extend_from_slice(b"GSV2");
+            out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            out.extend_from_slice(&comp);
+            out
+        } else {
+            raw
+        }
+    }
+
+    /// Decode the states-N.bin container (GSV1 raw or GSV2 zstd).
+    pub fn decode_container(b: &[u8]) -> Option<Self> {
+        if b.len() >= 8 && &b[0..4] == b"GSV2" {
+            let raw_len = u32::from_le_bytes(b[4..8].try_into().ok()?) as usize;
+            let raw = zstd::bulk::decompress(&b[8..], raw_len).ok()?;
+            if raw.len() != raw_len {
+                return None;
+            }
+            return Self::from_bytes(&raw);
+        }
+        Self::from_bytes(b)
+    }
 }
 
 /// Serialize one palette entry in the canonical put_entry wire format.
@@ -10622,6 +10658,44 @@ mod glob_tests {
         let back2 = glob_any_to_section(&glob, &reg2).expect("decode with reloaded registry");
         assert_eq!(back2, canon);
         crate::chunknbt::set_gid_rle_div_for_tests(None);
+    }
+
+    #[test]
+    fn registry_container_roundtrip_both_magics() {
+        // v0.9.107: states-N.bin container — GSV2 (zstd) when smaller, GSV1
+        // raw when not; old files parse forever, the gid order is identity.
+        let mut reg = StateRegistry::new();
+        for i in 0..200usize {
+            let plain = i % 3 == 0;
+            let mut props = Vec::new();
+            if !plain {
+                props.push(("level".to_string(), format!("{}", i % 16)));
+                props.push(("waterlogged".to_string(), (i % 2 == 0).to_string()));
+            }
+            reg.get_or_insert(GlobState {
+                plain,
+                name: format!("minecraft:block_{i:03}"),
+                props,
+            });
+        }
+        let gids: Vec<u32> = (0..200u32).collect();
+        // GSV2 path: a 200-state registry compresses hard (repetitive names)
+        let cont = reg.encode_container();
+        assert_eq!(&cont[0..4], b"GSV2", "a real registry must take the zstd form");
+        assert!(cont.len() < reg.to_bytes().len() / 2, "compression must pay: {} vs {}", cont.len(), reg.to_bytes().len());
+        let back = StateRegistry::decode_container(&cont).expect("GSV2 parse");
+        assert_eq!(back.len(), reg.len());
+        for (i, g) in gids.iter().enumerate() {
+            assert_eq!(back.get(*g).map(|s| s.name.clone()), reg.get(*g).map(|s| s.name.clone()), "gid {i} drifted");
+        }
+        // GSV1 path: a tiny registry stays raw, and a raw file parses
+        let mut tiny = StateRegistry::new();
+        tiny.get_or_insert(GlobState { plain: true, name: "minecraft:stone".into(), props: vec![] });
+        let raw = tiny.encode_container();
+        assert_eq!(&raw[0..4], b"GSV1", "a tiny registry must stay raw");
+        assert_eq!(StateRegistry::decode_container(&raw).expect("GSV1 parse").len(), 1);
+        // old-file compat: from_bytes still parses the raw wire
+        assert_eq!(StateRegistry::from_bytes(&raw).expect("old wire").len(), 1);
     }
 }
 

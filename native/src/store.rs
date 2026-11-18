@@ -2612,7 +2612,7 @@ impl Store {
 
     fn load_glob_reg(&self) {
         let Ok(bytes) = fs::read(self.states_path()) else { return };
-        match chunknbt::StateRegistry::from_bytes(&bytes) {
+        match chunknbt::StateRegistry::decode_container(&bytes) {
             Some(r) => *self.glob_reg.lock() = r,
             None => eprintln!("[c-saves] states-1.bin unparseable — starting an empty registry (old GLOB slabs would misresolve; re-import needed)"),
         }
@@ -2621,7 +2621,11 @@ impl Store {
     /// Persist the registry atomically (tmp + rename). Called BEFORE any
     /// slab that introduced new gids is appended, and on sync/seal.
     fn persist_glob_reg(&self) -> std::io::Result<()> {
-        let bytes = self.glob_reg.lock().to_bytes();
+        // v0.9.107: the container picks the smaller of raw GSV1 / GSV2
+        // zstd-19 (real registries are repetitive state-name strings — JJ
+        // 15.5 KB raw -> ~3 KB); tiny registries stay raw, old files parse
+        // forever (the magic dispatches).
+        let bytes = self.glob_reg.lock().encode_container();
         let tmp = self.dir.join("states-1.tmp");
         {
             use std::io::Write as _;
