@@ -2193,6 +2193,16 @@ pub struct Store {
     res_cache: Mutex<ResCache>,
     cur_dict: AtomicU8,
     next_dict_ver: AtomicU8,
+    /// v0.9.107: per-dict-version reference counts from RECIPE INSTANCES
+    /// whose tail rode Tail::Inline{dict} — the compressed bytes live inside
+    /// recipe wires (pending entries, batch records, kind-2/3 records),
+    /// invisible to the blobs map. This is the accounting that makes dict
+    /// FILE deletion structurally safe: the 11,819-missing bigworld loss
+    /// (see gc_dicts) came from deleting a file that inline tails still
+    /// referenced; now that state is observable. Bumped at write time
+    /// (bump_recipe_refs), dropped at every retire, rebuilt by the reopen
+    /// ref sweep.
+    dict_refs: Mutex<HashMap<u8, u64>>,
     /// v0.9.30: content-hash bucket representatives for dictionary
     /// training. The old Vec pool froze at the first 2*dict_train
     /// arrivals — which payloads arrive first depends on fs::read_dir
@@ -2349,6 +2359,38 @@ impl Drop for Store {
         self.flush_ctl.stop.store(true, Ordering::Release);
         self.flush_ctl.cv.notify_all();
         self.batch_ctl.cv.notify_all();
+        // v0.9.107: the close-time dict prune. After the batcher drain and
+        // the writer flush there are no concurrent writers (Drop owns the
+        // store), so the refcounts are final: a dict version with zero
+        // recipe references (dict_refs) and zero blob references
+        // (dict_id columns) — INCLUDING the current training target — is
+        // pure dead weight in the shipped container (measured 18.6 KB of a
+        // 289.6 KB Tectonic drain; the JJ dict can reach ~112 KiB). The
+        // live path keeps cur alive (gc_dicts' v != cur guard — a concurrent
+        // hot write could fetch the dict before an unlink and mint a
+        // dangling blob reference), but a CLOSE has no such window: the
+        // next open re-trains on demand and the hot tier falls back to
+        // dict-less zstd until then. CSAVES_DICT_GC=0 disables this too.
+        if std::env::var("CSAVES_DICT_GC").as_deref() != Ok("0") {
+            let used: std::collections::HashSet<u8> =
+                self.blobs.read().values().map(|l| l.dict_id).collect();
+            let dead: Vec<u8> = {
+                let refs = self.dict_refs.lock();
+                let mut dicts = self.dicts.write();
+                let dead: Vec<u8> = dicts
+                    .keys()
+                    .copied()
+                    .filter(|v| !used.contains(v) && refs.get(v).copied().unwrap_or(0) == 0)
+                    .collect();
+                for v in &dead {
+                    dicts.remove(v);
+                }
+                dead
+            };
+            for v in dead {
+                let _ = fs::remove_file(self.dict_dir().join(format!("dict-{v}.bin")));
+            }
+        }
     }
 }
 
@@ -2464,6 +2506,7 @@ impl Store {
             dicts: RwLock::new(HashMap::new()),
             cur_dict: AtomicU8::new(0),
             next_dict_ver: AtomicU8::new(1),
+            dict_refs: Mutex::new(HashMap::new()),
             dict_samples: Mutex::new(HashMap::new()),
             dict_enabled: AtomicBool::new(dict_enabled),
             dict_last_train_n: AtomicUsize::new(0),
@@ -2930,32 +2973,165 @@ impl Store {
     }
 
     fn gc_dicts(&self) {
-        // RAM-cache trim ONLY: dict FILES are never deleted. Compressed data
-        // outside the blobs map also references dict versions — kind-2 recipe
-        // inline tails (Tail::Inline{dict,..}) — which blob-only accounting
-        // cannot see. Deleting the file made every such chunk permanently
-        // unreadable (the 11,819-missing bigworld-survival loss). decompress()
-        // lazy-loads the file back on a cache miss, so the RAM map is a pure
-        // cache and the disk copies (<= ~112 KiB per version) are the truth.
+        // RAM-cache trim: dict versions neither current nor referenced by
+        // any blob leave the RAM map. Files are NOT deleted here anymore
+        // for the versions that still carry references — the v0.9.107
+        // refcount (dict_refs, per recipe instance) makes the previously
+        // invisible inline-tail references observable, so FILE deletion is
+        // now structurally safe below. The 11,819-missing bigworld loss
+        // came from deleting a file that kind-2 inline tails (Tail::Inline
+        // {dict,..}) still referenced — blob-only accounting could not see
+        // them; the refcount closes exactly that hole.
         let used: std::collections::HashSet<u8> =
             self.blobs.read().values().map(|l| l.dict_id).collect();
         let cur = self.cur_dict.load(Ordering::Relaxed);
-        let mut dicts = self.dicts.write();
-        let dead: Vec<u8> = dicts
-            .keys()
-            .copied()
-            .filter(|v| *v != cur && !used.contains(v))
-            .collect();
-        for v in dead {
-            dicts.remove(&v);
+        let (dead, dead_files): (Vec<u8>, Vec<u8>) = {
+            let refs = self.dict_refs.lock();
+            let mut dicts = self.dicts.write();
+            // ONE predicate for both the RAM trim and the file GC — a version
+            // neither current, nor blob-referenced, nor recipe-referenced is
+            // dead in both senses at once.
+            let dead: Vec<u8> = dicts
+                .keys()
+                .copied()
+                .filter(|v| *v != cur && !used.contains(v) && refs.get(v).copied().unwrap_or(0) == 0)
+                .collect();
+            for v in &dead {
+                dicts.remove(v);
+            }
+            // v0.9.107: FILE GC over the SAME dead set. A version with ZERO
+            // recipe references and ZERO blob references is pure dead weight
+            // on disk — the drained container carries it forever (measured:
+            // 18.6 KB of a 289.6 KB Tectonic drain = 6.4%). The read path
+            // lazy-loads files, so a file may only leave when nothing can
+            // name its version:
+            // - refs (inline tails in committed recipes + pending entries) == 0,
+            // - no blob's dict_id points at it,
+            // - and it is not the current training target (v != cur), which
+            //   future hot writes would reuse; everything else re-trains.
+            // CSAVES_DICT_GC=0 disables file deletion entirely (audit mode).
+            let df: Vec<u8> = if std::env::var("CSAVES_DICT_GC").as_deref() != Ok("0") {
+                dead.clone()
+            } else {
+                Vec::new()
+            };
+            drop(dicts);
+            (dead, df)
+        };
+        for v in dead_files {
+            let _ = fs::remove_file(self.dict_dir().join(format!("dict-{v}.bin")));
         }
+    }
+
+    /// v0.9.107: the HONEST container weight — segments PLUS the dict files
+    /// and persisted state/registry files that live next to them. disk_bytes
+    /// counts only segment bytes (GC/pack accounting semantics, unchanged);
+    /// the drained container the operator ships is the full directory, and
+    /// the dict files were invisible there (measured: 18.6 KB of a 289.6 KB
+    /// Tectonic drain). Diagnostics/benches report both.
+    pub fn full_disk_bytes(&self) -> u64 {
+        let mut total = self.disk_bytes();
+        if let Ok(rd) = fs::read_dir(self.dict_dir()) {
+            for e in rd.flatten() {
+                total += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        if let Ok(rd) = fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("states-") && name.ends_with(".bin") {
+                    total += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
+
+    /// v0.9.107: tail census over the committed recipes — kind counts,
+    /// inline raw/comp mass and per-dict-version reference counts (the
+    /// number that gates gc_dicts file deletion). Diagnostic JSON, same
+    /// spirit as slab_member_attribution_json.
+    pub fn tail_census_json(&self) -> String {
+        let entries: Vec<(u64, u32, u64, u32)> = self
+            .chunks
+            .read()
+            .iter()
+            .map(|(k, (s, o, l))| (*k, *s, *o, *l))
+            .collect();
+        let (mut none, mut inline, mut blob, mut pristine) = (0u64, 0u64, 0u64, 0u64);
+        let (mut inline_raw, mut inline_comp) = (0u64, 0u64);
+        let mut dict_use: HashMap<u8, u64> = HashMap::new();
+        let mut blob_raw = 0u64;
+        for (k, seg, off, len) in entries {
+            let rec = if len == BATCHED {
+                self.recipe_at(k, seg, off, len)
+            } else {
+                self.load_recipe(seg, off, len)
+            };
+            let Some(rec) = rec else { continue };
+            if rec.pristine.is_some() {
+                pristine += 1;
+                continue;
+            }
+            match &rec.tail {
+                Tail::None => none += 1,
+                Tail::Inline { dict, comp, raw } => {
+                    inline += 1;
+                    inline_raw += *raw as u64;
+                    inline_comp += comp.len() as u64;
+                    if *dict != 0 {
+                        *dict_use.entry(*dict).or_default() += 1;
+                    }
+                }
+                Tail::Blob(h) => {
+                    blob += 1;
+                    if let Some(loc) = self.blobs.read().get(h) {
+                        blob_raw += loc.raw_len as u64;
+                    }
+                }
+            }
+        }
+        let mut refs: Vec<(u8, u64)> = self.dict_refs.lock().iter().map(|(k, v)| (*k, *v)).collect();
+        refs.sort_unstable();
+        let mut dicts_on_disk = 0u64;
+        let mut dict_bytes = 0u64;
+        if let Ok(rd) = fs::read_dir(self.dict_dir()) {
+            for e in rd.flatten() {
+                dicts_on_disk += 1;
+                dict_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        let mut s = String::with_capacity(512);
+        s.push_str("{");
+        s.push_str(&format!(
+            r#""tails":{{"none":{none},"inline":{inline},"blob":{blob},"pristine":{pristine}}},"#
+        ));
+        s.push_str(&format!(
+            r#""inline":{{"raw":{inline_raw},"comp":{inline_comp}}},"blob_raw":{blob_raw},"#
+        ));
+        s.push_str(&format!(r#""dict_use":{{"#));
+        for (i, (v, c)) in refs.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(r#""v{v}":{c}"#));
+        }
+        s.push_str(&format!(
+            r#"}}, "dict_files":{dicts_on_disk},"dict_file_bytes":{dict_bytes}}}"#
+        ));
+        s
     }
 
     /// Lazy (re)load a dictionary version from its on-disk file into the RAM
     /// cache. Called from decompress() on a cache miss so reads survive any
-    /// trim/GC of the RAM map (files are never deleted — see gc_dicts). Also
-    /// covers stores reopened after a crash where the open-time loader
-    /// skipped a small/short file: the file is the source of truth.
+    /// trim/GC of the RAM map. v0.9.107: gc_dicts may now DELETE the file of
+    /// a version with zero references — a read can only reach this path for
+    /// a version something still names, and the refcounts (blobs' dict_id +
+    /// dict_refs from inline tails) hold the file alive in exactly those
+    /// cases; a missing file here degrades to None (the caller's failure
+    /// path), never to wrong bytes. Also covers stores reopened after a
+    /// crash where the open-time loader skipped a small/short file: the
+    /// file is the source of truth.
     fn load_dict_from_disk(&self, v: u8) -> Option<Arc<Vec<u8>>> {
         if v == 0 {
             return None;
@@ -3538,12 +3714,10 @@ impl Store {
                 self.load_recipe(seg, off, len)
             };
             if let Some(rec) = rec {
-                let mut blobs = self.blobs.write();
-                for h in rec.blob_hashes() {
-                    if let Some(loc) = blobs.get_mut(&h) {
-                        loc.refs += 1;
-                    }
-                }
+                // v0.9.107: bump_recipe_refs now covers the inline-tail dict
+                // references too — the reopen sweep and the write path share
+                // ONE bump so gc_dicts file deletion can key on the counts.
+                self.bump_recipe_refs(&rec);
                 *live_by_seg.entry(seg).or_default() += 8 + len as u64;
             }
         }
@@ -4468,10 +4642,19 @@ impl Store {
 
     fn bump_recipe_refs(&self, rec: &Recipe) {
         let _t = std::time::Instant::now();
-        let mut blobs = self.blobs.write();
-        for h in rec.blob_hashes() {
-            if let Some(loc) = blobs.get_mut(&h) {
-                loc.refs += 1;
+        {
+            let mut blobs = self.blobs.write();
+            for h in rec.blob_hashes() {
+                if let Some(loc) = blobs.get_mut(&h) {
+                    loc.refs += 1;
+                }
+            }
+        }
+        // v0.9.107: the inline tail's dict version is a compressed-data
+        // reference outside the blobs map — count it per recipe instance.
+        if let Tail::Inline { dict, .. } = &rec.tail {
+            if *dict != 0 {
+                *self.dict_refs.lock().entry(*dict).or_default() += 1;
             }
         }
         MT_BUMP_NS.fetch_add(_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -4479,18 +4662,35 @@ impl Store {
 
     fn drop_recipe_refs(&self, rec: &Recipe) {
         let _t = std::time::Instant::now();
-        let mut blobs = self.blobs.write();
-        for h in rec.blob_hashes() {
-            let evict = {
-                let Some(loc) = blobs.get_mut(&h) else { continue };
-                loc.refs = loc.refs.saturating_sub(1);
-                loc.refs == 0
-            };
-            if evict {
-                if let Some(loc) = blobs.remove(&h) {
-                    self.ids.write().remove(&loc.id);
-                    if let Some(s) = self.segs.read().get(&loc.seg) {
-                        s.live.fetch_sub(loc.body_len(), Ordering::Relaxed);
+        {
+            let mut blobs = self.blobs.write();
+            for h in rec.blob_hashes() {
+                let evict = {
+                    let Some(loc) = blobs.get_mut(&h) else { continue };
+                    loc.refs = loc.refs.saturating_sub(1);
+                    loc.refs == 0
+                };
+                if evict {
+                    if let Some(loc) = blobs.remove(&h) {
+                        self.ids.write().remove(&loc.id);
+                        if let Some(s) = self.segs.read().get(&loc.seg) {
+                            s.live.fetch_sub(loc.body_len(), Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        // v0.9.107: the matching inline-tail dict release (saturating — a
+        // drop must never resurrect a version the bump side never saw).
+        // The zero entry leaves the map: gc_dicts' predicate treats an
+        // ABSENT version as unreferenced, and the census shows {} not {v:0}.
+        if let Tail::Inline { dict, .. } = &rec.tail {
+            if *dict != 0 {
+                let mut refs = self.dict_refs.lock();
+                if let Some(e) = refs.get_mut(dict) {
+                    *e = e.saturating_sub(1);
+                    if *e == 0 {
+                        refs.remove(dict);
                     }
                 }
             }
@@ -8850,6 +9050,145 @@ pub mod tests {
                 .unwrap_or_else(|| panic!("chunk {i} unreadable after dict gc"));
             assert!(semantic(&got, &want), "chunk {i} drifted");
         }
+    }
+
+    #[test]
+    fn dict_close_prune_unreferenced_file_gone_and_reopen_decodes() {
+        // v0.9.107 archive flow: a store whose recipes carry NO inline-tail
+        // dict references (all tails clear tail_blob_min -> blob path) pays
+        // the dict FILE in the shipped container forever. The close-time
+        // prune must remove it (measured 18.6 KB of a 289.6 KB Tectonic
+        // drain), and every read must still decode after reopen (blob
+        // tails are cold-tier dict-free; the hot tier falls back to
+        // dict-less zstd and re-trains on demand).
+        let dir = temp_dir("dict-close-prune");
+        let cfg = Cfg { dict_train: 8, ..bench_cfg() };
+        let mk = |i: u64, salt: u64| {
+            // unique_payload's tail stays under tail_blob_min (inline path,
+            // dict 0 pre-training); the padding list pushes the tail over
+            // 512 B so every chunk rides the blob path (no dict reference).
+            let mut p = unique_payload(i as i32, salt);
+            let mut root: Value = fastnbt::from_bytes(&p).unwrap();
+            if let Value::Compound(m) = &mut root {
+                let pad: Vec<Value> = (0..40)
+                    .map(|k| Value::String(format!("pad-{salt}-{k:04}-{}", "x".repeat(24))))
+                    .collect();
+                m.insert("Padding".to_string(), Value::List(pad));
+            }
+            fastnbt::to_bytes(&root).unwrap()
+        };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        // pre-dict warm-up: inline tails carry dict 0 (plain zstd) — no refs
+        for i in 0..8u64 {
+            s.write_chunk(100 + i, &unique_payload(100 + i as i32, 50), false).unwrap();
+        }
+        assert!(s.train_dict_if_needed(), "dict v1 must train");
+        for i in 0..40u64 {
+            s.write_chunk(i, &mk(i, 0), false).unwrap();
+        }
+        s.sync();
+        s.seal();
+        s.request_pack();
+        for _ in 0..8 {
+            while s.compact_step() {}
+        }
+        s.sync();
+        let census = s.tail_census_json();
+        assert!(
+            census.contains(r#""dict_use":{}"#),
+            "fat-tail chunks must not reference any dict version: {census}"
+        );
+        drop(s);
+        assert!(
+            !dir.join("dicts").join("dict-1.bin").exists(),
+            "the unreferenced dict file must leave the shipped container"
+        );
+        // reopen: every read decodes, invariants hold
+        let s2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for i in 0..40u64 {
+            let got = s2
+                .read_chunk(i)
+                .unwrap_or_else(|| panic!("chunk {i} lost after dict prune"));
+            assert!(semantic(&got, &mk(i, 0)), "chunk {i} drifted after dict prune");
+        }
+        assert_eq!(s2.slab_invariant_scan().len(), 0, "invariants hold post-prune");
+        drop(s2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dict_refs_pin_file_until_last_inline_retires() {
+        // v0.9.107 refcount lifecycle: inline-tail recipes pin their dict
+        // version against gc_dicts (the 11,819-missing loss class, now
+        // OBSERVABLE); the last retire releases it; the live store keeps
+        // the current version (a concurrent hot write could still mint a
+        // reference), and the close-time prune removes it when the store
+        // is quiesced. Reopen after the prune decodes everything.
+        let dir = temp_dir("dict-refs-pin");
+        let cfg = Cfg { dict_train: 8, ..bench_cfg() };
+        let fat = |i: u64, salt: u64| {
+            let mut p = unique_payload(i as i32, salt);
+            let mut root: Value = fastnbt::from_bytes(&p).unwrap();
+            if let Value::Compound(m) = &mut root {
+                let pad: Vec<Value> = (0..40)
+                    .map(|k| Value::String(format!("pad-{salt}-{k:04}-{}", "x".repeat(24))))
+                    .collect();
+                m.insert("Padding".to_string(), Value::List(pad));
+            }
+            fastnbt::to_bytes(&root).unwrap()
+        };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        for i in 0..8u64 {
+            s.write_chunk(100 + i, &unique_payload(100 + i as i32, 50), false).unwrap();
+        }
+        assert!(s.train_dict_if_needed(), "dict v1 must train");
+        // 12 chunks with small tails -> INLINE tails compressed with dict v1
+        for i in 0..12u64 {
+            s.write_chunk(i, &unique_payload(i as i32, 0), false).unwrap();
+        }
+        let census = s.tail_census_json();
+        assert!(census.contains(r#""v1":12"#), "12 inline recipes must pin v1: {census}");
+        s.gc_dicts();
+        assert!(
+            dir.join("dicts").join("dict-1.bin").exists(),
+            "a referenced dict file must survive gc_dicts"
+        );
+        // rewrite ALL with fat tails: every inline recipe retires -> refs 0
+        for i in 0..12u64 {
+            s.write_chunk(i, &fat(i, 7), false).unwrap();
+        }
+        s.sync();
+        let census = s.tail_census_json();
+        assert!(
+            census.contains(r#""dict_use":{}"#),
+            "retired inline tails must release v1: {census}"
+        );
+        // the live store keeps the CURRENT version (v == cur guard)
+        s.gc_dicts();
+        assert!(
+            dir.join("dicts").join("dict-1.bin").exists(),
+            "cur_dict stays on disk while the store is live"
+        );
+        // the close-time prune (quiesced store) removes it
+        drop(s);
+        assert!(
+            !dir.join("dicts").join("dict-1.bin").exists(),
+            "close-time prune must remove the unreferenced cur dict"
+        );
+        // reopen: reads decode, invariants hold
+        let s2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for i in 0..12u64 {
+            let got = s2
+                .read_chunk(i)
+                .unwrap_or_else(|| panic!("chunk {i} lost after close prune"));
+            assert!(semantic(&got, &fat(i, 7)), "chunk {i} drifted after close prune");
+        }
+        for i in 0..8u64 {
+            assert!(s2.read_chunk(100 + i).is_some(), "warm-up chunk {i} lost");
+        }
+        assert_eq!(s2.slab_invariant_scan().len(), 0, "invariants hold post-prune");
+        drop(s2);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
