@@ -29,6 +29,10 @@ liblzma = { version = "0.4", features = ["static", "parallel"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["static", "parallel"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 
+[dev-dependencies]
+# codec-family sweep probes (codec_probe): pure-Rust brotli, no build risk
+brotli = "7"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
