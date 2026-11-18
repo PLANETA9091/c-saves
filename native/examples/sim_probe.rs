@@ -177,6 +177,76 @@ fn order_nn(members: &[Vec<u8>], bins: usize) -> Vec<usize> {
     chain
 }
 
+/// NN within lex-prefix buckets — the shippable approximation of the NN
+/// ceiling: bucket members by their first `pb` body bytes (palette+form
+/// prefix), greedy-NN chain INSIDE each bucket over `bins`-bin signatures,
+/// buckets concatenated in lex-prefix order. Cost O(n log n + sum k_i^2);
+/// palettes repeat across strata members, so buckets stay moderate.
+fn order_lexnn(members: &[Vec<u8>], pb: usize, bins: usize) -> Vec<usize> {
+    let n = members.len();
+    let mut ord: Vec<usize> = (0..n).collect();
+    ord.sort_by(|&a, &b| members[a].cmp(&members[b]));
+    // walk the lex-sorted list, cut buckets at prefix boundaries
+    let mut out = Vec::with_capacity(n);
+    let mut start = 0usize;
+    while start < n {
+        let key = {
+            let b = &members[ord[start]];
+            let e = pb.min(b.len());
+            b[..e].to_vec()
+        };
+        let mut end = start + 1;
+        while end < n {
+            let b = &members[ord[end]];
+            let eb = pb.min(b.len());
+            if eb != key.len() || b[..eb] != key[..] {
+                break;
+            }
+            end += 1;
+        }
+        if end - start <= 3 {
+            out.extend_from_slice(&ord[start..end]);
+        } else {
+            // NN inside the bucket: indices into `members`, chained, then
+            // appended in chain order
+            let idx: Vec<usize> = ord[start..end].to_vec();
+            out.extend(order_nn_idx(members, &idx, bins));
+        }
+        start = end;
+    }
+    out
+}
+
+fn order_nn_idx(members: &[Vec<u8>], idx: &[usize], bins: usize) -> Vec<usize> {
+    let sigs: Vec<Vec<u32>> = idx.iter().map(|&i| signature(&members[i], bins)).collect();
+    let hashes: Vec<u64> = idx.iter().map(|&i| body_hash(&members[i])).collect();
+    let k = idx.len();
+    let mut used = vec![false; k];
+    let mut chain = Vec::with_capacity(k);
+    let mut cur = (0..k).min_by(|&a, &b| members[idx[a]].cmp(&members[idx[b]])).unwrap();
+    used[cur] = true;
+    chain.push(idx[cur]);
+    for _ in 1..k {
+        let mut best: Option<(u64, u64, u64)> = None;
+        for (j, u) in used.iter().enumerate() {
+            if *u {
+                continue;
+            }
+            let d = l1(&sigs[cur], &sigs[j]);
+            let key = (d, hashes[j], j as u64);
+            if best.map(|b| key < b).unwrap_or(true) {
+                best = Some(key);
+            }
+        }
+        let (_, _, nxt_u) = best.unwrap();
+        let nxt = nxt_u as usize;
+        used[nxt] = true;
+        chain.push(idx[nxt]);
+        cur = nxt;
+    }
+    chain
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dim = PathBuf::from(args.get(1).expect("usage: sim_probe <dim-dir> [--import]"));
@@ -272,6 +342,7 @@ fn main() {
             ("id".into(), (0..n).collect()),
             ("lex".into(), order_lex(mems)),
             ("histlex32".into(), order_histlex(mems, 32)),
+            ("lexnn16_32".into(), order_lexnn(mems, 16, 32)),
             ("nn32".into(), order_nn(mems, 32)),
         ];
         if n <= 4000 {
