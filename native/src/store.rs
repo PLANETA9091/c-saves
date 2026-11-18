@@ -610,6 +610,16 @@ pub struct Cfg {
     /// each, total budget == cores). < 2 keeps the single-threaded bulk
     /// path.
     pub pack_mt_workers: usize,
+    /// v0.9.106: content-similarity member walk for the SECTION slab pool —
+    /// members sort lexicographically by body inside each slab group before
+    /// the variant streams build. Canonical members lead with palette+form
+    /// bytes and glob members share the registry frame, so lex clusters
+    /// same-palette / same-shape members adjacently and LZMA2 matches their
+    /// long identical prefixes (Tectonic strata corpus: csec3 -6.5%
+    /// standalone; JJ glob_g7 -16.6%, glob_g6 -2.9%; NN chains price a
+    /// further ~-3% ceiling but are O(n^2) — parked). Tails keep arrival
+    /// order (lex priced +0.26% there). 0/CSAVES_SLAB_LEX=0 opts out.
+    pub slab_lex: bool,
 }
 
 impl Default for Cfg {
@@ -683,6 +693,7 @@ impl Default for Cfg {
             seg_roll: 64 * 1024 * 1024,
             pack_mt_min: 1024 * 1024,
             pack_mt_workers: 0,
+            slab_lex: true,
         }
     }
 }
@@ -761,6 +772,9 @@ impl Cfg {
             seg_roll: env_parse("CSAVES_SEG_ROLL", 64 * 1024 * 1024),
             pack_mt_min: env_parse("CSAVES_PACK_MT_MIN", 1024 * 1024),
             pack_mt_workers: env_parse("CSAVES_PACK_MT_WORKERS", 0),
+            slab_lex: std::env::var("CSAVES_SLAB_LEX")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
             pristine: std::env::var("CSAVES_PRISTINE")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(false),
@@ -6791,6 +6805,34 @@ impl Store {
         if !cur.is_empty() {
             groups.push(cur);
         }
+        // v0.9.106: content-similarity walk. At this point the pool is
+        // HOMOGENEOUS (the partition above recursed the mixed case away):
+        // either all tails (0x0A) or all sections. Tails keep arrival order
+        // (the sim_probe matrix priced lex at +0.26% there — the order is a
+        // pure loss for them); the SECTION pool sorts lexicographically by
+        // member body inside each slab group before the variant streams
+        // build. Canonical members lead with palette+form bytes and glob
+        // members share the registry frame, so lex clusters same-palette /
+        // same-shape members adjacently and the cold window matches their
+        // long identical prefixes and near-identical band regions. The sort
+        // is a pure content function — bodies are unique within the pool
+        // (hash-deduped candidates), so the compare never ties and the
+        // order is deterministic across processes. It happens BEFORE the
+        // GLOB conversion, so registry gid assignment (first-reference
+        // order) shifts with the walk — internally consistent, roundtrip
+        // exact, and the pack->scan->pack stability gate re-derives every
+        // identity from content, not order. slab group MEMBERSHIP still
+        // follows arrival order (unchanged nondeterminism tolerance).
+        let tails_pool = groups
+            .first()
+            .and_then(|g| g.first())
+            .map(|c| c.3.first() == Some(&0x0A))
+            .unwrap_or(false);
+        if self.cfg.slab_lex && !tails_pool {
+            for g in groups.iter_mut() {
+                g.sort_by(|a, b| a.3.cmp(&b.3));
+            }
+        }
         // ---- Phase A (serial, group order): build BOTH variant streams per
         // group. The GLOB conversion order is IDENTICAL to the serial flow
         // (groups in order, members in order, same `len() <= 65536` gate per
@@ -9647,7 +9689,7 @@ pub(crate) mod glob_slab_test {
     /// sections_semantically_equal (palette-permutation and unused-state
     /// tolerant — the GLOB rebuild drops unused palette entries), every
     /// other root key exactly.
-    fn chunk_semantic_glob(a: &[u8], b: &[u8]) -> bool {
+    pub(crate) fn chunk_semantic_glob(a: &[u8], b: &[u8]) -> bool {
         let (Ok(va), Ok(vb)) = (
             fastnbt::from_bytes::<Value>(a),
             fastnbt::from_bytes::<Value>(b),
@@ -10461,6 +10503,183 @@ mod repro {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v0.9.106: the SECTION slab pool walks members in lexicographic body
+    /// order before the variant streams build — content-similarity adjacency
+    /// for the cold window (sim_probe: csec3 -6.5% standalone on the
+    /// Tectonic strata corpus, glob_g7 -16.6% / glob_g6 -2.9% on JJ; tails
+    /// priced +0.26% and keep arrival order). Pinned contract: (a) every
+    /// canon-class (csec*) member run on disk is lex-sorted — for canon
+    /// slabs the stored body IS the sort key; (b) glob/tail runs still
+    /// decode; (c) every read roundtrips through pack + reopen with the
+    /// semantic comparator; (d) the slab invariant scan stays clean.
+    ///
+    /// Corpus shape: each section draws its 20-state palette from a
+    /// DISJOINT 24-state pool, so no gid stream aligns across sections and
+    /// the GLOB variant (1 B/voxel + registry) loses the window gate to the
+    /// canon bit-packed form on every group — the stored csec* bodies are
+    /// exactly the lex sort keys. A per-chunk block_entities chest keeps
+    /// the tail pool populated (tails must stay arrival-ordered, untouched
+    /// by the sort).
+    fn lex_test_chunk(cx: i32, cz: i32, vi: usize) -> Vec<u8> {
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut sec_list = Vec::new();
+        for y in 0..24i32 {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = Vec::new();
+            let base = ((vi * 24 + y as usize) % 120) * 24;
+            for k in 0..20usize {
+                let mut c: Map<String, Value> = Map::new();
+                let id = base + k;
+                c.insert("Name".to_string(), Value::String(format!("minecraft:lx_{id}")));
+                let mut props: Map<String, Value> = Map::new();
+                props.insert("f".to_string(), Value::String(format!("{}", k % 2)));
+                c.insert("Properties".to_string(), Value::Compound(props));
+                pal.push(Value::Compound(c));
+            }
+            bs.insert("palette".to_string(), Value::List(pal));
+            // strata voxels inside the section's own 20-state palette
+            let mut vox = [0u8; 4096];
+            for x in 0..16usize {
+                for z in 0..16usize {
+                    for yy in 0..16usize {
+                        let band = ((x + z + yy) / 4 + vi + y as usize) % 20;
+                        let speck = (x * 31 + z * 17 + yy * 7 + vi) % 19 == 0;
+                        vox[x * 256 + z * 16 + yy] =
+                            if speck { (band + 5) % 20 } else { band } as u8;
+                    }
+                }
+            }
+            // vanilla width for a 20-state palette: ceil(log2(20)) = 5 bits
+            let vbits = ((20u32 - 1).ilog2() + 1).max(4);
+            let data = chunknbt::dense_to_nostroddle(&vox, 4096, 8, vbits);
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        let mut be = Vec::new();
+        let mut chest: Map<String, Value> = Map::new();
+        chest.insert("id".to_string(), Value::String("minecraft:chest".to_string()));
+        chest.insert("x".to_string(), Value::Int(cx * 16 + 5));
+        chest.insert("y".to_string(), Value::Int(64));
+        chest.insert("z".to_string(), Value::Int(cz * 16 + 5));
+        // > tail_blob_min (512 B) so the chest becomes a real tail-blob
+        // member instead of riding inline in the recipe body
+        let items: Vec<Value> = (0..48)
+            .map(|i| {
+                let mut it: Map<String, Value> = Map::new();
+                it.insert("Slot".to_string(), Value::Byte(i as i8));
+                it.insert(
+                    "id".to_string(),
+                    Value::String(format!("minecraft:stone_{:04}", (vi * 48 + i) % 997)),
+                );
+                it.insert("Count".to_string(), Value::Byte(1));
+                Value::Compound(it)
+            })
+            .collect();
+        chest.insert("Items".to_string(), Value::List(items));
+        be.push(Value::Compound(chest));
+        root.insert("block_entities".to_string(), Value::List(be));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn slab_lex_section_walk_sorted_and_roundtrip() {
+        // the walk contract assumes the NATURAL window gate (canon wins on
+        // the disjoint-palette corpus): the GLOB tests flip the process-
+        // global FORCE_GLOB_TEST static, which would push every group of
+        // THIS test's pack into the glob variant mid-flight — take their
+        // lock for the whole test.
+        let _g = glob_slab_test::tests_glob_lock();
+        let dir = temp_dir("slab-lex-a");
+        let cfg = Cfg {
+            slab_max_raw: 256 * 1024, // several slab groups from 48 chunks
+            ..bench_cfg()
+        };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        let n = 48usize;
+        let payloads: Vec<Vec<u8>> = (0..n)
+            .map(|i| lex_test_chunk((i % 7) as i32, (i / 7) as i32, i))
+            .collect();
+        for (i, p) in payloads.iter().enumerate() {
+            s.write_chunk(i as u64, p, false).unwrap();
+        }
+        s.request_pack();
+        let mut steps = 0;
+        while s.compact_step() {
+            steps += 1;
+            assert!(steps < 500, "drain did not converge ({steps} steps)");
+        }
+        // (a) canon-class members are lex-sorted WITHIN each slab (the disk
+        // walk is per-slab; a flat run could merge several sorted slabs).
+        // For canon slabs the stored body IS the sort key. Glob slabs store
+        // gid streams — their adjacency follows the same sorted walk but the
+        // stored bytes are not the keys, so only presence is asserted there.
+        let walks = s.slab_disk_walk();
+        let mut csec_slabs = 0usize;
+        let mut glob_members = 0usize;
+        let mut tail_members = 0usize;
+        for w in &walks {
+            if w.failed {
+                continue;
+            }
+            let first = w.members.first().map(|(c, _)| c.clone()).unwrap_or_default();
+            if first.starts_with("csec") {
+                for (idx, win) in w.members.windows(2).enumerate() {
+                    if win[0].1 > win[1].1 {
+                        panic!(
+                            "canon slab walk not lex-sorted: n={} idx={} a_len={} b_len={} a_head={:02x?} b_head={:02x?}",
+                            w.members.len(),
+                            idx,
+                            win[0].1.len(),
+                            win[1].1.len(),
+                            &win[0].1[..win[0].1.len().min(16)],
+                            &win[1].1[..win[1].1.len().min(16)]
+                        );
+                    }
+                }
+                csec_slabs += 1;
+            }
+            for (cls, _) in &w.members {
+                if cls.starts_with("glob") {
+                    glob_members += 1;
+                } else if cls == "tail_nbt" {
+                    tail_members += 1;
+                }
+            }
+        }
+        assert!(csec_slabs > 0, "no canon slab walked");
+        assert!(tail_members > 0, "corpus produced no tail members");
+        // (b)+(c) reads roundtrip after the reordered walk — the comparator
+        // must be palette-permutation-safe: the canonical CSEC re-encode
+        // reorders palettes by frequency, so a strict root compare would
+        // reject honest reads (same reason chunk_semantic_glob exists).
+        for (k, p) in payloads.iter().enumerate() {
+            let got = s.read_chunk(k as u64).expect("post-drain read");
+            assert!(
+                glob_slab_test::chunk_semantic_glob(&got, p),
+                "post-drain mismatch chunk {k}"
+            );
+        }
+        assert!(
+            s.slab_invariant_scan().is_empty(),
+            "slab invariant violations after lex walk"
+        );
+        drop(s);
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        for (k, p) in payloads.iter().enumerate() {
+            let got = s.read_chunk(k as u64).expect("reopen read");
+            assert!(
+                glob_slab_test::chunk_semantic_glob(&got, p),
+                "reopen mismatch chunk {k}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Pack-pass zstd-MT (intra-frame nbWorkers): same input + level +
     /// worker count compresses deterministically, decodes with the stock
     /// single-threaded decoder, and worker-count variants stay
@@ -10494,6 +10713,7 @@ mod repro {
             slab_max_raw: 2 * 1024 * 1024,
             pack_mt_min: 512 * 1024,
             pack_mt_workers: 2,
+            slab_lex: true,
             ..Cfg::default()
         };
         let s = Store::open_cfg(&dir, true, cfg).unwrap();
