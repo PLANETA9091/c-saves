@@ -352,21 +352,33 @@ fn tree_section(tv: u64) -> Value {
 }
 
 /// mountain mid band: stone/andesite/gravel bands over a SMOOTH gradient
-/// (real Tectonic ridges are smooth — the band pattern runs in long rows;
-/// per-column hash noise would overstate section uniqueness)
+/// (real Tectonic ridges are smooth — the band pattern runs in long rows).
+/// v0.9.110 corpus calibration: the intrusions are VEIN-CLUSTERED — vanilla
+/// worldgen lays gravel/andesite as CONTIGUOUS blobs (VeinSize 8-32), not
+/// per-column white noise; the white model overstated strata entropy (the
+/// LZ window lost a match every ~25 columns to an isolated literal). 1-3
+/// vein blobs per section, radius 2-4 columns, deterministic per chunk.
 fn mountain_band_section(y: i32, cx: i32, cz: i32) -> Value {
     let (gx, gz) = ridge_gradient(cx, cz);
+    let vein_n = (h2(cx, cz, 0xB2) % 3) as i32 + 1;
+    let mut veins: Vec<(i32, i32, i32)> = Vec::with_capacity(vein_n as usize);
+    for v in 0..vein_n {
+        let h = h2(cx, cz, 0xB3 + v as u64);
+        veins.push(((h % 16) as i32, ((h >> 8) % 16) as i32, 2 + ((h >> 16) % 3) as i32));
+    }
     let mut vals = vec![0u8; 4096];
     for (i, v) in vals.iter_mut().enumerate() {
         let x = (i & 15) as i32;
         let z = ((i >> 4) & 15) as i32;
         let yy = (i >> 8) as i32;
-        // band boundary drifts smoothly across the section; rare deterministic
-        // intrusions (gravel pockets) stay sparse like real mountain rock
+        // band boundary drifts smoothly across the section; the gravel veins
+        // cluster like vanilla worldgen blobs
         let band = yy * 4 + ((x - 8) * gx + (z - 8) * gz) / 4;
-        let r = h2(cx * 16 + x, cz * 16 + z, 0xB1 + yy as u64) % 100;
-        *v = if r < 4 {
-            2 // sparse gravel pocket
+        let in_vein = veins
+            .iter()
+            .any(|(vx, vz, r)| (x - vx) * (x - vx) + (z - vz) * (z - vz) <= r * r);
+        *v = if in_vein {
+            2 // gravel vein blob
         } else if band % 7 < 2 {
             1 // andesite stratum
         } else {
@@ -385,17 +397,30 @@ fn ridge_gradient(cx: i32, cz: i32) -> (i32, i32) {
 
 /// mountain surface section: ridge top at row `top`; the top boundary
 /// drifts SMOOTHLY across x/z (integer gradient — real ridges are smooth
-/// lines, not per-column noise); snow cap above y=144.
+/// lines); v0.9.110: the dips cluster into 1-2 erosion arcs per chunk
+/// (real erosion gullies are contiguous, not per-column noise); snow cap
+/// above y=144.
 fn mountain_surface_section(y: i32, cx: i32, cz: i32, top: usize, snow: bool) -> Value {
     let top = top as i32;
     let (gx, gz) = ridge_gradient(cx, cz);
+    // erosion dips: 1-2 arcs of contiguous columns (a gully cross-section),
+    // deterministic per chunk
+    let dip_n = (h2(cx, cz, 0x51E) % 2) as i32 + 1;
+    let mut dips: Vec<(i32, i32, i32)> = Vec::with_capacity(dip_n as usize); // (x, z, radius)
+    for v in 0..dip_n {
+        let h = h2(cx, cz, 0x51F + v as u64);
+        dips.push(((h % 16) as i32, ((h >> 8) % 16) as i32, 1 + ((h >> 16) % 2) as i32));
+    }
     let mut vals = vec![3u8; 4096]; // air above the ridge
     for (i, v) in vals.iter_mut().enumerate() {
         let x = (i & 15) as i32;
         let z = ((i >> 4) & 15) as i32;
         let yy = (i >> 8) as i32;
-        // smooth boundary drift across the section + rare deterministic dips
-        let d = ((x - 8) * gx + (z - 8) * gz) / 6 + if h2(cx * 16 + x, cz * 16 + z, 0x51F) % 100 < 8 { -1 } else { 0 };
+        // smooth boundary drift across the section + clustered erosion dips
+        let in_dip = dips
+            .iter()
+            .any(|(dx, dz, r)| (x - dx) * (x - dx) + (z - dz) * (z - dz) <= r * r);
+        let d = ((x - 8) * gx + (z - 8) * gz) / 6 + if in_dip { -1 } else { 0 };
         let t = top + d;
         *v = if yy > t {
             3
