@@ -426,8 +426,12 @@ fn main() {
     println!("SPEED pack: {:.2}s", t0.elapsed().as_secs_f64());
     println!("SPEED pack-census: {}", c_saves::store::pack_census_json());
     let container = st_r.disk_bytes() + st_e.disk_bytes();
+    // v0.9.107: the HONEST shipped weight — segments + dict/state files.
+    // The dict files prune at close (0.9.107), but a live store still
+    // carries them; the CI logs now show both numbers.
+    let full_container = st_r.full_disk_bytes() + st_e.full_disk_bytes();
     println!(
-        "SPEED container: c-saves {:.2} MiB (anvil sector-padded {:.2} MiB, x{:.2} smaller)",
+        "SPEED container: c-saves {:.2} MiB (anvil sector-padded {:.2} MiB, x{:.2} smaller) [full incl. dicts+states: {:.2} MiB]",
         container as f64 / 1_048_576.0,
         {
             let mut anvil = 0u64;
@@ -450,8 +454,10 @@ fn main() {
                 anvil += 8192 + sectors * 4096;
             }
             anvil as f64 / container.max(1) as f64
-        }
+        },
+        full_container as f64 / 1_048_576.0,
     );
+    println!("SPEED tail-census: region={}", st_r.tail_census_json());
 
     // container identity fingerprint: content hash over every container
     // file, sorted by path — cross-version byte-identity gate (the drained
