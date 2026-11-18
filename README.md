@@ -2141,6 +2141,13 @@ all stall points are captured as CI artifacts.
   no dictionary for whole-mode stores (measured net loss), frequency-only
   cold-tier recompression.
 
+* **The huge-world contract** — a Tectonic-shaped pregen calibrated to
+  vanilla vein worldgen drains to **14.8 B/chunk (x276 vs Anvil zlib-9)**
+  on the 96x96 corpus; the 384x384 full-mix average is 15.4 B/chunk, so a
+  20k x 20k world (400M chunks) projects to **~5.7 GiB vs Anvil's
+  ~1.49 TiB (x266)** — real stored content, no seed-regeneration
+  (`tectonic_probe` / `tectonic_scale_probe`).
+
 ## Verification
 
 Every import and pack pass is followed by semantic chunk verification
@@ -2149,8 +2156,13 @@ gate fails on any drift (`bad=0` required).
 
 ## CI
 
-* `bench` — unit tests (24), synthetic size gate (compact <= 15% of Anvil),
-  JJThunder corpus gate (bad=0, ratio >= 2.6x).
+* `bench` — twelve jobs on every push: unit tests (112), size gate (compact
+  <= 15% of Anvil), pristine/scale/play/JVM/serve/worst-case gates, the
+  JJThunder corpus gate (bad=0, ratio >= 2.6x), speed and real-export
+  benches. The container lines report BOTH weights since v0.9.107: the
+  segment bytes and the honest shipped weight (segments + dictionary +
+  state files; the dictionary prunes itself at close, see the lifecycle
+  note in `module.json`).
 * `bigworld` (manual dispatch) — generates a full 512x512-chunk JJThunder
   world on 16 parallel runners (128x128-chunk tiles), spawns 20k entities in
   the merged world and publishes the Anvil-vs-c-saves comparison. See
