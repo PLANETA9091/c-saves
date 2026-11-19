@@ -1057,6 +1057,11 @@ struct BatchJob {
     /// identical recipes share one slice; pregen oceans collapse).
     m: u32,
     stream: Arc<Vec<u8>>,
+    /// v0.9.112: the record kind — 0x0B (fixed-width key/index columns,
+    /// zstd-6) or 0x0C (varint delta-key column + varint body index,
+    /// zstd-19; measured -38% on the real nether batch stream: 15,141 ->
+    /// 9,420 B for 7,776 entries). Old containers decode forever.
+    kind: u8,
 }
 
 /// The batch handoff queue + its thread. The write path pushes at the
@@ -3543,11 +3548,16 @@ impl Store {
                                 }
                             }
                         }
-                        0x0B => {
-                            // v0.9.102 body-dedup batch:
-                            // [0x0B][u32 n][u32 m][u32 cl][u32 raw]{stream}
-                            // stream = [u64 key]×n ++ [u32 body_idx]×n ++
-                            // [u16 len]×m ++ concat(unique bodies).
+                        kb @ (0x0B | 0x0C) => {
+                            // v0.9.102 body-dedup batch; v0.9.112 adds the
+                            // varint-dense 0x0C layout:
+                            // [kind][u32 n][u32 m][u32 cl][u32 raw]{stream}
+                            // 0x0B stream = [u64 key]×n ++ [u32 body_idx]×n ++
+                            //   [u16 len]×m ++ concat(unique bodies).
+                            // 0x0C stream = [varint key0][varint key-delta]×(n-1)
+                            //   ++ [varint body_idx]×n ++ [u16 len]×m ++ concat
+                            //   (unique bodies) — the group was key-sorted at
+                            //   flush, so deltas are unsigned.
                             if body.len() < 17 {
                                 false
                             } else {
@@ -3567,26 +3577,64 @@ impl Store {
                                             let mut idxs = Vec::with_capacity(n);
                                             let mut lens = Vec::with_capacity(m.min(n));
                                             let mut p = 0usize;
-                                            for _ in 0..n {
-                                                if p + 8 > raw.len() {
-                                                    ok = false;
-                                                    break;
+                                            if kb == 0x0C {
+                                                // v0.9.112 varint columns: the
+                                                // key column is ABSOLUTE first
+                                                // value + unsigned deltas (the
+                                                // flush sorts by key), the index
+                                                // column is plain varint
+                                                let mut acc = 0u64;
+                                                for i in 0..n {
+                                                    let (v, np) = match Self::read_varint(&raw[p..]) {
+                                                        Some(x) => x,
+                                                        None => {
+                                                            ok = false;
+                                                            break;
+                                                        }
+                                                    };
+                                                    p += np;
+                                                    acc = if i == 0 {
+                                                        v
+                                                    } else {
+                                                        acc.wrapping_add(v)
+                                                    };
+                                                    keys.push(acc);
                                                 }
-                                                keys.push(u64::from_le_bytes(
-                                                    raw[p..p + 8].try_into().unwrap(),
-                                                ));
-                                                p += 8;
-                                            }
-                                            if ok {
+                                                if ok {
+                                                    for _ in 0..n {
+                                                        let (v, np) = match Self::read_varint(&raw[p..]) {
+                                                            Some(x) => x,
+                                                            None => {
+                                                                ok = false;
+                                                                break;
+                                                            }
+                                                        };
+                                                        p += np;
+                                                        idxs.push(v as u32);
+                                                    }
+                                                }
+                                            } else {
                                                 for _ in 0..n {
-                                                    if p + 4 > raw.len() {
+                                                    if p + 8 > raw.len() {
                                                         ok = false;
                                                         break;
                                                     }
-                                                    idxs.push(u32::from_le_bytes(
-                                                        raw[p..p + 4].try_into().unwrap(),
+                                                    keys.push(u64::from_le_bytes(
+                                                        raw[p..p + 8].try_into().unwrap(),
                                                     ));
-                                                    p += 4;
+                                                    p += 8;
+                                                }
+                                                if ok {
+                                                    for _ in 0..n {
+                                                        if p + 4 > raw.len() {
+                                                            ok = false;
+                                                            break;
+                                                        }
+                                                        idxs.push(u32::from_le_bytes(
+                                                            raw[p..p + 4].try_into().unwrap(),
+                                                        ));
+                                                        p += 4;
+                                                    }
                                                 }
                                             }
                                             if ok {
@@ -3765,7 +3813,7 @@ impl Store {
         // (17 B). Both streams slice identically per (soff, rl).
         let hlen = match kind {
             9 => 13usize,
-            0x0B => 17usize,
+            0x0B | 0x0C => 17usize,
             _ => return None,
         };
         let hdr = self.seg_read_body(seg, boff, hlen)?;
@@ -3903,6 +3951,14 @@ impl Store {
                     // the run lever for pregen worlds at zero read cost.
                     // kind-0x0B stream: [u64 key]×n ++ [u32 body_idx]×n ++
                     // [u16 len]×m ++ concat(unique [0xFF][recipe]).
+                    // kind-0x0C stream (v0.9.112, CSAVES_BATCH_VARINT=0
+                    // opts out): [varint key0][varint key-delta]×(n-1) ++
+                    // [varint body_idx]×n ++ [u16 len]×m ++ concat(unique
+                    // bodies) — the group is key-sorted, so the delta column
+                    // is unsigned; measured -38% compressed on the real
+                    // nether batch stream (15,141 -> 9,420 B, 7,776
+                    // entries) and compressed at zstd-19 off the write path
+                    // (the batcher thread owns the compression window).
                     let mut uniq: Vec<(u128, u16)> = Vec::with_capacity(n); // (body hash, len)
                     let mut seen: HashMap<u128, u32> = HashMap::with_capacity(n);
                     let mut idxs: Vec<u32> = Vec::with_capacity(n);
@@ -3920,19 +3976,51 @@ impl Store {
                         idxs.push(ix);
                     }
                     let m = uniq.len();
-                    let header_zone = (8 * n + 4 * n + 2 * m) as u32;
+                    let varint = std::env::var("CSAVES_BATCH_VARINT").as_deref() != Ok("0");
+                    let mut stream = Vec::with_capacity(BATCH_BYTES + 4096);
+                    let header_zone = if varint {
+                        // the header zone size depends on the varint column
+                        // lengths — build them first, then derive the soffs
+                        let mut keys_v = Vec::with_capacity(2 * n);
+                        let mut prev = 0u64;
+                        for (i, (k, _)) in group.iter().enumerate() {
+                            let v = if i == 0 { *k } else { k.wrapping_sub(prev) };
+                            let mut x = v;
+                            while x >= 0x80 {
+                                keys_v.push((x as u8) | 0x80);
+                                x >>= 7;
+                            }
+                            keys_v.push(x as u8);
+                            prev = *k;
+                        }
+                        let mut idxs_v = Vec::with_capacity(2 * n);
+                        for ix in &idxs {
+                            let mut x = *ix as u64;
+                            while x >= 0x80 {
+                                idxs_v.push((x as u8) | 0x80);
+                                x >>= 7;
+                            }
+                            idxs_v.push(x as u8);
+                        }
+                        let hz = (keys_v.len() + idxs_v.len() + 2 * m) as u32;
+                        stream.extend_from_slice(&keys_v);
+                        stream.extend_from_slice(&idxs_v);
+                        hz
+                    } else {
+                        let hz = (8 * n + 4 * n + 2 * m) as u32;
+                        for (k, _) in &group {
+                            stream.extend_from_slice(&k.to_le_bytes());
+                        }
+                        for ix in &idxs {
+                            stream.extend_from_slice(&ix.to_le_bytes());
+                        }
+                        hz
+                    };
                     let mut soffs = Vec::with_capacity(m);
                     let mut so = header_zone;
                     for (_, l) in &uniq {
                         soffs.push(so);
                         so += *l as u32;
-                    }
-                    let mut stream = Vec::with_capacity(BATCH_BYTES + 4096);
-                    for (k, _) in &group {
-                        stream.extend_from_slice(&k.to_le_bytes());
-                    }
-                    for ix in &idxs {
-                        stream.extend_from_slice(&ix.to_le_bytes());
                     }
                     for (_, l) in &uniq {
                         stream.extend_from_slice(&l.to_le_bytes());
@@ -3950,7 +4038,8 @@ impl Store {
                         keys.push(k);
                         arcs.push(a);
                     }
-                    BatchJob { keys, arcs, starts, m: m as u32, stream: Arc::new(stream) }
+                    let kind = if varint { 0x0Cu8 } else { 0x0Bu8 };
+                    BatchJob { keys, arcs, starts, m: m as u32, stream: Arc::new(stream), kind }
                 })
                 .collect()
         };
@@ -3963,6 +4052,25 @@ impl Store {
         }
     }
 
+    /// v0.9.112: LEB128-style unsigned varint read for the 0x0C batch
+    /// columns. Returns (value, bytes consumed); None on a truncated or
+    /// overlong encoding.
+    fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
+        let mut v = 0u64;
+        let mut sh = 0u32;
+        for (i, b) in buf.iter().enumerate() {
+            v |= ((b & 0x7F) as u64) << sh;
+            if b & 0x80 == 0 {
+                return Some((v, i + 1));
+            }
+            sh += 7;
+            if sh >= 64 {
+                return None;
+            }
+        }
+        None
+    }
+
     /// Commit one handed-off batch: compress, append the kind-9 record,
     /// re-point chunks + batch_idx, retire the pending entries that are
     /// still the handoff snapshot. Runs on the batcher thread. On an append
@@ -3972,19 +4080,21 @@ impl Store {
     fn commit_batch_job(&self, job: &BatchJob) -> Result<(), String> {
         let n = job.keys.len();
         let raw_total = job.stream.len() as u32;
-        // z6: the recipe flush used to run in the WRITE thread's critical
-        // path; z19 there ate ~49% of fresh-import wall time in sync pauses
-        // (measured via SPEED stages-import on the JJ corpus). Container
-        // cost of z6 vs z19 on these streams is a few %; section/BE
-        // payload bytes are re-tiered at the cold level by the pack pass.
-        let (dict_id, comp) =
-            self.compress_tier_level(&job.stream, self.cfg.recipe_level);
+        // z6 for the fixed-width 0x0B streams: the recipe flush used to run
+        // in the WRITE thread's critical path; z19 there ate ~49% of
+        // fresh-import wall time in sync pauses (measured via SPEED
+        // stages-import on the JJ corpus). v0.9.112: 0x0C streams are
+        // varint-dense AND compressed on the batcher thread (off the write
+        // path since v0.9.72, drain sites only wait bounded), so they take
+        // z19 outright — measured -38% vs the 0x0B z6 stream.
+        let lvl = if job.kind == 0x0C { 19 } else { self.cfg.recipe_level };
+        let (dict_id, comp) = self.compress_tier_level(&job.stream, lvl);
         debug_assert_eq!(dict_id, 0);
-        // v0.9.102: kind-0x0B record — the body-dedup batch wire.
-        // [0x0B][u32 n][u32 m][u32 cl][u32 raw]{stream}; kind 9 (per-entry
+        // v0.9.102/112: kind-0x0B/0x0C records — the body-dedup batch wires.
+        // [kind][u32 n][u32 m][u32 cl][u32 raw]{stream}; kind 9 (per-entry
         // bodies) stays valid forever, old containers decode unchanged.
         let mut body = Vec::with_capacity(17 + comp.len());
-        body.push(0x0Bu8);
+        body.push(job.kind);
         body.extend_from_slice(&(n as u32).to_le_bytes());
         body.extend_from_slice(&job.m.to_le_bytes());
         body.extend_from_slice(&(comp.len() as u32).to_le_bytes());
@@ -6398,11 +6508,11 @@ impl Store {
         let segs = self.segs.read();
         let s = segs.get(&seg)?;
         let sealed = !is_writer;
-        // v0.9.102: kind dispatch — kind 9 header 13 B, kind 0x0B 17 B.
+        // v0.9.102: kind dispatch — kind 9 header 13 B, kind 0x0B/0x0C 17 B.
         let kindb = s.read_at(boff, 1, sealed)?;
         let hlen = match kindb.first().copied()? {
             9 => 13usize,
-            0x0B => 17usize,
+            0x0B | 0x0C => 17usize,
             _ => return None,
         };
         let hdr = s.read_at(boff, hlen, sealed)?;
@@ -8085,12 +8195,12 @@ impl Store {
             let referenced = match base {
                 4 => blob_recs.contains(&(seg_id, body_at)),
                 8 => slab_recs.contains(&(seg_id, body_at)),
-                9 | 0x0B => batch_recs.contains(&(seg_id, body_at)),
+                9 | 0x0B | 0x0C => batch_recs.contains(&(seg_id, body_at)),
                 2 | 0x3F => bare_recs.contains(&(seg_id, body_at)), // bare recipe (0xFF) / legacy form (2)
                 // key-intern (6) and unknown kinds: conservative — live
                 _ => true,
             };
-            if referenced || !matches!(base, 4 | 8 | 9 | 0x0B | 2 | 0x3F) {
+            if referenced || !matches!(base, 4 | 8 | 9 | 0x0B | 0x0C | 2 | 0x3F) {
                 phys += 8 + blen;
             }
             off += 8 + blen;
@@ -8485,7 +8595,7 @@ impl Store {
                 };
                 let hlen = match kindb.first().copied().unwrap_or(0) {
                     9 => 13usize,
-                    0x0B => 17usize,
+                    0x0B | 0x0C => 17usize,
                     k => {
                         eprintln!("[c-saves] LEAK: unknown batch kind {k} key={key:016x}");
                         mark_broken();

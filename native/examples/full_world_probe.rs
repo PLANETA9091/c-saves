@@ -233,12 +233,43 @@ fn main() {
         );
         println!("   attribution: {}", st.slab_member_attribution_json());
         println!("   profile: {}", st.profile_json());
+        // v0.9.112: the reopen gate — drop the store, open it fresh, verify
+        // every chunk again. The reopen rebuilds the batch index by walking
+        // the 0x0B/0x0C record streams; a decode bug here TRUNCATES the
+        // segment at the first bad record (the scan's poison-guard) — this
+        // gate exists to catch exactly that before it can ship.
+        drop(st);
+        let st = Store::open_cfg(&store_dir, true, Cfg::from_env()).unwrap();
+        let (rok_s, rmiss) = (0usize, 0usize);
+        let mut rok_s = rok_s;
+        let mut rmiss = rmiss;
+        for &k in &keys {
+            let want = &payloads[by_key[&k]].1;
+            match st.read_chunk(k) {
+                Some(got) => {
+                    if chunks_semantic(want, &got) {
+                        rok_s += 1;
+                    }
+                }
+                None => rmiss += 1,
+            }
+        }
+        println!(
+            "   reopen verify: {}/{} semantic (miss={})",
+            rok_s,
+            payloads.len(),
+            rmiss
+        );
+        let (ok_s, miss) = (rok_s, rmiss);
         verify_line = if verify_line.is_empty() {
             format!("{} {}/{}", name, ok_s, payloads.len())
         } else {
             format!("{} | {} {}/{}", verify_line, name, ok_s, payloads.len())
         };
         drop(st);
+        if rok_s + rmiss != payloads.len() || rok_s != payloads.len() {
+            println!("   reopen gate: FAIL ({} ok, {} miss of {})", rok_s, rmiss, payloads.len());
+        }
         stats.push(DimStat {
             name,
             chunks: payloads.len(),
@@ -329,12 +360,14 @@ fn main() {
         pa_all * dims_n / pc_all.max(0.000001),
     );
 
-    // 8) the pass verdict: every chunk of every dimension verified
+    // 8) the pass verdict: every chunk of every dimension verified on the
+    // live store AND after a fresh reopen
     let bad_all: usize = stats.iter().map(|s| s.chunks - s.ok_s).sum();
     let miss_all: usize = stats.iter().map(|s| s.miss).sum();
     println!("total probe time {:.1?}", t_all.elapsed());
     if bad_all == 0 && miss_all == 0 {
         println!("verify: {} — bad=0 miss=0", verify_line);
+        println!("reopen: {} — bad=0 miss=0", verify_line);
         println!("=== full-world probe: PASS ===");
     } else {
         println!(
