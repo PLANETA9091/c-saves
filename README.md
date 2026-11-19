@@ -2167,13 +2167,27 @@ all stall points are captured as CI artifacts.
   Anvil's per-chunk sector floor (1 sector = 4 KiB even for a fully
   empty chunk) is measured, not assumed — every dimension weighs the
   same 4104 B/chunk on disk, so the c-saves ratios differ by terrain
-  mass alone. Projections (linear in chunks, the scaling law measured
-  on the 384x384 rings): a 40000x40000-BLOCK world (2500x2500 chunks per
-  dimension — the onlinemo.de/world `overworld=40000` input) stores at
-  **~149 MiB for all three dimensions** (overworld-only ~96 MiB against
-  the calculator's 50 GB estimate); a 20000x20000-CHUNK world (400M
-  chunks per dimension) stores at **~9.3 GiB vs ~4.48 TiB across the
-  three dimensions** (`full_world_probe`, CI-gated).
+  mass alone. At the larger 192x192 footprint (the drain fully reclaimed,
+  see the v0.9.111 GC fix below) the honest per-chunk average tightens:
+  overworld 13.6, nether **2.6** (x1601), end 4.9 — **7.0 B/chunk across
+  all three dimensions (x585, x0.0017 of Anvil)**. Projections (linear in
+  chunks, the scaling law measured on the 384x384 rings): a
+  40000x40000-BLOCK world (2500x2500 chunks per dimension — the
+  onlinemo.de/world `overworld=40000` input) stores at **~125 MiB for all
+  three dimensions** (overworld-only ~81 MiB against the calculator's
+  50 GB estimate); a 20000x20000-CHUNK world (400M chunks per dimension)
+  stores at **~7.8 GiB vs ~4.48 TiB across the three dimensions**
+  (`full_world_probe`, CI-gated).
+
+* **The physical GC contract (v0.9.111)** — the batch virtual credit
+  (v0.9.103) inflated segments' live counters above their physical totals,
+  and the dead-ratio formula read 0.229 on a segment that was 81%
+  physically dead (255,717 B of superseded hot blobs shipped in the
+  drained nether container — 9.3 B/chunk instead of the honest 1.9); the
+  GC stalled on every step. The ratio now walks the segment's records and
+  counts only bytes at least one live pointer still references — the
+  regression test's stall geometry reclaims 0% pre-fix, full reclaim
+  post-fix (JJ region −1.4% as a side effect).
 
 ## Verification
 

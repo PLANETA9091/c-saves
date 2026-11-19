@@ -8001,6 +8001,106 @@ impl Store {
         self.compact_step_inner()
     }
 
+    /// v0.9.111: the PHYSICALLY-live bytes of a segment — records that at
+    /// least one live pointer still references, at their physical sizes
+    /// (framing + header + compressed body). The dead ratio must be
+    /// physical: the old formula (1 - live/(total+virt_extra)) compared
+    /// the VIRTUALIZED live counter — batch commits credit the segment
+    /// with Σ(8+recipe) of virtual bytes (v0.9.103) — so a segment holding
+    /// live batch records plus superseded blobs computed a tiny dead
+    /// ratio while being mostly dead on disk. Measured on the 192x192
+    /// full-dimension nether import: seg-00001 carried live=858,859 vs
+    /// total=316,072, the formula read 0.229 < the 0.25 gate, and the GC
+    /// stalled every step — the drained container shipped 255,717 B of
+    /// physically-dead hot blobs (81% of the segment): 9.3 B/chunk
+    /// instead of the honest 1.9. The walk below is exact for blobs
+    /// (hash-located in the blobs map), slabs (shared records deduped by
+    /// (seg,off)) and batch/bare recipes (distinct records from the
+    /// chunks map), and conservative (live) for key-intern (kind-6) and
+    /// unknown records — correctness over reclaim, the poison-guard rule.
+    /// phys_live <= total by construction, so the v0.9.103 negative-ratio
+    /// stall (virtual live > total) is structurally impossible and the
+    /// denominator trick is gone.
+    fn seg_phys_live(&self, seg_id: u32) -> u64 {
+        let mut blob_recs: std::collections::HashSet<(u32, u64)> =
+            std::collections::HashSet::new();
+        let mut slab_recs: std::collections::HashSet<(u32, u64)> =
+            std::collections::HashSet::new();
+        {
+            let blobs = self.blobs.read();
+            for l in blobs.values() {
+                if l.seg != seg_id {
+                    continue;
+                }
+                if l.slab {
+                    slab_recs.insert((l.seg, l.off));
+                } else {
+                    blob_recs.insert((l.seg, l.off));
+                }
+            }
+        }
+        let mut batch_recs: std::collections::HashSet<(u32, u64)> =
+            std::collections::HashSet::new();
+        let mut bare_recs: std::collections::HashSet<(u32, u64)> =
+            std::collections::HashSet::new();
+        {
+            let chunks = self.chunks.read();
+            for (s, o, l) in chunks.values() {
+                if *s != seg_id {
+                    continue;
+                }
+                if *l == BATCHED {
+                    batch_recs.insert((*s, *o));
+                } else {
+                    bare_recs.insert((*s, *o));
+                }
+            }
+        }
+        let total = match self.segs.read().get(&seg_id) {
+            Some(s) => s.total.load(Ordering::Relaxed),
+            None => return 0,
+        };
+        let mut phys = 0u64;
+        let mut off = 0u64;
+        while off + 9 <= total {
+            let hdr = {
+                let segs = self.segs.read();
+                let Some(seg) = segs.get(&seg_id) else { return phys };
+                match seg.read_at(off, 9, true) {
+                    Some(h) => h,
+                    None => return total, // unreadable: treat ALL as live
+                }
+            };
+            let blen = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as u64;
+            if blen == 0 || off + 8 + blen > total {
+                // malformed tail: the walk cannot classify the rest —
+                // treat the whole segment as live (never overstate death)
+                return total;
+            }
+            // the pointer maps store BODY offsets (framing + 8 — the append
+            // return value); the walk visits framing starts
+            let body_at = off + 8;
+            let kind = hdr[8];
+            let base = kind & 0x3F; // strip the hot (0x40) / hashless (0x80) flags
+            let referenced = match base {
+                4 => blob_recs.contains(&(seg_id, body_at)),
+                8 => slab_recs.contains(&(seg_id, body_at)),
+                9 | 0x0B => batch_recs.contains(&(seg_id, body_at)),
+                2 | 0x3F => bare_recs.contains(&(seg_id, body_at)), // bare recipe (0xFF) / legacy form (2)
+                // key-intern (6) and unknown kinds: conservative — live
+                _ => true,
+            };
+            if referenced || !matches!(base, 4 | 8 | 9 | 0x0B | 2 | 0x3F) {
+                phys += 8 + blen;
+            }
+            off += 8 + blen;
+        }
+        if off != total {
+            return total; // walk did not classify the whole segment
+        }
+        phys
+    }
+
     fn compact_step_inner(&self) -> bool {
         self.train_dict_if_needed();
         self.flush_recipe_batch();
@@ -8023,17 +8123,15 @@ impl Store {
                 let total = s.total.load(Ordering::Relaxed);
                 let live = s.live.load(Ordering::Relaxed);
                 if total > self.cfg.compact_min {
-                    // v0.9.103: the denominator includes the segment's batch
-                    // virtual credit — live may legitimately exceed the
-                    // physical total (fat inline-tail bodies), and comparing
-                    // logical live against physical total made the ratio go
-                    // negative and stalled dead-ratio compaction forever on
-                    // import-heavy workloads.
-                    let denom = total + s.virt_extra.load(Ordering::Relaxed);
-                    let r = 1.0 - live as f64 / denom as f64;
+                    // v0.9.111: the ratio is PHYSICAL (seg_phys_live walk).
+                    // The old virtualized ratio (1 - live/(total+virt_extra))
+                    // read 0.229 on an 81%-dead segment and the GC stalled —
+                    // see seg_phys_live for the full measurement.
+                    let plive = self.seg_phys_live(*id);
+                    let r = 1.0 - plive as f64 / total as f64;
                     if std::env::var("CSAVES_GC_DEBUG").as_deref() == Ok("1") {
                         eprintln!(
-                            "[c-saves] gc-cand seg-{id:05} total={total} live={live} virt={} dead={r:.3}",
+                            "[c-saves] gc-cand seg-{id:05} total={total} plive={plive} virt={} dead={r:.3}",
                             s.virt_extra.load(Ordering::Relaxed)
                         );
                     }
@@ -9379,6 +9477,115 @@ pub mod tests {
             let p = chunk_payload(i - 15, i - 15, 6 * 100 + i as u64);
             let got = st2.read_chunk(key(i - 15, i - 15)).expect("read post-compact reopen");
             assert!(semantic(&got, &p), "chunk {i} mismatch post-compact reopen");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.111 REGRESSION: the batch virtual credit hid physically-dead
+    /// bytes from the dead-ratio. A segment holding LIVE batch records
+    /// (virtual live = Σ(8+recipe) far above the physical bytes) plus
+    /// superseded hot blobs computed a sub-gate dead ratio (measured 0.229
+    /// < the 0.25 gate on an 81%-dead segment — the 192x192 full-dimension
+    /// nether import shipped 255,717 B of dead hot blobs, 9.3 B/chunk
+    /// instead of the honest 1.9) and the GC stalled every step. The
+    /// physical walk must reclaim them: after the pack moves the blobs out
+    /// (the exact pack_fallback path that creates the geometry), the
+    /// container must SHRINK below its pre-pack weight — pre-fix it GREW
+    /// (dead blobs kept + slabs added) — and every chunk must read back.
+    #[test]
+    fn physical_dead_ratio_reclaims_virtual_credit_stall() {
+        let dir = temp_dir("phys-gc");
+        let mut cfg = bench_cfg();
+        cfg.compact_min = 64 * 1024; // the drain's default gate
+        cfg.compact_ratio = 0.25;
+        let st = Store::open_cfg(&dir, true, cfg).unwrap();
+        // the pregen geometry that bred the stall: a handful of payload
+        // shapes shared across THOUSANDS of coordinates (ocean_bare —
+        // byte-identical chunks except the coord pair). The section blobs
+        // dedup to a few KiB while the batch virtual credit accrues
+        // Σ(8+recipe) per chunk — virtual mass ~15x the blob mass, exactly
+        // the ratio that held the nether segment at 0.229 < the 0.25 gate.
+        let shapes: Vec<Vec<u8>> = (0..8u64)
+            .map(|v| chunk_payload(0, 0, v * 1000 + 7))
+            .collect();
+        let n = 24_000usize;
+        let mut want: Vec<(u64, usize)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (cx, cz) = ((i % 200) as i32, (i / 200) as i32);
+            want.push((key(cx, cz), i % 8));
+        }
+        for (k, si) in &want {
+            st.write_chunk_import(*k, &shapes[*si]).unwrap();
+        }
+        st.sync();
+        st.seal();
+        let d0 = st.disk_bytes();
+        // the pack pass: pack_fallback moves the hot blobs into slabs in a
+        // fresh segment — the old segment is left with live batch records
+        // (virtual credit) + dead blob bytes. The physical dead ratio must
+        // fire the drop and RECLAIM; the old virtualized ratio stalled
+        // (pre-fix post >= pre: dead bytes kept + slabs added).
+        st.request_pack();
+        for _ in 0..16 {
+            if !st.compact_step() {
+                break;
+            }
+        }
+        st.sync();
+        let d1 = st.disk_bytes();
+        eprintln!(
+            "phys-gc: pre={d0} post={d1} reclaimed={} ({:.1}%)",
+            d0.saturating_sub(d1),
+            100.0 * d0.saturating_sub(d1) as f64 / d0.max(1) as f64
+        );
+        assert!(
+            d1 < d0,
+            "the pack must reclaim the physically-dead bytes: pre={d0} post={d1}"
+        );
+        // the CI verify's own contract: compound fields strict, sections
+        // palette-permutation-safe (the canonical CSEC re-encode reorders
+        // palettes by frequency — semantically neutral); the import path's
+        // isLightOn=0 insertion (v0.9.53 light-strip contract) tolerated
+        let safe = |a: &[u8], b: &[u8]| -> bool {
+            let (Ok(Value::Compound(ma0)), Ok(Value::Compound(mb))) =
+                (fastnbt::from_bytes::<Value>(a), fastnbt::from_bytes::<Value>(b))
+            else {
+                return false;
+            };
+            let mut ma = ma0.clone();
+            ma.remove("isLightOn");
+            if ma.len() != mb.len() {
+                return false;
+            }
+            for (k, va) in &ma {
+                let Some(vb) = mb.get(k) else { return false };
+                if k == "sections" {
+                    let (Value::List(la), Value::List(lb)) = (va, vb) else { return false };
+                    if la.len() != lb.len() {
+                        return false;
+                    }
+                    for (sa, sb) in la.iter().zip(lb.iter()) {
+                        if !chunknbt::sections_semantically_equal(sa, sb) {
+                            return false;
+                        }
+                    }
+                } else if va != vb {
+                    return false;
+                }
+            }
+            true
+        };
+        for (k, si) in &want {
+            let got = st.read_chunk(*k).expect("read post-gc");
+            assert!(safe(&got, &shapes[*si]), "chunk {k:016x} mismatch post-gc");
+        }
+        drop(st);
+        let cfg2 = bench_cfg();
+        let st2 = Store::open_cfg(&dir, true, cfg2).unwrap();
+        assert_eq!(st2.chunk_count(), n);
+        for (k, si) in &want {
+            let got = st2.read_chunk(*k).expect("read post-gc reopen");
+            assert!(safe(&got, &shapes[*si]), "chunk {k:016x} mismatch post-gc reopen",);
         }
         let _ = fs::remove_dir_all(&dir);
     }

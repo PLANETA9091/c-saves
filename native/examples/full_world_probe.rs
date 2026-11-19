@@ -231,6 +231,8 @@ fn main() {
             payloads.len(),
             verify_t
         );
+        println!("   attribution: {}", st.slab_member_attribution_json());
+        println!("   profile: {}", st.profile_json());
         verify_line = if verify_line.is_empty() {
             format!("{} {}/{}", name, ok_s, payloads.len())
         } else {
