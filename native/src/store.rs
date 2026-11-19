@@ -3443,7 +3443,20 @@ impl Store {
                                             }
                                             true
                                         }
-                                        None => false,
+                                        None => {
+                                            // v0.9.113: a slab parse failure used to
+                                            // fall into the torn-tail truncation
+                                            // SILENTLY — one bad record erased every
+                                            // record after it and the reopen looked
+                                            // like a partial-loss heisenbug. Name the
+                                            // record LOUDLY (seg/off/stamp/n) so the
+                                            // operator sees exactly which slab and
+                                            // stamp refused to parse.
+                                            eprintln!(
+                                                "[c-saves] scan: slab record refused to parse seg={id} off={off} stamp={dict_id:#04x} n={n} raw_total={raw_total} cl={cl} — truncating the segment here"
+                                            );
+                                            false
+                                        }
                                     }
                                 }
                             }
@@ -4912,7 +4925,17 @@ impl Store {
             dict_id,
             SLAB_CODEC_LZMA2_HYB | SLAB_CODEC_LZMA2_MT_HYB | SLAB_CODEC_ZSTD_HYB
         );
-        let raw = self.decompress(dict_id, comp, raw_total)?;
+        let raw = match self.decompress(dict_id, comp, raw_total) {
+            Some(r) => r,
+            None => {
+                // v0.9.113: name the decode failure — a silent None here turns
+                // the whole slab into a torn-tail truncation downstream.
+                eprintln!(
+                    "[c-saves] slab parse: frame decode failed stamp={dict_id:#04x} n={n} raw_total={raw_total}"
+                );
+                return None;
+            }
+        };
         let mut out = Vec::with_capacity(n);
         let mut p = 0usize;
         let bitmap: Vec<u8> = if hybrid {
@@ -4949,6 +4972,12 @@ impl Store {
         }
         let total_raw: u64 = out.iter().map(|(_, rl, _)| *rl as u64).sum();
         if raw.len() != p + total_raw as usize {
+            eprintln!(
+                "[c-saves] slab parse: length mismatch stamp={dict_id:#04x} n={n} raw={} tab={} bodies={total_raw} (expected {})",
+                raw.len(),
+                p,
+                p + total_raw as usize
+            );
             return None;
         }
         if hashless || hybrid {
@@ -4986,11 +5015,26 @@ impl Store {
                             // reproduces the original bytes bit for bit.
                             Some(direct) => match chunknbt::canonical_reencode(&direct) {
                                 Some(canon) => xxhash_rust::xxh3::xxh3_128(&canon),
-                                None => return None,
+                                None => {
+                                    eprintln!(
+                                        "[c-saves] slab parse: re-encode refused, {}-B glob member stamp={dict_id:#04x} head={:02x?}",
+                                        bytes.len(),
+                                        &bytes[..bytes.len().min(12)]
+                                    );
+                                    return None;
+                                }
                             },
                             // unresolvable gid = real corruption: fail the
                             // parse LOUDLY, never mint a wrong identity
-                            None => return None,
+                            None => {
+                                eprintln!(
+                                    "[c-saves] slab parse: reconstruction refused, {}-B glob member reg={} stamp={dict_id:#04x} head={:02x?}",
+                                    bytes.len(),
+                                    reg.len(),
+                                    &bytes[..bytes.len().min(12)],
+                                );
+                                return None;
+                            }
                         }
                     }
                     Some(&0xC7) | Some(&0xC8) | Some(&0xC9) => {
