@@ -2155,28 +2155,28 @@ all stall points are captured as CI artifacts.
   chunks, outer islands, obsidian pillars, end-city starts), each written
   as real zlib-9 Anvil region files under the vanilla layout
   (`region/`, `DIM-1/region/`, `DIM1/region/`) and imported through the
-  production path; every chunk verified semantically, bad=0 pinned by a
-  CI gate. Measured at 96x96 (full weight = segments + dicts + states):
+  production path; every chunk verified semantically on the live store
+  AND after a fresh reopen (the v0.9.112 reopen gate), bad=0 pinned by a
+  CI gate. Measured at the 192x192 scale (full weight = segments + dicts
+  + states, the drain fully reclaimed, the varint batch stream shipped):
 
       dim         anvil B/chunk   c-saves B/chunk   ratio
-      overworld   4104            16.1              x254
-      nether      4104            3.0               x1363
-      end         4104            5.9               x701
-      ALL THREE   4104            8.3               x492  (x0.0020 of Anvil)
+      overworld   4104            12.5              x328
+      nether      4104            1.8               x2301
+      end         4104            4.0               x1026
+      ALL THREE   4104            6.1               x673  (x0.0015 of Anvil)
 
   Anvil's per-chunk sector floor (1 sector = 4 KiB even for a fully
   empty chunk) is measured, not assumed — every dimension weighs the
   same 4104 B/chunk on disk, so the c-saves ratios differ by terrain
-  mass alone. At the larger 192x192 footprint (the drain fully reclaimed,
-  see the v0.9.111 GC fix below) the honest per-chunk average tightens:
-  overworld 13.6, nether **2.6** (x1601), end 4.9 — **7.0 B/chunk across
-  all three dimensions (x585, x0.0017 of Anvil)**. Projections (linear in
-  chunks, the scaling law measured on the 384x384 rings): a
-  40000x40000-BLOCK world (2500x2500 chunks per dimension — the
-  onlinemo.de/world `overworld=40000` input) stores at **~125 MiB for all
-  three dimensions** (overworld-only ~81 MiB against the calculator's
-  50 GB estimate); a 20000x20000-CHUNK world (400M chunks per dimension)
-  stores at **~7.8 GiB vs ~4.48 TiB across the three dimensions**
+  mass alone; the per-chunk cost SATURATES with scale (6.9 B/chunk at
+  256x256 = 196,608 chunks). Projections (linear in chunks, the scaling
+  law measured on the rings): a 40000x40000-BLOCK world (2500x2500
+  chunks per dimension — the onlinemo.de/world `overworld=40000` input)
+  stores at **~109 MiB for all three dimensions** (overworld-only
+  ~74 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
+  beaten ~20x); a 20000x20000-CHUNK world (400M chunks per dimension)
+  stores at **~6.8 GiB vs ~4.48 TiB across the three dimensions**
   (`full_world_probe`, CI-gated).
 
 * **The physical GC contract (v0.9.111)** — the batch virtual credit
@@ -2188,6 +2188,12 @@ all stall points are captured as CI artifacts.
   counts only bytes at least one live pointer still references — the
   regression test's stall geometry reclaims 0% pre-fix, full reclaim
   post-fix (JJ region −1.4% as a side effect).
+
+* **The varint batch contract (v0.9.112)** — kind-0x0C records store the
+  batch key column as varint absolute+unsigned-deltas and the body index
+  as varint, compressed at zstd-19 on the batcher thread: −38% on the
+  real nether batch stream (15,141 -> 9,420 B, 7,776 entries). Kind-0x0B
+  and kind-9 decode forever.
 
 ## Verification
 
