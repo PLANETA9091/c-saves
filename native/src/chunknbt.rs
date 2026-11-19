@@ -7965,7 +7965,7 @@ pub struct GlobState {
 /// Global block-state registry: state -> gid, append-only. Gid 0 is the
 /// FIRST inserted state (a valid dense index must never be confused with
 /// "absent" — the registry never stores Option gids, so 0 is fine).
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct StateRegistry {
     states: Vec<GlobState>,
     index: HashMap<GlobState, u32>,

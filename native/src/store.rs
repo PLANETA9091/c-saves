@@ -121,6 +121,24 @@ const SLAB_CODEC_ZSTD_NH: u8 = 0xF8;
 const SLAB_CODEC_LZMA2_GNH: u8 = 0xF7;
 const SLAB_CODEC_LZMA2_GMT_NH: u8 = 0xF6;
 const SLAB_CODEC_ZSTD_GNH: u8 = 0xF5;
+/// v0.9.113: PER-MEMBER HYBRID rows — the 0xF7 family's all-or-nothing
+/// GROUP gate relaxed to a PER-MEMBER one. The tab carries an n-bit bitmap
+/// at the head; bitmap-0 rows are hashless (the identity is recomputed at
+/// scan through the exact v0.9.97 derivation — glob members via registry
+/// reconstruction + canonical re-encode, canon bytes via hash_of), bitmap-1
+/// rows carry the 16 B write-time hash (the divergent class: the glob
+/// roundtrip is semantic-lossless but not byte-lossless for members whose
+/// section carries data the gid stream cannot express — dead palette
+/// entries, RLE/light forms — so their identity is NOT derivable). Census
+/// on the drained Tectonic full-dimension corpus: 912/1286 glob members
+/// pass + every canon row riding the glob slab is hash-derivable -> the
+/// overworld tab loses 21,225 of 34,760 raw bytes (the hash column is the
+/// near-incompressible part) ~ -19.5% of the cold overworld stamp. The
+/// all-stable case keeps minting 0xF7 (no bitmap), the all-divergent case
+/// keeps 0xFC/0xFD (full column), CSAVES_SLAB_HASHES=0 keeps the old wire.
+const SLAB_CODEC_LZMA2_HYB: u8 = 0xF4;
+const SLAB_CODEC_LZMA2_MT_HYB: u8 = 0xF3;
+const SLAB_CODEC_ZSTD_HYB: u8 = 0xF2;
 /// Env opt-out for hashless canon slabs ("0" = keep the hashed 0xFC/0xFD
 /// wire; unset/any other value = hashless 0xFA/0xF9).
 fn slab_hashless() -> bool {
@@ -306,6 +324,7 @@ fn lzma2_compress_as(data: &[u8], stamp: u8) -> Option<(u8, Vec<u8>)> {
     let mut opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
         .ok()?;
     if stamp == SLAB_CODEC_LZMA2_TUNE || stamp == SLAB_CODEC_LZMA2_NH || stamp == SLAB_CODEC_LZMA2_GNH
+        || stamp == SLAB_CODEC_LZMA2_HYB
     {
         opts.literal_context_bits(LZMA2_COLD_LC)
             .literal_position_bits(LZMA2_COLD_LP)
@@ -352,6 +371,7 @@ fn lzma2_compress_maybe_mt_as(data: &[u8], threads: u32, st_raw: u8, st_mt: u8) 
     if st_mt == SLAB_CODEC_LZMA2_MT_NH
         || st_mt == SLAB_CODEC_LZMA2_MT
         || st_mt == SLAB_CODEC_LZMA2_GMT_NH
+        || st_mt == SLAB_CODEC_LZMA2_MT_HYB
     {
         if cold_lzma_tuned() {
             opts.literal_context_bits(LZMA2_COLD_LC)
@@ -2317,6 +2337,14 @@ pub struct Store {
     reg_dirty: AtomicBool,
 }
 
+impl Store {
+    /// DIAGNOSTIC: a clone of the persisted GLOB state registry (probe
+    /// access for identity-derivation experiments).
+    pub fn glob_reg_snapshot(&self) -> chunknbt::StateRegistry {
+        self.glob_reg.lock().clone()
+    }
+}
+
 impl Drop for Store {
     /// v0.9.70: a graceful close is durable. Live reads no longer flush the
     /// append buffer (they read through it), so without this Drop the only
@@ -2471,6 +2499,9 @@ struct SlabMemberWalk {
     table_len: usize,
     failed: bool,
     members: Vec<(String, Vec<u8>)>, // (class, body)
+    /// per-member stored identity hash (hashed stamps only; 0 for
+    /// hashless rows and when the column is absent)
+    hashes: Vec<u128>,
 }
 
 impl Store {
@@ -4501,6 +4532,9 @@ impl Store {
         if dict_id == SLAB_CODEC_LZMA2_GNH {
             return lzma2_decompress_tuned(data, raw_len as usize);
         }
+        if dict_id == SLAB_CODEC_LZMA2_HYB {
+            return lzma2_decompress_tuned(data, raw_len as usize);
+        }
         if dict_id == SLAB_CODEC_LZMA2_TUNE {
             return lzma2_decompress_tuned(data, raw_len as usize);
         }
@@ -4513,11 +4547,16 @@ impl Store {
         if dict_id == SLAB_CODEC_LZMA2_GMT_NH {
             return lzma2_mt_decompress(data, raw_len as usize);
         }
+        if dict_id == SLAB_CODEC_LZMA2_MT_HYB {
+            return lzma2_mt_decompress(data, raw_len as usize);
+        }
         // v0.9.91: 0xF8 = zstd cold_level fallback carrying hashless rows —
         // decode is the no-dict zstd path (same as dict_id 0), the stamp
         // only routes the row format. 0xF5 = the same for the GLOB family.
-        let no_dict =
-            dict_id == 0 || dict_id == SLAB_CODEC_ZSTD_NH || dict_id == SLAB_CODEC_ZSTD_GNH;
+        let no_dict = dict_id == 0
+            || dict_id == SLAB_CODEC_ZSTD_NH
+            || dict_id == SLAB_CODEC_ZSTD_GNH
+            || dict_id == SLAB_CODEC_ZSTD_HYB;
         DEC_C.with(|c| {
             let mut slot = c.borrow_mut();
             let key = (self.uid, dict_id);
@@ -4866,16 +4905,36 @@ impl Store {
                 | SLAB_CODEC_LZMA2_GMT_NH
                 | SLAB_CODEC_ZSTD_GNH
         );
+        // v0.9.113: hybrid rows — n-bit bitmap at the head, per-row hash
+        // presence. Bitmap-0 rows recompute exactly like the hashless
+        // stamps; bitmap-1 rows carry the stored write-time hash.
+        let hybrid = matches!(
+            dict_id,
+            SLAB_CODEC_LZMA2_HYB | SLAB_CODEC_LZMA2_MT_HYB | SLAB_CODEC_ZSTD_HYB
+        );
         let raw = self.decompress(dict_id, comp, raw_total)?;
         let mut out = Vec::with_capacity(n);
         let mut p = 0usize;
+        let bitmap: Vec<u8> = if hybrid {
+            let bl = n.div_ceil(8);
+            let bm = raw.get(0..bl)?.to_vec();
+            p = bl;
+            bm
+        } else {
+            Vec::new()
+        };
         let mut prev: i64 = 0;
-        for _ in 0..n {
+        for i in 0..n {
             let d = unzigzag(get_u64(&raw, &mut p)?);
             let bid = (prev + d) as u32;
             prev = prev + d;
             let rl = get_u64(&raw, &mut p)? as u32;
-            let h = if hashless {
+            let has_hash = if hybrid {
+                bitmap[i / 8] >> (i % 8) & 1 == 1
+            } else {
+                !hashless
+            };
+            let h = if !has_hash {
                 0u128 // placeholder; recomputed from the member body below
             } else {
                 if raw.len() < p + 16 {
@@ -4892,9 +4951,15 @@ impl Store {
         if raw.len() != p + total_raw as usize {
             return None;
         }
-        if hashless {
+        if hashless || hybrid {
             let mut q = p;
             for e in out.iter_mut() {
+                if e.2 != 0 {
+                    // hybrid bitmap-1 row: the stored write-time hash IS the
+                    // identity (the pack proved the derivation drifts here)
+                    q += e.1 as usize;
+                    continue;
+                }
                 let end = q + e.1 as usize;
                 if raw.len() < end {
                     return None;
@@ -5085,8 +5150,13 @@ impl Store {
                 table_len: 0,
                 failed: false,
                 members: Vec::new(),
+                hashes: Vec::new(),
             };
             let hashless = slab_stamp_hashless(dict_id);
+            let hybrid = matches!(
+                dict_id,
+                SLAB_CODEC_LZMA2_HYB | SLAB_CODEC_LZMA2_MT_HYB | SLAB_CODEC_ZSTD_HYB
+            );
             let Some(raw) = self.decompress(dict_id, &data, raw_total) else {
                 w.failed = true;
                 out.push(w);
@@ -5094,12 +5164,22 @@ impl Store {
             };
             // phase 1: the contiguous entry table ([bid varint][rl varint]
             // [+16 B hash when the stamp carries hashes]; bodies follow as
-            // one run — exactly parse_slab_v2's two-phase walk)
+            // one run — exactly parse_slab_v2's two-phase walk; hybrid rows
+            // prefix an n-bit bitmap and decide per row)
             let mut p = 0usize;
+            let bitmap = if hybrid {
+                let bl = n.div_ceil(8);
+                let bm = raw.get(0..bl).map(|b| b.to_vec()).unwrap_or_default();
+                p = bl;
+                bm
+            } else {
+                Vec::new()
+            };
             let mut prev: i64 = 0;
             let mut lens: Vec<u32> = Vec::with_capacity(n);
+            let mut hashes: Vec<u128> = Vec::with_capacity(n);
             let mut ok = true;
-            for _ in 0..n {
+            for i in 0..n {
                 let d = match get_u64(&raw, &mut p) {
                     Some(d) => d,
                     None => {
@@ -5115,12 +5195,22 @@ impl Store {
                         break;
                     }
                 };
-                if !hashless {
+                let has_hash = if hybrid {
+                    bitmap.get(i / 8).copied().unwrap_or(0) >> (i % 8) & 1 == 1
+                } else {
+                    !hashless
+                };
+                if has_hash {
                     if raw.len() < p + 16 {
                         ok = false;
                         break;
                     }
+                    let hi = u64::from_le_bytes(raw[p..p + 8].try_into().unwrap());
+                    let lo = u64::from_le_bytes(raw[p + 8..p + 16].try_into().unwrap());
+                    hashes.push(((hi as u128) << 64) | lo as u128);
                     p += 16;
+                } else {
+                    hashes.push(0);
                 }
                 lens.push(rl);
             }
@@ -5130,6 +5220,7 @@ impl Store {
                 continue;
             }
             w.table_len = p;
+            w.hashes = hashes;
             let total_raw: u64 = lens.iter().map(|&r| r as u64).sum();
             if raw.len() != p + total_raw as usize {
                 w.failed = true;
@@ -5163,7 +5254,7 @@ impl Store {
         let mut cls_raw: Map<&str, u64> = Map::new();
         let mut cls_n: Map<&str, u64> = Map::new();
         let mut stamps: Map<&str, u64> = Map::new();
-        let mut tab_bytes = (0u64, 0u64); // hashed, hashless
+        let mut tab_bytes = (0u64, 0u64, 0u64); // hashed, hashless, hybrid
         let mut slab_comp_total = 0u64;
         let mut slab_raw_total = 0u64;
         let mut unparseable = 0u64;
@@ -5173,6 +5264,11 @@ impl Store {
             let hashless = slab_stamp_hashless(w.stamp);
             if hashless {
                 tab_bytes.1 += w.table_len as u64;
+            } else if matches!(
+                w.stamp,
+                SLAB_CODEC_LZMA2_HYB | SLAB_CODEC_LZMA2_MT_HYB | SLAB_CODEC_ZSTD_HYB
+            ) {
+                tab_bytes.2 += w.table_len as u64;
             } else {
                 tab_bytes.0 += w.table_len as u64;
             }
@@ -5182,6 +5278,8 @@ impl Store {
                 0xF7 | 0xF6 => "lzma_gh",
                 0xF5 => "zstd_gh",
                 0xF8 => "zstd_nh",
+                0xF4 | 0xF3 => "lzma_hyb",
+                0xF2 => "zstd_hyb",
                 0x00 => "zstd_h",
                 _ => "other",
             };
@@ -5209,7 +5307,10 @@ impl Store {
             };
             s.push_str(&format!(r#""{k}":{{"n":{c},"raw":{r},"est_comp":{est}}},"#));
         }
-        s.push_str(&format!(r#""tab_hashed":{},"tab_hashless":{},"#, tab_bytes.0, tab_bytes.1));
+        s.push_str(&format!(
+            r#""tab_hashed":{},"tab_hashless":{},"tab_hybrid":{},"#,
+            tab_bytes.0, tab_bytes.1, tab_bytes.2
+        ));
         let mut ss: Vec<_> = stamps.iter().map(|(k, v)| format!(r#""{k}":{v}"#)).collect();
         ss.sort();
         s.push_str(&format!(r#""stamp_comp":{{{}}},"#, ss.join(",")));
@@ -5254,6 +5355,126 @@ impl Store {
             out.extend(w.members.iter().cloned());
         }
         out
+    }
+
+    /// DIAGNOSTIC: every slab member as (class, stamp, stored identity
+    /// hash, body) in disk order — hashed stamps carry the tab hash,
+    /// hashless rows report 0.
+    pub fn slab_members_with_hashes(&self) -> Vec<(String, u8, u128, Vec<u8>)> {
+        let walks = self.slab_disk_walk();
+        let mut out = Vec::new();
+        for w in &walks {
+            if w.failed {
+                continue;
+            }
+            for (i, (cls, body)) in w.members.iter().enumerate() {
+                out.push((
+                    cls.clone(),
+                    w.stamp,
+                    w.hashes.get(i).copied().unwrap_or(0),
+                    body.clone(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// DIAGNOSTIC (temporary): stamp x zero-hash census across all slabs.
+    pub fn slab_tab_head_json(&self) -> String {
+        use std::collections::BTreeMap;
+        let mut m: BTreeMap<u8, (u64, u64, u64)> = BTreeMap::new(); // stamp -> (slabs, members, zero_hash_members)
+        for w in &self.slab_disk_walk() {
+            if w.failed {
+                continue;
+            }
+            let e = m.entry(w.stamp).or_insert((0, 0, 0));
+            e.0 += 1;
+            e.1 += w.members.len() as u64;
+            e.2 += w.hashes.iter().filter(|&&h| h == 0).count() as u64;
+        }
+        let mut s = String::from("{");
+        for (st, (sl, n, z)) in &m {
+            s.push_str(&format!(r#""{:02x}":{{"slabs":{sl},"members":{n},"zero_hash":{z}}},"#, st));
+        }
+        s.push_str("\"end\":0}");
+        s
+    }
+
+    /// DIAGNOSTIC: the per-member hashless-GLOB gate census. For every
+    /// 0xCB/0xCC member riding a HASHED or HYBRID glob stamp this runs the
+    /// EXACT scan-side identity derivation — reconstruct over the persisted
+    /// (append-only) registry, canonical re-encode, xxh3_128 — and compares
+    /// against the stored write-time identity hash. Hashed slabs size the
+    /// per-member hybrid win (stable rows drop the 16 B hash column,
+    /// unstable rows keep it); hybrid slabs verify the SHIPPED mask: every
+    /// bitmap-1 row must still derive-verify (or it is the divergent class
+    /// the pack kept hashed), every bitmap-0 row is counted hashless (its
+    /// stored hash is gone — the derivation IS the identity).
+    pub fn glob_hashless_gate_json(&self) -> String {
+        let mut pass = 0u64;
+        let mut fail_reconstruct = 0u64;
+        let mut fail_drift = 0u64;
+        let mut nonconv = 0u64;
+        let mut hashed_glob_members = 0u64;
+        let mut hashed_tab_raw = 0u64;
+        let mut glob_tab_raw = 0u64;
+        let mut hybrid_rows = 0u64;
+        let mut hybrid_hashless = 0u64;
+        let mut hybrid_kept = 0u64;
+        for w in &self.slab_disk_walk() {
+            if w.failed {
+                continue;
+            }
+            let hybrid = matches!(
+                w.stamp,
+                SLAB_CODEC_LZMA2_HYB | SLAB_CODEC_LZMA2_MT_HYB | SLAB_CODEC_ZSTD_HYB
+            );
+            if slab_stamp_hashless(w.stamp) {
+                continue; // canon/0xF7 slabs carry no hash column
+            }
+            hashed_tab_raw += w.table_len as u64;
+            for (i, (_cls, body)) in w.members.iter().enumerate() {
+                hashed_glob_members += 1;
+                let stored = w.hashes.get(i).copied().unwrap_or(0);
+                if hybrid && stored == 0 {
+                    hybrid_rows += 1;
+                    hybrid_hashless += 1;
+                    if !matches!(body.first(), Some(&0xCB) | Some(&0xCC)) {
+                        nonconv += 1;
+                    }
+                    continue; // bitmap-0: the stored hash is gone by design
+                }
+                if hybrid {
+                    hybrid_kept += 1;
+                }
+                if !matches!(body.first(), Some(&0xCB) | Some(&0xCC)) {
+                    nonconv += 1;
+                    continue;
+                }
+                glob_tab_raw += 16;
+                let reg = self.glob_reg.lock();
+                match chunknbt::glob_any_to_section(body, &reg) {
+                    Some(direct) => match chunknbt::canonical_reencode(&direct) {
+                        Some(canon) => {
+                            if xxhash_rust::xxh3::xxh3_128(&canon) == stored {
+                                pass += 1;
+                            } else {
+                                fail_drift += 1;
+                            }
+                        }
+                        None => fail_reconstruct += 1,
+                    },
+                    None => fail_reconstruct += 1,
+                }
+            }
+        }
+        let glob_members = pass + fail_reconstruct + fail_drift;
+        let bitmap = (pass + fail_reconstruct + fail_drift + nonconv).div_ceil(8) as u64;
+        let keep_hash = fail_reconstruct + fail_drift + nonconv;
+        format!(
+            r#"{{"hashed_glob_members":{hashed_glob_members},"glob_members":{glob_members},"pass":{pass},"fail_drift":{fail_drift},"fail_reconstruct":{fail_reconstruct},"nonconv_canon_rows":{nonconv},"hashed_tab_raw":{hashed_tab_raw},"glob_hash_column_raw":{glob_tab_raw},"hybrid_rows":{hybrid_rows},"hybrid_hashless":{hybrid_hashless},"hybrid_kept":{hybrid_kept},"hybrid_column_raw":{keep_hash},"hybrid_bitmap_raw":{bitmap},"hybrid_saved_raw":{}}}"#,
+            (pass * 16).saturating_sub(bitmap)
+        )
     }
 
     /// Intern a recipe key name; persists it as a kind-6 record so scans
@@ -7191,6 +7412,14 @@ impl Store {
             /// mismatch is what corrupts: a hashed stamp on a hashless tab
             /// misparses at scan). glob_stable && slab_hashless().
             glob_hashless: bool,
+            /// v0.9.113: the mask MIXED (some rows carry the hash column,
+            /// some don't) -> the hybrid stamps 0xF4/0xF3/0xF2 with the
+            /// n-bit bitmap. Mutually exclusive with glob_hashless.
+            glob_hybrid: bool,
+            /// v0.9.113: the per-member hash-presence mask (true = row
+            /// carries the 16 B write-time hash). Captured for the mint
+            /// dispatch and for tests to assert the mask semantics.
+            glob_hash_mask: Vec<bool>,
         }
         let _tb = std::time::Instant::now();
         let cores = std::thread::available_parallelism()
@@ -7357,14 +7586,31 @@ impl Store {
                 // their stored gid bytes hash differently from the canonical
                 // identities the write path dedups on.
                 let nh = slab_hashless();
-                let build = |lens: &[usize], raws: &[&[u8]], hashless: bool| -> (Vec<u8>, usize) {
+                let build = |lens: &[usize], raws: &[&[u8]], mask: &[bool]| -> (Vec<u8>, usize) {
                     let mut tab = Vec::with_capacity(n * 4);
+                    // v0.9.113: mixed masks mint the hybrid row format — an
+                    // n-bit bitmap prefixes the rows; all-false / all-true
+                    // masks keep the bitmapless hashless / hashed layouts
+                    // (the stamp family and the layout always agree by
+                    // construction: hybrid stamps are minted iff mixed).
+                    let any = mask.iter().any(|&m| m);
+                    let all = mask.iter().all(|&m| m);
+                    if any && !all {
+                        let bm_len = mask.len().div_ceil(8);
+                        let mut bm = vec![0u8; bm_len];
+                        for (i, &m) in mask.iter().enumerate() {
+                            if m {
+                                bm[i / 8] |= 1 << (i % 8);
+                            }
+                        }
+                        tab.extend_from_slice(&bm);
+                    }
                     let mut prev_id: i64 = 0;
                     for (i, (h, id, _loc, _raw)) in group.iter().enumerate() {
                         put_u64(&mut tab, zigzag(*id as i64 - prev_id));
                         prev_id = *id as i64;
                         put_u64(&mut tab, lens[i] as u64);
-                        if !hashless {
+                        if mask[i] {
                             tab.extend_from_slice(&((h >> 64) as u64).to_le_bytes());
                             tab.extend_from_slice(&(*h as u64).to_le_bytes());
                         }
@@ -7379,7 +7625,8 @@ impl Store {
                 let canon_lens: Vec<usize> = group.iter().map(|c| c.3.len()).collect();
                 let canon_raws: Vec<&[u8]> = group.iter().map(|c| c.3.as_slice()).collect();
                 let _tbc = std::time::Instant::now();
-                let (canon_stream, canon_tab_len) = build(&canon_lens, &canon_raws, nh);
+                let canon_mask: Vec<bool> = vec![!nh; n];
+                let (canon_stream, canon_tab_len) = build(&canon_lens, &canon_raws, &canon_mask);
                 PK_B_TAB_NS.fetch_add(_tbc.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 // GLOB variant (jj_exp5: x2.16 on vanilla-terrain dense
                 // content): the same members with dense CSEC sections
@@ -7395,11 +7642,21 @@ impl Store {
                 let mut glob_t: Option<GVar> = None;
                 let mut glob_stable = true;
                 let mut glob_hashless = false;
+                // v0.9.113: the per-member hash-presence mask — true = the
+                // row carries the 16 B write-time hash. A converted member
+                // keeps its hash exactly when the recompute derivation
+                // drifts (stable == false); a non-converting member stores
+                // its canon bytes verbatim (identity = hash_of(bytes),
+                // always derivable -> hashless row). Mixed masks mint the
+                // hybrid stamps; all-false keeps 0xF7; all-true keeps the
+                // hashed triple.
+                let mut glob_hash_mask: Vec<bool> = Vec::new();
                 let _tg = std::time::Instant::now();
                 {
                     let base = offs[gi];
                     let mut glens = Vec::with_capacity(n);
                     let mut graws: Vec<Vec<u8>> = Vec::with_capacity(n);
+                    let mut conv: Vec<bool> = Vec::with_capacity(n);
                     let mut any = false;
                     for (mi, (_h, _id, _loc, raw)) in group.iter().enumerate() {
                         match globs[base + mi].take() {
@@ -7408,10 +7665,12 @@ impl Store {
                                 glob_stable &= stables[base + mi];
                                 glens.push(g.len());
                                 graws.push(g);
+                                conv.push(true);
                             }
                             None => {
                                 glens.push(raw.len());
                                 graws.push(raw.clone());
+                                conv.push(false);
                             }
                         }
                     }
@@ -7424,8 +7683,15 @@ impl Store {
                         // stream can never ride the wrong family (the 0xF7
                         // scan rebuilds every identity from the stored
                         // bytes; the hashed stamp must find its hash column)
-                        glob_hashless = glob_stable && slab_hashless();
-                        let (gs, gtab_len) = build(&glens, &graws_ref, glob_hashless);
+                        // v0.9.113: the gate relaxes to PER MEMBER — the
+                        // mask carries the write-time hash only for the
+                        // divergent members; CSAVES_SLAB_HASHES=0 keeps the
+                        // hashed wire everywhere.
+                        glob_hash_mask = (0..n)
+                            .map(|mi| (conv[mi] && !stables[base + mi]) || !slab_hashless())
+                            .collect();
+                        glob_hashless = glob_hash_mask.iter().all(|&m| !m) && slab_hashless();
+                        let (gs, gtab_len) = build(&glens, &graws_ref, &glob_hash_mask);
                         PK_B_TAB_NS.fetch_add(_tbg.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let reg_w = if graws.iter().any(|g| chunknbt::glob_member_wide(g)) {
                             2u8
@@ -7461,7 +7727,7 @@ impl Store {
                             if differs {
                                 let traws_ref: Vec<&[u8]> =
                                     traws.iter().map(|v| v.as_slice()).collect();
-                                let (gts, gttab) = build(&tlens, &traws_ref, glob_hashless);
+                                let (gts, gttab) = build(&tlens, &traws_ref, &glob_hash_mask);
                                 glob_t_var = Some(GVar {
                                     stream: gts,
                                     tab_len: gttab,
@@ -7474,12 +7740,21 @@ impl Store {
                     }
                 }
                 PK_B_GLOB_NS.fetch_add(_tg.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let glob_hybrid = if glob.is_some() {
+                    let any = glob_hash_mask.iter().any(|&m| m);
+                    let all = glob_hash_mask.iter().all(|&m| m);
+                    any && !all
+                } else {
+                    false
+                };
                 GBuild {
                     group,
                     canon: GVar { stream: canon_stream, tab_len: canon_tab_len, lens: canon_lens },
                     glob,
                     glob_t,
                     glob_hashless,
+                    glob_hybrid,
+                    glob_hash_mask,
                 }
             })
             .collect();
@@ -7572,6 +7847,11 @@ impl Store {
                         // dead weight — drop it (the 0.9.93 win, minus its
                         // correctness hole)
                         (SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH)
+                    } else if b.glob_hybrid {
+                        // v0.9.113 per-member hybrid: the bitmap marks the
+                        // divergent rows (they keep the hash column), the
+                        // rest recompute at scan
+                        (SLAB_CODEC_LZMA2_HYB, SLAB_CODEC_LZMA2_MT_HYB, SLAB_CODEC_ZSTD_HYB)
                     } else {
                         glob_triple
                     });
@@ -7582,6 +7862,8 @@ impl Store {
                 if b.glob_t.is_some() {
                     v.push(if b.glob_hashless {
                         (SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH)
+                    } else if b.glob_hybrid {
+                        (SLAB_CODEC_LZMA2_HYB, SLAB_CODEC_LZMA2_MT_HYB, SLAB_CODEC_ZSTD_HYB)
                     } else {
                         glob_triple
                     });
@@ -7676,6 +7958,7 @@ impl Store {
                             if stamp == SLAB_CODEC_LZMA2_MT
                                 || stamp == SLAB_CODEC_LZMA2_MT_NH
                                 || stamp == SLAB_CODEC_LZMA2_GMT_NH
+                                || stamp == SLAB_CODEC_LZMA2_MT_HYB
                             {
                                 PK_MT_JOBS.fetch_add(1, Ordering::Relaxed);
                                 PK_MT_BYTES.fetch_add(stream.len() as u64, Ordering::Relaxed);
@@ -7686,6 +7969,7 @@ impl Store {
                             match st_raw {
                                 SLAB_CODEC_LZMA2_NH => SLAB_CODEC_ZSTD_NH,
                                 SLAB_CODEC_LZMA2_GNH => SLAB_CODEC_ZSTD_GNH,
+                                SLAB_CODEC_LZMA2_HYB => SLAB_CODEC_ZSTD_HYB,
                                 _ => 0,
                             },
                             bulk_compress(stream, level).1,
@@ -7698,6 +7982,7 @@ impl Store {
                             match st_raw {
                                 SLAB_CODEC_LZMA2_NH => SLAB_CODEC_ZSTD_NH,
                                 SLAB_CODEC_LZMA2_GNH => SLAB_CODEC_ZSTD_GNH,
+                                SLAB_CODEC_LZMA2_HYB => SLAB_CODEC_ZSTD_HYB,
                                 _ => 0,
                             },
                             bulk_compress(stream, level).1,
@@ -10672,6 +10957,151 @@ pub(crate) mod glob_slab_test {
         }
         // dedup through the reopened, hashless identities: a fresh chunk key
         // whose sections equal chunk 0's must hit the existing members
+        let before = st2.blobs.read().len();
+        st2.write_chunk(99_999u64, &payloads[0], false).unwrap();
+        st2.sync();
+        let after = st2.blobs.read().len();
+        assert_eq!(
+            before, after,
+            "identity drift after reopen: a same-content write minted new blobs"
+        );
+        drop(st2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The MIXED class (v0.9.113): half the sections of every chunk come
+    /// from the byte-exact ordered generator, half from the divergent
+    /// strata generator — the per-member mask must mint the HYBRID stamps
+    /// (0xF4/0xF3/0xF2, n-bit bitmap) and the reopen must rebuild every
+    /// identity exactly: bitmap-0 rows through the recompute derivation,
+    /// bitmap-1 rows through the stored hash. A same-content write after
+    /// reopen must dedup against BOTH row classes (the exact hole the
+    /// all-or-nothing gate left open: mixed groups rode 0xFC and paid the
+    /// full hash column).
+    fn glob_chunk_payload_mixed(i: usize) -> Vec<u8> {
+        use chunknbt::dense_to_nostroddle;
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut sec_list = Vec::new();
+        for y in 0..24i32 {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = Vec::new();
+            for k in 0..20usize {
+                let mut c: Map<String, Value> = Map::new();
+                let id = (i * 7 + y as usize * 3 + k) % 200;
+                c.insert("Name".to_string(), Value::String(format!("minecraft:st_{id}")));
+                let mut props: Map<String, Value> = Map::new();
+                props.insert("f".to_string(), Value::String(format!("{}", k % 2)));
+                c.insert("Properties".to_string(), Value::Compound(props));
+                pal.push(Value::Compound(c));
+            }
+            bs.insert("palette".to_string(), Value::List(pal));
+            let mut vox = [0u8; 4096];
+            if y % 2 == 0 {
+                // byte-exact class: first-reference order == palette order
+                for (t, v) in vox.iter_mut().enumerate() {
+                    *v = (t % 20) as u8;
+                }
+            } else {
+                // divergent class: strata bands + speckle
+                for x in 0..16usize {
+                    for z in 0..16usize {
+                        for yy in 0..16usize {
+                            let band = ((x + z + yy) / 4 + i + y as usize) % 20;
+                            let speck = (x * 31 + z * 17 + yy * 7 + i) % 19 == 0;
+                            vox[x * 256 + z * 16 + yy] =
+                                if speck { (band + 5) % 20 } else { band } as u8;
+                        }
+                    }
+                }
+            }
+            let vbits = ((20u32 - 1).ilog2() + 1).max(4);
+            let data = dense_to_nostroddle(&vox, 4096, 8, vbits);
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn glob_hybrid_mixed_group_mints_and_survives_reopen() {
+        let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_force_glob_for_tests(Some(true));
+        let dir = temp_dir("glob-hybrid-mixed");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let n = 24usize;
+        let payloads: Vec<Vec<u8>> = (0..n).map(glob_chunk_payload_mixed).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            st.write_chunk(i as u64, p, false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for _ in 0..50 {
+            st.request_pack();
+            if !st.compact_step() {
+                break;
+            }
+        }
+        let stamps: Vec<u8> = st
+            .blobs
+            .read()
+            .values()
+            .filter(|l| l.slab)
+            .map(|l| l.dict_id)
+            .collect();
+        assert!(
+            stamps.iter().any(
+                |d| *d == SLAB_CODEC_LZMA2_HYB || *d == SLAB_CODEC_LZMA2_MT_HYB
+            ),
+            "the mixed class must mint the HYBRID glob family, stamps={stamps:?}"
+        );
+        assert!(
+            !stamps
+                .iter()
+                .any(|d| [SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH]
+                    .contains(d)),
+            "a mixed group must never mint the fully-hashless family, stamps={stamps:?}"
+        );
+        // the mask: every hybrid slab carries BOTH row classes (12 divergent
+        // + 12 byte-exact members per chunk); the walk reports bitmap-0 rows
+        // as hash 0
+        let (mut zero, mut kept, mut hybrid_members) = (0u64, 0u64, 0u64);
+        for (cls, _stamp, h, _body) in st.slab_members_with_hashes() {
+            if cls.starts_with("glob_g") {
+                hybrid_members += 1;
+                if h == 0 {
+                    zero += 1;
+                } else {
+                    kept += 1;
+                }
+            }
+        }
+        assert!(kept > 0, "the divergent members must keep their hashes");
+        assert!(zero > 0, "the byte-exact members must drop their hashes");
+        assert_eq!(
+            kept, zero,
+            "the mixed generator halves the mask: kept {kept} vs hashless {zero}"
+        );
+        drop(st);
+        // reopen: scan rebuilds identities — bitmap-0 through the recompute,
+        // bitmap-1 through the stored column
+        let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let v = st2.slab_invariant_scan();
+        assert!(
+            v.is_empty(),
+            "scan identities must equal the write-time keys on the hybrid wire: {v:?}"
+        );
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st2
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable post-reopen"));
+            assert!(chunk_semantic_glob(&got, p), "chunk {i} semantically wrong post-reopen");
+        }
+        // dedup through the reopened hybrid identities: BOTH row classes
         let before = st2.blobs.read().len();
         st2.write_chunk(99_999u64, &payloads[0], false).unwrap();
         st2.sync();

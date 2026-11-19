@@ -2161,22 +2161,22 @@ all stall points are captured as CI artifacts.
   + states, the drain fully reclaimed, the varint batch stream shipped):
 
       dim         anvil B/chunk   c-saves B/chunk   ratio
-      overworld   4104            12.5              x328
-      nether      4104            1.8               x2301
-      end         4104            4.0               x1026
-      ALL THREE   4104            6.1               x673  (x0.0015 of Anvil)
+      overworld   4104            10.2              x402
+      nether      4104            1.8               x2303
+      end         4104            4.0               x1032
+      ALL THREE   4104            5.3               x771  (x0.0013 of Anvil)
 
   Anvil's per-chunk sector floor (1 sector = 4 KiB even for a fully
   empty chunk) is measured, not assumed — every dimension weighs the
   same 4104 B/chunk on disk, so the c-saves ratios differ by terrain
-  mass alone; the per-chunk cost SATURATES with scale (6.9 B/chunk at
-  256x256 = 196,608 chunks). Projections (linear in chunks, the scaling
+  mass alone; the per-chunk cost SATURATES with scale (5.3 B/chunk at
+  192x192 = 110,592 chunks). Projections (linear in chunks, the scaling
   law measured on the rings): a 40000x40000-BLOCK world (2500x2500
   chunks per dimension — the onlinemo.de/world `overworld=40000` input)
-  stores at **~109 MiB for all three dimensions** (overworld-only
-  ~74 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
-  beaten ~20x); a 20000x20000-CHUNK world (400M chunks per dimension)
-  stores at **~6.8 GiB vs ~4.48 TiB across the three dimensions**
+  stores at **~95 MiB for all three dimensions** (overworld-only
+  ~61 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
+  beaten ~38x); a 20000x20000-CHUNK world (400M chunks per dimension)
+  stores at **~5.9 GiB vs ~4.48 TiB across the three dimensions**
   (`full_world_probe`, CI-gated).
 
 * **The physical GC contract (v0.9.111)** — the batch virtual credit
@@ -2195,6 +2195,31 @@ all stall points are captured as CI artifacts.
   real nether batch stream (15,141 -> 9,420 B, 7,776 entries). Kind-0x0B
   and kind-9 decode forever.
 
+* **The per-member hybrid contract (v0.9.113)** — the v0.9.97 hashless-GLOB
+  gate was all-or-nothing per GROUP: one divergent member (its section
+  carries data the gid stream cannot re-express — dead palette entries,
+  light/RLE forms — so reconstruct + canonical re-encode produces
+  byte-DIFFERENT wire and the identity hash drifts) forced the 16 B hash
+  column onto EVERY member of its group. The gate now runs PER MEMBER:
+  hybrid slabs (stamps 0xF4/0xF3/0xF2) prefix their entry table with an
+  n-bit bitmap; bitmap-0 rows are hashless (the scan recomputes the
+  identity through the exact v0.9.97 derivation — registry reconstruction
+  + canonical re-encode for glob members, hash_of(stored bytes) for canon
+  rows riding the slab), bitmap-1 rows carry the write-time hash. The
+  census on the drained Tectonic full-dimension corpus: 912/1286 glob
+  members pass the derivation + all 428 canon rows are derivable -> the
+  overworld tab loses 21,225 of 34,760 raw bytes (the hash column IS the
+  near-incompressible part) and the cold overworld stamp drops −18.2%
+  (124,159 -> 101,628 B at 96x96). The all-stable case keeps minting 0xF7
+  (no bitmap), the all-divergent case keeps 0xFC/0xFD, and
+  CSAVES_SLAB_HASHES=0 keeps the fully hashed wire. New CI gate
+  `glob_hybrid_mixed_group_mints_and_survives_reopen` pins the mixed-mask
+  mint (12 divergent + 12 byte-exact members per chunk), the reopen
+  identity exactness across BOTH row classes and same-content dedup after
+  reopen; enc_fp stays EXACT (6d240d7166cdda99/12130/9971843) — the encode
+  path is untouched. `gate_census` example reports the shipped mask
+  (hybrid_rows / hybrid_hashless / hybrid_kept) per store.
+
 ## Verification
 
 Every import and pack pass is followed by semantic chunk verification
@@ -2203,7 +2228,7 @@ gate fails on any drift (`bad=0` required).
 
 ## CI
 
-* `bench` — twelve jobs on every push: unit tests (112), size gate (compact
+* `bench` — twelve jobs on every push: unit tests (114), size gate (compact
   <= 15% of Anvil), pristine/scale/play/JVM/serve/worst-case gates, the
   JJThunder corpus gate (bad=0, ratio >= 2.6x), speed and real-export
   benches. The container lines report BOTH weights since v0.9.107: the
