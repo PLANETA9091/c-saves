@@ -44,6 +44,7 @@ jobs:
             native/bench_pristine_audit.txt
             native/bench_export_roundtrip.txt
             native/bench_scale_probe.txt
+            native/bench_full_world.txt
       - name: size profile (what weighs the most)
         working-directory: native
         run: |
@@ -162,6 +163,24 @@ jobs:
           grep -q "poi elision gate: PASS (vanilla poi/ -> 0 persisted)" bench_scale_probe.txt || { echo "FAIL: poi elision gate"; exit 1; }
           grep -q "scale total gate: PASS (< x0.0001 — the whole-world arithmetic)" bench_scale_probe.txt || { echo "FAIL: whole-world arithmetic"; exit 1; }
           grep -q "=== scale probe: PASS ===" bench_scale_probe.txt || { echo "FAIL: scale verdict"; exit 1; }
+      - name: full-dimension gate — nether + end join the honest weight (v0.9.110)
+        working-directory: native
+        run: |
+          cargo build --release --example full_world_probe
+          # the SAME 64x64 chunk square in ALL THREE dimensions (overworld
+          # Tectonic mix, nether cavern model, end void+islands), each
+          # written as real zlib-9 Anvil region files (region/,
+          # DIM-1/region/, DIM1/region/) and imported through the
+          # production path into its own store. Every chunk of every
+          # dimension verified semantically (bad=0), the honest weight is
+          # full_disk_bytes (segments+dicts+states). The ratio gate keeps
+          # the full-dimension arithmetic under 5% of Anvil.
+          ./target/release/examples/full_world_probe 64 2>&1 | tee bench_full_world.txt
+          grep -q "verify: overworld 4096/4096 | nether 4096/4096 | end 4096/4096 — bad=0 miss=0" bench_full_world.txt || { echo "FAIL: full-dimension verify"; exit 1; }
+          RATIO=$(grep "full-dimension ratio:" bench_full_world.txt | grep -o "x0\.[0-9]*" | grep -o "0\.[0-9]*")
+          echo "full-dimension ratio: $RATIO"
+          awk -v r="$RATIO" 'BEGIN { if (r+0 > 0.05) { print "FAIL: full-dimension ratio " r " exceeds 0.05"; exit 1 } print "OK" }'
+          grep -q "=== full-world probe: PASS ===" bench_full_world.txt || { echo "FAIL: full-world verdict"; exit 1; }
 
   play-bench:
     runs-on: ubuntu-latest

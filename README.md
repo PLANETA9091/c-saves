@@ -2148,6 +2148,33 @@ all stall points are captured as CI artifacts.
   ~1.49 TiB (x266)** — real stored content, no seed-regeneration
   (`tectonic_probe` / `tectonic_scale_probe`).
 
+* **The full-dimension contract (v0.9.110)** — nether and end join the
+  arithmetic. The SAME chunk square is generated in all THREE dimensions
+  (overworld Tectonic mix; nether cavern model — lava seas, soul valleys,
+  glowstone ceilings, fortress starts; end void model — NO-section void
+  chunks, outer islands, obsidian pillars, end-city starts), each written
+  as real zlib-9 Anvil region files under the vanilla layout
+  (`region/`, `DIM-1/region/`, `DIM1/region/`) and imported through the
+  production path; every chunk verified semantically, bad=0 pinned by a
+  CI gate. Measured at 96x96 (full weight = segments + dicts + states):
+
+      dim         anvil B/chunk   c-saves B/chunk   ratio
+      overworld   4104            16.1              x254
+      nether      4104            3.0               x1363
+      end         4104            5.9               x701
+      ALL THREE   4104            8.3               x492  (x0.0020 of Anvil)
+
+  Anvil's per-chunk sector floor (1 sector = 4 KiB even for a fully
+  empty chunk) is measured, not assumed — every dimension weighs the
+  same 4104 B/chunk on disk, so the c-saves ratios differ by terrain
+  mass alone. Projections (linear in chunks, the scaling law measured
+  on the 384x384 rings): a 40000x40000-BLOCK world (2500x2500 chunks per
+  dimension — the onlinemo.de/world `overworld=40000` input) stores at
+  **~149 MiB for all three dimensions** (overworld-only ~96 MiB against
+  the calculator's 50 GB estimate); a 20000x20000-CHUNK world (400M
+  chunks per dimension) stores at **~9.3 GiB vs ~4.48 TiB across the
+  three dimensions** (`full_world_probe`, CI-gated).
+
 ## Verification
 
 Every import and pack pass is followed by semantic chunk verification

@@ -788,3 +788,618 @@ pub fn z19(data: &[u8]) -> usize {
     c.write_all(data).unwrap();
     c.finish().unwrap().len()
 }
+
+// ================================================== nether builders
+//
+// The nether is a CAVERN: bedrock floor + bedrock ceiling, netherrack
+// strata with clustered vein blobs (the same calibrated vanilla-vein
+// model as the overworld mountains), a lava sea filling the open space
+// below y=10, glowstone hanging under the ceiling, fortresses crossing
+// chunks with real structure starts. Sections y=0..7 (128 tall).
+// Heightmaps are CONST 128 in the whole dimension — the bedrock ceiling
+// is the top motion-blocking surface from above (true vanilla behavior),
+// so the tail dedups globally.
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum NetherClass {
+    LavaSea,
+    NetherPlains,
+    SoulValley,
+    GlowCeiling,
+    Fortress,
+}
+
+impl NetherClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            NetherClass::LavaSea => "nether_lava_sea",
+            NetherClass::NetherPlains => "nether_plains",
+            NetherClass::SoulValley => "nether_soul_valley",
+            NetherClass::GlowCeiling => "nether_glow_ceiling",
+            NetherClass::Fortress => "nether_fortress",
+        }
+    }
+}
+
+const NB_NAMES: &[&str] = &[
+    "minecraft:netherrack",   // 0
+    "minecraft:blackstone",   // 1
+    "minecraft:gravel",       // 2
+    "minecraft:soul_sand",    // 3
+    "minecraft:glowstone",    // 4
+    "minecraft:lava",         // 5
+    "minecraft:air",          // 6
+    "minecraft:bedrock",      // 7
+    "minecraft:nether_bricks", // 8
+];
+
+fn nether_gradient(cx: i32, cz: i32, salt: u64) -> (i32, i32) {
+    let h = h2(cx, cz, salt);
+    ((h % 3) as i32 - 1, ((h >> 8) % 3) as i32 - 1)
+}
+
+/// cavern terrain: below `floor` = netherrack with clustered vein blobs,
+/// row `floor` = surface block, above = air.
+fn nether_terrain_section(
+    y: i32,
+    cx: i32,
+    cz: i32,
+    floor: i32,
+    surface: u8,
+    salt: u64,
+) -> Value {
+    let (gx, gz) = nether_gradient(cx, cz, salt);
+    let vein_n = (h2(cx, cz, salt ^ 0xB2) % 3) as i32 + 1;
+    let mut veins: Vec<(i32, i32, i32, u8)> = Vec::with_capacity(vein_n as usize);
+    for v in 0..vein_n {
+        let h = h2(cx, cz, (salt ^ 0xB3) + v as u64);
+        veins.push((
+            (h % 16) as i32,
+            ((h >> 8) % 16) as i32,
+            2 + ((h >> 16) % 3) as i32,
+            if (h >> 24) % 2 == 0 { 1 } else { 2 },
+        ));
+    }
+    let lo = y * 16;
+    let mut vals = vec![6u8; 4096]; // air
+    for (i, v) in vals.iter_mut().enumerate() {
+        let x = (i & 15) as i32;
+        let z = ((i >> 4) & 15) as i32;
+        let w = lo + (i >> 8) as i32;
+        let drift = ((x - 8) * gx + (z - 8) * gz) / 6;
+        let f = floor + drift;
+        let mut vb = 1u8;
+        let in_vein = veins.iter().any(|(vx, vz, r, b)| {
+            if (x - vx) * (x - vx) + (z - vz) * (z - vz) <= r * r {
+                vb = *b;
+                true
+            } else {
+                false
+            }
+        });
+        *v = if w < f {
+            if in_vein {
+                vb
+            } else {
+                0 // netherrack
+            }
+        } else if w == f {
+            surface
+        } else {
+            6 // air
+        };
+    }
+    sec_mixed(y, NB_NAMES, &vals)
+}
+
+/// y=0 of a lava sea: bedrock rows + netherrack up to row 9, lava rows
+/// 10..=15 — the byte-identical mass of the whole nether.
+fn nether_lava_floor_section() -> Value {
+    let mut vals = vec![5u8; 4096]; // lava
+    for (i, v) in vals.iter_mut().enumerate() {
+        let yy = (i >> 8) as i32;
+        if yy <= 9 {
+            *v = 0; // netherrack
+        }
+        if yy == 0 || (yy == 1 && h2(i as i32, 7, 0xB3D) % 5 < 2) {
+            *v = 7; // bedrock
+        }
+    }
+    sec_mixed(0, NB_NAMES, &vals)
+}
+
+/// y=0 of the solid floor: bedrock noise over netherrack — shared shape
+/// across every non-lava class.
+fn nether_bedrock_floor_section() -> Value {
+    let mut vals = vec![0u8; 4096]; // netherrack
+    for (i, v) in vals.iter_mut().enumerate() {
+        let yy = (i >> 8) as i32;
+        if yy == 0 || (yy == 1 && h2(i as i32, 7, 0xB3D) % 5 < 2) {
+            *v = 7; // bedrock
+        }
+    }
+    sec_mixed(0, NB_NAMES, &vals)
+}
+
+/// y=7: netherrack rows 0..=13 + bedrock rows 14..=15 — shared everywhere.
+fn nether_ceiling_section() -> Value {
+    let mut vals = vec![0u8; 4096];
+    for (i, v) in vals.iter_mut().enumerate() {
+        let yy = (i >> 8) as i32;
+        if yy >= 14 {
+            *v = 7; // bedrock
+        }
+    }
+    sec_mixed(7, NB_NAMES, &vals)
+}
+
+/// ceiling boundary: netherrack above `ceil`, air below; glowstone
+/// clusters hang under the ceiling (GlowCeiling variant sprinkle).
+fn nether_ceiling_boundary_section(
+    y: i32,
+    cx: i32,
+    cz: i32,
+    ceil: i32,
+    glow: Option<u64>,
+) -> Value {
+    let (gx, gz) = nether_gradient(cx, cz, 0xCE1);
+    let cl_n = (h2(cx, cz, 0x61A) % 3) as i32 + 1;
+    let mut cls: Vec<(i32, i32, i32)> = Vec::with_capacity(cl_n as usize);
+    if let Some(var) = glow {
+        for v in 0..cl_n {
+            let h = h2(cx, cz, (0x61B + v as u64) ^ var);
+            cls.push(((h % 16) as i32, ((h >> 8) % 16) as i32, 1 + ((h >> 16) % 2) as i32));
+        }
+    }
+    let lo = y * 16;
+    let mut vals = vec![6u8; 4096]; // air
+    for (i, v) in vals.iter_mut().enumerate() {
+        let x = (i & 15) as i32;
+        let z = ((i >> 4) & 15) as i32;
+        let w = lo + (i >> 8) as i32;
+        let drift = ((x - 8) * gx + (z - 8) * gz) / 6;
+        let c = ceil + drift;
+        let in_cl = cls
+            .iter()
+            .any(|(cx2, cz2, r)| (x - cx2) * (x - cx2) + (z - cz2) * (z - cz2) <= r * r);
+        *v = if w >= c {
+            0 // netherrack ceiling mass
+        } else if in_cl && w >= c - 3 {
+            4 // glowstone
+        } else {
+            6 // air
+        };
+    }
+    sec_mixed(y, NB_NAMES, &vals)
+}
+
+/// fortress walkway: a nether-brick box crossing the chunk (floor, roof,
+/// parapet walls), unique per chunk and per span — vanilla fortress
+/// corridors never repeat byte-identically.
+fn fortress_section(y: i32, cx: i32, cz: i32, span: u64) -> Value {
+    let bx = 2 + (h2(cx, cz, 0xF04 + span) % 3) as usize;
+    let bz = 4 + (h2(cx, cz, 0xF14 + span) % 3) as usize;
+    let floor_row = 4usize;
+    let mut vals = vec![6u8; 4096]; // air (the cavern)
+    for (i, v) in vals.iter_mut().enumerate() {
+        let x = (i & 15) as usize;
+        let z = ((i >> 4) & 15) as usize;
+        let yy = (i >> 8) as usize;
+        let in_x = x >= bx && x < bx + 11;
+        let in_z = z >= bz && z < bz + 8;
+        if !(in_x && in_z) {
+            continue;
+        }
+        let edge = x == bx || x == bx + 10 || z == bz || z == bz + 7;
+        if yy == floor_row || yy == floor_row + 5 {
+            *v = 8; // nether bricks
+        } else if yy > floor_row && yy < floor_row + 5 && edge {
+            *v = 8;
+        }
+    }
+    sec_mixed(y, NB_NAMES, &vals)
+}
+
+pub struct NetherBuilder {
+    cache: Map<(u8, u64), Vec<u8>>,
+    cx_w: i32,
+}
+
+impl NetherBuilder {
+    pub fn new(cx_w: i32) -> Self {
+        NetherBuilder { cache: Map::new(), cx_w }
+    }
+
+    pub fn classify(&self, cx: i32, cz: i32) -> (NetherClass, u64) {
+        let h = h2(cx, cz, 0x7E7);
+        if h % 100 < 2 {
+            (NetherClass::Fortress, 0)
+        } else if cx < (self.cx_w * 5) / 8 {
+            // the lava-sea band mirrors the overworld ocean band: the vast
+            // flat mass whose chunks repeat across coordinates
+            (NetherClass::LavaSea, 0)
+        } else if h % 100 < 15 {
+            (NetherClass::SoulValley, (h >> 8) % 6)
+        } else if h % 100 < 27 {
+            (NetherClass::GlowCeiling, (h >> 16) % 6)
+        } else {
+            (NetherClass::NetherPlains, (h >> 24) % 6)
+        }
+    }
+
+    fn nether_heightmaps() -> Value {
+        heightmaps(vec![
+            ("MOTION_BLOCKING", hm_const(128)),
+            ("MOTION_BLOCKING_NO_LEAVES", hm_const(128)),
+            ("OCEAN_FLOOR", hm_const(128)),
+            ("WORLD_SURFACE", hm_const(128)),
+        ])
+    }
+
+    fn shared(&mut self, cls: NetherClass, var: u64, cx: i32, cz: i32) -> Vec<u8> {
+        let ck = (cls as u8, var);
+        if let Some(p) = self.cache.get(&ck) {
+            return patch_coords(p, cx, cz);
+        }
+        let floor: i32 = if cls == NetherClass::SoulValley { 26 } else { 28 };
+        let ceil: i32 = 104 + (var as i32 % 3) * 4;
+        let surface: u8 = if cls == NetherClass::SoulValley { 3 } else { 0 };
+        let salt = 0x100 + var * 0x10;
+        let mut secs: Vec<Value> = Vec::with_capacity(8);
+        if cls == NetherClass::LavaSea {
+            secs.push(nether_lava_floor_section());
+        } else {
+            secs.push(nether_bedrock_floor_section());
+        }
+        secs.push(nether_terrain_section(1, cx, cz, floor, surface, salt));
+        secs.push(nether_terrain_section(2, cx, cz, floor, surface, salt));
+        secs.push(sec_empty(3));
+        secs.push(sec_empty(4));
+        secs.push(sec_empty(5));
+        secs.push(nether_ceiling_boundary_section(
+            6,
+            cx,
+            cz,
+            ceil,
+            if cls == NetherClass::GlowCeiling { Some(var) } else { None },
+        ));
+        secs.push(nether_ceiling_section());
+        let p = chunk_nbt(cx, cz, secs, Self::nether_heightmaps(), None);
+        self.cache.insert(ck, p.clone());
+        p
+    }
+
+    fn fortress(&mut self, cx: i32, cz: i32) -> Vec<u8> {
+        let floor = 28;
+        let mut secs: Vec<Value> = Vec::with_capacity(8);
+        secs.push(nether_bedrock_floor_section());
+        secs.push(nether_terrain_section(1, cx, cz, floor, 0, 0x190));
+        secs.push(nether_terrain_section(2, cx, cz, floor, 0, 0x190));
+        secs.push(fortress_section(3, cx, cz, 0));
+        secs.push(fortress_section(4, cx, cz, 1));
+        secs.push(sec_empty(5));
+        secs.push(nether_ceiling_boundary_section(6, cx, cz, 104, None));
+        secs.push(nether_ceiling_section());
+        // the structure start carries chunkX/chunkZ — recipe identity
+        // breaks the way vanilla fortress starts do
+        let mut start: Map<String, Value> = Map::new();
+        start.insert("id".to_string(), Value::String("minecraft:fortress".to_string()));
+        start.insert("chunkX".to_string(), Value::Int(cx));
+        start.insert("chunkZ".to_string(), Value::Int(cz));
+        let mut starts: Map<String, Value> = Map::new();
+        starts.insert("minecraft:fortress".to_string(), Value::Compound(start));
+        chunk_nbt(cx, cz, secs, Self::nether_heightmaps(), Some(Value::Compound(starts)))
+    }
+
+    pub fn payload(&mut self, cx: i32, cz: i32) -> (Vec<u8>, NetherClass) {
+        let (cls, var) = self.classify(cx, cz);
+        let p = match cls {
+            NetherClass::Fortress => self.fortress(cx, cz),
+            _ => self.shared(cls, var, cx, cz),
+        };
+        (p, cls)
+    }
+}
+
+// ===================================================== end builders
+//
+// The End is a VOID with islands: pure-void chunks have NO sections at
+// all (vanilla omits empty sections; the whole chunk is a bare tail),
+// the main island is flat endstone slabs, outer islands repeat a small
+// family of shapes across coordinates (real outer-end island shapes),
+// obsidian pillars rise from the void with height variants, end cities
+// break identity with real structure starts. Sections y=0..15 (256 tall).
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum EndClass {
+    Void,
+    MainIsland,
+    OuterIsland,
+    Pillar,
+    EndCity,
+}
+
+impl EndClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            EndClass::Void => "end_void",
+            EndClass::MainIsland => "end_main_island",
+            EndClass::OuterIsland => "end_outer_island",
+            EndClass::Pillar => "end_pillar",
+            EndClass::EndCity => "end_city",
+        }
+    }
+}
+
+const END_NAMES: &[&str] = &[
+    "minecraft:endstone",        // 0
+    "minecraft:obsidian",        // 1
+    "minecraft:purpur_block",    // 2
+    "minecraft:end_stone_bricks", // 3
+    "minecraft:air",             // 4
+];
+
+fn end_island_core(y: i32, var: u64, bot_row: i32, top_row: i32) -> Value {
+    // endstone ellipse slab: rows bot..=top inside the ellipse (the outer
+    // island shape family — a handful of seeds repeating across the void)
+    let rx = 4 + (var % 3) as i32;
+    let rz = 4 + ((var >> 4) % 3) as i32;
+    let lo = y * 16;
+    let mut vals = vec![4u8; 4096]; // air
+    for (i, v) in vals.iter_mut().enumerate() {
+        let x = (i & 15) as i32;
+        let z = ((i >> 4) & 15) as i32;
+        let w = lo + (i >> 8) as i32;
+        let inside = ((x - 7) * (x - 7)) * (rz * rz) + ((z - 7) * (z - 7)) * (rx * rx)
+            <= (rx * rz) * (rx * rz);
+        if inside && w >= lo + bot_row && w <= lo + top_row {
+            *v = 0; // endstone
+        }
+    }
+    sec_mixed(y, END_NAMES, &vals)
+}
+
+fn end_main_surface(y: i32) -> Value {
+    // flat main-island top: endstone row 0, air above
+    let mut vals = vec![4u8; 4096];
+    for (i, v) in vals.iter_mut().enumerate() {
+        if (i >> 8) == 0 {
+            *v = 0; // endstone
+        }
+    }
+    sec_mixed(y, END_NAMES, &vals)
+}
+
+fn end_pillar_section(y: i32, bot: i32, top: i32) -> Value {
+    // obsidian column, radius 2 at the chunk center, from y=76 up to top
+    let lo = y * 16;
+    let mut vals = vec![4u8; 4096]; // air
+    for (i, v) in vals.iter_mut().enumerate() {
+        let x = (i & 15) as i32;
+        let z = ((i >> 4) & 15) as i32;
+        let w = lo + (i >> 8) as i32;
+        if (x - 7) * (x - 7) + (z - 7) * (z - 7) <= 4 && w >= bot && w <= top {
+            *v = 1; // obsidian
+        }
+    }
+    sec_mixed(y, END_NAMES, &vals)
+}
+
+/// end-city ground floor: the island slab (rows up to 56) MERGED with the
+/// tower base (a chunk has ONE section per Y).
+fn end_city_base_section(y: i32, var: u64, city_top: i32) -> Value {
+    let rx = 4 + (var % 3) as i32;
+    let rz = 4 + ((var >> 4) % 3) as i32;
+    let lo = y * 16;
+    let mut vals = vec![4u8; 4096]; // air
+    for (i, v) in vals.iter_mut().enumerate() {
+        let x = (i & 15) as i32;
+        let z = ((i >> 4) & 15) as i32;
+        let w = lo + (i >> 8) as i32;
+        let inside = ((x - 7) * (x - 7)) * (rz * rz) + ((z - 7) * (z - 7)) * (rx * rx)
+            <= (rx * rz) * (rx * rz);
+        if inside && w <= 56 {
+            *v = 0; // endstone island
+            continue;
+        }
+        let box_ = (x - 7).abs() <= 3 && (z - 7).abs() <= 3;
+        let ring = (x - 7).abs() == 3 || (z - 7).abs() == 3;
+        if box_ && w >= 56 && w <= city_top {
+            if ring {
+                *v = 2; // purpur walls
+            } else if w == 56 || w % 4 == 0 {
+                *v = 3; // end stone brick floors
+            }
+        }
+    }
+    sec_mixed(y, END_NAMES, &vals)
+}
+
+fn end_city_tower_section(y: i32, city_top: i32) -> Value {
+    let lo = y * 16;
+    let mut vals = vec![4u8; 4096]; // air
+    for (i, v) in vals.iter_mut().enumerate() {
+        let x = (i & 15) as i32;
+        let z = ((i >> 4) & 15) as i32;
+        let w = lo + (i >> 8) as i32;
+        let box_ = (x - 7).abs() <= 3 && (z - 7).abs() <= 3;
+        let ring = (x - 7).abs() == 3 || (z - 7).abs() == 3;
+        if box_ && w <= city_top {
+            if ring {
+                *v = 2; // purpur
+            } else if w % 4 == 0 {
+                *v = 3; // floors
+            }
+        }
+    }
+    sec_mixed(y, END_NAMES, &vals)
+}
+
+pub struct EndBuilder {
+    cache: Map<(u8, u64), Vec<u8>>,
+    cx_w: i32,
+}
+
+impl EndBuilder {
+    pub fn new(cx_w: i32) -> Self {
+        EndBuilder { cache: Map::new(), cx_w }
+    }
+
+    pub fn classify(&self, cx: i32, cz: i32) -> (EndClass, u64) {
+        let cc = self.cx_w / 2;
+        let d = (cx - cc).abs().max((cz - cc).abs());
+        let h = h2(cx, cz, 0xE0);
+        if d <= 5 {
+            (EndClass::MainIsland, 0)
+        } else if d <= 9 && h % 100 < 45 {
+            (EndClass::Pillar, (h >> 8) % 3)
+        } else if h % 100 < 16 {
+            if (h >> 16) % 100 < 22 {
+                (EndClass::EndCity, (h >> 24) % 4)
+            } else {
+                (EndClass::OuterIsland, (h >> 8) % 6)
+            }
+        } else {
+            (EndClass::Void, 0)
+        }
+    }
+
+    fn void_chunk(&mut self, cx: i32, cz: i32) -> Vec<u8> {
+        let ck = (EndClass::Void as u8, 0);
+        if let Some(p) = self.cache.get(&ck) {
+            return patch_coords(p, cx, cz);
+        }
+        // vanilla void: NO sections at all, heightmaps all zero
+        let hm = heightmaps(vec![
+            ("MOTION_BLOCKING", hm_const(0)),
+            ("MOTION_BLOCKING_NO_LEAVES", hm_const(0)),
+            ("OCEAN_FLOOR", hm_const(0)),
+            ("WORLD_SURFACE", hm_const(0)),
+        ]);
+        let p = chunk_nbt(cx, cz, Vec::new(), hm, None);
+        self.cache.insert(ck, p.clone());
+        p
+    }
+
+    fn main_island(&mut self, cx: i32, cz: i32) -> Vec<u8> {
+        let ck = (EndClass::MainIsland as u8, 0);
+        if let Some(p) = self.cache.get(&ck) {
+            return patch_coords(p, cx, cz);
+        }
+        let mut secs: Vec<Value> = Vec::with_capacity(16);
+        for y in 0..=4 {
+            secs.push(sec_full(y, "minecraft:endstone"));
+        }
+        secs.push(end_main_surface(5));
+        for y in 6..=15 {
+            secs.push(sec_empty(y));
+        }
+        let hm = heightmaps(vec![
+            ("MOTION_BLOCKING", hm_const(81)),
+            ("MOTION_BLOCKING_NO_LEAVES", hm_const(81)),
+            ("OCEAN_FLOOR", hm_const(80)),
+            ("WORLD_SURFACE", hm_const(81)),
+        ]);
+        let p = chunk_nbt(cx, cz, secs, hm, None);
+        self.cache.insert(ck, p.clone());
+        p
+    }
+
+    fn outer_island(&mut self, var: u64, cx: i32, cz: i32) -> Vec<u8> {
+        let ck = (EndClass::OuterIsland as u8, var);
+        if let Some(p) = self.cache.get(&ck) {
+            return patch_coords(p, cx, cz);
+        }
+        let mut secs: Vec<Value> = Vec::with_capacity(16);
+        secs.push(sec_empty(0));
+        secs.push(sec_empty(1));
+        secs.push(end_island_core(2, var, 8, 15));
+        secs.push(end_island_core(3, var, 0, 8));
+        for y in 4..=15 {
+            secs.push(sec_empty(y));
+        }
+        let hm = heightmaps(vec![
+            ("MOTION_BLOCKING", hm_const(57)),
+            ("MOTION_BLOCKING_NO_LEAVES", hm_const(57)),
+            ("OCEAN_FLOOR", hm_const(56)),
+            ("WORLD_SURFACE", hm_const(57)),
+        ]);
+        let p = chunk_nbt(cx, cz, secs, hm, None);
+        self.cache.insert(ck, p.clone());
+        p
+    }
+
+    fn pillar(&mut self, var: u64, cx: i32, cz: i32) -> Vec<u8> {
+        let ck = (EndClass::Pillar as u8, var);
+        if let Some(p) = self.cache.get(&ck) {
+            return patch_coords(p, cx, cz);
+        }
+        let top = 96 + var as i32 * 4;
+        let mut secs: Vec<Value> = Vec::with_capacity(16);
+        for y in 0..=3 {
+            secs.push(sec_empty(y));
+        }
+        secs.push(end_pillar_section(4, 76, top));
+        secs.push(end_pillar_section(5, 80, top));
+        secs.push(end_pillar_section(6, 96, top));
+        for y in 7..=15 {
+            secs.push(sec_empty(y));
+        }
+        let hm = heightmaps(vec![
+            ("MOTION_BLOCKING", hm_const((top + 1) as u16)),
+            ("MOTION_BLOCKING_NO_LEAVES", hm_const((top + 1) as u16)),
+            ("OCEAN_FLOOR", hm_const(0)),
+            ("WORLD_SURFACE", hm_const((top + 1) as u16)),
+        ]);
+        let p = chunk_nbt(cx, cz, secs, hm, None);
+        self.cache.insert(ck, p.clone());
+        p
+    }
+
+    fn end_city(&mut self, var: u64, cx: i32, cz: i32) -> Vec<u8> {
+        let city_top = 84 + var as i32 * 4;
+        let mut secs: Vec<Value> = Vec::with_capacity(16);
+        secs.push(sec_empty(0));
+        secs.push(sec_empty(1));
+        secs.push(end_island_core(2, var, 8, 15));
+        secs.push(end_city_base_section(3, var, city_top));
+        secs.push(end_city_tower_section(4, city_top));
+        secs.push(end_city_tower_section(5, city_top));
+        for y in 6..=15 {
+            secs.push(sec_empty(y));
+        }
+        let over: Vec<(usize, u16)> = (0..40)
+            .map(|i| {
+                (
+                    (h2(cx, cz, 0x2E0 + i) % 256) as usize,
+                    (city_top + 1) as u16,
+                )
+            })
+            .collect();
+        let hm = heightmaps(vec![
+            ("MOTION_BLOCKING", hm_over(57, &over)),
+            ("MOTION_BLOCKING_NO_LEAVES", hm_over(57, &over)),
+            ("OCEAN_FLOOR", hm_over(56, &over)),
+            ("WORLD_SURFACE", hm_over(57, &over)),
+        ]);
+        let mut start: Map<String, Value> = Map::new();
+        start.insert("id".to_string(), Value::String("minecraft:end_city".to_string()));
+        start.insert("chunkX".to_string(), Value::Int(cx));
+        start.insert("chunkZ".to_string(), Value::Int(cz));
+        let mut starts: Map<String, Value> = Map::new();
+        starts.insert("minecraft:end_city".to_string(), Value::Compound(start));
+        chunk_nbt(cx, cz, secs, hm, Some(Value::Compound(starts)))
+    }
+
+    pub fn payload(&mut self, cx: i32, cz: i32) -> (Vec<u8>, EndClass) {
+        let (cls, var) = self.classify(cx, cz);
+        let p = match cls {
+            EndClass::Void => self.void_chunk(cx, cz),
+            EndClass::MainIsland => self.main_island(cx, cz),
+            EndClass::OuterIsland => self.outer_island(var, cx, cz),
+            EndClass::Pillar => self.pillar(var, cx, cz),
+            EndClass::EndCity => self.end_city(var, cx, cz),
+        };
+        (p, cls)
+    }
+}
