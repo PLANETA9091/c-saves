@@ -266,6 +266,22 @@ fn main() {
         } else {
             format!("{} | {} {}/{}", verify_line, name, ok_s, payloads.len())
         };
+        // v0.9.116: the CLOSE weight — the honest shipped weight is the one
+        // ON DISK after the store closes. The live drain's final segment
+        // sits in the writer slot (GC-exempt) and its full reclaim happens
+        // at close; the reopened store's full_disk_bytes reads exactly the
+        // shipped files (segments + dicts + states), the same bytes the
+        // reopen verify just proved readable. Measured on the 192x192
+        // full-dimension corpus: live 5.1 B/chunk -> close 0.59 B/chunk
+        // (the writer segment carried ~8x of the live weight).
+        let close_full = st.full_disk_bytes();
+        let close_container = st.disk_bytes();
+        println!(
+            "   close weight: segments {} + dicts/states = {} (live-printed full {} — the writer segment the drain exempted)",
+            mib(close_container),
+            mib(close_full),
+            mib(full)
+        );
         drop(st);
         if rok_s + rmiss != payloads.len() || rok_s != payloads.len() {
             println!("   reopen gate: FAIL ({} ok, {} miss of {})", rok_s, rmiss, payloads.len());
@@ -275,8 +291,8 @@ fn main() {
             chunks: payloads.len(),
             raw,
             anvil,
-            container,
-            full,
+            container: close_container,
+            full: close_full,
             ok_s,
             miss,
         });
@@ -286,7 +302,7 @@ fn main() {
     let tot_c: usize = stats.iter().map(|s| s.chunks).sum();
     let tot_anvil: u64 = stats.iter().map(|s| s.anvil).sum();
     let tot_full: u64 = stats.iter().map(|s| s.full).sum();
-    println!("== per-dimension honest weight ({}x{} = {} chunks/dim, full weight incl. dicts+states) ==", f, f, f * f);
+    println!("== per-dimension CLOSE weight ({}x{} = {} chunks/dim, the shipped bytes on disk incl. dicts+states) ==", f, f, f * f);
     println!("dim        chunks  anvil         anvil B/chunk  c-saves full   B/chunk  ratio");
     for s in &stats {
         println!(
