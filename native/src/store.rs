@@ -581,6 +581,10 @@ pub struct Cfg {
     pub pristine_region: bool,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
+    /// v0.9.114: physically-dead bytes that make a segment UNDER compact_min
+    /// a compaction candidate anyway (the last-segment blind spot: a drained
+    /// store's tail segment can be 95% dead at 42 KiB and never reclaim).
+    pub compact_dead_min: u64,
     /// Slab member cap for whole-mode stores (entity/POI payloads).
     /// Real JJThunder entity chunks average ~40 KiB, so the cap must admit
     /// whole entity chunks as slab members: batched 4 MiB slabs reach the
@@ -698,6 +702,7 @@ impl Default for Cfg {
             pristine_fresh: true,
             pristine_region: false,
             compact_min: 64 * 1024,
+            compact_dead_min: 8 * 1024,
             compact_ratio: 0.25,
             auto_pack_bytes: 4 * 1024 * 1024,
             slab_max_member_whole: 1024 * 1024,
@@ -777,6 +782,7 @@ impl Cfg {
             cold_level: env_parse("CSAVES_COLD_LEVEL", 6),
             recipe_level: env_parse("CSAVES_RECIPE_LEVEL", 6),
             compact_min: env_parse("CSAVES_COMPACT_MIN_BYTES", 64 * 1024),
+            compact_dead_min: env_parse("CSAVES_COMPACT_DEAD_MIN_BYTES", 8 * 1024),
             compact_ratio: env_parse("CSAVES_COMPACT_DEAD_RATIO", 0.25),
             auto_pack_bytes: env_parse("CSAVES_AUTO_PACK_BYTES", 4 * 1024 * 1024),
             slab_max_member_whole: env_parse("CSAVES_SLAB_MAX_MEMBER_WHOLE", 1024 * 1024),
@@ -8561,20 +8567,37 @@ impl Store {
                 }
                 let total = s.total.load(Ordering::Relaxed);
                 let live = s.live.load(Ordering::Relaxed);
-                if total > self.cfg.compact_min {
+                // v0.9.114: the compact_min gate also had a SMALL-SEGMENT
+                // blind spot — the LAST segment of a drained store can sit
+                // under compact_min (64 KiB) while being nearly all dead.
+                // Measured: the 64x64 full-dimension nether import ships
+                // seg-00001 at 41,901 B with 40,033 B of superseded hot
+                // blobs (95.5% physically dead, blobs_regular=0) — the
+                // honest weight was 11.4 B/chunk against the true ~1.9, and
+                // the projection arithmetic inherited the fat. The physical
+                // walk is cheap on small segments (header reads over mmap),
+                // so every segment >= 4 KiB gets walked; a small segment
+                // becomes a candidate when its dead bytes exceed
+                // compact_dead_min (default 8 KiB) — a live small segment
+                // never fires, a dead one reclaims exactly once.
+                let walk_worthy = total > self.cfg.compact_min || total >= 4096;
+                if walk_worthy {
                     // v0.9.111: the ratio is PHYSICAL (seg_phys_live walk).
                     // The old virtualized ratio (1 - live/(total+virt_extra))
                     // read 0.229 on an 81%-dead segment and the GC stalled —
                     // see seg_phys_live for the full measurement.
                     let plive = self.seg_phys_live(*id);
+                    let dead_bytes = total.saturating_sub(plive);
+                    let candidate =
+                        total > self.cfg.compact_min || dead_bytes >= self.cfg.compact_dead_min;
                     let r = 1.0 - plive as f64 / total as f64;
                     if std::env::var("CSAVES_GC_DEBUG").as_deref() == Ok("1") {
                         eprintln!(
-                            "[c-saves] gc-cand seg-{id:05} total={total} plive={plive} virt={} dead={r:.3}",
+                            "[c-saves] gc-cand seg-{id:05} total={total} plive={plive} virt={} dead={r:.3} cand={candidate}",
                             s.virt_extra.load(Ordering::Relaxed)
                         );
                     }
-                    if worst.map(|w| r > w.1).unwrap_or(true) {
+                    if candidate && worst.map(|w| r > w.1).unwrap_or(true) {
                         worst = Some((*id, r));
                     }
                 }
@@ -10841,16 +10864,18 @@ pub(crate) mod glob_slab_test {
     }
 
     #[test]
-    fn glob_hashless_gated_divergent_class_stays_hashed() {
-        // v0.9.97: the pack-side stability gate. The sliding-window payload
-        // class (glob_chunk_payload) reconstructs byte-DIFFERENTLY (0/144 in
-        // glob_stable_probe) — every group containing it must KEEP the
-        // hashed glob wire (0xFC/0xFD). The hashless family (0xF7/0xF6/0xF5)
-        // must never mint for it, yet the store stays fully readable and
-        // the invariant scan clean.
+    fn glob_dead_entry_class_goes_hashless() {
+        // v0.9.114: the FORMER divergent class. The sliding-window payload
+        // (glob_chunk_payload) carries dead palette entries — under the
+        // v0.9.113 canonical form the reconstruction was byte-DIFFERENT
+        // (0/144 in glob_stable_probe) and the group kept the hashed wire.
+        // The write-time dead-entry drop aligns the canonical form with the
+        // rebuild, so the SAME content now passes the stability gate and
+        // mints the HASHLESS family (0xF7/0xF6/0xF5) — no hybrid stamps, no
+        // hash column, derivation closed, invariant scan clean.
         let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_force_glob_for_tests(Some(true));
-        let dir = temp_dir("glob-gated-divergent");
+        let dir = temp_dir("glob-dead-entry-hashless");
         let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
         let n = 24usize;
         let payloads: Vec<Vec<u8>> = (0..n).map(glob_chunk_payload).collect();
@@ -10877,19 +10902,35 @@ pub(crate) mod glob_slab_test {
             "no GLOB slabs were produced under CSAVES_FORCE_GLOB=1"
         );
         assert!(
-            stamps.iter().any(|d| *d == SLAB_CODEC_LZMA2_TUNE || *d == SLAB_CODEC_LZMA2_MT),
-            "the divergent class must mint HASHED glob slabs, stamps={stamps:?}"
+            stamps.iter().any(|d| [
+                SLAB_CODEC_LZMA2_GNH,
+                SLAB_CODEC_LZMA2_GMT_NH,
+                SLAB_CODEC_ZSTD_GNH
+            ]
+            .contains(d)),
+            "the dead-entry class must mint the HASHLESS glob family, stamps={stamps:?}"
         );
         assert!(
-            !stamps
-                .iter()
-                .any(|d| [SLAB_CODEC_LZMA2_GNH, SLAB_CODEC_LZMA2_GMT_NH, SLAB_CODEC_ZSTD_GNH]
-                    .contains(d)),
-            "the gate leaked: a divergent group minted the hashless family, stamps={stamps:?}"
+            !stamps.iter().any(|d| [
+                SLAB_CODEC_LZMA2_TUNE,
+                SLAB_CODEC_LZMA2_MT,
+                SLAB_CODEC_LZMA2_HYB,
+                SLAB_CODEC_LZMA2_MT_HYB
+            ]
+            .contains(d)),
+            "the dead-entry class kept a hash column, stamps={stamps:?}"
+        );
+        // the derivation must close: every glob member passes the scan-side
+        // identity recompute (no drift, no kept hashes)
+        let gate = st.glob_hashless_gate_json();
+        assert!(
+            gate.contains("\"fail_drift\":0")
+                && gate.contains("\"fail_reconstruct\":0"),
+            "gate census must show zero drift on the dead-entry class: {gate}"
         );
         assert!(
             st.slab_invariant_scan().is_empty(),
-            "invariant scan must stay clean on the hashed wire"
+            "invariant scan must stay clean on the hashless wire"
         );
         for (i, p) in payloads.iter().enumerate() {
             let got = st
@@ -11073,8 +11114,16 @@ pub(crate) mod glob_slab_test {
 
     #[test]
     fn glob_hybrid_mixed_group_mints_and_survives_reopen() {
+        // v0.9.114: the mixed mask mints when the WRITE-TIME canonical form
+        // carries dead block entries. The dead-drop knob OFF restores the
+        // v0.9.113 canonical form — the old-container simulation: stored
+        // bytes carry dead entries, the rebuild drops them, the stability
+        // gate fails those members and they keep their 16 B hash column,
+        // while the byte-exact ordered members drop theirs. The per-member
+        // bitmap carries BOTH row classes through pack, reopen and dedup.
         let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_force_glob_for_tests(Some(true));
+        chunknbt::set_glob_dead_drop_for_tests(Some(false));
         let dir = temp_dir("glob-hybrid-mixed");
         let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
         let n = 24usize;
@@ -11155,6 +11204,8 @@ pub(crate) mod glob_slab_test {
             "identity drift after reopen: a same-content write minted new blobs"
         );
         drop(st2);
+        set_force_glob_for_tests(None);
+        chunknbt::set_glob_dead_drop_for_tests(None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -11163,19 +11214,22 @@ pub(crate) mod glob_slab_test {
         // v0.9.95, v0.9.97 CONTEXT: the hashless-GLOB family (0xF7/0xF6/
         // 0xF5) is minted ONLY for groups whose every converted member
         // passes the pack-side recompute check (see flush_slab_cands stage
-        // 3). This test pins WHY the gate exists: the scan-side identity
-        // recompute needs glob_any_to_section(stored) (or any re-encode of
-        // it) to reproduce the ORIGINAL canonical member bytes bit for bit.
-        // The JJ corpus's convertible dense subset DOES
-        // reconstruct exactly (glob_par: 2715/2715) — but sliding-palette
-        // sections do NOT: the reconstruction is semantically equal
+        // 3). The scan-side identity recompute needs
+        // glob_any_to_section(stored) -> canonical_reencode to reproduce
+        // the ORIGINAL canonical member bytes bit for bit.
+        // v0.9.114 BOTH SIDES: with the write-time dead-entry drop ON the
+        // sliding-palette class reconstructs BYTE-EXACTLY (the canonical
+        // form and the rebuild agree — the whole former divergence class is
+        // closed); with the knob OFF (the v0.9.113 canonical form, the
+        // old-container simulation) the reconstruction is semantically equal
         // and byte-DIFFERENT (canonical 3056 B vs reconstruction 2444 B
-        // measured). The gate refuses those groups, keeping the hashed
-        // wire; this test makes sure the divergence class never silently
-        // vanishes from the suite.
+        // measured) — the gate refuses those groups, keeping the hashed
+        // wire. The divergence class must never silently vanish from the
+        // suite.
         use chunknbt::{SecBytes, Split, StateRegistry};
         let mut reg = StateRegistry::new();
         let mut diverged = 0usize;
+        let mut exact = 0usize;
         for i in 0..6usize {
             let payload = glob_chunk_payload(i);
             let Ok(Split::Split { sections, .. }) =
@@ -11195,7 +11249,8 @@ pub(crate) mod glob_slab_test {
                     panic!("member {h:016x}: reconstruction refused");
                 };
                 if direct == csec && chunknbt::hash_of(&direct) == *h {
-                    continue; // the byte-exact class (dense lightless members)
+                    exact += 1;
+                    continue; // the byte-exact class (drop ON: every convertible member)
                 }
                 diverged += 1;
                 assert_ne!(
@@ -11205,12 +11260,47 @@ pub(crate) mod glob_slab_test {
                 );
             }
         }
-        // (the exact class exists on JJ's dense lightless subset — glob_par
-        // 2715/2715 — but the synthetic payload sections all carry light, so
-        // every convertible member here diverges)
+        // drop ON (the shipped default): the former divergent class closed —
+        // every convertible member reconstructs byte-exactly
         assert!(
-            diverged > 0,
-            "the divergence class vanished — hashless GLOB may be re-evaluated (see the glob_triple comment)"
+            exact > 0 && diverged == 0,
+            "the dead-entry class must reconstruct byte-exactly under the drop: exact={exact} diverged={diverged}"
+        );
+        // drop OFF (the old-container simulation): the reconstruction is
+        // byte-different again — the gate's reason to exist stays pinned.
+        // Fresh content (i 6..12): the encode cache keys on the structural
+        // hash, which does not know the knob — re-splitting the phase-1
+        // payloads would return the phase-1 canonical bytes from the cache.
+        chunknbt::set_glob_dead_drop_for_tests(Some(false));
+        let mut reg2 = StateRegistry::new();
+        let mut diverged_off = 0usize;
+        for i in 6..12usize {
+            let payload = glob_chunk_payload(i);
+            let Ok(Split::Split { sections, .. }) =
+                chunknbt::split(&payload, false, None, true)
+            else {
+                panic!("split failed");
+            };
+            for (h, sb) in &sections {
+                let csec = match sb {
+                    SecBytes::Shared(a) => (**a).clone(),
+                    SecBytes::Owned(b) => b.clone(),
+                };
+                let Some(glob) = chunknbt::section_to_glob(&csec, &mut reg2) else {
+                    continue;
+                };
+                let Some(direct) = chunknbt::glob_any_to_section(&glob, &reg2) else {
+                    panic!("member {h:016x}: reconstruction refused (knob off)");
+                };
+                if !(direct == csec && chunknbt::hash_of(&direct) == *h) {
+                    diverged_off += 1;
+                }
+            }
+        }
+        chunknbt::set_glob_dead_drop_for_tests(None);
+        assert!(
+            diverged_off > 0,
+            "the v0.9.113 canonical form must still diverge under the knob off"
         );
     }
 

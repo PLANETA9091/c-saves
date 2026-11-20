@@ -2161,23 +2161,52 @@ all stall points are captured as CI artifacts.
   + states, the drain fully reclaimed, the varint batch stream shipped):
 
       dim         anvil B/chunk   c-saves B/chunk   ratio
-      overworld   4104            10.2              x402
-      nether      4104            1.8               x2303
-      end         4104            4.0               x1032
-      ALL THREE   4104            5.3               x771  (x0.0013 of Anvil)
+      overworld   4104            9.6               x428
+      nether      4104            1.7               x2390
+      end         4104            4.0               x1031
+      ALL THREE   4104            5.1               x806  (x0.0012 of Anvil)
 
   Anvil's per-chunk sector floor (1 sector = 4 KiB even for a fully
   empty chunk) is measured, not assumed — every dimension weighs the
   same 4104 B/chunk on disk, so the c-saves ratios differ by terrain
-  mass alone; the per-chunk cost SATURATES with scale (5.3 B/chunk at
+  mass alone; the per-chunk cost SATURATES with scale (5.1 B/chunk at
   192x192 = 110,592 chunks). Projections (linear in chunks, the scaling
   law measured on the rings): a 40000x40000-BLOCK world (2500x2500
   chunks per dimension — the onlinemo.de/world `overworld=40000` input)
-  stores at **~95 MiB for all three dimensions** (overworld-only
-  ~61 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
-  beaten ~38x); a 20000x20000-CHUNK world (400M chunks per dimension)
-  stores at **~5.9 GiB vs ~4.48 TiB across the three dimensions**
+  stores at **~91 MiB for all three dimensions** (overworld-only
+  ~57 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
+  beaten ~40x); a 20000x20000-CHUNK world (400M chunks per dimension)
+  stores at **~5.7 GiB vs ~4.48 TiB across the three dimensions (x2418)**
   (`full_world_probe`, CI-gated).
+
+* **The dead-entry drop contract (v0.9.114)** — the canonical CSEC encoder
+  leaves palette entries the voxel stream never references out of the
+  stored form (BLOCK palettes only; biome containers ride tails verbatim,
+  which keeps every old container's glob derivation byte-stable). Worldgen
+  palettes are larded with dead entries: 67.5% of the Tectonic overworld's
+  data sections, 74.7% of ALL nether palette entries, 54.5% of the end's —
+  a dead entry costs its palette bytes AND can push the stream one
+  width-bit up (n=20 dead 4 -> n=16: 3066 -> 2454 B per section, -19.9%).
+  The GLOB rebuild already emitted used-only states, so dead-carrying
+  sections could never pass the pack stability gate and kept their 16 B
+  identity hash forever; with the drop the whole class mints the hashless
+  family (192x192 overworld: tab_hybrid 6,004 -> 0, every glob stamp
+  hashless). Derivation-safe by construction (glob wires never carry dead
+  block entries) and knobbed `CSAVES_GLOB_DEAD_DROP=0`. The shift pass
+  mirrors the drop — dead originals map to u32::MAX, the target ref map
+  skips them (their identities ship as verbatim extras) and the ref space
+  uses the kept count; the pre-fix geometry mapped dead-entry identities
+  onto ref position 0 and corrupted 7 chunks on the full-dimension corpus
+  (caught by the verify gate, bad=7 — the gate exists for exactly this).
+
+* **The GC last-segment contract (v0.9.114)** — `compact_min` (64 KiB)
+  never considered a drained store's tail segment: the 64x64 nether
+  import shipped seg-00001 at 41,901 B with 40,033 B of physically-dead
+  superseded hot blobs (95.5% dead, blobs_regular=0) — 11.4 B/chunk
+  against the true ~1.9, and the projection arithmetic inherited the
+  fat. Segments >= 4 KiB now walk the physical live set; dead bytes >=
+  `CSAVES_COMPACT_DEAD_MIN_BYTES` (8 KiB default) make them candidates —
+  the nether drains to the honest 1.6-1.7 B/chunk.
 
 * **The physical GC contract (v0.9.111)** — the batch virtual credit
   (v0.9.103) inflated segments' live counters above their physical totals,

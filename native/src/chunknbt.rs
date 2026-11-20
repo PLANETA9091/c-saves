@@ -233,6 +233,42 @@ fn glob_fill_enabled() -> bool {
             .unwrap_or(true)
     })
 }
+/// v0.9.114: the write-time DEAD-ENTRY DROP for BLOCK palettes. On by
+/// default; CSAVES_GLOB_DEAD_DROP=0 restores the v0.9.113 canonical form
+/// (dead block entries stay). DERIVATION-SAFE in both positions: glob
+/// wires never carry dead block entries (the registry re-expresses used
+/// states only), so the scan's identity derivation over glob members is
+/// byte-identical with the drop on or off — the knob only changes the
+/// write-time CSEC bytes (dedup keys) and the pack stability gate's
+/// outcome for dead-carrying members. Flipping mid-life therefore never
+/// corrupts: CSEC members are keyed by hash(stored bytes) either way.
+static GLOB_DEAD_DROP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(test)]
+static GLOB_DEAD_DROP_OVR: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
+#[cfg(test)]
+pub(crate) fn set_glob_dead_drop_for_tests(v: Option<bool>) {
+    match v {
+        Some(v) => {
+            GLOB_DEAD_DROP_OVR.1.store(v as u64, Ordering::Relaxed);
+            GLOB_DEAD_DROP_OVR.0.store(true, Ordering::Relaxed);
+        }
+        None => GLOB_DEAD_DROP_OVR.0.store(false, Ordering::Relaxed),
+    }
+}
+fn glob_dead_drop_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if GLOB_DEAD_DROP_OVR.0.load(Ordering::Relaxed) {
+            return GLOB_DEAD_DROP_OVR.1.load(Ordering::Relaxed) != 0;
+        }
+    }
+    // NOTE: bool::from_str only accepts "true"/"false" — "0" must parse as
+    // OFF explicitly (the CSAVES_NO_SCAN comparison style).
+    *GLOB_DEAD_DROP.get_or_init(|| match std::env::var("CSAVES_GLOB_DEAD_DROP").as_deref() {
+        Ok("0") | Ok("false") | Ok("off") | Ok("no") => false,
+        _ => true,
+    })
+}
 static GLOB_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 #[cfg(test)]
 static GLOB_DEBUG_OVR: (AtomicBool, AtomicU64) = (AtomicBool::new(false), AtomicU64::new(0));
@@ -2803,6 +2839,18 @@ fn section_encode_view(
         order_shift: u32,
         facts_out: &mut Option<SectionFacts>,
     ) -> Option<(bool, u8)> {
+        // v0.9.114: the dead-entry drop applies to the BLOCK palette only
+        // (entries == 4096). The BIOME container rides the CSEC tail and the
+        // GLOB wire's verbatim tail: the scan's identity derivation for OLD
+        // containers' glob members re-encodes that tail through the same
+        // canonical encoder, so a biome drop would change the derived hash
+        // of every old glob member whose biome palette carries dead entries
+        // (88% of the calibration corpus) — a systematic read miss at
+        // reopen. Block palettes never ride tails (the glob wire re-express
+        // es them through the registry), so their drop is derivable both
+        // ways: new members mint hashless, old glob members (which by
+        // construction carry no dead block entries) derive byte-identically.
+        let dead_drop = entries == 4096 && glob_dead_drop_enabled();
         let pal = &pdv.palette;
         let n = pal.len();
         if n == 0 || n > 65535 {
@@ -2875,7 +2923,39 @@ fn section_encode_view(
         });
         SPLT_PAL.0.fetch_add(t_pal.elapsed().as_nanos() as u64, Ordering::Relaxed);
         SPLT_PAL.1.fetch_add(1, Ordering::Relaxed);
-        out.extend_from_slice(&(n as u16).to_le_bytes());
+        // v0.9.114: DEAD-ENTRY DROP — palette entries the voxel stream never
+        // references leave the canonical form. The GLOB rebuild
+        // (glob_to_section / glob2_to_section) emits only USED states, so a
+        // section whose canonical form carried dead entries could never pass
+        // the pack stability gate (rebuild + re-encode != canonical) and kept
+        // its 16 B identity hash forever. Measured incidence: the Tectonic
+        // overworld corpus has 67.5% of data sections with dead block
+        // entries (187 hybrid kept-hash rows = the whole drift class), the
+        // nether cavern model 74.7% of ALL palette entries dead, the end
+        // 54.5%. Dead entries cost palette bytes in EVERY such section and
+        // lock them out of the hashless family. The drop is a pure function
+        // of content (deterministic => dedup-stable), semantically a no-op
+        // (a palette is a pure lookup), and vanilla-compatible (the strict
+        // reader walks the stream's indices; any width reproduces them).
+        // Old containers are immune by construction: CSEC members are keyed
+        // by hash(stored bytes) and never re-encoded in place, their
+        // dead-carrying members FAIL the new stability gate (no conversion,
+        // no rewrite, shift-perm targets stay byte-stable), and glob
+        // members minted earlier carry no dead entries (the rebuild drops
+        // them), so the new derivation reproduces the old bytes exactly.
+        // Dead entries sort strictly after all used ones (count DESC puts
+        // count-0 last), so the kept order is a PREFIX of the sorted order:
+        // truncating preserves the canonical rule byte for byte.
+        let n_used = if dead_drop {
+            let u = order_idx.iter().filter(|&&i| counts[i] > 0).count();
+            if u < n {
+                order_idx.truncate(u);
+            }
+            u
+        } else {
+            n
+        };
+        out.extend_from_slice(&(n_used as u16).to_le_bytes());
         for &oi in &order_idx {
             put_entry(out, &pal[oi])?;
         }
@@ -2883,23 +2963,28 @@ fn section_encode_view(
         // a 2-entry palette wastes 4x (2 KiB vs 512 B per section). Under
         // 16-entry palettes re-pack at ceillog2(n); the decoder normalizes
         // back to the vanilla width. n >= 16: ceillog2 >= 4, no change.
-        let narrow = bits_for(n) < 4;
-        let out_bits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+        // The width comes from the KEPT palette (dead entries dropped above).
+        let narrow = bits_for(n_used) < 4;
+        let out_bits = if narrow { bits_for(n_used) } else { bits_for(n_used).max(4) };
         // IDENTITY shortcut: the palette is already in canonical order and
         // the packing width is unchanged — the vanilla longs ARE the dense
         // stream byte-for-byte (LE). RLE candidates are still evaluated on
         // the unpacked stream below, so the chosen form stays a pure
-        // function of content (dedup-stable across re-saves).
+        // function of content (dedup-stable across re-saves). With dead
+        // entries dropped the kept order is a prefix, so kept[i]==i still
+        // proves the used indices are identity-mapped (dead indices never
+        // appear in the stream).
         let identity = !narrow
             && in_bits == out_bits
             && matches!(in_bits, 1 | 2 | 4 | 8 | 16 | 32)
             && order_idx.iter().enumerate().all(|(i, &old)| old == i);
-        // remap old palette index -> canonical index
+        // remap old palette index -> canonical index (dead entries keep the
+        // 0 init; their indices never appear in the voxel stream)
         let mut remap = vec![0u8; n];
         for (new_i, &old_i) in order_idx.iter().enumerate() {
             remap[old_i] = new_i as u8;
         }
-        if n > 256 {
+        if n_used > 256 {
             // wide palettes: remap table must be u16; RLE (byte indices)
             // does not apply — dense only. The remap fuses into the pack
             // loop (identical bytes to packing the materialized stream).
@@ -3416,11 +3501,16 @@ struct ShiftSec {
     /// per-plane fingerprints of `ident` (cheap reject for shift matching)
     plane_fp: [u64; 16],
     /// canonical position (in the stored CSEC3 palette) of each original
-    /// palette index — ref-space mapping for targets
+    /// palette index — ref-space mapping for targets. v0.9.114: DEAD
+    /// entries (dropped from the canonical form) carry u32::MAX — they are
+    /// NOT in the stored palette, so a ref lookup must never hit them.
     canon_of_orig: Vec<u32>,
     /// chunk-global identity id of each ORIGINAL palette entry
     id_of_orig: Vec<u32>,
     n: usize,
+    /// v0.9.114: the entries the STORED canonical palette carries (the
+    /// dead-drop kept count) — the ref space the decoder reconstructs.
+    n_kept: usize,
 }
 
 /// Plane fingerprints of a ShiftSec ident stream (16 planes x 256 entries).
@@ -3577,7 +3667,13 @@ fn shift_sec_of_view(
         pal.iter().map(|e| (e.plain, e.name, &e.props)).collect();
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then_with(|| keys[a].cmp(&keys[b])));
-    let mut canon_of_orig = vec![0u32; n];
+    // v0.9.114: mirror the encoder's dead-entry drop — the stored canonical
+    // palette carries only USED entries (count DESC puts count-0 last, so
+    // the kept set is a prefix of the sorted order). Dead entries map to
+    // u32::MAX: a ref-space lookup must never reach them.
+    let n_kept = order.iter().filter(|&&i| counts[i] > 0).count();
+    order.truncate(n_kept);
+    let mut canon_of_orig = vec![u32::MAX; n];
     for (pos, &oi) in order.iter().enumerate() {
         canon_of_orig[oi] = pos as u32;
     }
@@ -3585,7 +3681,7 @@ fn shift_sec_of_view(
     let t_fp = std::time::Instant::now();
     let plane_fp = plane_fps(&ident);
     ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
+    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n, n_kept })
 }
 /// ShiftSec build from encoder facts (v0.9.12): identical output to
 /// shift_sec_of for the same section — the canonical order is the same
@@ -3620,7 +3716,10 @@ fn shift_sec_from_facts_view(
     }
     ST_SHIFT_UNP_NS.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let t_key = std::time::Instant::now();
-    let mut canon_of_orig = vec![0u32; n];
+    // v0.9.114: facts.order carries only the KEPT entries (the encoder's
+    // dead-entry drop truncated it) — dead originals map to u32::MAX.
+    let n_kept = facts.order.len();
+    let mut canon_of_orig = vec![u32::MAX; n];
     for (pos, &oi) in facts.order.iter().enumerate() {
         let oi = oi as usize;
         if oi >= n {
@@ -3633,7 +3732,7 @@ fn shift_sec_from_facts_view(
     let plane_fp = plane_fps(&ident);
     ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ST_SHIFT_FAST.fetch_add(1, Ordering::Relaxed);
-    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
+    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n, n_kept })
 }
 
 /// ShiftSec build straight from the typed lite section (v0.9.14): identical
@@ -3668,7 +3767,9 @@ fn shift_sec_from_facts_lite(
     }
     ST_SHIFT_UNP_NS.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let t_key = std::time::Instant::now();
-    let mut canon_of_orig = vec![0u32; n];
+    // v0.9.114: facts.order carries only the KEPT entries (see the view path)
+    let n_kept = facts.order.len();
+    let mut canon_of_orig = vec![u32::MAX; n];
     for (pos, &oi) in facts.order.iter().enumerate() {
         let oi = oi as usize;
         if oi >= n {
@@ -3681,7 +3782,7 @@ fn shift_sec_from_facts_lite(
     let plane_fp = plane_fps(&ident);
     ST_SHIFT_FP_NS.fetch_add(t_fp.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ST_SHIFT_FAST.fetch_add(1, Ordering::Relaxed);
-    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n })
+    Some(ShiftSec { ident, plane_fp, canon_of_orig, id_of_orig, n, n_kept })
 }
 
 /// The shift pass: replace dense CSEC3 sections with shift refs where a
@@ -3979,7 +4080,13 @@ fn shift_ref_pass(
         let t_tail0 = t_all.elapsed().as_nanos() as u64;
         let tj = ss_get!(j).unwrap();
         let kw = k * 256;
-        let n_t = tj.n;
+        // v0.9.114: the ref space is the TARGET'S STORED palette (the
+        // dead-drop kept count) — the decoder rebuilds from tpal.len(),
+        // so the top-stream width and the ref numbering must agree on the
+        // KEPT count, and the ref map must never reach a dead entry
+        // (canon_of_orig == u32::MAX: those identities fall to the extras
+        // path and ship verbatim).
+        let n_t = tj.n_kept;
         if n_t + 255 > 65535 {
             continue;
         }
@@ -3989,6 +4096,9 @@ fn shift_ref_pass(
         // dominated the top-plane remap loop at ~100k lookups per import.
         let mut t_rev: HashMap<u32, usize, RawBuildC> = HashMap::with_capacity_and_hasher(n_t, RawBuildC);
         for (oi, &id) in tj.id_of_orig.iter().enumerate() {
+            if tj.canon_of_orig[oi] == u32::MAX {
+                continue; // dead entry: not in the stored palette
+            }
             t_rev.entry(id).or_insert(oi);
         }
         // ref-space mapping of the section's top planes; extras = identities
