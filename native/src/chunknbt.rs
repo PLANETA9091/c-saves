@@ -8307,6 +8307,13 @@ pub struct GlobPre {
     pub n: usize,
     /// csec offset of the tail after the dense stream
     pub tail_off: usize,
+    /// v0.9.115: the member's csec stream was MULTI-RUN RLE — the raw gid
+    /// wire expands 4-40x against it, so the gid-RLE admission opens for
+    /// this member even when the global admission is retired (the JJ
+    /// raw-alignment win does not apply to streams the source itself
+    /// stored run-length coded). Content-driven: a pure function of the
+    /// member bytes, dedup-stable.
+    pub from_rle: bool,
 }
 
 /// Stage 1 (PURE — no registry): header checks + palette parse + dense
@@ -8370,6 +8377,7 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
             out_bits: 4,
             n,
             tail_off: p,
+            from_rle: false,
         });
     }
     if f1 & 3 != 3 {
@@ -8383,27 +8391,95 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
     // admission always wins for uniform content, and the transposed order
     // folds to the same single run). Convert it to the fill form exactly
     // like the no-data route above.
+    //
+    // v0.9.115: MULTI-RUN RLE route — strata sections (nether lava seas,
+    // layered overworld geology) encode as several [idx][varint run] pairs;
+    // the pre only admitted the single-run uniform shape, so the ENTIRE
+    // strata class stayed csec3: measured 12,766 of 18,432 nether sections
+    // refused here (palettes p50=2, p90=3) = 99.3% of the nether slab mass
+    // (raw 799 KB, est_comp 19 KB at 192x192). The run stream parses
+    // exactly like section_decode3's RLE arm ([idx u8][varint run] pairs,
+    // byte indices, n <= 256, vanilla order or y-fast transposed); the
+    // expansion un-transposes for the transposed form and the stream joins
+    // the ordinary gid route — the registry mapping, the pack admission
+    // (raw vs gid-RLE), the lex walk and the cross-section alignment do
+    // the rest. Rebuild + re-encode reproduce the stored form because the
+    // canonical encoder re-chooses the same RLE admission on the same
+    // content; anything that does not reproduce keeps its hash via the
+    // stability gate, as always.
     if f2 & 48 != 0 {
-        if !glob_fill_enabled() {
+        let ord = (f2 >> 4) & 3; // 1 = vanilla order, 2 = y-fast transposed
+        if ord == 0 || n > 256 {
             if glob_debug() {
-                eprintln!("glob: skip rle f1={f1:02x} f2={f2:02x} (fill off)");
+                eprintln!("glob: skip rle ord={ord} n={n} (bad order bits or wide palette)");
             }
             return None;
         }
+        let mut vv: Vec<u8> = Vec::with_capacity(4096);
         let mut q = p;
-        let idx = *csec.get(q)?;
-        q += 1;
-        let run = read_uvarint(csec, &mut q)? as usize;
-        if (idx as usize) >= n || run != 4096 {
-            if glob_debug() {
-                eprintln!("glob: skip rle idx={idx} run={run} n={n} (not single-run uniform)");
+        while vv.len() < 4096 {
+            let idx = *csec.get(q)?;
+            q += 1;
+            if idx as usize >= n {
+                if glob_debug() {
+                    eprintln!("glob: skip rle idx={idx} n={n} (out of range)");
+                }
+                return None;
             }
-            return None;
+            let run = read_uvarint(csec, &mut q)? as usize;
+            if run == 0 || vv.len() + run > 4096 {
+                if glob_debug() {
+                    eprintln!("glob: skip rle run={run} at {} (bad length)", vv.len());
+                }
+                return None;
+            }
+            vv.resize(vv.len() + run, idx);
+        }
+        // single-run uniform content folds to the fill form exactly like
+        // v0.9.100 (fill-knob gated: the knob opts out of the FILL FORM,
+        // not out of the ordinary gid route below)
+        if vv.iter().all(|&x| x == vv[0]) {
+            if !glob_fill_enabled() {
+                if glob_debug() {
+                    eprintln!("glob: skip rle single-run n={n} (fill off)");
+                }
+                return None;
+            }
+            let idx = vv[0] as usize;
+            return Some(GlobPre {
+                states,
+                vox: vec![idx as u32; 4096],
+                ref_order: vec![idx as u32],
+                y,
+                f1,
+                f2c: f2 & !4 & !16 & !32,
+                f3,
+                out_bits: 4,
+                n,
+                tail_off: q,
+                from_rle: false,
+            });
+        }
+        let vox: Vec<u32> = if ord == 2 {
+            transpose_fast_y(&vv, 16).iter().map(|&x| x as u32).collect()
+        } else {
+            vv.iter().map(|&x| x as u32).collect()
+        };
+        // the fused bounds+first-reference scan is shared with the dense
+        // route below (vox is already bounds-checked by the run parse)
+        let mut seen = vec![false; n];
+        let mut ref_order: Vec<u32> = Vec::with_capacity(n.min(4096));
+        for &v in &vox {
+            let vi = v as usize;
+            if !seen[vi] {
+                seen[vi] = true;
+                ref_order.push(v);
+            }
         }
         return Some(GlobPre {
             states,
-            vox: vec![idx as u32; 4096],
-            ref_order: vec![idx as u32],
+            vox,
+            ref_order,
             y,
             f1,
             f2c: f2 & !4 & !16 & !32,
@@ -8411,6 +8487,7 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
             out_bits: 4,
             n,
             tail_off: q,
+            from_rle: true,
         });
     }
     // dense stream width: narrow (f2 bit2) packs at bits_for(n), else the
@@ -8453,6 +8530,7 @@ pub fn section_glob_pre(csec: &[u8]) -> Option<GlobPre> {
         out_bits,
         n,
         tail_off: p + stream_len,
+        from_rle: false,
     })
 }
 
@@ -8549,7 +8627,19 @@ pub fn section_glob_finish_as(
     // 4x rule admits streams whose RLE is small but whose slab compresses
     // WORSE (corpus: x2.99 vs x3.08 at div=4). The divisor is tunable —
     // CSAVES_GID_RLE_DIV, 0 disables gid RLE entirely.
-    let div: u64 = gid_rle_div();
+    //
+    // v0.9.115: members whose csec stream arrived MULTI-RUN RLE open the
+    // admission at the measured div=4 even when the global admission is
+    // retired: their raw gid wire expands 4-40x against the stored run
+    // stream (the nether strata class would lose the mint's window gate and
+    // stay csec3 forever). Content-driven (from_rle is a pure function of
+    // the member bytes), so the wire choice stays dedup-stable; the global
+    // knob still overrides when explicitly set.
+    let div: u64 = if pre.from_rle && gid_rle_div() == 0 {
+        4
+    } else {
+        gid_rle_div()
+    };
     if glob_debug() {
         eprintln!("glob: n={n} vox_max={:?} max_gid={max_gid} wide={wide}", pre.vox.iter().max());
     }
@@ -10618,10 +10708,19 @@ mod glob_tests {
         );
         sec2.insert("block_states".to_string(), Value::Compound(bs2));
         let canon2 = section_encode(&Value::Compound(sec2)).expect("encode2");
-        // the encoder chose an RLE form (f2 order bits set) -> not globbable
+        // v0.9.115: the encoder chose an RLE form (f2 order bits set) and the
+        // multi-run RLE route now CONVERTS it — the wire joins the ordinary
+        // gid family and the rebuild reproduces the stored canonical bytes
+        // (the pack stability gate closes on the whole strata class)
         assert!(canon2.len() > 4);
         if canon2[2] & 48 != 0 {
-            assert!(section_to_glob(&canon2, &mut reg).is_none(), "rle must not glob");
+            let g = section_to_glob(&canon2, &mut reg).expect("multi-run rle converts now");
+            let direct = glob_any_to_section(&g, &reg).expect("rebuild");
+            assert_eq!(
+                canonical_reencode(&direct).as_deref(),
+                Some(canon2.as_slice()),
+                "stability gate must close on the multi-run rle class"
+            );
         }
     }
 

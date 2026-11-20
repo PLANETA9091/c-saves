@@ -2161,10 +2161,10 @@ all stall points are captured as CI artifacts.
   + states, the drain fully reclaimed, the varint batch stream shipped):
 
       dim         anvil B/chunk   c-saves B/chunk   ratio
-      overworld   4104            9.6               x428
-      nether      4104            1.7               x2390
-      end         4104            4.0               x1031
-      ALL THREE   4104            5.1               x806  (x0.0012 of Anvil)
+      overworld   4104            9.5               x434
+      nether      4104            1.7               x2389
+      end         4104            4.0               x1030
+      ALL THREE   4104            5.1               x812  (x0.0012 of Anvil)
 
   Anvil's per-chunk sector floor (1 sector = 4 KiB even for a fully
   empty chunk) is measured, not assumed — every dimension weighs the
@@ -2198,6 +2198,21 @@ all stall points are captured as CI artifacts.
   uses the kept count; the pre-fix geometry mapped dead-entry identities
   onto ref position 0 and corrupted 7 chunks on the full-dimension corpus
   (caught by the verify gate, bad=7 — the gate exists for exactly this).
+
+* **The multi-run RLE route (v0.9.115)** — `section_glob_pre` admitted only
+  the SINGLE-run uniform RLE shape, so every strata section (nether lava
+  seas: 12,766 of 18,432 generated sections refused, palettes p50=2;
+  layered overworld geology) stayed csec3 forever. The route now parses the
+  full [idx][varint run] stream like the decoder's RLE arm (byte indices,
+  n <= 256, vanilla or y-fast transposed order), folds single-run content
+  to the fill form, and joins the ordinary gid route for the rest;
+  members whose source stream was run-length coded open the gid-RLE
+  admission (div=4) so their wire stays compact against the stored runs.
+  The JJThunder corpus drains -1.6% from the route; the 4-byte void
+  sections and 0xC9 shift refs stay the only correct refusals (void csec3
+  is 4 B — smaller than any glob wire). A dedicated tail stream with a
+  trained 64 KiB zstd dictionary was probed and REJECTED: the mixed LZMA2
+  window beats it ~2x on the end's 100%-unique city tails.
 
 * **The GC last-segment contract (v0.9.114)** — `compact_min` (64 KiB)
   never considered a drained store's tail segment: the 64x64 nether
