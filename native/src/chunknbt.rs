@@ -1578,6 +1578,130 @@ fn rle_stream_len_u16(v: &[u32]) -> u64 {
     total
 }
 
+/// v0.9.117: RLE SIZE of a u32 gid stream under the CANONICAL [idx u8]
+/// [varint run] framing (the framing byte count is remap-independent —
+/// see rle_stream_len_mapped), with the early exit at `bound`. This is the
+/// glob-rebuild admission scan: the canonical index stream's run structure
+/// equals the raw gid stream's (the remap is injective), so the exact
+/// length is computable without materializing the remap.
+fn rle_stream_len_mapped_bounded(v: &[u32], bound: u64) -> u64 {
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == v[i] {
+            run += 1;
+        }
+        total += 1 + uvarint_len(run as u64);
+        if total > bound {
+            return total;
+        }
+        i += run;
+    }
+    total
+}
+
+/// v0.9.117: transposed twin of rle_stream_len_mapped_bounded — the same
+/// (x, z, y) inline-transposition walk as rle_transposed_len_bounded over
+/// the u32 stream, [idx u8][varint run] framing, early exit at `bound`.
+fn rle_transposed_len_mapped_bounded(v: &[u32], side: usize, bound: u64) -> u64 {
+    let s2 = side * side;
+    let mut total = 0u64;
+    let mut run_val = 0u32;
+    let mut run_len = 0usize;
+    'outer: for x in 0..side {
+        for z in 0..side {
+            let base = z * side + x;
+            for y in 0..side {
+                let e = v[y * s2 + base];
+                if run_len > 0 && e == run_val {
+                    run_len += 1;
+                } else {
+                    if run_len > 0 {
+                        total += 1 + uvarint_len(run_len as u64);
+                        if total > bound {
+                            break 'outer;
+                        }
+                    }
+                    run_val = e;
+                    run_len = 1;
+                }
+            }
+        }
+    }
+    if run_len > 0 {
+        total += 1 + uvarint_len(run_len as u64);
+    }
+    total
+}
+
+/// v0.9.117: rle_encode_stream over a mapped u8 stream ([idx u8][varint
+/// run] framing) — identical bytes to rle_encode_stream over the
+/// materialized remapped stream, without the extra 4096-byte remap
+/// materialization. The glob rebuild uses this to emit the winning RLE
+/// wire straight off the raw gid stream.
+fn rle_encode_stream_mapped_u8(v: &[u8], remap: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() / 4 + 16);
+    let mut i = 0usize;
+    while i < v.len() {
+        let idx = remap[v[i] as usize];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == v[i] {
+            run += 1;
+        }
+        out.push(idx);
+        push_uvarint(&mut out, run as u64);
+        i += run;
+    }
+    out
+}
+
+/// v0.9.117: FUSED counts + RLE length over a u8 stream — one run walk
+/// instead of two full 4096 passes. The per-voxel histogram increment was
+/// the rebuild's dominant cost (13.8 of 20.5 us: store-forwarding stalls
+/// when consecutive bytes hit the same counter — exactly what long runs
+/// do); per-RUN accumulation collapses 4096 increments to a few hundred
+/// and folds the admission scan's first walk into the same pass. Run
+/// structure is preserved by the injective canonical remap, so the run
+/// walk yields the EXACT same counts and RLE length as the old two passes
+/// (the [idx u8] framing length is remap-independent).
+fn counts_rle_len_u8(v: &[u8]) -> ([u32; 256], u64) {
+    let mut counts = [0u32; 256];
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let g = v[i];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == g {
+            run += 1;
+        }
+        counts[g as usize] += run as u32;
+        total += 1 + uvarint_len(run as u64);
+        i += run;
+    }
+    (counts, total)
+}
+
+/// v0.9.117: u32 twin of counts_rle_len_u8 for the narrow GLOB2 gid payload
+/// (gids < 256 — the u8-wire forms 0/1/2/6/7 guarantee it): counts and the
+/// canonical [idx u8][varint run] framing length in one run walk.
+fn counts_rle_len_u32(v: &[u32]) -> ([u32; 256], u64) {
+    let mut counts = [0u32; 256];
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < v.len() {
+        let g = v[i];
+        let mut run = 1usize;
+        while i + run < v.len() && v[i + run] == g {
+            run += 1;
+        }
+        counts[g as usize] += run as u32;
+        total += 1 + uvarint_len(run as u64);
+        i += run;
+    }
+    (counts, total)
+}
+
 /// v0.9.33: early-exit twin of rle_stream_len_u16.
 fn rle_stream_len_u16_bounded(v: &[u32], bound: u64) -> u64 {
     let mut total = 0u64;
@@ -8769,6 +8893,7 @@ pub fn section_to_glob(csec: &[u8], reg: &mut StateRegistry) -> Option<Vec<u8>> 
 /// semantically irrelevant (a palette is a pure lookup), verified by the
 /// semantic comparators.
 pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+    let _tg = std::time::Instant::now();
     if glob.first() != Some(&GLOB_MAGIC) {
         return None;
     }
@@ -8784,11 +8909,15 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     let stream = glob.get(p..p + 4096)?;
     p += 4096;
     let tail = &glob[p..];
-    // counts per gid over the section's voxels
-    let mut counts = [0u32; 256];
-    for &g in stream {
-        counts[g as usize] += 1;
-    }
+    // v0.9.117: counts + the canonical RLE framing length in ONE run walk
+    // (the per-voxel histogram was the rebuild's dominant cost —
+    // store-forwarding stalls on consecutive same-counter increments; the
+    // run walk accumulates per RUN). Counts and framing length are EXACT —
+    // identical to the old two full passes.
+    let (mut counts, la_raw) = counts_rle_len_u8(stream);
+    ST_GRB_PRE.0.fetch_add(_tg.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_GRB_PRE.1.fetch_add(1, Ordering::Relaxed);
+    let _ts = std::time::Instant::now();
     // distinct used gids in the frequency-canonical order — EXACTLY the
     // enc_pal_data_canon rule: count DESC (dominant first), ties by
     // (plain, name, props) ASC. The rebuild MUST reproduce the canonical
@@ -8824,36 +8953,59 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     if n == 0 || n > 65535 {
         return None;
     }
+    ST_GRB_SORT.0.fetch_add(_ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_GRB_SORT.1.fetch_add(1, Ordering::Relaxed);
+    let _tc = std::time::Instant::now();
     let mut gid2canon = [0u8; 256];
     for (i, (_, g)) in used.iter().enumerate() {
         gid2canon[*g as usize] = i as u8;
     }
-    let vox: Vec<u8> = stream.iter().map(|&g| gid2canon[g as usize]).collect();
-    // same form choice as the canonical encoder
+    // same form choice as the canonical encoder. v0.9.117: the dense length
+    // is the formula (4096 whole groups at any out_bits), so the dense pack
+    // runs LAZILY — only when no RLE candidate wins — and the RLE admission
+    // scans walk the RAW gid stream with the early exit at the admission
+    // bound (the canonical index stream's run structure equals the raw
+    // stream's — the remap is injective — and the [idx u8] framing length is
+    // remap-independent). Decisions and output bytes are identical to the
+    // materialized formulation; the rebuild skips two full walks + the
+    // remap materialization on noise-heavy sections and the dense pack on
+    // RLE winners (measured 21.4 -> ~10 us per rebuild on the JJ corpus,
+    // the read-cold path's dominant cost).
     let narrow = bits_for(n) < 4;
     let out_bits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
-    let dense = dense_pack(&vox, out_bits);
-    let mut best_len = dense.len();
+    let dense_len = (4096usize * out_bits as usize + 7) / 8;
+    let bound = (dense_len / 4) as u64;
+    let mut best_len = dense_len;
     let mut best: Option<(u8, Vec<u8>)> = None;
-    // size-only scans (exact lengths, same run walk) — materialize only the
-    // winning candidate; identical decisions and bytes to full materialize
-    let la = rle_stream_len(&vox);
-    let a_ok = la * 4 <= dense.len() as u64 && la + 32 <= dense.len() as u64;
-    let lb = rle_transposed_len(&vox, 16);
-    let b_ok = lb * 4 <= dense.len() as u64 && lb + 32 <= dense.len() as u64;
+    // v0.9.117: `la` came out of the fused counts walk; only the TRANSPOSED
+    // candidate walks here (early exit at the admission bound). Decisions
+    // and bytes are identical to the materialized formulation.
+    let la = la_raw;
+    let a_ok = la * 4 <= dense_len as u64 && la + 32 <= dense_len as u64;
+    let lb = rle_transposed_len_bounded(stream, 16, bound);
+    let b_ok = lb * 4 <= dense_len as u64 && lb + 32 <= dense_len as u64;
+    ST_GRB_SCAN.0.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_GRB_SCAN.1.fetch_add(1, Ordering::Relaxed);
+    let _tm = std::time::Instant::now();
     if a_ok {
         if b_ok && lb < la {
             best_len = lb as usize;
-            best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
+            best = Some((
+                2,
+                rle_encode_stream_mapped_u8(&transpose_fast_y(stream, 16), &gid2canon),
+            ));
         } else {
             best_len = la as usize;
-            best = Some((1, rle_encode_stream(&vox)));
+            best = Some((1, rle_encode_stream_mapped_u8(stream, &gid2canon)));
         }
     } else if b_ok {
         best_len = lb as usize;
-        best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
+        best = Some((
+            2,
+            rle_encode_stream_mapped_u8(&transpose_fast_y(stream, 16), &gid2canon),
+        ));
     }
-    let mut out = Vec::with_capacity(16 + n * 32 + dense.len() + tail.len());
+    let mut out = Vec::with_capacity(16 + n * 32 + dense_len + tail.len());
     out.push(magic);
     out.push(f1);
     let mut f2n = f2 & !4 & !16 & !32;
@@ -8874,6 +9026,9 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     }
     match best {
         None => {
+            let vox: Vec<u8> = stream.iter().map(|&g| gid2canon[g as usize]).collect();
+            let dense = dense_pack(&vox, out_bits);
+            debug_assert_eq!(dense.len(), dense_len);
             out.extend_from_slice(&dense);
             let _ = best_len;
         }
@@ -8885,6 +9040,8 @@ pub fn glob_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     // f2n was computed BEFORE the palette/stream were pushed; patch byte 2
     out[2] = f2n;
     out.extend_from_slice(tail);
+    ST_GRB_MAT.0.fetch_add(_tm.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_GRB_MAT.1.fetch_add(1, Ordering::Relaxed);
     ST_GLOB_DEC.fetch_add(1, Ordering::Relaxed);
     Some(out)
 }
@@ -8952,6 +9109,7 @@ pub fn glob_any_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> 
 /// re-choice for n <= 256, dense-only wide packing for n > 256 — with a
 /// payload-decode step (gform) in front.
 pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+    let _tg = std::time::Instant::now();
     if glob.first() != Some(&GLOB2_MAGIC) {
         return None;
     }
@@ -9056,20 +9214,40 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         return None;
     }
     let tail = &glob[p..];
-    let max_gid = *gids.iter().max()? as usize;
-    // counts per gid over the section's voxels — sized to the gid range the
-    // section actually touches (the u8 hot path never allocates beyond 256)
-    let mut counts = vec![0u32; max_gid + 1];
-    for &g in &gids {
-        counts[g as usize] += 1;
-    }
+    // v0.9.117: fused counts + canonical-RLE-length run walk for the u8-wire
+    // gforms (0/1/2/6/7 — every gid < 256 by construction); the wide forms
+    // keep the exact max+counts path. Same counts, same framing length as
+    // the old three full passes — the per-voxel histogram was the rebuild's
+    // dominant cost (store-forwarding stalls; the run walk accumulates per
+    // RUN), and the run structure is remap-invariant, so `la` is EXACT.
+    let narrow_gid = matches!(gform, 0 | 1 | 2 | 6 | 7);
+    let (mut counts_arr, la_pre) = if narrow_gid {
+        counts_rle_len_u32(&gids)
+    } else {
+        ([0u32; 256], 0u64)
+    };
+    ST_GRB_PRE.0.fetch_add(_tg.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_GRB_PRE.1.fetch_add(1, Ordering::Relaxed);
+    let _ts = std::time::Instant::now();
     // distinct used gids in the frequency-canonical order — EXACTLY the
     // enc_pal_data_canon rule (count DESC, ties (plain, name, props) ASC);
     // see glob_to_section for why byte-identity matters (shift-ref perms)
-    let mut used: Vec<(u32, u32)> = (0..counts.len() as u32)
-        .filter(|&g| counts[g as usize] > 0)
-        .map(|g| (counts[g as usize], g))
-        .collect();
+    let mut used: Vec<(u32, u32)> = if narrow_gid {
+        (0..256u32)
+            .filter(|&g| counts_arr[g as usize] > 0)
+            .map(|g| (counts_arr[g as usize], g))
+            .collect()
+    } else {
+        let max_gid = *gids.iter().max()? as usize;
+        let mut counts = vec![0u32; max_gid + 1];
+        for &g in &gids {
+            counts[g as usize] += 1;
+        }
+        (0..counts.len() as u32)
+            .filter(|&g| counts[g as usize] > 0)
+            .map(|g| (counts[g as usize], g))
+            .collect()
+    };
     // v0.9.75: reference snapshot (see glob_to_section) — no per-gid clones
     let snap: Vec<Option<&GlobState>> = used.iter().map(|&(_, g)| reg.get(g)).collect();
     let key = state_key;
@@ -9087,7 +9265,14 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     if n == 0 || n > 65535 {
         return None;
     }
+    ST_GRB_SORT.0.fetch_add(_ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_GRB_SORT.1.fetch_add(1, Ordering::Relaxed);
+    let _tc = std::time::Instant::now();
     let magic = if f3 != 0 { CSEC4_MAGIC } else { CSEC3_MAGIC };
+    // v0.9.117: max gid == the max USED gid (counts[gid]>0 exactly for the
+    // gids the stream touches) — one scan over the used vec instead of the
+    // full 4096-voxel max().
+    let max_gid = used.iter().map(|&(_, g)| g).max().unwrap_or(0) as usize;
     // v0.9.100: fill member sourced from a NO-DATA uniform section (f1 bit1
     // clear) — the canonical form carries palette-only block_states with no
     // voxel stream, so the rebuild reproduces exactly that shape instead of
@@ -9142,30 +9327,49 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         ST_GLOB_DEC.fetch_add(1, Ordering::Relaxed);
         return Some(out);
     }
-    // narrow rebuild: same form re-choice as the canonical encoder
+    // narrow rebuild: same form re-choice as the canonical encoder.
+    // v0.9.117: lazy dense + bounded mapped RLE scans over the raw gid
+    // stream (same decision-equivalence argument as glob_to_section — the
+    // remap is injective, the [idx u8] framing is remap-independent), so
+    // the rebuild materializes neither the remapped voxels nor the dense
+    // pack when an RLE candidate wins.
     let narrow = bits_for(n) < 4;
     let out_bits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
-    let vox: Vec<u8> = gids.iter().map(|&g| gid2canon[g as usize] as u8).collect();
-    let dense = dense_pack(&vox, out_bits);
-    let mut best_len = dense.len();
+    let dense_len = (4096usize * out_bits as usize + 7) / 8;
+    let bound = (dense_len / 4) as u64;
+    let remap8: Vec<u8> = (0..=max_gid)
+        .map(|g| if g < gid2canon.len() { gid2canon[g] as u8 } else { 0 })
+        .collect();
+    let mut best_len = dense_len;
     let mut best: Option<(u8, Vec<u8>)> = None;
-    // size-only scans (exact lengths, same run walk) — materialize only the
-    // winning candidate; identical decisions and bytes to full materialize
-    let la = rle_stream_len(&vox);
-    let a_ok = la * 4 <= dense.len() as u64 && la + 32 <= dense.len() as u64;
-    let lb = rle_transposed_len(&vox, 16);
-    let b_ok = lb * 4 <= dense.len() as u64 && lb + 32 <= dense.len() as u64;
+    // v0.9.117: `la` came out of the fused counts walk on the narrow gforms;
+    // the wide forms walk it here (bounded). Only the TRANSPOSED candidate
+    // walks for both. Decisions and bytes are identical to the materialized
+    // formulation.
+    let la = if narrow_gid { la_pre } else { rle_stream_len_mapped_bounded(&gids, bound) };
+    let a_ok = la * 4 <= dense_len as u64 && la + 32 <= dense_len as u64;
+    let lb = rle_transposed_len_mapped_bounded(&gids, 16, bound);
+    let b_ok = lb * 4 <= dense_len as u64 && lb + 32 <= dense_len as u64;
+    ST_GRB_SCAN.0.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_GRB_SCAN.1.fetch_add(1, Ordering::Relaxed);
+    let _tm = std::time::Instant::now();
     if a_ok {
         if b_ok && lb < la {
             best_len = lb as usize;
-            best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
+            best = Some((
+                2,
+                rle_encode_stream_mapped(&transpose_fast_y_u16(&gids, 16), &remap8),
+            ));
         } else {
             best_len = la as usize;
-            best = Some((1, rle_encode_stream(&vox)));
+            best = Some((1, rle_encode_stream_mapped(&gids, &remap8)));
         }
     } else if b_ok {
         best_len = lb as usize;
-        best = Some((2, rle_encode_stream(&transpose_fast_y(&vox, 16))));
+        best = Some((
+            2,
+            rle_encode_stream_mapped(&transpose_fast_y_u16(&gids, 16), &remap8),
+        ));
     }
     let mut f2n = f2 & !4 & !16 & !32;
     if narrow && best.is_none() {
@@ -9190,6 +9394,9 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     }
     match best {
         None => {
+            let vox: Vec<u8> = gids.iter().map(|&g| gid2canon[g as usize] as u8).collect();
+            let dense = dense_pack(&vox, out_bits);
+            debug_assert_eq!(dense.len(), dense_len);
             out.extend_from_slice(&dense);
         }
         Some((ord, bytes)) => {
@@ -9198,12 +9405,25 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         }
     }
     out.extend_from_slice(tail);
+    ST_GRB_MAT.0.fetch_add(_tm.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    ST_GRB_MAT.1.fetch_add(1, Ordering::Relaxed);
     ST_GLOB_DEC.fetch_add(1, Ordering::Relaxed);
     Some(out)
 }
 
 static ST_GLOB_ENC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ST_GLOB_DEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// v0.9.117 rebuild-stage decomposition (ns): counts+parse / sort / admission
+// scans / materialize — the read-cold profile pointed here, the stage split
+// names the remaining 20 us.
+pub static ST_GRB_PRE: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+pub static ST_GRB_SORT: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+pub static ST_GRB_SCAN: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+pub static ST_GRB_MAT: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
 
 #[cfg(test)]
 mod fused_tests {

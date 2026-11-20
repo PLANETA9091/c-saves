@@ -2031,6 +2031,11 @@ pub static ST_DECOMP: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::ne
 // stalled behind that write under the writer mutex
 pub static ST_BUFREAD: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static ST_GLOB_CONV: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// v0.9.117 diagnostics: canon-cache hit/miss split + rebuild ns — the cold
+// read profile showed 95k conversion calls for ~2k unique members; these
+// name the share that rebuilt instead of hit.
+pub static ST_GLOB_HIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+pub static ST_GLOB_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static ST_SHIFT_RES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 // write path
 pub static WST_SPLIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -2124,7 +2129,7 @@ pub fn read_stage_json() -> String {
         format!("\"{}\":{{ns:{},n:{},per_call:{}}}", name, ns, n, if n > 0 { ns / n } else { 0 })
     };
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
         fmt("recipe", &ST_RECIPE),
         fmt("tail", &ST_TAIL),
         fmt("tailc_hit", &ST_TAILC_HIT),
@@ -2142,6 +2147,12 @@ pub fn read_stage_json() -> String {
         fmt("slab_miss", &ST_SLAB_MISS),
         fmt("decomp", &ST_DECOMP),
         fmt("glob_conv", &ST_GLOB_CONV),
+        fmt("glob_hit", &ST_GLOB_HIT),
+        fmt("glob_miss", &ST_GLOB_MISS),
+        fmt("grb_pre", &chunknbt::ST_GRB_PRE),
+        fmt("grb_sort", &chunknbt::ST_GRB_SORT),
+        fmt("grb_scan", &chunknbt::ST_GRB_SCAN),
+        fmt("grb_mat", &chunknbt::ST_GRB_MAT),
         fmt("shift_res", &ST_SHIFT_RES),
     )
 }
@@ -2160,7 +2171,11 @@ pub fn write_stage_json() -> String {
 }
 
 pub fn read_stage_reset() {
-    for st in [&ST_RECIPE, &ST_TAIL, &ST_TAILC_HIT, &ST_TAILC_MISS, &ST_RESC_HIT, &ST_RESC_MISS, &ST_TAIL_PREAD, &ST_TAIL_DEC, &ST_TAIL_PUT, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_SHIFT_RES] {
+    for st in [&ST_RECIPE, &ST_TAIL, &ST_TAILC_HIT, &ST_TAILC_MISS, &ST_RESC_HIT, &ST_RESC_MISS, &ST_TAIL_PREAD, &ST_TAIL_DEC, &ST_TAIL_PUT, &ST_SECTLOAD, &ST_JOIN_FUSED, &ST_JOIN_LEGACY, &ST_PARSE, &ST_SLAB_HIT, &ST_SLAB_MISS, &ST_DECOMP, &ST_GLOB_CONV, &ST_GLOB_HIT, &ST_GLOB_MISS, &ST_SHIFT_RES] {
+        st.0.store(0, Ordering::Relaxed);
+        st.1.store(0, Ordering::Relaxed);
+    }
+    for st in [&chunknbt::ST_GRB_PRE, &chunknbt::ST_GRB_SORT, &chunknbt::ST_GRB_SCAN, &chunknbt::ST_GRB_MAT] {
         st.0.store(0, Ordering::Relaxed);
         st.1.store(0, Ordering::Relaxed);
     }
@@ -6861,11 +6876,16 @@ impl Store {
             return None;
         }
         if let Some(c) = self.canon_cache.lock().get(&h) {
+            ST_GLOB_HIT.0.fetch_add(1, Ordering::Relaxed);
             return Some(c);
         }
+        ST_GLOB_HIT.1.fetch_add(1, Ordering::Relaxed);
+        let t = std::time::Instant::now();
         let reg = self.glob_reg.lock();
         match chunknbt::glob_any_to_section(bytes, &reg) {
             Some(c) => {
+                ST_GLOB_MISS.0.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                ST_GLOB_MISS.1.fetch_add(1, Ordering::Relaxed);
                 let c = Arc::new(c);
                 self.canon_cache.lock().put(h, c.clone());
                 Some(c)
