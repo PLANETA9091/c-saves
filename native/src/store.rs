@@ -7570,6 +7570,52 @@ impl Store {
         let mut globs: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut globs_t: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut stables: Vec<bool> = vec![true; total];
+        // v0.9.118 NARROW: per-member narrow width for the T stream — the
+        // member's own registry-mapping max, through the 1/2/4-bit ladder.
+        // Byte-aligned widths only, so a narrow member (2048/1024/512 B)
+        // and a u8 member (4096 B) coexist in one window without bit-residue
+        // shifts; the measured mixed-stream cost is +0.9% at a 43/57
+        // wide/narrow mix (JJThunder) and the win is -16.7% on the
+        // fully-narrow Tectonic overworld. Members whose pre/pgid is None
+        // (refused conversions) ride the twin verbatim and gate nothing.
+        // COST PRE-GATE: a mostly-wide group (fewer than 75% of its
+        // converting members narrow-eligible) skips the narrow twin build —
+        // the mixed stream measured ABOVE the u8 twin there, so the window
+        // gate would reject it and the compression would be pure pack-wall
+        // cost (JJThunder keeps today's bytes and today's pack cost). The
+        // window gate stays the byte-level authority: a built twin ships
+        // only when it compressed smaller.
+        let mut narrow_bits: Vec<u32> = vec![8; total];
+        {
+            let mut gbase = 0usize;
+            for group in &groups {
+                let (mut conv, mut narrow_ok) = (0usize, 0usize);
+                for (mi, _) in group.iter().enumerate() {
+                    let j = gbase + mi;
+                    if let (Some(pre), Some(pgid)) = (&pres[j], &pgids[j]) {
+                        conv += 1;
+                        let mut gmax: u32 = 0;
+                        for v in &pre.vox {
+                            let g = pgid[*v as usize];
+                            if g > gmax {
+                                gmax = g;
+                            }
+                        }
+                        let b = chunknbt::narrow_gid_bits(gmax);
+                        narrow_bits[j] = b;
+                        if b < 8 {
+                            narrow_ok += 1;
+                        }
+                    }
+                }
+                if conv == 0 || (narrow_ok as f64 / conv as f64) < 0.75 {
+                    for mi in 0..group.len() {
+                        narrow_bits[gbase + mi] = 8;
+                    }
+                }
+                gbase += group.len();
+            }
+        }
         {
             let next = std::sync::atomic::AtomicUsize::new(0);
             // v0.9.98: the worker produces BOTH glob variants per member —
@@ -7581,6 +7627,7 @@ impl Store {
                 std::sync::Mutex::new((0..total).map(|_| None).collect());
             let pres_ref = &pres;
             let pgids_ref = &pgids;
+            let narrow_ref = &narrow_bits;
             std::thread::scope(|sc| {
                 for _ in 0..cores.min(total).max(1) {
                     sc.spawn(|| loop {
@@ -7595,9 +7642,13 @@ impl Store {
                             _ => None,
                         };
                         let rt = match (&pres_ref[j], &pgids_ref[j]) {
-                            (Some(pre), Some(pgid)) => {
-                                chunknbt::section_glob_finish_as(flat_raws[j], pre, pgid, true)
-                            }
+                            (Some(pre), Some(pgid)) => chunknbt::section_glob_finish_as(
+                                flat_raws[j],
+                                pre,
+                                pgid,
+                                true,
+                                narrow_ref[j],
+                            ),
                             _ => None,
                         };
                         let stable = match &r {
@@ -10794,6 +10845,52 @@ pub(crate) mod glob_slab_test {
         fastnbt::to_bytes(&Value::Compound(root)).unwrap()
     }
 
+    /// 16-distinct-state chunk (v0.9.118): every section's registry mapping
+    /// tops at gid <= 15, so the whole group is narrow-eligible — the T
+    /// stream packs every raw winner at 4 bits (gform 26).
+    fn glob_chunk_payload_narrow(i: usize) -> Vec<u8> {
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut sec_list = Vec::new();
+        for y in 0..24i32 {
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(y as i8));
+            let mut bs: Map<String, Value> = Map::new();
+            let mut pal = Vec::new();
+            for k in 0..16usize {
+                let mut c: Map<String, Value> = Map::new();
+                let id = (i * 5 + y as usize * 2 + k) % 16;
+                c.insert("Name".to_string(), Value::String(format!("minecraft:nst_{id}")));
+                // props derive from the STATE id (not the palette position):
+                // one (name, props) pair per distinct block, so the registry
+                // holds exactly 16 states and every member's gids stay 0..15
+                let mut props: Map<String, Value> = Map::new();
+                props.insert("f".to_string(), Value::String(format!("{}", id % 2)));
+                c.insert("Properties".to_string(), Value::Compound(props));
+                pal.push(Value::Compound(c));
+            }
+            bs.insert("palette".to_string(), Value::List(pal));
+            let mut vox = [0u8; 4096];
+            for x in 0..16usize {
+                for z in 0..16usize {
+                    for yy in 0..16usize {
+                        let band = ((x + z + yy) / 4 + i + y as usize) % 16;
+                        let speck = (x * 31 + z * 17 + yy * 7 + i) % 23 == 0;
+                        vox[x * 256 + z * 16 + yy] = if speck { (band + 7) % 16 } else { band } as u8;
+                    }
+                }
+            }
+            // vanilla width for a 16-state palette: 4 bits
+            let vbits = ((16u32 - 1).ilog2() + 1).max(4);
+            let data = chunknbt::dense_to_nostroddle(&vox, 4096, 8, vbits);
+            bs.insert("data".to_string(), Value::LongArray(fastnbt::LongArray::new(data)));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            sec_list.push(Value::Compound(sec));
+        }
+        root.insert("sections".to_string(), Value::List(sec_list));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
     /// Chunk-level SEMANTIC comparator: sections compared with
     /// sections_semantically_equal (palette-permutation and unused-state
     /// tolerant — the GLOB rebuild drops unused palette entries), every
@@ -11226,6 +11323,59 @@ pub(crate) mod glob_slab_test {
         drop(st2);
         set_force_glob_for_tests(None);
         chunknbt::set_glob_dead_drop_for_tests(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_narrow_members_survive_pack_and_reopen() {
+        // v0.9.118 narrow gid streams: a group whose every member's registry
+        // mapping tops at gid <= 15 packs its raw winners at 4 bits in the T
+        // stream (gform 26). The drained container must carry narrow
+        // members, every identity must survive reopen through the scan-side
+        // derivation (decode narrow -> canonical re-encode), and a
+        // same-content write through the reopened store must dedup.
+        let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_force_glob_for_tests(Some(true));
+        let dir = temp_dir("glob-narrow-reopen");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let payloads: Vec<Vec<u8>> = (0..8).map(glob_chunk_payload_narrow).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            st.write_chunk(i as u64, p, false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        for _ in 0..50 {
+            st.request_pack();
+            if !st.compact_step() {
+                break;
+            }
+        }
+        let mut narrow_members = 0usize;
+        for (cls, _stamp, _h, _body) in st.slab_members_with_hashes() {
+            if cls.starts_with("glob_g26") {
+                narrow_members += 1;
+            }
+        }
+        assert!(narrow_members > 0, "no narrow member minted after drain");
+        st.sync();
+        drop(st);
+        let st2 = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st2
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable post-reopen"));
+            assert!(chunk_semantic_glob(&got, p), "chunk {i} semantically wrong post-reopen");
+        }
+        let before = st2.blobs.read().len();
+        st2.write_chunk(99_999u64, &payloads[0], false).unwrap();
+        st2.sync();
+        let after = st2.blobs.read().len();
+        assert_eq!(
+            before, after,
+            "identity drift after reopen: a same-content write minted new blobs"
+        );
+        drop(st2);
+        set_force_glob_for_tests(None);
         let _ = fs::remove_dir_all(&dir);
     }
 

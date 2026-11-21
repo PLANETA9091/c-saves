@@ -2017,3 +2017,67 @@ the representation is the one primitive every modern format carries. Gates:
 single-state contract), enc_fp EXACT 6d240d7166cdda99/12130/9971843, jj
 verify 946/946 x4.51, invariant scan 0, bench_size compact x0.06. The enc_fp
 needle is untouched.
+
+## v0.9.118 — narrow gid streams: the structural zero half leaves the wire
+
+The probe started as a bit-plane experiment (`bp_probe`): the GLOB gid
+stream is frequency-canonical (gid 0 = the dominant state), so the HIGH
+bit-planes should be sparse and LZMA2 should collapse them — separate the
+planes, price each. The answer was a decisive NEGATIVE: per-member
+bit-planes compressed +51-100% WORSE (B/C/D/E/F variants all lost; LZMA2's
+match finder owns the interleaved zero structure, and splitting destroys
+the literal contexts). But the plane census that killed the idea exposed
+something better: on the drained Tectonic full-dimension overworld, EVERY
+g6 member's max gid is <= 15 — planes 4-7 are all-zero in all 1,270
+members. The u8 gid stream carries a structurally zero half; the
+frequency-canonical registry makes this the norm for worldgen terrain.
+
+bp_probe A/B (LZMA2 preset 6|EXTREME lc4/lp0/pb0, member-concatenated
+streams, the drained 96x96 Tectonic overworld store):
+
+| variant | raw | LZMA2 | vs A |
+|---|---|---|---|
+| A u8 as stored (transposed) | 5,201,920 | 40,565 | 100.0% |
+| G 4-bit narrow (all members) | 2,600,960 | 33,780 | 83.3% |
+| J per-member honest (incl. 3/5/6/7-bit) | 2,176,512 | 33,642 | 82.9% |
+| J2 per-member BYTE-ALIGNED ladder | 2,600,960 | 33,780 | 83.3% |
+| K u8 plain order | 5,201,920 | 86,797 | 213.9% |
+| L narrow plain order | 2,600,960 | 92,424 | 227.8% |
+
+Readings: (1) narrow wins ONLY in the y-fast transposed order — plain
+narrow LOSES to plain u8 (L > K), so the narrow form replaces gform 6,
+never the base; (2) the byte-aligned ladder (J2) matches the honest
+per-member widths (J) within 0.4% — non-byte-aligned widths buy nothing
+and shift every later member's byte boundary, so the wire carries
+{1,2,4,8} bits only; (3) the JJ corpus verdict is mixed-width caution:
+its 2,715 g6 members split 1,532 narrow / 1,183 wide, and the byte-aligned
+mixed stream measured 100.93% of the u8 stream — a +0.9% regression the
+window gate must never be forced to eat.
+
+Wire: `0xCC [f1][f2'][f3][Y][gform][payload][tail]` with gform
+`10 | wsel<<4` (26/42/58 = 4/2/1 bits), payload MSB-first bit-packed at
+4096 voxels x ladder width = whole bytes (no residue, no length
+ambiguity). Decode is the exact inverse + the standard transpose
+involution. The choice is per-member content (max gid over the member's
+own registry mapping), the pack builds the narrow twin in the EXISTING
+T-twin slot (same stream count, same compression budget), and the window
+gate compares canon vs u8-base vs narrow-T compressed sizes — the byte-
+level authority. A 75% cost pre-gate skips the narrow twin build for
+mostly-wide groups (JJThunder: 56.5% narrow-eligible -> skip; bytes AND
+pack cost unchanged — the corpus container stayed x4.75 / 1.18 MiB
+verbatim). Refused (None-pre) members ride the twin verbatim and gate
+nothing. The hashless identity derivation flows through the canonical
+re-encode (variant-independent by construction), so narrow members mint
+hashless exactly like g6 members did.
+
+Full-dimension verdict (192x192, honest close weight, bad=0 everywhere):
+overworld 9.5 -> 8.0 B/chunk (x434 -> x510), nether 1.7 -> 1.6
+(x2389 -> x2547), end 4.0 -> 3.7 (x1030 -> x1118), ALL THREE 5.1 -> 4.4
+(x812 -> x924). Projections: the operator's 40000x40000-block world
+90.9 -> 79.4 MiB (overworld-only 50 GB -> ~48 MiB); 20000x20000 chunks
+5.7 -> 5.0 GiB (x2772). Pack wall cost: +0.2s local on the narrow-built
+corpora, zero on JJ (pre-gate). Import unchanged (123.8 MB/s local).
+enc_fp EXACT 6d240d7166cdda99/12130/9971843 (the encode path untouched),
+116/116 tests (two new: the three-width finish roundtrip + the pack/
+reopen/dedup contract), bench_size compact x0.06. CSAVES_GLOB_NARROW=0
+opts out.

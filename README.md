@@ -2161,23 +2161,51 @@ all stall points are captured as CI artifacts.
   + states, the drain fully reclaimed, the varint batch stream shipped):
 
       dim         anvil B/chunk   c-saves B/chunk   ratio
-      overworld   4104            9.5               x434
-      nether      4104            1.7               x2389
-      end         4104            4.0               x1030
-      ALL THREE   4104            5.1               x812  (x0.0012 of Anvil)
+      overworld   4104            8.0               x510
+      nether      4104            1.6               x2547
+      end         4104            3.7               x1118
+      ALL THREE   4104            4.4               x924  (x0.0011 of Anvil)
+
+  (the v0.9.110 narrow-less numbers at the same scale: 9.5/1.7/4.0/5.1
+  = x812 — the v0.9.118 narrow gid streams took the overworld -16%.)
 
   Anvil's per-chunk sector floor (1 sector = 4 KiB even for a fully
   empty chunk) is measured, not assumed — every dimension weighs the
   same 4104 B/chunk on disk, so the c-saves ratios differ by terrain
-  mass alone; the per-chunk cost SATURATES with scale (5.1 B/chunk at
+  mass alone; the per-chunk cost SATURATES with scale (4.4 B/chunk at
   192x192 = 110,592 chunks). Projections (linear in chunks, the scaling
   law measured on the rings): a 40000x40000-BLOCK world (2500x2500
   chunks per dimension — the onlinemo.de/world `overworld=40000` input)
-  stores at **~91 MiB for all three dimensions** (overworld-only
-  ~57 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
-  beaten ~40x); a 20000x20000-CHUNK world (400M chunks per dimension)
-  stores at **~5.7 GiB vs ~4.48 TiB across the three dimensions (x2418)**
+  stores at **~79 MiB for all three dimensions** (overworld-only
+  ~48 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
+  beaten ~48x); a 20000x20000-CHUNK world (400M chunks per dimension)
+  stores at **~5.0 GiB vs ~4.48 TiB across the three dimensions (x2772)**
   (`full_world_probe`, CI-gated).
+
+* **The narrow gid contract (v0.9.118)** — the GLOB T-variant packs every
+  raw-u8 winner at 1/2/4 bits per voxel (gform `10 | wsel<<4` = 26/42/58,
+  MSB-first, byte-aligned ladder — no bit-residue shifts across members)
+  when the member's registry mapping tops below 16. The frequency-
+  canonical registry made half of every u8 gid stream structurally zero:
+  the drained Tectonic overworld's whole g6 class measured max_gid<=15
+  (1,270/1,270 members), so 50% of its 5.2 MB raw was the wasted upper
+  nibble. The discovery path was a NEGATIVE probe: bit-plane splitting
+  regressed LZMA2 +51-100% (the match finder owns the interleaved zeros),
+  but the plane census exposed the structural zero half; narrow packing
+  removes it outright — the class's LZMA2 stream dropped -17.1% and the
+  overworld dimension closed at -16%. Design gates: per-member widths
+  (mixed 2048/4096-B members measured +0.9% at JJThunder's 43/57 mix —
+  no bit-residue, the ladder never packs 3/5/6/7-bit widths), a 75% cost
+  pre-gate skips the narrow twin build for mostly-wide groups (JJ keeps
+  its bytes AND its pack cost — the JJThunder corpus container is
+  unchanged at x4.75, verify 946/946), and the window gate stays the
+  byte-level authority (a built narrow twin ships only when it compressed
+  smaller than the u8 twin). Decode is the exact inverse; the hashless
+  identity derivation flows through the canonical re-encode and never
+  sees the form. enc_fp pin EXACT (6d240d7166cdda99/12130/9971843),
+  116/116 tests (`glob_narrow_gid_forms_roundtrip_byte_identical`,
+  `glob_narrow_members_survive_pack_and_reopen`), `bp_probe` committed as
+  the evidence. CSAVES_GLOB_NARROW=0 opts out.
 
 * **The dead-entry drop contract (v0.9.114)** — the canonical CSEC encoder
   leaves palette entries the voxel stream never references out of the

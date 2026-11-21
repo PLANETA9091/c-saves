@@ -233,6 +233,17 @@ fn glob_fill_enabled() -> bool {
             .unwrap_or(true)
     })
 }
+/// v0.9.118: narrow gid streams for qualifying groups (gform 10 family).
+/// On by default; CSAVES_GLOB_NARROW=0 opts out.
+static GLOB_NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn glob_narrow_enabled() -> bool {
+    *GLOB_NARROW.get_or_init(|| {
+        std::env::var("CSAVES_GLOB_NARROW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(true)
+    })
+}
 /// v0.9.114: the write-time DEAD-ENTRY DROP for BLOCK palettes. On by
 /// default; CSAVES_GLOB_DEAD_DROP=0 restores the v0.9.113 canonical form
 /// (dead block entries stay). DERIVATION-SAFE in both positions: glob
@@ -8688,7 +8699,59 @@ pub fn section_glob_resolve(pre: &GlobPre, reg: &mut StateRegistry) -> Option<Ve
 /// transpose is an involution, so the decoder restores vanilla order with
 /// one application.
 pub fn section_glob_finish(csec: &[u8], pre: &GlobPre, pgid: &[u32]) -> Option<Vec<u8>> {
-    section_glob_finish_as(csec, pre, pgid, false)
+    section_glob_finish_as(csec, pre, pgid, false, 0)
+}
+
+/// The narrow width ladder for a raw gid stream: gids <= 1 -> 1 bit,
+/// <= 3 -> 2 bits, <= 15 -> 4 bits; anything wider returns 8 — the caller
+/// treats 8 as "no narrow" (the u8 stream stays). Byte-aligned widths only
+/// (4096 voxels x {1,2,4} bits are whole bytes; a 3-bit member would shift
+/// every later member's byte boundary inside the slab window for a 0.4%
+/// marginal win the probe measured as noise).
+pub fn narrow_gid_bits(max_gid: u32) -> u32 {
+    if max_gid <= 1 {
+        1
+    } else if max_gid <= 3 {
+        2
+    } else if max_gid <= 15 {
+        4
+    } else {
+        8
+    }
+}
+
+/// The gform high-nibble width selector (4 bits -> 1, 2 -> 2, 1 -> 3).
+fn narrow_wsel(bits: u32) -> u8 {
+    match bits {
+        4 => 1,
+        2 => 2,
+        1 => 3,
+        _ => 0,
+    }
+}
+
+/// MSB-first bit pack of a raw u8 gid stream at 1/2/4 bits per voxel.
+/// 4096 voxels x any ladder width is a whole number of bytes, so no residue
+/// byte ever ships at 4096 entries; the flush keeps the helper correct for
+/// other lengths anyway.
+fn pack_gid_narrow(v: &[u8], bits: u32) -> Vec<u8> {
+    debug_assert!(matches!(bits, 1 | 2 | 4));
+    let mut out = Vec::with_capacity(v.len() * bits as usize / 8 + 1);
+    let mut acc: u64 = 0;
+    let mut nacc: u32 = 0;
+    for &g in v {
+        acc = (acc << bits) | u64::from(g & ((1u8 << bits) - 1));
+        nacc += bits;
+        if nacc == 8 {
+            out.push(acc as u8);
+            acc = 0;
+            nacc = 0;
+        }
+    }
+    if nacc > 0 {
+        out.push((acc << (8 - nacc)) as u8);
+    }
+    out
 }
 
 pub fn section_glob_finish_as(
@@ -8696,6 +8759,7 @@ pub fn section_glob_finish_as(
     pre: &GlobPre,
     pgid: &[u32],
     t_variant: bool,
+    narrow_bits: u32,
 ) -> Option<Vec<u8>> {
     let n = pre.n;
     // gid stream: one gid per voxel. The registry may cross the 256-state
@@ -8833,6 +8897,22 @@ pub fn section_glob_finish_as(
             }
         } else if b_ok {
             (2, rle_encode_stream(&transpose_fast_y(&raw, 16)))
+        } else if t_variant && narrow_bits > 0 && narrow_bits < 8 && glob_narrow_enabled() {
+            // v0.9.118 NARROW: the qualifying group's T stream packs every
+            // raw winner at the GROUP's narrow width (the probe on the
+            // drained Tectonic overworld: the whole g6 class -17.1% LZMA2;
+            // every member's max gid <= 15, so half of each u8 stream was
+            // structurally zero — the frequency-canonical registry makes
+            // this the norm for worldgen terrain). Plain-order narrow LOSES
+            // (+6.5% measured) and mixed-width groups lose on extreme-terrain
+            // corpora (+8.9% JJ), so the narrow arm rides the TRANSPOSED
+            // variant only, gated per group (one wide member disables it and
+            // the cross-member byte alignment stays intact). The width rides
+            // the gform byte's high nibble: 10 | wsel<<4 = 26/42/58. The
+            // base stream keeps the u8 raws, so the window gate always sees
+            // a never-worse fallback.
+            let t = transpose_fast_y(&raw, 16);
+            (10 | (narrow_wsel(narrow_bits) << 4), pack_gid_narrow(&t, narrow_bits))
         } else if t_variant {
             // plain-transposed u8: same bytes reordered y-fast. The RLE
             // admission above keeps its own transposed winner (gform 2);
@@ -9208,6 +9288,50 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
             let g = u16::from_le_bytes(c.try_into().ok()?) as u32;
             gids.resize(4096, g);
         }
+        26 | 42 | 58 => {
+            // v0.9.118 narrow transposed raw (gform 10 | wsel<<4): the gid
+            // stream packs at the width carried in the gform byte's high
+            // nibble (1 -> 4 bits, 2 -> 2 bits, 3 -> 1 bit), MSB-first —
+            // the exact inverse of pack_gid_narrow. 4096 voxels x every
+            // ladder width is a whole number of bytes, so the payload
+            // length is unambiguous and the verbatim tail starts right
+            // after it.
+            let bits = match gform >> 4 {
+                1 => 4u32,
+                2 => 2u32,
+                3 => 1u32,
+                _ => return None,
+            };
+            let s = glob.get(p..p + 4096 * bits as usize / 8)?;
+            p += 4096 * bits as usize / 8;
+            let mut raw: Vec<u8> = Vec::with_capacity(4096);
+            match bits {
+                4 => {
+                    for &b in s {
+                        raw.push(b >> 4);
+                        raw.push(b & 0x0f);
+                    }
+                }
+                2 => {
+                    for &b in s {
+                        raw.push((b >> 6) & 3);
+                        raw.push((b >> 4) & 3);
+                        raw.push((b >> 2) & 3);
+                        raw.push(b & 3);
+                    }
+                }
+                _ => {
+                    for &b in s {
+                        for sh in (0..8).rev() {
+                            raw.push((b >> sh) & 1);
+                        }
+                    }
+                }
+            }
+            for g in transpose_fast_y(&raw, 16) {
+                gids.push(g as u32);
+            }
+        }
         _ => return None,
     }
     if gids.len() != 4096 {
@@ -9220,7 +9344,7 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     // the old three full passes — the per-voxel histogram was the rebuild's
     // dominant cost (store-forwarding stalls; the run walk accumulates per
     // RUN), and the run structure is remap-invariant, so `la` is EXACT.
-    let narrow_gid = matches!(gform, 0 | 1 | 2 | 6 | 7);
+    let narrow_gid = matches!(gform, 0 | 1 | 2 | 6 | 7 | 26 | 42 | 58);
     let (mut counts_arr, la_pre) = if narrow_gid {
         counts_rle_len_u32(&gids)
     } else {
@@ -11058,8 +11182,8 @@ mod glob_tests {
         let mut reg = StateRegistry::new();
         let pre = section_glob_pre(&canon).expect("glob pre");
         let pgid = section_glob_resolve(&pre, &mut reg).expect("resolve");
-        let base = section_glob_finish_as(&canon, &pre, &pgid, false).expect("finish base");
-        let t = section_glob_finish_as(&canon, &pre, &pgid, true).expect("finish T");
+        let base = section_glob_finish_as(&canon, &pre, &pgid, false, 0).expect("finish base");
+        let t = section_glob_finish_as(&canon, &pre, &pgid, true, 0).expect("finish T");
         assert_eq!(base[0], GLOB_MAGIC, "noisy gid stream stays 0xCB in base");
         assert_eq!(t[0], GLOB2_MAGIC, "T variant carries 0xCC");
         assert_eq!(t[5], 6, "T variant flips the plain-u8 winner to gform 6");
@@ -11081,6 +11205,51 @@ mod glob_tests {
         let back = transpose_fast_y(t_payload, 16);
         assert_eq!(back.as_slice(), &base[5..5 + 4096], "involution");
         crate::chunknbt::set_gid_rle_div_for_tests(None);
+    }
+
+    #[test]
+    fn glob_narrow_gid_forms_roundtrip_byte_identical() {
+        // v0.9.118 narrow gid streams: the raw fallback packs at 1/2/4 bits
+        // per voxel in the T variant (gform 10 | wsel<<4 = 26/42/58) when
+        // the member's registry mapping tops below 16. Every ladder width
+        // must decode byte-identically through the scan-side chain
+        // (glob_any_to_section -> canonical_reencode); the base stream
+        // keeps the legacy u8 wire so the window gate never regresses.
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        for (distinct, gform_want, bits) in [(16usize, 26u8, 4u32), (4, 42, 2), (2, 58, 1)] {
+            let noisy = glob_section(6 + distinct as i32, 0xFEED + distinct as u64, distinct);
+            let canon = section_encode(&noisy).expect("encode");
+            let mut reg = StateRegistry::new();
+            let pre = section_glob_pre(&canon).expect("pre");
+            let pgid = section_glob_resolve(&pre, &mut reg).expect("resolve");
+            let gmax = pre.vox.iter().map(|&v| pgid[v as usize]).max().unwrap();
+            let narrow = narrow_gid_bits(gmax);
+            assert_eq!(narrow, bits, "ladder width for {distinct}-state content");
+            let base = section_glob_finish_as(&canon, &pre, &pgid, false, 0).expect("base");
+            let t_u8 = section_glob_finish_as(&canon, &pre, &pgid, true, 0).expect("t u8");
+            let t_n = section_glob_finish_as(&canon, &pre, &pgid, true, narrow).expect("t narrow");
+            assert_eq!(t_n[5], gform_want, "narrow gform for width {bits}");
+            assert_eq!(
+                t_n.len(),
+                t_u8.len() - 4096 * (8 - bits) as usize / 8,
+                "narrow payload shrank exactly 4096*(8-bits)/8 bytes"
+            );
+            assert_eq!(base[0], GLOB_MAGIC, "base keeps the legacy u8 wire");
+            for w in [&base, &t_u8, &t_n] {
+                let direct = glob_any_to_section(w, &reg).expect("decode");
+                let recanon = canonical_reencode(&direct).expect("re-encode");
+                assert_eq!(recanon, canon, "width {bits} roundtrip byte-identical");
+            }
+        }
+        // the ladder itself
+        assert_eq!(narrow_gid_bits(0), 1);
+        assert_eq!(narrow_gid_bits(1), 1);
+        assert_eq!(narrow_gid_bits(2), 2);
+        assert_eq!(narrow_gid_bits(3), 2);
+        assert_eq!(narrow_gid_bits(4), 4);
+        assert_eq!(narrow_gid_bits(15), 4);
+        assert_eq!(narrow_gid_bits(16), 8);
+        assert_eq!(narrow_gid_bits(255), 8);
     }
 
     #[test]
