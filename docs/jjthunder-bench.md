@@ -2081,3 +2081,72 @@ enc_fp EXACT 6d240d7166cdda99/12130/9971843 (the encode path untouched),
 116/116 tests (two new: the three-width finish roundtrip + the pack/
 reopen/dedup contract), bench_size compact x0.06. CSAVES_GLOB_NARROW=0
 opts out.
+
+## v0.9.119 — map-alias: the duplicate heightmap half leaves the tail
+
+The probe started as a heightmap deep-dive (`tail_hm_probe`): the end's
+tails are 97% of its slab mass and heightmaps are 88.8% of tail raw
+(1.4 MB over 1,239 tails), so the next representation had to be worth a
+dimension. The answer was a decisive NEGATIVE across the whole variant
+ladder, on the real drained tails through one identical writer:
+
+| variant | raw | LZMA2 | vs A |
+|---|---|---|---|
+| A v2 as stored (first-order zigzag-varint chain) | 1,720,187 | 103,785 | 100.0% |
+| B second-order delta chain | 1,814,629 | 112,334 | 108.2% |
+| C serpentine scan + first-order | 1,720,187 | 104,138 | 100.3% |
+| D serpentine + second-order | 1,814,629 | 112,389 | 108.3% |
+| E 4-bit nibble zigzag deltas | 1,518,349 | 112,533 | 108.4% |
+| F serpentine + nibble | 1,518,037 | 112,517 | 108.4% |
+| G no heightmaps at all (the ceiling) | 309,468 | 9,922 | 9.6% |
+
+The census explained every loss: 74.9% of first-order deltas are EXACTLY
+zero and every nonzero delta is |d| > 3 (cliffs, not slopes), so
+second-order chains widen the byte width and nibble packing pays escape
+varints on the jumps. The v0.9.32 chain is the floor of the CHAIN — and
+the ceiling line (G) showed the real prize was never the chain: it was
+the MAP COUNT.
+
+`hm_map_dedup_probe` counted the maps inside each tail: 4 maps per
+chunk, and EXACTLY half are byte-identical WITHIN the tail — the end:
+MOTION_BLOCKING == MOTION_BLOCKING_NO_LEAVES (no leaves) and
+OCEAN_FLOOR == WORLD_SURFACE (no water); the overworld: 48.0%; the
+nether: tails already collapsed to 2 members. Whole-tail content dedup
+cannot claim these bytes — they sit inside otherwise-unique tails.
+Map-level within-tail dedup priced 104,006 → 93,254 (-10.3%) on the end
+tail stream and 55,066 → 48,468 (-12.0%) on the overworld's.
+
+Wire: the Heightmaps compound's duplicate maps store
+`[0xC5][u8 target-name len][target name]` instead of their 283-byte
+dense body. The alias target is the alphabetically FIRST name carrying
+the body — content-determined, walk-order-free (the compound key order
+on the wire is semantically free), so the byte-level scan path
+(scan_root's Heightmaps branch, items collect -> alias pass -> edits)
+and the Value-level tail_encode mint IDENTICAL canonical tails for
+identical content, and the tail identity (structural_hash) is stable in
+both knob positions. Refs resolve BY NAME on every read path: the
+join's tail_decode (dense pass + ref pass) and the direct emit's
+two-phase walk (collect entries -> decode dense once -> emit, refs pull
+the target's longs under the ref's own name). Unresolvable/corrupt refs
+stay verbatim ByteArrays (the safe side).
+
+The second probe of the tick was the narrow gid stream's LZMA2 lc/lp
+ladder (`gid_lc_probe`): the 0.9.118 narrow representation is nibble-
+phase structured, so lp=1 contexts could plausibly help — the ladder
+measured FLAT (113,631-113,920 over 10,227,712 raw = 1.11% ±0.07%,
+lc0lp1 best by noise). The codec axis stays closed on the narrow form;
+the side-finding is that g26's real mixed-frame cost is ~113.7 KB, well
+under the proportional est_comp impression.
+
+Full-dimension verdict (192x192, honest close weight, bad=0 everywhere):
+overworld 8.1 -> 7.8 B/chunk (x510 -> x523), nether 1.6 (x2546), end
+3.7 -> 3.4 (x1116 -> x1217), ALL THREE 4.4 -> 4.3 (x923 -> x959).
+Projections: the operator's 40000x40000-block world 79.5 -> 76.5 MiB;
+20000x20000 chunks 5.0 -> 4.8 GiB (x2878). Import unchanged, JJ verify
+4371/4371 semantic-equal, compact x0.05 (was x0.06 — JJ re-saves alias
+too). enc_fp pin EXACT (6d240d7166cdda99/12130/9971843 — the section
+encode path never sees tails), 120/120 tests (`hmap_alias_
+scan_and_value_paths_agree`, `hmap_alias_decode_resolves_by_name`,
+`hmap_alias_all_identical_aliases_three`, `hmap_alias_store_roundtrip_
+and_dedup`). CSAVES_HMAP_ALIAS=0 opts out. The probes committed as
+evidence: `tail_hm_probe`, `hm_map_dedup_probe`, `gid_lc_probe`.

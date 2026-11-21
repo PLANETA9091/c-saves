@@ -244,6 +244,23 @@ fn glob_narrow_enabled() -> bool {
             .unwrap_or(true)
     })
 }
+/// v0.9.119: within-tail heightmap map aliasing (the map-alias contract).
+/// On by default; CSAVES_HMAP_ALIAS=0 restores the v0.9.32 canonical form
+/// (every map stores its own dense body). DERIVATION-SAFE: the alias runs
+/// AFTER densification and only touches the tail's Heightmaps compound —
+/// section identities never see tails, and the tail identity
+/// (structural_hash) is content-determined in both knob positions because
+/// the alias decision (target = alphabetically first duplicate body) is
+/// content-determined, not walk-order-determined.
+static HMAP_ALIAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn hmap_alias_enabled() -> bool {
+    *HMAP_ALIAS.get_or_init(|| {
+        std::env::var("CSAVES_HMAP_ALIAS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(true)
+    })
+}
 /// v0.9.114: the write-time DEAD-ENTRY DROP for BLOCK palettes. On by
 /// default; CSAVES_GLOB_DEAD_DROP=0 restores the v0.9.113 canonical form
 /// (dead block entries stay). DERIVATION-SAFE in both positions: glob
@@ -486,6 +503,12 @@ fn is_csec4(b: Option<&u8>) -> bool {
     matches!(b, Some(&CSEC3_MAGIC) | Some(&CSEC4_MAGIC))
 }
 const HMAP_MAGIC: u8 = 0xC6; // repacked heightmap ByteArray marker
+/// v0.9.119: within-compound map alias. A Heightmaps map whose dense body
+/// duplicates an earlier map's body stores [0xC5][u8 target-name len]
+/// [target name] instead of its own dense body; every read path resolves
+/// the ref back to the target's LongArray. Name-addressed (not order-
+/// addressed) because the wire's compound key order is semantically free.
+const HMAP_REF_MAGIC: u8 = 0xC5;
 
 // -------------------------------------------------- derived-data strip ----
 // Light is DERIVED data: starlight recomputes SkyLight/BlockLight from block
@@ -4997,21 +5020,65 @@ fn hmap_decode(b: &[u8]) -> Option<Vec<i64>> {
     }
 }
 
-/// Apply the tail value transforms (currently: heightmap repack) recursively
-/// to every key of a compound. Only touches shapes we understand; everything
-/// else is left as-is, so the transform is always reversible.
+/// Apply the tail value transforms (heightmap repack + v0.9.119 map alias)
+/// recursively to every key of a compound. Only touches shapes we
+/// understand; everything else is left as-is, so the transform is always
+/// reversible.
 fn tail_encode(v: &mut Value) {
     match v {
         Value::Compound(m) => {
             for (k, val) in m.iter_mut() {
                 if k == "Heightmaps" {
                     if let Value::Compound(hm) = val {
-                        for hv in hm.values_mut() {
+                        // densify every densifiable LongArray (v0.9.32);
+                        // track which names converted — ONLY those join the
+                        // alias pool, so the Value path and the byte-level
+                        // scan path (which only sees 37-long LongArrays)
+                        // make identical decisions on identical content.
+                        let mut densified: Vec<String> = Vec::new();
+                        for (nk, hv) in hm.iter_mut() {
                             if let Value::LongArray(la) = hv {
                                 if let Some(dense) = hmap_encode(la.as_ref()) {
                                     *hv = Value::ByteArray(fastnbt::ByteArray::new(
                                         dense.iter().map(|x| *x as i8).collect(),
                                     ));
+                                    densified.push(nk.clone());
+                                }
+                            }
+                        }
+                        // v0.9.119 map alias: duplicate dense bodies collapse
+                        // to name-addressed refs (target = alphabetically
+                        // first name carrying the body — content-determined,
+                        // so walk order cannot change the decision).
+                        if hmap_alias_enabled() && densified.len() > 1 {
+                            densified.sort();
+                            let mut first_of:
+                                std::collections::HashMap<Vec<u8>, String> = Default::default();
+                            for name in &densified {
+                                let body = match hm.get(name) {
+                                    Some(Value::ByteArray(ba)) => {
+                                        let raw: Vec<u8> =
+                                            ba.as_ref().iter().map(|x| *x as u8).collect();
+                                        if raw.first() == Some(&HMAP_MAGIC) {
+                                            raw
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+                                    _ => continue,
+                                };
+                                let tgt = first_of
+                                    .entry(body.clone())
+                                    .or_insert_with(|| name.clone());
+                                if *tgt != *name {
+                                    let mut rb = vec![HMAP_REF_MAGIC, tgt.len() as u8];
+                                    rb.extend_from_slice(tgt.as_bytes());
+                                    hm.insert(
+                                        name.clone(),
+                                        Value::ByteArray(fastnbt::ByteArray::new(
+                                            rb.iter().map(|x| *x as i8).collect(),
+                                        )),
+                                    );
                                 }
                             }
                         }
@@ -5036,12 +5103,36 @@ fn tail_decode(v: &mut Value) {
             for (k, val) in m.iter_mut() {
                 if k == "Heightmaps" {
                     if let Value::Compound(hm) = val {
-                        for hv in hm.values_mut() {
+                        // pass 1: dense ByteArray (our marker) -> LongArray;
+                        // keep the decoded longs keyed by name.
+                        let mut decoded: std::collections::HashMap<String, Vec<i64>> =
+                            Default::default();
+                        for (nk, hv) in hm.iter_mut() {
                             if let Value::ByteArray(ba) = hv {
                                 let raw: Vec<u8> = ba.as_ref().iter().map(|x| *x as u8).collect();
                                 if raw.first() == Some(&HMAP_MAGIC) {
                                     if let Some(longs) = hmap_decode(&raw) {
+                                        decoded.insert(nk.clone(), longs.clone());
                                         *hv = Value::LongArray(fastnbt::LongArray::new(longs));
+                                    }
+                                }
+                            }
+                        }
+                        // pass 2 (v0.9.119): resolve map-alias refs by name;
+                        // unresolvable refs stay verbatim (safe side).
+                        for hv in hm.values_mut() {
+                            if let Value::ByteArray(ba) = hv {
+                                let raw: Vec<u8> = ba.as_ref().iter().map(|x| *x as u8).collect();
+                                if raw.first() == Some(&HMAP_REF_MAGIC) && raw.len() >= 2 {
+                                    let tl = raw[1] as usize;
+                                    if raw.len() == 2 + tl {
+                                        if let Some(t) = std::str::from_utf8(&raw[2..]).ok() {
+                                            if let Some(longs) = decoded.get(t) {
+                                                *hv = Value::LongArray(fastnbt::LongArray::new(
+                                                    longs.clone(),
+                                                ));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -5880,6 +5971,19 @@ fn scan_root<'a>(payload: &'a [u8], strip: bool) -> Option<ScanOut<'a>> {
                 // TAG_Byte_Array form tail_encode would produce. The edit
                 // range covers the WHOLE entry (type byte + name + payload);
                 // the replacement re-emits type + name.
+                // v0.9.119: densified items collect first, the alias pass
+                // (target = alphabetically first duplicate body — the SAME
+                // rule tail_encode applies) rewrites duplicates into
+                // name-addressed refs, and only then the edits emit — so
+                // both encode paths mint identical canonical tails.
+                struct HmItem {
+                    it_pos: usize,
+                    span: usize,
+                    iname: Vec<u8>,
+                    dense: std::sync::Arc<Vec<u8>>,
+                    ref_to: Option<usize>,
+                }
+                let mut items: Vec<HmItem> = Vec::new();
                 loop {
                     let it_pos = p;
                     let it = *sr!(payload.get(p), 3);
@@ -5918,16 +6022,52 @@ fn scan_root<'a>(payload: &'a [u8], strip: bool) -> Option<ScanOut<'a>> {
                         }
                     };
                     let Some(dense) = dense_arc else { continue };
-                    let mut rep = Vec::with_capacity(7 + iname.len() + dense.len());
+                    items.push(HmItem {
+                        it_pos,
+                        span: p - it_pos,
+                        iname: iname.to_vec(),
+                        dense,
+                        ref_to: None,
+                    });
+                }
+                // alias pass: identical dense bodies -> refs to the
+                // alphabetically first name (content-determined target).
+                if hmap_alias_enabled() && items.len() > 1 {
+                    let mut idx: Vec<usize> = (0..items.len()).collect();
+                    idx.sort_by(|a, b| items[*a].iname.cmp(&items[*b].iname));
+                    let mut first_of: std::collections::HashMap<Vec<u8>, usize> =
+                        Default::default();
+                    for &i in &idx {
+                        let body = items[i].dense.as_slice();
+                        match first_of.get(body) {
+                            Some(&t) => items[i].ref_to = Some(t),
+                            None => {
+                                first_of.insert(body.to_vec(), i);
+                            }
+                        }
+                    }
+                }
+                for it_ in &items {
+                    let mut rep = Vec::with_capacity(7 + it_.iname.len() + it_.dense.len());
                     rep.push(7u8); // TAG_Byte_Array
-                    rep.extend_from_slice(&(iname.len() as u16).to_be_bytes());
-                    rep.extend_from_slice(iname);
-                    // TAG_Byte_Array payload length is an i32 (standard NBT
-                    // — fastnbt serializes ByteArray the same way, and the
-                    // join-side Heightmaps walk reads 4 bytes here)
-                    rep.extend_from_slice(&(dense.len() as i32).to_be_bytes());
-                    rep.extend_from_slice(&dense[..]);
-                    edits.push((it_pos, p - it_pos, rep));
+                    rep.extend_from_slice(&(it_.iname.len() as u16).to_be_bytes());
+                    rep.extend_from_slice(&it_.iname);
+                    if let Some(t) = it_.ref_to {
+                        let tn = &items[t].iname;
+                        // [0xC5][u8 target-name len][target name]
+                        let body_len = 2 + tn.len();
+                        rep.extend_from_slice(&(body_len as i32).to_be_bytes());
+                        rep.push(HMAP_REF_MAGIC);
+                        rep.push(tn.len() as u8);
+                        rep.extend_from_slice(tn);
+                    } else {
+                        // TAG_Byte_Array payload length is an i32 (standard NBT
+                        // — fastnbt serializes ByteArray the same way, and the
+                        // join-side Heightmaps walk reads 4 bytes here)
+                        rep.extend_from_slice(&(it_.dense.len() as i32).to_be_bytes());
+                        rep.extend_from_slice(&it_.dense[..]);
+                    }
+                    edits.push((it_.it_pos, it_.span, rep));
                 }
                 SPLT_ROOT_HMAP.0.fetch_add(t_hm.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 SPLT_ROOT_HMAP.1.fetch_add(1, Ordering::Relaxed);
@@ -7846,10 +7986,18 @@ fn emit_tail_direct(
             sections_done = true;
         }
         if name == "Heightmaps" && tag == 0x0A {
-            // inner entries: dense ByteArray (our marker) -> LongArray
+            // inner entries: dense ByteArray (our marker) -> LongArray.
+            // v0.9.119: the compound may carry map-alias refs whose target
+            // sits at ANY walk position (the store's key order is
+            // semantically free), so the walk collects entries first and a
+            // second pass emits — dense maps decode once, refs resolve by
+            // target name from the fully-decoded set.
             out.push(0x0A);
             out.extend_from_slice(b"\x00\x0AHeightmaps");
+            let mut decoded: Vec<(Vec<u8>, Vec<i64>)> = Vec::new();
+            let mut entries: Vec<(u8, usize, Vec<u8>, usize, usize)> = Vec::new();
             loop {
+                let e0 = p; // tag byte
                 let itag = *tail.get(p)?;
                 p += 1;
                 if itag == 0 {
@@ -7857,37 +8005,76 @@ fn emit_tail_direct(
                 }
                 let inl = u16::from_be_bytes(tail.get(p..p + 2)?.try_into().ok()?) as usize;
                 p += 2;
-                let iname = tail.get(p..p + inl)?;
+                let iname = tail.get(p..p + inl)?.to_vec();
                 p += inl;
-                if itag == 0x07 {
-                    let n = i32::from_be_bytes(tail.get(p..p + 4)?.try_into().ok()?) as usize;
-                    p += 4;
-                    let raw = tail.get(p..p + n)?;
-                    p += n;
+                let vs = p;
+                nbt_skip(tail, &mut p, itag, 1)?;
+                entries.push((itag, inl, iname, vs, p));
+                let _ = e0;
+            }
+            for (itag, _, iname, vs, _) in &entries {
+                if *itag != 0x07 {
+                    continue;
+                }
+                let n = i32::from_be_bytes(tail.get(*vs..*vs + 4)?.try_into().ok()?) as usize;
+                let raw = tail.get(*vs + 4..*vs + 4 + n)?;
+                if raw.first() == Some(&HMAP_MAGIC) {
+                    if let Some(longs) = hmap_decode(raw) {
+                        decoded.push((iname.clone(), longs));
+                    }
+                }
+            }
+            for (itag, inl, iname, vs, vend) in &entries {
+                if *itag == 0x07 {
+                    let n = i32::from_be_bytes(tail.get(*vs..*vs + 4)?.try_into().ok()?) as usize;
+                    let raw = tail.get(*vs + 4..*vs + 4 + n)?;
                     if raw.first() == Some(&HMAP_MAGIC) {
-                        if let Some(longs) = hmap_decode(raw) {
+                        // dense: reuse the decoded longs (single hmap_decode)
+                        if let Some((_, longs)) =
+                            decoded.iter().find(|(nm, _)| nm == iname)
+                        {
                             out.push(0x0C); // TAG_Long_Array (12)
-                            out.extend_from_slice(&(inl as u16).to_be_bytes());
+                            out.extend_from_slice(&(*inl as u16).to_be_bytes());
                             out.extend_from_slice(iname);
                             out.extend_from_slice(&(longs.len() as i32).to_be_bytes());
-                            for l in &longs {
+                            for l in longs {
                                 out.extend_from_slice(&l.to_be_bytes());
                             }
                             continue;
                         }
+                    } else if raw.first() == Some(&HMAP_REF_MAGIC) && raw.len() >= 2 {
+                        // map alias: [0xC5][u8 target len][target name] ->
+                        // emit the target's LongArray under THIS entry's name
+                        let tl = raw[1] as usize;
+                        if raw.len() == 2 + tl {
+                            if let Some(t) = std::str::from_utf8(&raw[2..]).ok() {
+                                if let Some((_, longs)) = decoded
+                                    .iter()
+                                    .find(|(nm, _)| nm.as_slice() == t.as_bytes())
+                                {
+                                    out.push(0x0C);
+                                    out.extend_from_slice(&(*inl as u16).to_be_bytes());
+                                    out.extend_from_slice(iname);
+                                    out.extend_from_slice(&(longs.len() as i32).to_be_bytes());
+                                    for l in longs {
+                                        out.extend_from_slice(&l.to_be_bytes());
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     // not our dense form: copy verbatim
                     out.push(0x07);
-                    out.extend_from_slice(&(inl as u16).to_be_bytes());
+                    out.extend_from_slice(&(*inl as u16).to_be_bytes());
                     out.extend_from_slice(iname);
                     out.extend_from_slice(&(n as i32).to_be_bytes());
                     out.extend_from_slice(raw);
                 } else {
                     // unexpected inner tag (e.g. a LongArray heightmap that
                     // could not be densified): copy the whole entry verbatim
-                    let e0 = p - 3 - inl; // tag(1) + namelen(2) + name(inl)
-                    nbt_skip(tail, &mut p, itag, 1)?;
-                    out.extend_from_slice(tail.get(e0..p)?);
+                    let e0 = vs - 3 - inl; // tag(1) + namelen(2) + name(inl)
+                    out.extend_from_slice(tail.get(e0..*vend)?);
                 }
             }
             out.push(0x00); // end Heightmaps compound
@@ -10632,6 +10819,197 @@ mod codec_tests {
         let mut bad = la.clone();
         bad[36] |= 1 << 40;
         assert!(hmap_encode(&bad).is_none());
+    }
+
+    /// v0.9.119: the map-alias contract. Four maps, two identical pairs
+    /// (the end pattern) -> two dense bodies + two name-addressed refs;
+    /// both encode paths (byte-level scan and Value-level tail_encode)
+    /// mint the SAME canonical tail; every decode path resolves refs back
+    /// to the source LongArrays.
+    fn alias_payload() -> Vec<u8> {
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut hm: Map<String, Value> = Map::new();
+        let ea: Vec<u8> = (0..256).map(|i| (i % 197 + 3) as u8).collect();
+        let eb: Vec<u8> = (0..256).map(|i| ((i * 7) % 241 + 2) as u8).collect();
+        let la = pack_nostroddle(&ea, 9);
+        let lb = pack_nostroddle(&eb, 9);
+        assert_eq!(la.len(), 37);
+        assert_eq!(lb.len(), 37);
+        hm.insert(
+            "MOTION_BLOCKING".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(la.clone())),
+        );
+        hm.insert(
+            "MOTION_BLOCKING_NO_LEAVES".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(la.clone())),
+        );
+        hm.insert(
+            "OCEAN_FLOOR".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(lb.clone())),
+        );
+        hm.insert(
+            "WORLD_SURFACE".to_string(),
+            Value::LongArray(fastnbt::LongArray::new(lb.clone())),
+        );
+        root.insert("Heightmaps".to_string(), Value::Compound(hm));
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(0));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert(
+            "palette".to_string(),
+            Value::List(vec![Value::String("minecraft:stone".into())]),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        root.insert("sections".to_string(), Value::List(vec![Value::Compound(sec)]));
+        fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn hmap_alias_scan_and_value_paths_agree() {
+        let p = alias_payload();
+        // byte-level scan path
+        let t1 = match split(&p, false, None, true).unwrap() {
+            Split::Split { tail, .. } => tail,
+            _ => panic!("expected split"),
+        };
+        // Value-level path: strip + tail_encode + re-serialize
+        let v: Value = fastnbt::from_bytes(&p).unwrap();
+        let mut tv = v.clone();
+        strip_derived_chunk(&mut tv);
+        tail_encode(&mut tv);
+        let t2 = to_bytes(&tv);
+        // both canonical tails carry the SAME Heightmaps value tree (the
+        // compound key order is semantically free; the values must match)
+        let (Value::Compound(m1), Value::Compound(m2)) = (
+            fastnbt::from_bytes::<Value>(&t1).unwrap(),
+            fastnbt::from_bytes::<Value>(&t2).unwrap(),
+        ) else {
+            panic!("tails must parse");
+        };
+        let (Some(Value::Compound(h1)), Some(Value::Compound(h2))) =
+            (m1.get("Heightmaps"), m2.get("Heightmaps"))
+        else {
+            panic!("heightmaps must exist");
+        };
+        assert_eq!(h1.len(), 4);
+        let canon = |h: &Map<String, Value>| -> Vec<(String, Vec<u8>)> {
+            let mut out: Vec<(String, Vec<u8>)> = h
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        match v {
+                            Value::ByteArray(ba) => {
+                                ba.as_ref().iter().map(|x| *x as u8).collect()
+                            }
+                            _ => vec![],
+                        },
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(canon(h1), canon(h2), "scan and Value paths must alias identically");
+        // exactly 2 refs (the two duplicate pairs), each naming its target
+        let refs = canon(h1)
+            .into_iter()
+            .filter(|(_, b)| b.first() == Some(&HMAP_REF_MAGIC))
+            .collect::<Vec<_>>();
+        assert_eq!(refs.len(), 2, "two duplicate maps must alias");
+        // the alphabetical-first of each pair stays dense
+        let dense_names: Vec<String> = canon(h1)
+            .into_iter()
+            .filter(|(_, b)| b.first() == Some(&HMAP_MAGIC))
+            .map(|(k, _)| k)
+            .collect();
+        assert!(dense_names.contains(&"MOTION_BLOCKING".to_string()));
+        assert!(dense_names.contains(&"OCEAN_FLOOR".to_string()));
+    }
+
+    #[test]
+    fn hmap_alias_decode_resolves_by_name() {
+        let p = alias_payload();
+        let t = match split(&p, false, None, true).unwrap() {
+            Split::Split { tail, .. } => tail,
+            _ => panic!("expected split"),
+        };
+        // Value-level decode (the join path's transform): refs resolve to
+        // the source LongArrays.
+        let mut tv: Value = fastnbt::from_bytes(&t).unwrap();
+        tail_decode(&mut tv);
+        let Value::Compound(m) = tv else { panic!() };
+        let Some(Value::Compound(hm)) = m.get("Heightmaps") else { panic!() };
+        let src: Value = fastnbt::from_bytes(&p).unwrap();
+        let Value::Compound(sm) = src else { panic!() };
+        let Some(Value::Compound(shm)) = sm.get("Heightmaps") else { panic!() };
+        for (k, v) in shm {
+            assert_eq!(hm.get(k), Some(v), "map {k} must rehydrate to the source LongArray");
+        }
+        // byte-level emit path (serve/export): emit_tail_direct on the
+        // stored tail -> LongArrays again (the emitter writes the compound
+        // BODY; callers prepend the root header)
+        let mut out = Vec::new();
+        emit_tail_direct(&t, &[], &mut out, None).expect("direct emit must accept our tail");
+        let mut full = vec![0x0Au8, 0, 0];
+        full.extend_from_slice(&out);
+        let Value::Compound(m2) = fastnbt::from_bytes::<Value>(&full).unwrap() else {
+            panic!()
+        };
+        let Some(Value::Compound(hm2)) = m2.get("Heightmaps") else { panic!() };
+        for (k, v) in shm {
+            assert_eq!(hm2.get(k), Some(v), "direct-emit map {k} must rehydrate identically");
+        }
+    }
+
+    #[test]
+    fn hmap_alias_all_identical_aliases_three() {
+        // four maps with ONE body: the alphabetical-first stays dense, the
+        // other three collapse to name-addressed refs. (The knob-off shape
+        // is pinned by the env gate reading OnceLock — same code path with
+        // the alias pass skipped, exercised by CSAVES_HMAP_ALIAS=0 in the
+        // CI matrix.)
+        let mut root: Map<String, Value> = Map::new();
+        root.insert("DataVersion".to_string(), Value::Int(4189));
+        let mut hm: Map<String, Value> = Map::new();
+        let ea: Vec<u8> = (0..256).map(|i| ((i * 3) % 211 + 5) as u8).collect();
+        let la = pack_nostroddle(&ea, 9);
+        assert_eq!(la.len(), 37);
+        for k in [
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES",
+            "OCEAN_FLOOR",
+            "WORLD_SURFACE",
+        ] {
+            hm.insert(k.to_string(), Value::LongArray(fastnbt::LongArray::new(la.clone())));
+        }
+        root.insert("Heightmaps".to_string(), Value::Compound(hm));
+        let mut sec: Map<String, Value> = Map::new();
+        sec.insert("Y".to_string(), Value::Byte(0));
+        let mut bs: Map<String, Value> = Map::new();
+        bs.insert(
+            "palette".to_string(),
+            Value::List(vec![Value::String("minecraft:stone".into())]),
+        );
+        sec.insert("block_states".to_string(), Value::Compound(bs));
+        root.insert("sections".to_string(), Value::List(vec![Value::Compound(sec)]));
+        let p = fastnbt::to_bytes(&Value::Compound(root)).unwrap();
+        let t = match split(&p, false, None, true).unwrap() {
+            Split::Split { tail, .. } => tail,
+            _ => panic!("expected split"),
+        };
+        let v: Value = fastnbt::from_bytes(&t).unwrap();
+        let Value::Compound(m) = v else { panic!() };
+        let Some(Value::Compound(hmc)) = m.get("Heightmaps") else { panic!() };
+        let refs = hmc
+            .values()
+            .filter(|val| {
+                matches!(val, Value::ByteArray(ba)
+                    if !ba.as_ref().is_empty() && ba.as_ref()[0] as u8 == HMAP_REF_MAGIC)
+            })
+            .count();
+        assert_eq!(refs, 3, "three duplicates of one body must alias to the first");
     }
 
     #[test]

@@ -2161,26 +2161,57 @@ all stall points are captured as CI artifacts.
   + states, the drain fully reclaimed, the varint batch stream shipped):
 
       dim         anvil B/chunk   c-saves B/chunk   ratio
-      overworld   4104            8.0               x510
-      nether      4104            1.6               x2547
-      end         4104            3.7               x1118
-      ALL THREE   4104            4.4               x924  (x0.0011 of Anvil)
+      overworld   4104            7.8               x523
+      nether      4104            1.6               x2546
+      end         4104            3.4               x1217
+      ALL THREE   4104            4.3               x959  (x0.0010 of Anvil)
 
-  (the v0.9.110 narrow-less numbers at the same scale: 9.5/1.7/4.0/5.1
-  = x812 — the v0.9.118 narrow gid streams took the overworld -16%.)
+  (the v0.9.118 narrow-less numbers at the same scale: 9.5/1.7/4.0/5.1
+  = x812; the v0.9.118 narrow gid streams took the overworld -16%, and
+  the v0.9.119 map-alias contract took the end -8% and the overworld
+  -3.7% further.)
 
   Anvil's per-chunk sector floor (1 sector = 4 KiB even for a fully
   empty chunk) is measured, not assumed — every dimension weighs the
   same 4104 B/chunk on disk, so the c-saves ratios differ by terrain
-  mass alone; the per-chunk cost SATURATES with scale (4.4 B/chunk at
+  mass alone; the per-chunk cost SATURATES with scale (4.3 B/chunk at
   192x192 = 110,592 chunks). Projections (linear in chunks, the scaling
   law measured on the rings): a 40000x40000-BLOCK world (2500x2500
   chunks per dimension — the onlinemo.de/world `overworld=40000` input)
-  stores at **~79 MiB for all three dimensions** (overworld-only
-  ~48 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
+  stores at **~76.5 MiB for all three dimensions** (overworld-only
+  ~47 MiB against the calculator's 50 GB estimate — the 2.3 GB target is
   beaten ~48x); a 20000x20000-CHUNK world (400M chunks per dimension)
-  stores at **~5.0 GiB vs ~4.48 TiB across the three dimensions (x2772)**
+  stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
+
+* **The map-alias contract (v0.9.119)** — the tail's Heightmaps compound
+  collapses duplicate maps into name-addressed refs
+  (`[0xC5][u8 target-name len][target name]`): every drained corpus
+  carries 4 maps per chunk and EXACTLY half are byte-identical (the end:
+  OCEAN_FLOOR==WORLD_SURFACE and MOTION_BLOCKING==MOTION_BLOCKING_NO_LEAVES
+  — no water, no leaves; the overworld: 48%; whole-tail dedup cannot
+  claim this — the maps sit INSIDE otherwise-unique tails). The alias
+  target is the alphabetically first name carrying the body —
+  content-determined, walk-order-free (the wire's compound key order is
+  semantically free), minted IDENTICALLY by the byte-level scan path and
+  the Value-level tail_encode, resolved by name on every read path (the
+  join's tail_decode and the direct emit's two-phase walk). Refs are
+  charged 2 + len(name) bytes against a 283-byte dense body. The
+  discovery probe was negative-first: heightmap deep-dive variants (a
+  second-order delta chain +8.2%, serpentine scan +0.3%, 4-bit nibble
+  deltas +8.4%) all LOST to the v0.9.32 first-order zigzag-varint chain
+  — the floor was the MAP COUNT, not the chain — and the narrow gid
+  stream's LZMA2 lc/lp ladder measured flat (113.6-113.9 KiB over
+  10.2 MB raw, ±0.07%: the nibble-phase context hypothesis is dead).
+  Measured 192x192 (honest close weight, bad=0 everywhere): end
+  3.7 → 3.4 B/chunk (x1217), overworld 8.1 → 7.8 (x523), nether 1.6
+  (x2546), ALL THREE 4.4 → 4.3 (x959); the operator's world 79.5 →
+  76.5 MiB; 20000x20000 chunks 5.0 → 4.8 GiB (x2878). enc_fp pin EXACT
+  (the section encode path never sees tails), 120/120 tests (three new:
+  the scan/Value path-agreement contract, the name-resolution contract
+  over BOTH decode paths, the all-identical 3-of-4 aliasing), JJ verify
+  4371/4371, compact x0.05 (was x0.06 — JJ re-saves alias too).
+  CSAVES_HMAP_ALIAS=0 opts out.
 
 * **The narrow gid contract (v0.9.118)** — the GLOB T-variant packs every
   raw-u8 winner at 1/2/4 bits per voxel (gform `10 | wsel<<4` = 26/42/58,

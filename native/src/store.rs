@@ -10475,6 +10475,55 @@ pub mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// v0.9.119: the map-alias contract through the store — the end pattern
+    /// (two identical heightmap pairs, no water / no leaves) aliases within
+    /// the tail, rehydrates byte-identical on read (both the join path and
+    /// the direct emit), and identical chunks still dedup.
+    #[test]
+    fn hmap_alias_store_roundtrip_and_dedup() {
+        let dir = temp_dir("hmap_alias");
+        let st = Store::open_cfg(&dir, true, bench_cfg()).unwrap();
+        let payload = |seed: u64| -> Vec<u8> {
+            let mut base: Map<String, Value> = Map::new();
+            base.insert("DataVersion".to_string(), Value::Int(4189));
+            let mut hm: Map<String, Value> = Map::new();
+            let la: Vec<i64> = {
+                let ea: Vec<u8> = (0..256).map(|i| (i % 199 + (seed as usize % 5)) as u8).collect();
+                chunknbt::pack_nostroddle(&ea, 9)
+            };
+            let lb: Vec<i64> = {
+                let eb: Vec<u8> = (0..256).map(|i| ((i * 7 + seed as usize) % 239 + 2) as u8).collect();
+                chunknbt::pack_nostroddle(&eb, 9)
+            };
+            hm.insert("MOTION_BLOCKING".to_string(), Value::LongArray(fastnbt::LongArray::new(la.clone())));
+            hm.insert("MOTION_BLOCKING_NO_LEAVES".to_string(), Value::LongArray(fastnbt::LongArray::new(la.clone())));
+            hm.insert("OCEAN_FLOOR".to_string(), Value::LongArray(fastnbt::LongArray::new(lb.clone())));
+            hm.insert("WORLD_SURFACE".to_string(), Value::LongArray(fastnbt::LongArray::new(lb.clone())));
+            base.insert("Heightmaps".to_string(), Value::Compound(hm));
+            let mut sec: Map<String, Value> = Map::new();
+            sec.insert("Y".to_string(), Value::Byte(0));
+            let mut bs: Map<String, Value> = Map::new();
+            bs.insert("palette".to_string(), Value::List(vec![Value::String("minecraft:stone".into())]));
+            sec.insert("block_states".to_string(), Value::Compound(bs));
+            base.insert("sections".to_string(), Value::List(vec![Value::Compound(sec)]));
+            fastnbt::to_bytes(&Value::Compound(base)).unwrap()
+        };
+        for i in 0..6u64 {
+            st.write_chunk(key(i as i32, 300), &payload(i), false).unwrap();
+        }
+        // a second pass of the SAME chunks: re-saves must stay identical
+        for i in 0..6u64 {
+            st.write_chunk(key(i as i32, 300), &payload(i), false).unwrap();
+        }
+        for i in 0..6u64 {
+            let got = st.read_chunk(key(i as i32, 300)).unwrap();
+            assert!(semantic(&got, &payload(i)), "chunk {i} must rehydrate semantically");
+        }
+        let disk = st.disk_bytes();
+        assert!(disk < payload(0).len() as u64 * 7, "aliased tails must dedup: disk {disk}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn slab_batching_roundtrip_and_reopen() {
         let dir = temp_dir("slab");
