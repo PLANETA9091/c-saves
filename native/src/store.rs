@@ -11396,6 +11396,12 @@ pub(crate) mod glob_slab_test {
         // measured) — the gate refuses those groups, keeping the hashed
         // wire. The divergence class must never silently vanish from the
         // suite.
+        // v0.9.118: the test READS the dead-drop knob through the encoder,
+        // so it must hold GLOB_TEST_LOCK like every knob-touching test —
+        // the 0.9.118 additions shifted the 4-thread schedule enough to
+        // expose the race (a concurrent drop-OFF phase made the whole
+        // first phase diverge: exact=0 diverged=144 on CI).
+        let _g = GLOB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use chunknbt::{SecBytes, Split, StateRegistry};
         let mut reg = StateRegistry::new();
         let mut diverged = 0usize;
