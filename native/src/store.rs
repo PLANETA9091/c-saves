@@ -356,11 +356,26 @@ fn lzma2_compress_maybe_mt(data: &[u8], threads: u32) -> Option<(u8, Vec<u8>)> {
     lzma2_compress_maybe_mt_as(data, threads, st_raw, SLAB_CODEC_LZMA2_MT)
 }
 
+/// v0.9.120: the ST cross-over. The MT container's block boundaries reset
+/// the LZMA2 context — measured on the real Tectonic overworld g26 frame
+/// (10.26 MB, 4,994 lex-clustered narrow members): the single-context raw
+/// frame encodes to 118.3 KB while the shipped MT frame took 166.9 KB on a
+/// 2-core box (+41% — every block restarts the literal/probability state
+/// and rips the cross-member matches the lex walk earned). The block-count
+/// curve prices the loss: 2 blocks +5.1%, 4 +9.9%, 8 +13.0%, 16 +17.8%.
+/// Streams at or below MT_ST_CROSS go ST raw (full window, one context):
+/// at ~3.5 s/10 MB encode on the (background, pack-thread) path the wall
+/// cost is noise against the bytes saved; bigger streams keep MT with a
+/// 4 MB block floor so a 100 MB stream cannot degrade below the curve's
+/// flat region.
+const MT_ST_CROSS: usize = 16 * 1024 * 1024;
+const MT_BLOCK_MIN: u64 = 4 * 1024 * 1024;
+
 /// Stamp-aware variant: `st_raw` rides small/raw streams, `st_mt` the
 /// blocked .xz container. Caller pairs the stamp with the ROW FORMAT it
 /// built (hashless canon rows -> (0xFA, 0xF9); hashed rows -> (0xFC, 0xFD)).
 fn lzma2_compress_maybe_mt_as(data: &[u8], threads: u32, st_raw: u8, st_mt: u8) -> Option<(u8, Vec<u8>)> {
-    if threads < 2 || data.len() < 2 * 1024 * 1024 {
+    if threads < 2 || data.len() <= MT_ST_CROSS {
         return lzma2_compress_as(data, st_raw);
     }
     // v0.9.90: the MT .xz container is self-describing, so the tuned filter
@@ -386,9 +401,12 @@ fn lzma2_compress_maybe_mt_as(data: &[u8], threads: u32, st_raw: u8, st_mt: u8) 
     let mut b = liblzma::stream::MtStreamBuilder::new();
     b.threads(threads);
     b.filters(f);
-    // at least one block per worker, never below 1 MiB (block overhead),
+    // at least one block per worker, never below the 4 MB floor (v0.9.120),
     // never above the stream itself
-    let per = (data.len() as u64 / threads as u64).clamp(1024 * 1024, 64 * 1024 * 1024);
+    // v0.9.120: the block floor rises to 4 MB (was 1 MB) — the block-count
+    // curve above prices a 1 MB block at +17.8% over the single context;
+    // 4 MB blocks keep even heavily-threaded runs near the flat region.
+    let per = (data.len() as u64 / threads as u64).clamp(MT_BLOCK_MIN, 64 * 1024 * 1024);
     b.block_size(per);
     let mut stream = b.encoder().ok()?;
     let mut out = Vec::with_capacity(data.len() / 3 + 64);
@@ -9312,27 +9330,34 @@ pub mod tests {
         // through the SAME dispatch the read path uses (dict_id=0xFD) and
         // stay decodable below the MT threshold (small streams take the
         // raw encoder, big ones the blocked container).
-        let big: Vec<u8> = (0..3 * 1024 * 1024usize)
+        // v0.9.120: the ST cross-over rises to 16 MB (the block-boundary
+        // context resets priced +5.1..+41% on the real Tectonic g26 frame),
+        // so the mid stream that used to mint the MT stamp now takes the
+        // raw encoder + raw stamp, and only a > 16 MB stream crosses.
+        let mid: Vec<u8> = (0..3 * 1024 * 1024usize)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add((i / 4096) as u8))
             .collect();
-        // small stream: routes to the RAW encoder and MUST carry the raw
-        // stamp (a raw stream under the MT stamp would land in the .xz
-        // decoder and corrupt — the stamp decision lives inside the helper)
+        let big: Vec<u8> = (0..17 * 1024 * 1024usize)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add((i / 4096) as u8))
+            .collect();
+        // small + mid streams: RAW encoder and MUST carry the raw stamp (a
+        // raw stream under the MT stamp would land in the .xz decoder and
+        // corrupt — the stamp decision lives inside the helper)
         let small: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
-        let (stamp, sb) = lzma2_compress_maybe_mt(&small, 4).expect("small encode");
-        // v0.9.90: the tuned literal filter (lc=4 lp=0 pb=0) rides its own
-        // stamp; the legacy 0xFE config stays minted under CSAVES_LZMA_TUNE=0.
-        let want_small = if cold_lzma_tuned() { SLAB_CODEC_LZMA2_TUNE } else { SLAB_CODEC_LZMA2 };
-        assert_eq!(stamp, want_small, "small stream keeps the raw-stamp family");
-        // decode through the SAME dispatch the read path uses, both configs
-        assert_eq!(
-            match stamp {
-                SLAB_CODEC_LZMA2_TUNE => lzma2_decompress_tuned(&sb, small.len()),
-                _ => lzma2_decompress(&sb, small.len()),
-            }
-            .unwrap(),
-            small
-        );
+        let want_raw = if cold_lzma_tuned() { SLAB_CODEC_LZMA2_TUNE } else { SLAB_CODEC_LZMA2 };
+        for (name, s) in [("small", &small), ("mid", &mid)] {
+            let (stamp, sb) = lzma2_compress_maybe_mt(s, 4).expect("st encode");
+            assert_eq!(stamp, want_raw, "{name} stream keeps the raw-stamp family");
+            assert_eq!(
+                match stamp {
+                    SLAB_CODEC_LZMA2_TUNE => lzma2_decompress_tuned(&sb, s.len()),
+                    _ => lzma2_decompress(&sb, s.len()),
+                }
+                .unwrap(),
+                *s,
+                "{name} stream decodes through the raw dispatch",
+            );
+        }
         // big stream: MT container stamp + .xz decode
         let (stamp2, eb) = lzma2_compress_maybe_mt(&big, 4).expect("mt encode");
         assert_eq!(stamp2, SLAB_CODEC_LZMA2_MT, "big stream takes the MT stamp");

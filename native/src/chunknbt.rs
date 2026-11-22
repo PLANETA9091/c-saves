@@ -1736,6 +1736,52 @@ fn counts_rle_len_u32(v: &[u32]) -> ([u32; 256], u64) {
     (counts, total)
 }
 
+// v0.9.120: const nibble LUTs for the narrow gid unpack — the read-cold
+// grb_pre pass ran a per-voxel shift/mask/push cascade for every rebuild
+// (4,096 pushes per member); the LUT pairs/triples/quads each payload byte
+// into its gids with one bounds check per member byte instead of per voxel.
+const fn build_nib2() -> [[u8; 2]; 256] {
+    let mut t = [[0u8; 2]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = [(i >> 4) as u8, (i & 0x0f) as u8];
+        i += 1;
+    }
+    t
+}
+const fn build_nib4() -> [[u8; 4]; 256] {
+    let mut t = [[0u8; 4]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = [
+            ((i >> 6) & 3) as u8,
+            ((i >> 4) & 3) as u8,
+            ((i >> 2) & 3) as u8,
+            (i & 3) as u8,
+        ];
+        i += 1;
+    }
+    t
+}
+const fn build_nib8() -> [[u8; 8]; 256] {
+    let mut t = [[0u8; 8]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut row = [0u8; 8];
+        let mut sh = 8;
+        while sh > 0 {
+            sh -= 1;
+            row[7 - sh] = ((i >> sh) & 1) as u8;
+        }
+        t[i] = row;
+        i += 1;
+    }
+    t
+}
+static NIB2: [[u8; 2]; 256] = build_nib2();
+static NIB4: [[u8; 4]; 256] = build_nib4();
+static NIB8: [[u8; 8]; 256] = build_nib8();
+
 /// v0.9.33: early-exit twin of rle_stream_len_u16.
 fn rle_stream_len_u16_bounded(v: &[u32], bound: u64) -> u64 {
     let mut total = 0u64;
@@ -9394,6 +9440,9 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     }
     // decode the gid payload: one u32 gid per voxel
     let mut gids: Vec<u32> = Vec::with_capacity(4096);
+    // v0.9.120: the narrow gforms keep their transposed payload in u8 so the
+    // fused counts walk runs cache-resident (4 KB vs the u32 twin's 16 KB)
+    let mut narrow_t8: Option<Vec<u8>> = None;
     match gform {
         0 => {
             let s = glob.get(p..p + 4096)?;
@@ -9492,32 +9541,32 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
             let s = glob.get(p..p + 4096 * bits as usize / 8)?;
             p += 4096 * bits as usize / 8;
             let mut raw: Vec<u8> = Vec::with_capacity(4096);
+            // v0.9.120: LUT unpack — one bounds-checked extend per payload
+            // byte (was a per-voxel shift/mask/push cascade)
             match bits {
                 4 => {
                     for &b in s {
-                        raw.push(b >> 4);
-                        raw.push(b & 0x0f);
+                        raw.extend_from_slice(&NIB2[b as usize]);
                     }
                 }
                 2 => {
                     for &b in s {
-                        raw.push((b >> 6) & 3);
-                        raw.push((b >> 4) & 3);
-                        raw.push((b >> 2) & 3);
-                        raw.push(b & 3);
+                        raw.extend_from_slice(&NIB4[b as usize]);
                     }
                 }
                 _ => {
                     for &b in s {
-                        for sh in (0..8).rev() {
-                            raw.push((b >> sh) & 1);
-                        }
+                        raw.extend_from_slice(&NIB8[b as usize]);
                     }
                 }
             }
-            for g in transpose_fast_y(&raw, 16) {
-                gids.push(g as u32);
-            }
+            let t = transpose_fast_y(&raw, 16);
+            // v0.9.120: keep the transposed payload in u8 — the fused counts
+            // walk runs over the u8 view (4 KB, cache-resident) instead of
+            // the u32 twin's 16 KB stride; identical counts and framing
+            // length because the values are the same in the same order.
+            gids.extend(t.iter().map(|&g| g as u32));
+            narrow_t8 = Some(t);
         }
         _ => return None,
     }
@@ -9532,7 +9581,9 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     // dominant cost (store-forwarding stalls; the run walk accumulates per
     // RUN), and the run structure is remap-invariant, so `la` is EXACT.
     let narrow_gid = matches!(gform, 0 | 1 | 2 | 6 | 7 | 26 | 42 | 58);
-    let (mut counts_arr, la_pre) = if narrow_gid {
+    let (mut counts_arr, la_pre) = if let Some(t8) = &narrow_t8 {
+        counts_rle_len_u8(t8)
+    } else if narrow_gid {
         counts_rle_len_u32(&gids)
     } else {
         ([0u32; 256], 0u64)

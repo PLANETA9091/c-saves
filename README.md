@@ -2184,6 +2184,40 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.120 speed floor contract** — the byte axes are CLOSED, the
+  tick priced them and moved to time. The MT .xz container's block
+  boundaries reset the LZMA2 context: on the real Tectonic g26 frame
+  (10.2 MB narrow members, lex-clustered) one context encodes 118.3 KB
+  while 2 blocks cost +5.1%, 8 +13.0%, 16 +17.8% — and the rank-select
+  that sends the k = cores/2 longest streams to MT was handing the glob
+  frame to the blocked encoder on every 4+-core host (the 2-core CI
+  runner kept it ST by k=1 luck). Streams ≤ 16 MB now ALWAYS encode
+  single-context ST raw (`MT_ST_CROSS`), larger ones keep MT with a
+  4 MB block floor (was 1 MB): pack wall −8.5% on the 2-core bench
+  (JJ compaction 73.8 → 67.5 s) and no multi-core ratio cliff remains.
+  The narrow gid rebuild's read path went LUT: the per-voxel
+  shift/mask/push cascade became one bounds-checked extend per payload
+  byte (`NIB2/NIB4/NIB8` const tables) and the fused counts walk runs
+  the u8 view of the transposed payload (4 KB cache-resident vs the u32
+  twin's 16 KB stride; grb_pre −5.6%, glob_miss −2.8%). Four byte axes
+  probed and closed NEGATIVE with numbers, so nobody pays for them
+  again: the inter-section delta chain (+112.8% RLE / +407.9% sparse
+  vs the shipped frame — LZMA2's match machinery already expresses the
+  lex-neighborhood sharing better than any explicit delta), the
+  cross-record batch body pool (+18.6/+65.8/+96.7% per dimension —
+  only 7% of bodies repeat across records, and one big window loses the
+  per-record structure), the batch idx-delta column (−3.9% ow /
+  −1.2% nether / +8.5% end — noise), and the whole codec ladder on
+  dumped member streams (LZMA2 preset 9, lc/lp variants, brotli-11,
+  ppmd-6, zstd-19 — all flat vs the shipped preset-6e lc4lp0pb0). The
+  byte floor is the lex-clustered narrow frame itself. Honest close
+  weight unchanged at the floor: 192×192 overworld 7.9, nether 1.6,
+  end 3.4, ALL THREE 4.3 B/chunk (x959); 50 GB → ~47 MiB; 20000×20000
+  chunks 4.8 GiB. enc_fp pin EXACT (the canon encode path is untouched),
+  120/120 tests (the MT threshold contract rewritten: small + mid stay
+  raw, only > 16 MB crosses), JJ verify 4371/4371 compact x0.05,
+  speed verify 728+218 bad=0, full-dimension probe 64+192 bad=0 miss=0.
+
 * **The map-alias contract (v0.9.119)** — the tail's Heightmaps compound
   collapses duplicate maps into name-addressed refs
   (`[0xC5][u8 target-name len][target name]`): every drained corpus
@@ -2331,7 +2365,7 @@ gate fails on any drift (`bad=0` required).
 
 ## CI
 
-* `bench` — twelve jobs on every push: unit tests (114), size gate (compact
+* `bench` — twelve jobs on every push: unit tests (120), size gate (compact
   <= 15% of Anvil), pristine/scale/play/JVM/serve/worst-case gates, the
   JJThunder corpus gate (bad=0, ratio >= 2.6x), speed and real-export
   benches. The container lines report BOTH weights since v0.9.107: the
