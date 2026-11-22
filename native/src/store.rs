@@ -7929,6 +7929,70 @@ impl Store {
                 v
             })
             .collect();
+        // v0.9.121: the FORFEITED canon encode. The window gate compared
+        // canon-comp vs glob-comp, but the census counters (worktree, both
+        // corpora: Tectonic 96 and JJ bench_size) recorded ZERO canon wins
+        // across every group: the glob variant's payload is the same voxel
+        // data through the registry's frequency-canonical gids — narrow
+        // 1/2/4-bit streams, RLE forms and shared-state encoding all shrink
+        // the raw side — and the compressed side followed every time. A canon
+        // stream whose glob twin carries a 2x RAW advantage is now never
+        // compressed (the pole that used to pin the pack wall: Tectonic's
+        // 20.7 MB canon stream rode the MT encoder ONLY to lose the gate);
+        // the glob variant takes the slot directly. Groups without a glob
+        // variant keep the canon encode (the fallback path is unchanged),
+        // and CSAVES_FORCE_GLOB=1 makes the forfeit a no-op (glob wins
+        // either way). The 2x margin is deliberately generous: it prices the
+        // worst measured case (canon never won even ONCE at any raw ratio)
+        // with a 2x safety net on top.
+        let mut flat_kind: Vec<u8> = Vec::with_capacity(flat.len());
+        let mut flat_build: Vec<usize> = Vec::with_capacity(flat.len());
+        let skip_canon: Vec<bool> = builds
+            .iter()
+            .map(|b| {
+                b.glob
+                    .as_ref()
+                    .map(|(g, _)| g.stream.len() * 3 < b.canon.stream.len() * 2)
+                    .unwrap_or(false)
+            })
+            .collect();
+        // v0.9.121: the FORFEITED base glob — the same argument one level
+        // deeper. The narrow arm (v0.9.118) rides the TRANSPOSED variant
+        // ONLY ("the base stream keeps the u8 raws, so the window gate
+        // always sees a never-worse fallback"), which makes the base u8
+        // stream (4096 B/member) a guaranteed loser wherever the narrow
+        // variant exists: Tectonic 192x192 base 20.7 MB vs narrow 10.4 MB
+        // raw — the 20.7 MB stream rode the MT encoder ONLY to lose the
+        // gate to its own narrow twin. Forfeit it when the narrow twin
+        // carries a 1.5x raw advantage (census: the narrow twin won EVERY
+        // base-vs-T comparison on both corpora; JJ never builds glob_t —
+        // its RLE-heavy groups fail the narrow pre-gate — so this is a
+        // pure Tectonic-shaped-world win).
+        let skip_base: Vec<bool> = builds
+            .iter()
+            .map(|b| {
+                b.glob_t
+                    .as_ref()
+                    .map(|gt| gt.stream.len() * 3 < b.glob.as_ref().map(|(g, _)| g.stream.len()).unwrap_or(usize::MAX) * 2)
+                    .unwrap_or(false)
+            })
+            .collect();
+        {
+            let mut bi = 0usize;
+            for b in &builds {
+                flat_kind.push(0);
+                flat_build.push(bi);
+                if b.glob.is_some() {
+                    flat_kind.push(1);
+                    flat_build.push(bi);
+                }
+                if b.glob_t.is_some() {
+                    flat_kind.push(2);
+                    flat_build.push(bi);
+                }
+                bi += 1;
+            }
+        }
         // v0.9.91: per-stream (raw, mt) stamp pairs — canon streams mint the
         // hashless family when the gate is on, glob streams always the hashed
         // family (the stamp and the row format must travel together). The
@@ -8080,6 +8144,16 @@ impl Store {
         }
         let _tc = std::time::Instant::now();
         let compress_one = |i: usize| -> (u8, Vec<u8>) {
+            // v0.9.121: the forfeited canon slot returns an empty payload —
+            // Phase C routes forfeited groups straight to the glob variant
+            // (the counters say it never lost), so the MT pole that used to
+            // burn the pack wall on a stream that always lost is GONE.
+            if flat_kind[i] == 0 && skip_canon[flat_build[i]] {
+                return (0u8, Vec::new());
+            }
+            if flat_kind[i] == 1 && skip_base[flat_build[i]] {
+                return (0u8, Vec::new());
+            }
             let stream = flat[i];
             let (st_raw, st_mt, st_zstd) = stamp_pairs[i];
             if lz {
@@ -8168,7 +8242,11 @@ impl Store {
         // ---- Phase C (serial, group order): variant pick + append + blob
         // map updates, exactly the serial flow's decisions and byte layout.
         let mut task_at = 0usize;
+        let mut build_at = 0usize;
         for GBuild { group, canon, glob, mut glob_t, .. } in builds {
+            let forfeited = skip_canon[build_at];
+            let base_forfeited = skip_base[build_at];
+            build_at += 1;
             let (cc_did, cc) = outs[task_at].take().expect("canon comp missing");
             task_at += 1;
             let cg = glob.as_ref().map(|_| {
@@ -8185,10 +8263,11 @@ impl Store {
                 task_at += 1;
                 (d, c)
             });
-            let use_t = match (&cg, &cg_t) {
-                (Some((_, gc)), Some((_, tc))) => tc.len() < gc.len(),
-                _ => false,
-            };
+            let use_t = base_forfeited
+                || match (&cg, &cg_t) {
+                    (Some((_, gc)), Some((_, tc))) => tc.len() < gc.len(),
+                    _ => false,
+                };
             let mut glob = glob;
             let mut cg = cg;
             if use_t {
@@ -8220,7 +8299,7 @@ impl Store {
                         std::env::var("CSAVES_FORCE_GLOB").as_deref() == Ok("1")
                     })
                 };
-                if force || cg.len() < cc.len() {
+                if force || forfeited || cg.len() < cc.len() {
                     // the registry MUST be on disk before the slab that
                     // references its gids (crash = silent misresolution)
                     if self.reg_dirty.swap(false, Ordering::Relaxed) {

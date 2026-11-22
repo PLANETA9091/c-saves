@@ -2184,6 +2184,30 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.121 forfeited-losers contract** — the pack compressed TWO
+  whole-frame streams per glob group ONLY to lose the window gate. The
+  census counters (worktree build, both corpora) recorded ZERO canon
+  wins across every group on Tectonic AND JJ: the glob variant's payload
+  is the same voxel data through the registry's frequency-canonical
+  gids, and the compressed side followed the raw side every time. Deeper
+  still: the v0.9.118 narrow arm deliberately keeps the base u8 stream
+  as a "never-worse fallback", which made the base encode (Tectonic
+  192×192: 20.7 MB of u8 raws) a GUARANTEED loss every time its own
+  narrow twin (10.4 MB) existed — the 20.7 MB stream rode the MT
+  encoder purely to lose to itself. Both losers are now forfeited
+  without compressing: a group whose glob twin carries a 1.5× raw
+  advantage skips the canon encode; a group whose narrow twin carries a
+  1.5× raw advantage skips the base encode. Glob-absent groups and
+  narrow-gate-failed groups keep the old encodes (JJ: its RLE-heavy
+  groups never build glob_t AND its canon streams are SMALLER than the
+  glob ones — ratio 0.62 — so no forfeit fires there: the guard is the
+  feature). CSAVES_FORCE_GLOB=1 makes the forfeit a no-op. Measured:
+  full-world probe 192×192 wall 62.2 → 54.4 s (**-12.5%**, runs
+  54.5/54.3), JJ byte-for-byte unchanged, honest close weight unchanged
+  at the floor (7.9/1.6/3.4/4.3 B/chunk, x959). enc_fp pin EXACT,
+  120/120 tests, JJ verify 4371/4371 compact x0.05, speed verify
+  728+218 bad=0, full-dimension probe 64+192 bad=0 miss=0.
+
 * **The v0.9.120 speed floor contract** — the byte axes are CLOSED, the
   tick priced them and moved to time. The MT .xz container's block
   boundaries reset the LZMA2 context: on the real Tectonic g26 frame
