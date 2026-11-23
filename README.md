@@ -2184,6 +2184,28 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.123 batch-stream decode memo — the recipes pole collapses
+  93%** — the 0.9.122 pack census exposed the #2 pole (recipes re-queue,
+  1.19 s of the 192×192 overworld pack wall), and the cause was
+  embarrassing: the pull loop decompressed the WHOLE kind-0x0B/0x0C
+  stream for EVERY entry it moved — a 1700-entry record paid ~1700 zstd
+  decodes of the same ~340 KB bytes (36864 keys × 340 KB = 12.5 GB of
+  decode work = the pole). The record bytes are immutable inside the
+  dying segment (appends never rewrite, `seal()` stopped new ones), so
+  ONE decode per record body offset is exact: a
+  `HashMap<boff, Arc<Vec<u8>>>` memo living across the fixpoint passes
+  serves every subsequent entry of the same record with zero reads and
+  zero decompresses. Measured: **recipes 1.19 s → 85 ms** overworld
+  (nether 485 → 67 ms, end 642 → 88 ms), counted pack wall 8.53 →
+  **7.35 s (−14%)** — comp (the single narrow LZMA2 stream, the byte
+  floor's price) is now 93% of it; full-world probe 192 total 53.0 →
+  51.4 s. Wire unchanged, pointers unchanged, scan unchanged. Honest
+  close weight unchanged at the floor: 192×192 overworld 7.9, nether
+  1.6, end 3.4, ALL THREE 4.3 B/chunk (x958); 50 GB → ~47 MiB;
+  20000×20000 chunks 4.8 GiB. enc_fp pin EXACT, 120/120 tests, JJ
+  compact x0.05 verify 1661 clean, speed verify 728+218 bad=0,
+  full-dimension probe 64 (5.6 s) + 192 (51.4 s) bad=0 miss=0.
+
 * **The v0.9.122 pack-wall decomposition + the parallel-LZMA2 axes priced
   dead** — the full-world probe now prints the PACK CENSUS per dimension
   (`pack_census_json`, reset per dim): after the forfeits the 192×192

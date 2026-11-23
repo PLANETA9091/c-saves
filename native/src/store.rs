@@ -9055,6 +9055,16 @@ impl Store {
         // appends target this segment, so only the one in-flight flush can
         // add pointers; each pass moves at least what it sees.
         let _tr = std::time::Instant::now();
+        // v0.9.123: the batch-stream decode memo. The per-key path used to
+        // decompress the WHOLE kind-0x0B/0x0C stream for EVERY entry it
+        // moved — a 1700-entry record paid ~1700 zstd decodes of the same
+        // ~340 KB bytes (36864 keys x 340 KB = 12.5 GB of decode work on
+        // the 192x192 overworld = the 1.19 s recipes pole, measured via the
+        // pack census). The record bytes are immutable inside the dying
+        // segment (appends never rewrite, seal() stopped new ones), so one
+        // decode per RECORD BODY OFFSET is exact; the memo lives across the
+        // fixpoint passes (a re-snapshot can re-visit the same records).
+        let mut batch_raw_memo: HashMap<u64, std::sync::Arc<Vec<u8>>> = HashMap::new();
         loop {
         let recs: Vec<(u64, u32, u64, u32)> = {
             let chunks = self.chunks.read();
@@ -9104,45 +9114,54 @@ impl Store {
                 if is_writer {
                     self.flush_writer();
                 }
-                let segs = self.segs.read();
-                let Some(seg) = segs.get(&worst_id) else { continue };
-                // v0.9.102: kind dispatch — kind 9 header is 13 B
-                // ([n][cl][raw]), kind 0x0B adds [m] (17 B).
-                let Some(kindb) = seg.read_at(boff, 1, !is_writer) else {
-                    eprintln!("[c-saves] LEAK: hdr read fail key={key:016x} boff={boff}");
-                    mark_broken();
-                    continue;
-                };
-                let hlen = match kindb.first().copied().unwrap_or(0) {
-                    9 => 13usize,
-                    0x0B | 0x0C => 17usize,
-                    k => {
-                        eprintln!("[c-saves] LEAK: unknown batch kind {k} key={key:016x}");
+                // v0.9.123: memo hit = zero reads, zero decompress. Miss =
+                // the full header + body read + ONE decode, then shared.
+                let raw_arc = if let Some(a) = batch_raw_memo.get(&boff) {
+                    a.clone()
+                } else {
+                    let segs = self.segs.read();
+                    let Some(seg) = segs.get(&worst_id) else { continue };
+                    // v0.9.102: kind dispatch — kind 9 header is 13 B
+                    // ([n][cl][raw]), kind 0x0B adds [m] (17 B).
+                    let Some(kindb) = seg.read_at(boff, 1, !is_writer) else {
+                        eprintln!("[c-saves] LEAK: hdr read fail key={key:016x} boff={boff}");
                         mark_broken();
                         continue;
-                    }
+                    };
+                    let hlen = match kindb.first().copied().unwrap_or(0) {
+                        9 => 13usize,
+                        0x0B | 0x0C => 17usize,
+                        k => {
+                            eprintln!("[c-saves] LEAK: unknown batch kind {k} key={key:016x}");
+                            mark_broken();
+                            continue;
+                        }
+                    };
+                    let Some(hdr) = seg.read_at(boff, hlen, !is_writer) else {
+                        eprintln!("[c-saves] LEAK: hdr read fail key={key:016x} boff={boff}");
+                        mark_broken();
+                        continue;
+                    };
+                    let cl = u32::from_le_bytes(hdr[hlen - 8..hlen - 4].try_into().unwrap()) as usize;
+                    let raw_total =
+                        u32::from_le_bytes(hdr[hlen - 4..hlen].try_into().unwrap());
+                    let Some(data) = seg.read_at(boff + hlen as u64, cl, !is_writer) else {
+                        eprintln!("[c-saves] LEAK: body read fail key={key:016x} cl={cl}");
+                        mark_broken();
+                        continue;
+                    };
+                    drop(segs);
+                    let Some(raw) = self.decompress(0, &data, raw_total) else {
+                        eprintln!("[c-saves] LEAK: batch decompress fail key={key:016x}");
+                        mark_broken();
+                        continue;
+                    };
+                    let a = std::sync::Arc::new(raw);
+                    batch_raw_memo.insert(boff, a.clone());
+                    a
                 };
-                let Some(hdr) = seg.read_at(boff, hlen, !is_writer) else {
-                    eprintln!("[c-saves] LEAK: hdr read fail key={key:016x} boff={boff}");
-                    mark_broken();
-                    continue;
-                };
-                let cl = u32::from_le_bytes(hdr[hlen - 8..hlen - 4].try_into().unwrap()) as usize;
-                let raw_total =
-                    u32::from_le_bytes(hdr[hlen - 4..hlen].try_into().unwrap());
-                let Some(data) = seg.read_at(boff + hlen as u64, cl, !is_writer) else {
-                    eprintln!("[c-saves] LEAK: body read fail key={key:016x} cl={cl}");
-                    mark_broken();
-                    continue;
-                };
-                drop(segs);
-                let Some(raw) = self.decompress(0, &data, raw_total) else {
-                    eprintln!("[c-saves] LEAK: batch decompress fail key={key:016x}");
-                    mark_broken();
-                    continue;
-                };
-                let Some(e) = raw.get(soff as usize..(soff + rl) as usize) else {
-                    eprintln!("[c-saves] LEAK: slice fail key={key:016x} soff={soff} rl={rl} rawlen={}", raw.len());
+                let Some(e) = raw_arc.get(soff as usize..(soff + rl) as usize) else {
+                    eprintln!("[c-saves] LEAK: slice fail key={key:016x} soff={soff} rl={rl} rawlen={}", raw_arc.len());
                     mark_broken();
                     continue;
                 };
