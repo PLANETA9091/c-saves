@@ -2184,6 +2184,35 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.124 read-cold decomposed, the content-cache axis closed** —
+  the full-world probe now prints the READ-STAGE census per dimension
+  (reset before each verify pass): the Tectonic 96×96 overworld cold
+  read lives in **join_fused 8.7 µs/chunk (60%)** — sectload 4.9 µs
+  (the 1707 unique GLOB rebuilds at 18.4 µs each = 3.4 µs/chunk
+  amortized; the hit path is ~118 ns and rides the recipe's stored
+  hash — no re-hashing), recipe+tail+shift 0.8 µs; nether join_fused
+  78%, end 82% — the fused NBT emitter is THE read-cold pole on every
+  dimension, and at the JJ scale (131-section chunks, ~157 KB of
+  section bytes per chunk) it is memcpy-bound: 131 splices at 20 GB/s
+  reproduce the measured wall. The obvious pregen-world lever — a
+  CONTENT read cache (cold reads of content-identical chunks collapse
+  to one decode; key = the recipe's canonical content hash: section
+  hashes + tail identity + the chunk key ONLY when the recipe
+  reinserts coords) — was implemented, measured and REVERTED: ZERO
+  hits at any cap, because real Anvil chunks embed their coordinates
+  (`pos_from_key`/`starts_from_key` recipes mix the whole key into the
+  canonical inputs, so the output truly differs per coordinate and the
+  content key degenerates to the per-key result cache). The 0.9.120
+  batch census 782/7011 was dedup SAVINGS (11%), not a repeat factor —
+  89% of the overworld recipe bodies are unique; the 98% repeat share
+  that DOES exist (84,439 glob conversions over 1,707 unique members)
+  is already collapsed by the section-level emit splice cache (warm
+  20 GB/s). Honest close weight unchanged at the floor: 192×192
+  overworld 7.9, nether 1.6, end 3.4, ALL THREE 4.3 B/chunk (x958);
+  50 GB → ~47 MiB; 20000×20000 chunks 4.8 GiB. enc_fp pin EXACT,
+  120/120 tests, JJ compact x0.05 verify 1661 clean, full-dimension
+  probe 96 + 192 bad=0 miss=0.
+
 * **The v0.9.123 batch-stream decode memo — the recipes pole collapses
   93%** — the 0.9.122 pack census exposed the #2 pole (recipes re-queue,
   1.19 s of the 192×192 overworld pack wall), and the cause was

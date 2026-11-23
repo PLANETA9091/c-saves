@@ -207,6 +207,7 @@ fn main() {
         let full = st.full_disk_bytes();
 
         // 4) verify every read against the generated payload
+        c_saves::store::read_stage_reset();
         let t0 = std::time::Instant::now();
         let (mut ok_s, mut miss) = (0usize, 0usize);
         for &k in &keys {
@@ -221,6 +222,7 @@ fn main() {
             }
         }
         let verify_t = t0.elapsed();
+        println!("   read-cold stages: {}", c_saves::store::read_stage_json());
         println!(
             "   import {:.1?} | container {} (full {}) | {:.1} B/chunk | anvil {} = {:.0} B/chunk | verify {}/{} in {:.1?}",
             import_t,
