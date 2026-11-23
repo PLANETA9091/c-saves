@@ -2184,6 +2184,42 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.122 pack-wall decomposition + the parallel-LZMA2 axes priced
+  dead** — the full-world probe now prints the PACK CENSUS per dimension
+  (`pack_census_json`, reset per dim): after the forfeits the 192×192
+  overworld pack wall lives in **comp 6.87 s (54%)** — and `mtjobs:0`:
+  every MT encode is gone (forfeits removed the loser streams, the ST
+  cross-over keeps the survivors single-context), so the pole is ONE raw
+  tuned-p6e encode of the 10.26 MB lex-clustered narrow glob twin
+  (stream-level parallelism already spreads the rest). Recipes re-queue
+  1.19 s (14%), Phase A build 0.47 s, victims+append ≈ 0. Measured
+  production math: import enqueue 0.66 s + pack ≈ 9.2 s per 36864-chunk
+  dimension overworld, ~12.6 s all three dims — the honest wall the
+  400M-chunk operator world pays (≈ 12.7 h linear). The obvious way out
+  — split the big stream into parts and compress them in parallel — is
+  now PRICED DEAD with a roundtrip-verified probe (`pdc_probe`, the
+  preset-dict chained-parts design: part i encodes with
+  `preset_dict` = the full preceding raw stream, so only the LZMA2
+  probability model resets; the decoder chains the decoded tails): at
+  the production scale (9.78 MB g26 dump) **K=2 costs +0.677% bytes AND
+  the parallel makespan 5.12 s equals the 5.31 s single-context wall** —
+  the BT4 dict-priming pass re-hashes the whole preset dict and eats the
+  entire parallelism gain; K=4 is strictly worse (+1.89% bytes, 9.99 s
+  work, 7.48 s par); at the 2.49 MB scale K=2 is +1.93% with work UP
+  25%. The HC4 match-finder alternative: **+20.68% bytes** at the
+  production scale (+14.18% at 2.49 MB) — dead too. Read-side
+  candidates closed by CI data: the MT warm read scales 2× at 2 threads
+  (853k ops/s vs ~436k single-equivalent — the global-mutex contention
+  hypothesis is invisible at this scale; the runners are 2-vCPU), and
+  the join_fused 4-bit emit fast path already exists
+  (`dense_to_nostroddle` byte-copies when in_bits == out_bits divides
+  64; warm reads are 100% result-cache hits anyway). Honest close
+  weight unchanged at the floor: 192×192 overworld 7.9, nether 1.6,
+  end 3.4, ALL THREE 4.3 B/chunk (x958); 50 GB → ~47 MiB; 20000×20000
+  chunks 4.8 GiB. enc_fp pin EXACT, 120/120 tests, JJ compact x0.05
+  verify clean, speed verify 728+218 bad=0, full-dimension probe 64
+  (5.8 s) + 192 (53.0 s) bad=0 miss=0.
+
 * **The v0.9.121 forfeited-losers contract** — the pack compressed TWO
   whole-frame streams per glob group ONLY to lose the window gate. The
   census counters (worktree build, both corpora) recorded ZERO canon

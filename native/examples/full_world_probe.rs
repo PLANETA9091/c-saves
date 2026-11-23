@@ -189,6 +189,7 @@ fn main() {
         }
 
         // 3) the production import path into its own store + full drain
+        c_saves::store::pack_census_reset();
         let store_dir = out.join(format!("store-{}", name));
         let st = Store::open_cfg(&store_dir, true, Cfg::from_env()).unwrap();
         let t0 = std::time::Instant::now();
@@ -201,6 +202,7 @@ fn main() {
         }
         let import_t = t0.elapsed();
         drain(&st);
+        println!("   pack census: {}", c_saves::store::pack_census_json());
         let container = st.disk_bytes();
         let full = st.full_disk_bytes();
 
