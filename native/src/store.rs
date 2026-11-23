@@ -2053,6 +2053,17 @@ static ST_GLOB_CONV: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new
 // read profile showed 95k conversion calls for ~2k unique members; these
 // name the share that rebuilt instead of hit.
 pub static ST_GLOB_HIT: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+// v0.9.125 TEMP scan diagnostics: the GLOB identity recompute split
+pub static SCAN_CONV_NS: AtomicU64 = AtomicU64::new(0);
+pub static SCAN_RE_NS: AtomicU64 = AtomicU64::new(0);
+pub static SCAN_HASH_NS: AtomicU64 = AtomicU64::new(0);
+pub static SCAN_CONV_N: AtomicU64 = AtomicU64::new(0);
+pub fn reset_scan_diag() {
+    SCAN_CONV_NS.store(0, Ordering::Relaxed);
+    SCAN_RE_NS.store(0, Ordering::Relaxed);
+    SCAN_HASH_NS.store(0, Ordering::Relaxed);
+    SCAN_CONV_N.store(0, Ordering::Relaxed);
+}
 pub static ST_GLOB_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static ST_SHIFT_RES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 // write path
@@ -4964,6 +4975,8 @@ impl Store {
             dict_id,
             SLAB_CODEC_LZMA2_HYB | SLAB_CODEC_LZMA2_MT_HYB | SLAB_CODEC_ZSTD_HYB
         );
+        let _dbg = std::env::var("CSAVES_SCAN_DEBUG").as_deref() == Ok("1");
+        let _t0 = std::time::Instant::now();
         let raw = match self.decompress(dict_id, comp, raw_total) {
             Some(r) => r,
             None => {
@@ -4975,6 +4988,8 @@ impl Store {
                 return None;
             }
         };
+        let _t_dec = _t0.elapsed().as_nanos() as u64;
+        let _t1 = std::time::Instant::now();
         let mut out = Vec::with_capacity(n);
         let mut p = 0usize;
         let bitmap: Vec<u8> = if hybrid {
@@ -5009,6 +5024,7 @@ impl Store {
             };
             out.push((bid, rl, h));
         }
+        let _t_tab = _t1.elapsed().as_nanos() as u64;
         let total_raw: u64 = out.iter().map(|(_, rl, _)| *rl as u64).sum();
         if raw.len() != p + total_raw as usize {
             eprintln!(
@@ -5019,76 +5035,151 @@ impl Store {
             );
             return None;
         }
+        let _t_re0 = std::time::Instant::now();
         if hashless || hybrid {
-            let mut q = p;
-            for e in out.iter_mut() {
-                if e.2 != 0 {
-                    // hybrid bitmap-1 row: the stored write-time hash IS the
-                    // identity (the pack proved the derivation drifts here)
-                    q += e.1 as usize;
-                    continue;
-                }
-                let end = q + e.1 as usize;
-                if raw.len() < end {
-                    return None;
-                }
-                let bytes = &raw[q..end];
-                // Identity must equal the WRITE-TIME dedup key exactly.
-                // v0.9.93: 0xCB/0xCC GLOB members reconstruct their canonical
-                // form over the persistent registry (loaded before scan;
-                // glob_par measured 0 divergences) and hash it; CSEC3/4 +
-                // 0xC9 shift-ref members are keyed by hash_of(stored bytes);
-                // fallback NBT members (tails) are keyed structurally, which
-                // structural_hash_wire recomputes without a parse.
-                e.2 = match bytes.first() {
-                    Some(&0xCB) | Some(&0xCC) => {
-                        let reg = self.glob_reg.lock();
-                        match chunknbt::glob_any_to_section(bytes, &reg) {
-                            // v0.9.95: hash the FULL CANONICAL RE-ENCODE, not
-                            // glob_any_to_section's direct output — the direct
-                            // wire re-emits the walked form (2444 vs 3056 B on
-                            // RLE-form sections), semantically equal but
-                            // byte-different, and its hash would drift from
-                            // the write-time dedup key. The canonical encoder
-                            // is content-deterministic: the re-encode
-                            // reproduces the original bytes bit for bit.
-                            Some(direct) => match chunknbt::canonical_reencode(&direct) {
-                                Some(canon) => xxhash_rust::xxh3::xxh3_128(&canon),
-                                None => {
-                                    eprintln!(
-                                        "[c-saves] slab parse: re-encode refused, {}-B glob member stamp={dict_id:#04x} head={:02x?}",
-                                        bytes.len(),
-                                        &bytes[..bytes.len().min(12)]
-                                    );
-                                    return None;
+            // v0.9.125: the identity recompute IS the reopen scan's pole —
+            // measured 251 ms of the 290 ms 192x192 overworld open (17.7 us
+            // glob reconstruction + 22.1 us canonical re-encode per member,
+            // 6317 members). The rows are INDEPENDENT: precompute each row's
+            // byte range, snapshot the registry ONCE (immutable for the
+            // scope — the scan runs at open, before any writer thread
+            // exists), and recompute across the cores.
+            let ranges: Vec<(usize, usize)> = {
+                let mut q = p;
+                out.iter()
+                    .map(|e| {
+                        let r = (q, q + e.1 as usize);
+                        q = r.1;
+                        r
+                    })
+                    .collect()
+            };
+            let _t_snap = std::time::Instant::now();
+            let reg = self.glob_reg_snapshot();
+            let snap_ns = _t_snap.elapsed().as_nanos() as u64;
+            let results: std::sync::Mutex<Vec<Option<Hash>>> =
+                std::sync::Mutex::new((0..out.len()).map(|_| None).collect());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let cores = std::thread::available_parallelism()
+                .map(|c| c.get())
+                .unwrap_or(1);
+            std::thread::scope(|sc| {
+                let results = &results;
+                let next = &next;
+                let reg = &reg;
+                let raw = &raw;
+                let ranges = &ranges;
+                let out_ref = &out;
+                for _ in 0..cores {
+                    sc.spawn(move || loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= out_ref.len() {
+                            break;
+                        }
+                        if out_ref[i].2 != 0 {
+                            // hybrid bitmap-1 row: the stored write-time hash
+                            // IS the identity (the pack proved the derivation
+                            // drifts here)
+                            continue;
+                        }
+                        let (qs, end) = ranges[i];
+                        if raw.len() < end {
+                            results.lock().unwrap()[i] = None;
+                            continue;
+                        }
+                        let bytes = &raw[qs..end];
+                        // Identity must equal the WRITE-TIME dedup key exactly.
+                        // v0.9.93: 0xCB/0xCC GLOB members reconstruct their
+                        // canonical form over the persistent registry (loaded
+                        // before scan; glob_par measured 0 divergences) and
+                        // hash it; CSEC3/4 + 0xC9 shift-ref members are keyed
+                        // by hash_of(stored bytes); fallback NBT members
+                        // (tails) are keyed structurally, which
+                        // structural_hash_wire recomputes without a parse.
+                        let h = match bytes.first() {
+                            Some(&0xCB) | Some(&0xCC) => {
+                                let direct: Option<Vec<u8>> = match chunknbt::glob_any_to_section(bytes, reg) {
+                                    // v0.9.95: hash the FULL CANONICAL
+                                    // RE-ENCODE, not glob_any_to_section's
+                                    // direct output — the direct wire re-emits
+                                    // the walked form (2444 vs 3056 B on
+                                    // RLE-form sections), semantically equal
+                                    // but byte-different, and its hash would
+                                    // drift from the write-time dedup key. The
+                                    // canonical encoder is content-
+                                    // deterministic: the re-encode reproduces
+                                    // the original bytes bit for bit.
+                                    Some(d) => Some(d),
+                                    // unresolvable gid = real corruption: fail
+                                    // the parse LOUDLY, never mint a wrong
+                                    // identity
+                                    None => {
+                                        eprintln!(
+                                            "[c-saves] slab parse: reconstruction refused, {}-B glob member reg={} stamp={dict_id:#04x} head={:02x?}",
+                                            bytes.len(),
+                                            reg.len(),
+                                            &bytes[..bytes.len().min(12)],
+                                        );
+                                        None
+                                    }
+                                };
+                                let Some(direct) = direct else {
+                                    continue;
+                                };
+                                match chunknbt::canonical_reencode(&direct) {
+                                    Some(canon) => Some(xxhash_rust::xxh3::xxh3_128(&canon)),
+                                    None => {
+                                        eprintln!(
+                                            "[c-saves] slab parse: re-encode refused, {}-B glob member stamp={dict_id:#04x} head={:02x?}",
+                                            bytes.len(),
+                                            &bytes[..bytes.len().min(12)]
+                                        );
+                                        None
+                                    }
                                 }
-                            },
-                            // unresolvable gid = real corruption: fail the
-                            // parse LOUDLY, never mint a wrong identity
-                            None => {
-                                eprintln!(
-                                    "[c-saves] slab parse: reconstruction refused, {}-B glob member reg={} stamp={dict_id:#04x} head={:02x?}",
-                                    bytes.len(),
-                                    reg.len(),
-                                    &bytes[..bytes.len().min(12)],
-                                );
-                                return None;
                             }
+                            Some(&0xC7) | Some(&0xC8) | Some(&0xC9) => {
+                                Some(xxhash_rust::xxh3::xxh3_128(bytes))
+                            }
+                            Some(&0x0A) => Some(match chunknbt::structural_hash_wire(bytes) {
+                                Some(h) => h,
+                                None => match fastnbt::from_bytes::<fastnbt::Value>(bytes) {
+                                    Ok(v) => chunknbt::structural_hash(&v),
+                                    Err(_) => xxhash_rust::xxh3::xxh3_128(bytes),
+                                },
+                            }),
+                            _ => Some(xxhash_rust::xxh3::xxh3_128(bytes)),
+                        };
+                        results.lock().unwrap()[i] = h;
+                    });
+                }
+            });
+            // merge: any None = a row failed its identity derivation — the
+            // parse fails LOUDLY (the torn-tail truncation downstream names
+            // the slab; the eprintlns above name the member)
+            let merged = results.into_inner().unwrap();
+            let mut bad: Option<usize> = None;
+            for (i, e) in out.iter_mut().enumerate() {
+                match merged[i] {
+                    Some(h) => e.2 = h,
+                    None => {
+                        if e.2 == 0 {
+                            bad = Some(i);
                         }
                     }
-                    Some(&0xC7) | Some(&0xC8) | Some(&0xC9) => {
-                        xxhash_rust::xxh3::xxh3_128(bytes)
-                    }
-                    Some(&0x0A) => match chunknbt::structural_hash_wire(bytes) {
-                        Some(h) => h,
-                        None => match fastnbt::from_bytes::<fastnbt::Value>(bytes) {
-                            Ok(v) => chunknbt::structural_hash(&v),
-                            Err(_) => xxhash_rust::xxh3::xxh3_128(bytes),
-                        },
-                    },
-                    _ => xxhash_rust::xxh3::xxh3_128(bytes),
-                };
-                q = end;
+                }
+            }
+            if let Some(i) = bad {
+                eprintln!(
+                    "[c-saves] slab parse: identity row {i} failed stamp={dict_id:#04x} n={n} — truncating the segment here"
+                );
+                return None;
+            }
+            if _dbg {
+                eprintln!(
+                    "[slab-dbg] stamp={dict_id:#04x} n={n} decode={_t_dec} tab={_t_tab} reid={} ns (reg snapshot {snap_ns} ns, cores {cores})",
+                    _t_re0.elapsed().as_nanos() as u64,
+                );
             }
         }
         Some((out, p))

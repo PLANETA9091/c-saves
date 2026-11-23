@@ -2184,6 +2184,33 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.125 reopen scan decomposed, the identity recompute
+  parallelized** — `scan_timing` (new probe) names the reopen wall, the
+  last unmeasured surface (every server restart pays it): the 192×192
+  overworld open was 290 ms of which ONE GLOB slab record (kind 0x88,
+  6317 hashless members) took 259 ms — inside it the identity recompute
+  = **112 ms glob reconstruction** (17.7 µs/member: payload decode +
+  registry remap + wire build) **+ 139 ms `canonical_reencode`**
+  (22.1 µs/member: `section_decode` → `sec_view_of_value` →
+  `section_encode_view`, the Value-tree round trip) + 12 ms LZMA2 frame
+  decode; nether/end opens are ~20 ms (no GLOB mass). The rows are
+  INDEPENDENT: the recompute now precomputes each row's byte range,
+  snapshots the registry ONCE (3 µs — immutable for the scope, the scan
+  runs at open before any writer exists), and recomputes across the
+  cores (`thread::scope` worker pool; per-row failures still fail the
+  parse LOUDLY exactly as before). Measured: reid 251.8 → 154.4 ms,
+  overworld open 290 → **193 ms (−33%)** on the 2-core bench; linear
+  projection at the operator scale (6.25M-chunk overworld): the
+  restart scan ~44 s → ~24 s. The deeper lever — a direct CSEC-wire →
+  SecView parser killing the Value round trip in `canonical_reencode`
+  (est. reid → ~35 ms) — is priced and deferred. Honest close weight
+  unchanged at the floor: 192×192 overworld 7.9, nether 1.6, end 3.4,
+  ALL THREE 4.3 B/chunk (x958); 50 GB → ~47 MiB; 20000×20000 chunks
+  4.8 GiB. enc_fp pin EXACT, 120/120 tests, JJ compact x0.05 verify
+  1661 clean, speed verify 728+218 bad=0, full-dimension probe 64+192
+  bad=0 miss=0 (the reopen verify reads EVERY chunk after reopen
+  through the parallel identities).
+
 * **The v0.9.124 read-cold decomposed, the content-cache axis closed** —
   the full-world probe now prints the READ-STAGE census per dimension
   (reset before each verify pass): the Tectonic 96×96 overworld cold
