@@ -2184,6 +2184,31 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.126 canonical re-encode pipeline decomposed, the direct
+  parser priced and deferred** — `scan_timing` now splits the re-encode
+  stage per phase: on the 192×192 overworld identity recompute (139 ms)
+  **section_decode = 86 ms (62%)** — the fastnbt Value tree: a HashMap
+  per section, a String allocation per palette entry,
+  `dense_unpack` + `pack_nostroddle` per pal_data, plus
+  `vanillify_section_value` — **sec_view_of_value 2 ms**,
+  **section_encode_view 78 ms**. The encode side is ALREADY a direct
+  byte-level emitter (presize, f-flags, the canonical palette
+  machinery), so the only killable half is the Value-tree decode: a
+  direct CSEC-wire → SecView parser would take the re-encode to
+  ~75 ms (reid 154 → ~70 ms, open 193 → ~115 ms) — but it re-derives
+  the WRITE-TIME identity of every GLOB member on every container ever
+  minted, the exact surface where the v0.9.93 hashless derivation
+  drifted and a systematic reopen read-miss lived. The lever is priced,
+  the risk is named, and the work is deferred until it can carry its
+  own equivalence harness (old-vs-new identity byte equality across the
+  full corpus, not just the gates). The diagnostics ship:
+  `SCAN_RE_DEC/VIEW/ENC` counters + the reencode-split line in
+  scan_timing. Honest close weight unchanged at the floor: 192×192
+  overworld 7.9, nether 1.6, end 3.4, ALL THREE 4.3 B/chunk (x958);
+  50 GB → ~47 MiB; 20000×20000 chunks 4.8 GiB. enc_fp pin EXACT,
+  120/120 tests, JJ compact x0.05 verify 1661 clean, full-dimension
+  probe 64 + 192 bad=0 miss=0.
+
 * **The v0.9.125 reopen scan decomposed, the identity recompute
   parallelized** — `scan_timing` (new probe) names the reopen wall, the
   last unmeasured surface (every server restart pays it): the 192×192

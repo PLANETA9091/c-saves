@@ -9402,11 +9402,22 @@ fn state_key<'a>(s: Option<&'a GlobState>) -> (bool, &'a str, &'a Vec<(String, S
 /// pure function of the section content, so the re-encode reproduces the
 /// original bytes bit for bit (differential-tested).
 pub fn canonical_reencode(member: &[u8]) -> Option<Vec<u8>> {
+    let _t0 = std::time::Instant::now();
     let v = section_decode(member)?;
+    let _t1 = std::time::Instant::now();
+    SCAN_RE_DEC.fetch_add((_t1 - _t0).as_nanos() as u64, Ordering::Relaxed);
     let view = sec_view_of_value(&v)?;
+    let _t2 = std::time::Instant::now();
+    SCAN_RE_VIEW.fetch_add((_t2 - _t1).as_nanos() as u64, Ordering::Relaxed);
     let (c, _) = section_encode_view(&view, false)?;
+    SCAN_RE_ENC.fetch_add(_t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Some(c)
 }
+
+// v0.9.126 TEMP: canonical_reencode pipeline split (scan_timing prints)
+pub static SCAN_RE_DEC: AtomicU64 = AtomicU64::new(0);
+pub static SCAN_RE_VIEW: AtomicU64 = AtomicU64::new(0);
+pub static SCAN_RE_ENC: AtomicU64 = AtomicU64::new(0);
 
 pub fn glob_any_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     match glob.first() {

@@ -41,6 +41,12 @@ fn main() {
             c_saves::store::SCAN_RE_NS.load(Ordering::Relaxed),
             c_saves::store::SCAN_HASH_NS.load(Ordering::Relaxed)
         );
+        println!(
+            "  reencode-split: decode {} ns | view {} ns | encode {} ns",
+            c_saves::chunknbt::SCAN_RE_DEC.load(Ordering::Relaxed),
+            c_saves::chunknbt::SCAN_RE_VIEW.load(Ordering::Relaxed),
+            c_saves::chunknbt::SCAN_RE_ENC.load(Ordering::Relaxed)
+        );
         drop(st);
     }
 }

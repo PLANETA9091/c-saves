@@ -2063,6 +2063,9 @@ pub fn reset_scan_diag() {
     SCAN_RE_NS.store(0, Ordering::Relaxed);
     SCAN_HASH_NS.store(0, Ordering::Relaxed);
     SCAN_CONV_N.store(0, Ordering::Relaxed);
+    chunknbt::SCAN_RE_DEC.store(0, Ordering::Relaxed);
+    chunknbt::SCAN_RE_VIEW.store(0, Ordering::Relaxed);
+    chunknbt::SCAN_RE_ENC.store(0, Ordering::Relaxed);
 }
 pub static ST_GLOB_MISS: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 static ST_SHIFT_RES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
