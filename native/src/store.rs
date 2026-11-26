@@ -321,6 +321,18 @@ fn lzma2_compress_as(data: &[u8], stamp: u8) -> Option<(u8, Vec<u8>)> {
     // v0.9.90: + explicit lc=4 lp=0 pb=0 under the 0xFC stamp (-1.20% on the
     // same stream, identical encode wall); CSAVES_LZMA_TUNE=0 keeps the
     // legacy 0xFE config. The stamp follows the ACTUAL config minted.
+    // v0.9.128 LATENT-CORRUPTION FIX: process_vec runs ONE pass over the
+    // output Vec's SPARE CAPACITY — a stream whose compressed size exceeds
+    // the initial capacity (len/3 + 64) came back Ok with the input only
+    // PARTIALLY consumed: the wire carried a valid chunk header declaring
+    // the full unpacked size over a truncated payload (the decoder hit the
+    // zero end-marker early and returned short — the 0x0D batch record
+    // class, which compresses only ~1.76:1, was the first caller to cross
+    // the line; every slab stream so far compressed 3:1+ and always fit).
+    // The encode now loops until total_in() covers the whole input (each
+    // iteration reserves fresh output capacity), refuses on no-progress,
+    // and Finish runs under the same room guarantee. This hardens every
+    // lzma2_compress* caller (slabs AND batches) against low-ratio inputs.
     let mut opts = liblzma::stream::LzmaOptions::new_preset(LZMA2_COLD_PRESET | LZMA2_COLD_EXTREME)
         .ok()?;
     if stamp == SLAB_CODEC_LZMA2_TUNE || stamp == SLAB_CODEC_LZMA2_NH || stamp == SLAB_CODEC_LZMA2_GNH
@@ -336,8 +348,34 @@ fn lzma2_compress_as(data: &[u8], stamp: u8) -> Option<(u8, Vec<u8>)> {
     f.lzma2(&opts);
     let mut stream = liblzma::stream::Stream::new_raw_encoder(&f).ok()?;
     let mut out = Vec::with_capacity(data.len() / 3 + 64);
-    stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
-    stream.process_vec(&[], &mut out, liblzma::stream::Action::Finish).ok()?;
+    let mut consumed = 0usize;
+    while consumed < data.len() {
+        if out.len() == out.capacity() {
+            out.reserve(64 * 1024);
+        }
+        let before = stream.total_in() as usize;
+        stream
+            .process_vec(&data[consumed..], &mut out, liblzma::stream::Action::Run)
+            .ok()?;
+        let now = stream.total_in() as usize;
+        if now == before {
+            return None; // no progress even with fresh room — never mint garbage
+        }
+        consumed = now;
+    }
+    // Finish MUST loop to StreamEnd: one call may flush only part of the
+    // encoder's internal buffer and return Ok with more output pending.
+    loop {
+        if out.len() == out.capacity() {
+            out.reserve(64 * 1024);
+        }
+        let st = stream
+            .process_vec(&[], &mut out, liblzma::stream::Action::Finish)
+            .ok()?;
+        if matches!(st, liblzma::stream::Status::StreamEnd) {
+            break;
+        }
+    }
     Some((stamp, out))
 }
 
@@ -410,8 +448,36 @@ fn lzma2_compress_maybe_mt_as(data: &[u8], threads: u32, st_raw: u8, st_mt: u8) 
     b.block_size(per);
     let mut stream = b.encoder().ok()?;
     let mut out = Vec::with_capacity(data.len() / 3 + 64);
-    stream.process_vec(data, &mut out, liblzma::stream::Action::Run).ok()?;
-    stream.process_vec(&[], &mut out, liblzma::stream::Action::Finish).ok()?;
+    // v0.9.128: the SAME completion contract as lzma2_compress_as — Run must
+    // be re-called until the input is fully consumed (a pass stops at the
+    // output's spare capacity) and Finish must loop to StreamEnd (one call
+    // may flush only part of the encoder's internal buffer).
+    let mut consumed = 0usize;
+    while consumed < data.len() {
+        if out.len() == out.capacity() {
+            out.reserve(64 * 1024);
+        }
+        let before = stream.total_in() as usize;
+        stream
+            .process_vec(&data[consumed..], &mut out, liblzma::stream::Action::Run)
+            .ok()?;
+        let now = stream.total_in() as usize;
+        if now == before {
+            return None;
+        }
+        consumed = now;
+    }
+    loop {
+        if out.len() == out.capacity() {
+            out.reserve(64 * 1024);
+        }
+        let st = stream
+            .process_vec(&[], &mut out, liblzma::stream::Action::Finish)
+            .ok()?;
+        if matches!(st, liblzma::stream::Status::StreamEnd) {
+            break;
+        }
+    }
     Some((st_mt, out))
 }
 
@@ -728,7 +794,7 @@ impl Default for Cfg {
             dict_train: 200,
             tail_blob_min: 512,
             slab_max_member: 64 * 1024,
-            slab_max_raw: 8 * 1024 * 1024,
+            slab_max_raw: 16 * 1024 * 1024,
             slab_max_raw_whole: 4 * 1024 * 1024,
             slab_cache: 32 * 1024 * 1024,
             canon_cache: 16 * 1024 * 1024,
@@ -808,7 +874,7 @@ impl Cfg {
             dict_train: env_parse("CSAVES_DICT_TRAIN_BLOBS", 200),
             tail_blob_min: env_parse("CSAVES_TAIL_BLOB_MIN", 512),
             slab_max_member: env_parse("CSAVES_SLAB_MAX_MEMBER", 64 * 1024),
-            slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 8 * 1024 * 1024),
+            slab_max_raw: env_parse("CSAVES_SLAB_MAX_RAW", 16 * 1024 * 1024),
             slab_max_raw_whole: env_parse("CSAVES_SLAB_MAX_RAW_WHOLE", 4 * 1024 * 1024),
             slab_cache: env_parse("CSAVES_SLAB_CACHE", 32 * 1024 * 1024),
             canon_cache: env_parse("CSAVES_CANON_CACHE", 16 * 1024 * 1024),
@@ -1104,9 +1170,20 @@ struct BatchJob {
     /// v0.9.112: the record kind — 0x0B (fixed-width key/index columns,
     /// zstd-6) or 0x0C (varint delta-key column + varint body index,
     /// zstd-19; measured -38% on the real nether batch stream: 15,141 ->
-    /// 9,420 B for 7,776 entries). Old containers decode forever.
+    /// 9,420 B for 7,776 entries). v0.9.128 adds 0x0D: the SAME varint-dense
+    /// column layout with a raw LZMA2 tuned payload (the slab codec, preset
+    /// 6|EXTREME lc4/lp0/pb0) — the batch ladder priced it -13.5% across the
+    /// real three-dimension record corpus (144,545 -> 125,045 B); the
+    /// commit gates per record (only mints 0x0D when it is smaller).
+    /// Old containers decode forever.
     kind: u8,
 }
+
+/// v0.9.128: batch record kind 0x0D — varint-dense columns + raw LZMA2
+/// tuned payload. The codec stamp rides the KIND byte (no dict id column):
+/// the three decode sites (scan arm, load_batched, prefetch_batch_body)
+/// route 0x0D payloads to lzma2_decompress_tuned.
+const BATCH_KIND_LZ: u8 = 0x0D;
 
 /// The batch handoff queue + its thread. The write path pushes at the
 /// 192 KiB crossing WITHOUT waiting (the pending entries stay readable);
@@ -2058,6 +2135,9 @@ pub static SCAN_CONV_NS: AtomicU64 = AtomicU64::new(0);
 pub static SCAN_RE_NS: AtomicU64 = AtomicU64::new(0);
 pub static SCAN_HASH_NS: AtomicU64 = AtomicU64::new(0);
 pub static SCAN_CONV_N: AtomicU64 = AtomicU64::new(0);
+// v0.9.128: batch LZ-gate telemetry — records where the whole-record raw
+// LZMA2 tuned stream beat the zstd-19 fact (kind 0x0D minted).
+pub static BATCH_LZ_WINS: AtomicU64 = AtomicU64::new(0);
 pub fn reset_scan_diag() {
     SCAN_CONV_NS.store(0, Ordering::Relaxed);
     SCAN_RE_NS.store(0, Ordering::Relaxed);
@@ -3645,7 +3725,7 @@ impl Store {
                                 }
                             }
                         }
-                        kb @ (0x0B | 0x0C) => {
+                        kb @ (0x0B | 0x0C | 0x0D) => {
                             // v0.9.102 body-dedup batch; v0.9.112 adds the
                             // varint-dense 0x0C layout:
                             // [kind][u32 n][u32 m][u32 cl][u32 raw]{stream}
@@ -3655,6 +3735,9 @@ impl Store {
                             //   ++ [varint body_idx]×n ++ [u16 len]×m ++ concat
                             //   (unique bodies) — the group was key-sorted at
                             //   flush, so deltas are unsigned.
+                            // v0.9.128: 0x0D = the SAME varint-dense column
+                            // layout with a raw LZMA2 tuned payload (codec
+                            // stamp rides the kind byte).
                             if body.len() < 17 {
                                 false
                             } else {
@@ -3666,7 +3749,12 @@ impl Store {
                                 if body.len() < 17 + cl || n == 0 {
                                     false
                                 } else {
-                                    match self.decompress(0, &body[17..17 + cl], raw_total as u32) {
+                                    let bdec = if kb == BATCH_KIND_LZ {
+                                        SLAB_CODEC_LZMA2_TUNE
+                                    } else {
+                                        0
+                                    };
+                                    match self.decompress(bdec, &body[17..17 + cl], raw_total as u32) {
                                         Some(raw) if raw.len() == raw_total => {
                                             let raw = Arc::new(raw);
                                             let mut ok = true;
@@ -3674,12 +3762,15 @@ impl Store {
                                             let mut idxs = Vec::with_capacity(n);
                                             let mut lens = Vec::with_capacity(m.min(n));
                                             let mut p = 0usize;
-                                            if kb == 0x0C {
+                                            if kb != 0x0B {
                                                 // v0.9.112 varint columns: the
                                                 // key column is ABSOLUTE first
                                                 // value + unsigned deltas (the
                                                 // flush sorts by key), the index
                                                 // column is plain varint
+                                                // v0.9.128: 0x0C and 0x0D share
+                                                // the varint columns; only 0x0B
+                                                // is fixed-width.
                                                 let mut acc = 0u64;
                                                 for i in 0..n {
                                                     let (v, np) = match Self::read_varint(&raw[p..]) {
@@ -3906,18 +3997,20 @@ impl Store {
             return self.parse_recipe_body(e);
         }
         let kind = *self.seg_read_body(seg, boff, 1)?.first()?;
-        // header widths: kind 9 = [n][cl][raw] (13 B), kind 0x0B adds [m]
-        // (17 B). Both streams slice identically per (soff, rl).
+        // header widths: kind 9 = [n][cl][raw] (13 B), kind 0x0B/0x0C/0x0D adds
+        // [m] (17 B). Both streams slice identically per (soff, rl). The 0x0D
+        // payload is raw LZMA2 tuned (v0.9.128); 0x0B/0x0C stay zstd.
         let hlen = match kind {
             9 => 13usize,
-            0x0B | 0x0C => 17usize,
+            0x0B | 0x0C | 0x0D => 17usize,
             _ => return None,
         };
         let hdr = self.seg_read_body(seg, boff, hlen)?;
         let cl = u32::from_le_bytes(hdr[hlen - 8..hlen - 4].try_into().ok()?) as usize;
         let raw_total = u32::from_le_bytes(hdr[hlen - 4..hlen].try_into().ok()?) as usize;
         let data = self.seg_read_body(seg, boff + hlen as u64, cl)?;
-        let raw = self.decompress(0, &data, raw_total as u32)?;
+        let bdec = if kind == BATCH_KIND_LZ { SLAB_CODEC_LZMA2_TUNE } else { 0 };
+        let raw = self.decompress(bdec, &data, raw_total as u32)?;
         let e = raw.get(soff as usize..(soff + rl) as usize)?;
         let out = self.parse_recipe_body(e);
         self.slab_cache.lock().put(ck, Arc::new(raw));
@@ -4185,13 +4278,33 @@ impl Store {
         // path since v0.9.72, drain sites only wait bounded), so they take
         // z19 outright — measured -38% vs the 0x0B z6 stream.
         let lvl = if job.kind == 0x0C { 19 } else { self.cfg.recipe_level };
-        let (dict_id, comp) = self.compress_tier_level(&job.stream, lvl);
+        let (dict_id, zstd_comp) = self.compress_tier_level(&job.stream, lvl);
         debug_assert_eq!(dict_id, 0);
+        // v0.9.128: the LZ gate — the whole-record raw LZMA2 tuned stream
+        // (the slab codec) vs the zstd-19 fact; the smaller one ships. ONLY
+        // for the varint-dense 0x0C jobs (the 0x0D kind declares varint
+        // columns; the fixed-width 0x0B layout must keep its zstd record).
+        // The batch ladder measured -13.5% on the real three-dimension
+        // corpus (varint-dense recipe columns are pointer-dense: LZMA's
+        // long-range matches cross the key/index column boundary that
+        // zstd-19's per-block literals miss). Encode cost lands on the
+        // batcher thread (off the write path); decode is memoized per record.
+        let (kind, comp) = if job.kind == 0x0C {
+            match lzma2_compress_as(&job.stream, SLAB_CODEC_LZMA2_TUNE) {
+                Some((_, lzb)) if lzb.len() < zstd_comp.len() => {
+                    BATCH_LZ_WINS.fetch_add(1, Ordering::Relaxed);
+                    (BATCH_KIND_LZ, lzb)
+                }
+                _ => (job.kind, zstd_comp),
+            }
+        } else {
+            (job.kind, zstd_comp)
+        };
         // v0.9.102/112: kind-0x0B/0x0C records — the body-dedup batch wires.
         // [kind][u32 n][u32 m][u32 cl][u32 raw]{stream}; kind 9 (per-entry
         // bodies) stays valid forever, old containers decode unchanged.
         let mut body = Vec::with_capacity(17 + comp.len());
-        body.push(job.kind);
+        body.push(kind);
         body.extend_from_slice(&(n as u32).to_le_bytes());
         body.extend_from_slice(&job.m.to_le_bytes());
         body.extend_from_slice(&(comp.len() as u32).to_le_bytes());
@@ -6882,11 +6995,13 @@ impl Store {
         let segs = self.segs.read();
         let s = segs.get(&seg)?;
         let sealed = !is_writer;
-        // v0.9.102: kind dispatch — kind 9 header 13 B, kind 0x0B/0x0C 17 B.
+        // v0.9.102: kind dispatch — kind 9 header 13 B, kind 0x0B/0x0C/0x0D
+        // 17 B. The 0x0D payload is raw LZMA2 tuned (v0.9.128).
         let kindb = s.read_at(boff, 1, sealed)?;
-        let hlen = match kindb.first().copied()? {
+        let kind0 = kindb.first().copied()?;
+        let hlen = match kind0 {
             9 => 13usize,
-            0x0B | 0x0C => 17usize,
+            0x0B | 0x0C | 0x0D => 17usize,
             _ => return None,
         };
         let hdr = s.read_at(boff, hlen, sealed)?;
@@ -6900,7 +7015,8 @@ impl Store {
         } else {
             s.read_at(boff + hlen as u64, cl, true)
         }?;
-        self.decompress(0, &data, raw_total as u32).map(Arc::new)
+        let bdec = if kind0 == BATCH_KIND_LZ { SLAB_CODEC_LZMA2_TUNE } else { 0 };
+        self.decompress(bdec, &data, raw_total as u32).map(Arc::new)
     }
 
     /// One slab frame's decompressed body (the read_blob slab miss path
@@ -7496,7 +7612,27 @@ impl Store {
                 return;
             }
         }
-        // split into slab-sized groups
+        // split into slab-sized groups — v0.9.128: the GLOBAL LEX WALK.
+        // The v0.9.106 lex sort ran INSIDE each slab group, but the group
+        // SPLIT itself followed arrival order: a 10.26 MB class pool was
+        // bucketed by arrival and each bucket lex-sorted separately, so the
+        // cross-slab matches the lex clustering earns never formed (the
+        // dumped whole-pool lex stream prices at 118,261 B vs the shipped
+        // 166,857 for the same 4,994 g26 members — the two-window loss plus
+        // arrival-order buckets, not the entry table). The sort now runs on
+        // the WHOLE pool BEFORE the split: slabs become contiguous lex
+        // ranges, every window sees its full lexical neighborhood, and slab
+        // membership itself turns content-deterministic (pack -> scan ->
+        // pack re-sorts the same bytes into the same groups — strictly more
+        // stable than the arrival-order membership it replaces). Tails keep
+        // arrival order (the sim_probe matrix priced lex at +0.26% there).
+        let pool_is_tails = cands
+            .first()
+            .map(|c| c.3.first() == Some(&0x0A))
+            .unwrap_or(false);
+        if self.cfg.slab_lex && !pool_is_tails {
+            cands.sort_by(|a, b| a.3.cmp(&b.3));
+        }
         let slab_raw_cap = if self.whole_mode.load(Ordering::Relaxed) {
             self.cfg.slab_max_raw_whole
         } else {
@@ -7518,23 +7654,20 @@ impl Store {
             groups.push(cur);
         }
         // v0.9.106: content-similarity walk. At this point the pool is
-        // HOMOGENEOUS (the partition above recursed the mixed case away):
-        // either all tails (0x0A) or all sections. Tails keep arrival order
-        // (the sim_probe matrix priced lex at +0.26% there — the order is a
-        // pure loss for them); the SECTION pool sorts lexicographically by
-        // member body inside each slab group before the variant streams
-        // build. Canonical members lead with palette+form bytes and glob
-        // members share the registry frame, so lex clusters same-palette /
-        // same-shape members adjacently and the cold window matches their
-        // long identical prefixes and near-identical band regions. The sort
-        // is a pure content function — bodies are unique within the pool
-        // (hash-deduped candidates), so the compare never ties and the
-        // order is deterministic across processes. It happens BEFORE the
-        // GLOB conversion, so registry gid assignment (first-reference
-        // order) shifts with the walk — internally consistent, roundtrip
-        // exact, and the pack->scan->pack stability gate re-derives every
-        // identity from content, not order. slab group MEMBERSHIP still
-        // follows arrival order (unchanged nondeterminism tolerance).
+        // HOMOGENEOUS (the partition above recursed the mixed case away)
+        // and — since v0.9.128 — ALREADY globally lex-sorted: the per-group
+        // sort below is a no-op belt-and-suspenders that keeps the old gate
+        // semantics when CSAVES_SLAB_LEX=0. Canonical members lead with
+        // palette+form bytes and glob members share the registry frame, so
+        // lex clusters same-palette / same-shape members adjacently and the
+        // cold window matches their long identical prefixes and
+        // near-identical band regions. The sort is a pure content function
+        // — bodies are unique within the pool (hash-deduped candidates), so
+        // the compare never ties and the order is deterministic across
+        // processes. It happens BEFORE the GLOB conversion, so registry gid
+        // assignment (first-reference order) shifts with the walk —
+        // internally consistent, roundtrip exact, and the pack->scan->pack
+        // stability gate re-derives every identity from content, not order.
         let tails_pool = groups
             .first()
             .and_then(|g| g.first())
@@ -8765,12 +8898,12 @@ impl Store {
             let referenced = match base {
                 4 => blob_recs.contains(&(seg_id, body_at)),
                 8 => slab_recs.contains(&(seg_id, body_at)),
-                9 | 0x0B | 0x0C => batch_recs.contains(&(seg_id, body_at)),
+                9 | 0x0B | 0x0C | 0x0D => batch_recs.contains(&(seg_id, body_at)),
                 2 | 0x3F => bare_recs.contains(&(seg_id, body_at)), // bare recipe (0xFF) / legacy form (2)
                 // key-intern (6) and unknown kinds: conservative — live
                 _ => true,
             };
-            if referenced || !matches!(base, 4 | 8 | 9 | 0x0B | 0x0C | 2 | 0x3F) {
+            if referenced || !matches!(base, 4 | 8 | 9 | 0x0B | 0x0C | 0x0D | 2 | 0x3F) {
                 phys += 8 + blen;
             }
             off += 8 + blen;
@@ -9189,15 +9322,17 @@ impl Store {
                     let segs = self.segs.read();
                     let Some(seg) = segs.get(&worst_id) else { continue };
                     // v0.9.102: kind dispatch — kind 9 header is 13 B
-                    // ([n][cl][raw]), kind 0x0B adds [m] (17 B).
+                    // ([n][cl][raw]), kind 0x0B/0x0C/0x0D add [m] (17 B). The
+                    // 0x0D payload is raw LZMA2 tuned (v0.9.128).
                     let Some(kindb) = seg.read_at(boff, 1, !is_writer) else {
                         eprintln!("[c-saves] LEAK: hdr read fail key={key:016x} boff={boff}");
                         mark_broken();
                         continue;
                     };
-                    let hlen = match kindb.first().copied().unwrap_or(0) {
+                    let kind0 = kindb.first().copied().unwrap_or(0);
+                    let hlen = match kind0 {
                         9 => 13usize,
-                        0x0B | 0x0C => 17usize,
+                        0x0B | 0x0C | 0x0D => 17usize,
                         k => {
                             eprintln!("[c-saves] LEAK: unknown batch kind {k} key={key:016x}");
                             mark_broken();
@@ -9218,7 +9353,8 @@ impl Store {
                         continue;
                     };
                     drop(segs);
-                    let Some(raw) = self.decompress(0, &data, raw_total) else {
+                    let bdec = if kind0 == BATCH_KIND_LZ { SLAB_CODEC_LZMA2_TUNE } else { 0 };
+                    let Some(raw) = self.decompress(bdec, &data, raw_total) else {
                         eprintln!("[c-saves] LEAK: batch decompress fail key={key:016x}");
                         mark_broken();
                         continue;
@@ -9486,6 +9622,55 @@ pub mod tests {
                 .read_chunk(i as u64)
                 .unwrap_or_else(|| panic!("durability: chunk {i} lost without sync"));
             assert!(semantic(&got, &p), "durability: chunk {i} mismatched");
+        }
+    }
+
+    #[test]
+    fn lzma2_low_ratio_stream_roundtrip() {
+        // v0.9.128 LATENT-CORRUPTION FIX regression: process_vec runs ONE
+        // pass over the output Vec's spare capacity (len/3 + 64 here). A
+        // stream whose compressed size EXCEEDS that capacity came back Ok
+        // with the input only PARTIALLY consumed — a valid chunk header
+        // declaring the full unpacked size over a truncated payload (the
+        // decoder then hits the zero end-marker early and returns short).
+        // Incompressible data compresses ~1:1 and MUST roundtrip exactly;
+        // the old one-pass encode truncated it silently.
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let mut data = Vec::with_capacity(64 * 1024);
+        for _ in 0..64 * 1024 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            data.push(rng as u8);
+        }
+        for stamp in [SLAB_CODEC_LZMA2_TUNE, SLAB_CODEC_LZMA2] {
+            let (got_stamp, comp) = lzma2_compress_as(&data, stamp).expect("low-ratio encode");
+            assert_eq!(got_stamp, stamp);
+            assert!(
+                comp.len() > data.len() / 3 + 64,
+                "incompressible stream must exceed the initial capacity ({}, want > {}) — the regression only bites past the line",
+                comp.len(),
+                data.len() / 3 + 64
+            );
+            let dec = if stamp == SLAB_CODEC_LZMA2_TUNE {
+                lzma2_decompress_tuned(&comp, data.len())
+            } else {
+                lzma2_decompress(&comp, data.len())
+            }
+            .expect("low-ratio decode");
+            assert_eq!(
+                dec.len(),
+                data.len(),
+                "decoded length must match (comp={})",
+                comp.len()
+            );
+            let diff = dec
+                .iter()
+                .zip(data.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(usize::MAX);
+            assert!(diff == usize::MAX, "first divergence at byte {diff} of {}", data.len());
+            assert_eq!(dec, data, "low-ratio stream must roundtrip byte-exact");
         }
     }
 

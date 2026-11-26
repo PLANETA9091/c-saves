@@ -2184,6 +2184,48 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.128 batch LZMA tier + a latent-corruption fix in the cold
+  encoder.** The compression sprint opens on the batch pool (recipes are
+  the nether's 61% and the end's 16% of the close weight): batch records
+  gain kind **0x0D** — the SAME varint-dense column layout with a raw
+  LZMA2 tuned (preset 6|EXTREME lc4/lp0/pb0) payload, minted per record
+  only when it beats the zstd-19 fact (the gate compares both encoders on
+  the batcher thread, off the write path). The batch ladder priced it
+  **−13.5% on the real three-dimension record corpus (144,545 → 125,045
+  B)** — the varint recipe columns are pointer-dense, and LZMA's
+  long-range matches cross the key/index column boundary that zstd-19's
+  per-record window misses; the drained probe showed **batch+misc −19%
+  (62,024 → 50,196 B of the 192² overworld close weight)**. All four
+  decode sites (the scan arm, `load_batched`, `prefetch_batch_body`, the
+  pack pull memo) dispatch 0x0D by the kind byte; 0x0B/0x0C records and
+  every older container decode unchanged. **LATENT-CORRUPTION FIX** found
+  BY the new gate: `lzma2_compress_as`/`_maybe_mt` ran `process_vec`
+  ONCE — a stream whose compressed size exceeds the output Vec's initial
+  spare capacity (`len/3 + 64`) came back Ok with the input only PARTIALLY
+  consumed, minting a valid chunk header declaring the full unpacked size
+  over a truncated payload (the decoder hits the zero end-marker early
+  and silently returns short). Every slab stream so far compressed 3:1+
+  and never crossed the line; the batch class (~1.76:1) was the first
+  caller to trip it — the durability contract caught it as chunk loss.
+  The encoders now loop until `total_in` covers the whole input (each
+  pass reserves fresh output room), **Finish loops to `Status::StreamEnd`**
+  (one call may flush only part of the internal buffer), no-progress
+  refuses to mint, and the regression test `lzma2_low_ratio_stream_roundtrip`
+  pins an incompressible 64 KiB stream byte-exact through both raw
+  stamps. The cold slab cap rises 8 → 16 MiB (`CSAVES_SLAB_MAX_RAW`) so a
+  class pool rides ONE single-context ST window, and the v0.9.106 lex
+  walk now sorts the WHOLE pool before the cap split (slab membership
+  becomes content-deterministic; the dumped whole-pool lex stream prices
+  only −1.8% vs the shipped id-order frame — spatial locality already
+  clusters like lex — so the reorder is a determinism win, not a byte
+  win). Numbers: 192×192 close weight ALL THREE **4.3 → 4.1 B/chunk
+  (x1001 of Anvil)**, projection 20000×20000 chunks **4.8 → 4.6 GiB
+  (x3002)**; gates all green: enc_fp pin EXACT
+  6d240d7166cdda99/12130/9971843 (the canonical encoder untouched),
+  **123/123 tests** (the new roundtrip regression included), bench_size
+  compact x0.06 verify clean, jj_profile verify 946/946, speed verify
+  728+218 bad=0, full-dimension probe 64 + 192 PASS bad=0 miss=0.
+
 * **The v0.9.127 identity derivation fused: the rebuild feeds the canonical
   encoder directly** — the deferred 0.9.126 lever shipped in TWO stages,
   each carrying its own equivalence harness. Stage 1, the direct

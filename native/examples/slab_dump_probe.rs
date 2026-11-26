@@ -89,6 +89,12 @@ fn main() {
         }
         let path = format!("/tmp/slab_dump/{}_{}.bin", which, cls);
         std::fs::write(&path, &bin).unwrap();
+        // member boundaries (u32 LE each) — for offline wire dissection
+        let mut idx = Vec::with_capacity(bodies.len() * 4);
+        for b in &bodies {
+            idx.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        }
+        std::fs::write(format!("{}.idx", path), &idx).unwrap();
         println!("{:<14} n={:<6} raw={:<9} -> {}", cls, v.len(), raw, path);
     }
 }
