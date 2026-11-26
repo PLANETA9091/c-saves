@@ -2628,6 +2628,24 @@ struct RootList<'a> {
 struct PalDataV<'a> {
     palette: Vec<PalEntry<'a>>,
     data: Option<&'a [i64]>,
+    // v0.9.127: the fused-identity pre input for enc_pal_data_canon — the
+    // canonical voxel stream + per-position counts, already in the
+    // frequency-canonical palette order (the GLOB rebuild derived exactly
+    // this order from the registry). Only the read-side identity path
+    // builds it; the Value/lite/wire views always carry None, so the
+    // write-side encoder never sees it (enc_fp untouched).
+    pre: Option<PreVox>,
+}
+
+struct PreVox {
+    vox: Vec<u32>,
+    counts: Vec<u32>,
+}
+
+impl Clone for PreVox {
+    fn clone(&self) -> Self {
+        PreVox { vox: self.vox.clone(), counts: self.counts.clone() }
+    }
 }
 
 #[derive(Clone)]
@@ -2706,7 +2724,7 @@ fn pal_data_view_of_value(bm: &std::collections::HashMap<String, Value>) -> Opti
         Some(_) => return None,
         None => None,
     };
-    Some(PalDataV { palette, data })
+    Some(PalDataV { palette, data, pre: None })
 }
 
 /// SecLite -> SecView. `strip` drops the derived fields exactly like
@@ -2740,7 +2758,7 @@ fn pal_data_view_of_lit<'a>(pd: &'a PalData<'a>) -> Option<PalDataV<'a>> {
         palette.push(pal_entry_from_lit(p)?);
     }
     let data = pd.data.as_ref().map(|la| la.as_ref() as &[i64]);
-    Some(PalDataV { palette, data })
+    Some(PalDataV { palette, data, pre: None })
 }
 
 /// feed() over the lite form. Byte-stream-identical to feed(&Value) for the
@@ -3060,73 +3078,110 @@ fn section_encode_view(
         if n == 0 || n > 65535 {
             return None;
         }
-        // One unpack feeds everything downstream (v0.9.7): frequency counts
-        // for the canonical order, the remap, and the dense/RLE candidates
-        // used to re-unpack the same 4096 voxels a second time (~4 µs/section).
-        // Failure modes keep the old outputs: malformed data still yields
-        // None (via the sanity check below), and the no-data path keeps the
-        // all-zero counts order.
-        let data: &[i64] = match pdv.data {
-            Some(d) => d,
-            None => {
-                if n > 1 {
+        // v0.9.127: the fused-identity pre input — canonical voxels + counts
+        // already in the frequency-canonical palette order (the GLOB rebuild
+        // derived exactly this order from the registry), so the unpack and
+        // sort halves disappear. No longs ride along (data stays empty), so
+        // the identity shortcut auto-fails (in_bits=0 != out_bits) and the
+        // dense candidate packs through dense_pack_mapped — byte-identical
+        // to the longs memcpy it replaces (identity fires only at whole-long
+        // widths, where the continuous LSB stream IS the longs, LE).
+        // Malformed pre (len mismatch, or zero counts = dead entries —
+        // impossible on glob members by construction) refuses the fused
+        // path -> None, and the caller falls back to the two-step chain.
+        let (v, counts, mut order_idx, data, in_bits): (
+            Vec<u32>,
+            Vec<u32>,
+            Vec<usize>,
+            &[i64],
+            u32,
+        ) = if let Some(pre) = &pdv.pre {
+                if pre.counts.len() != n
+                    || pre.vox.len() != entries
+                    || pre.counts.iter().any(|&c| c == 0)
+                {
                     return None;
                 }
-                let t_pal0 = std::time::Instant::now();
-                let mut order_idx: Vec<usize> = (0..n).collect();
-                order_idx.sort_by(|&a, &b| {
-                    (pal[a].plain, pal[a].name, &pal[a].props)
-                        .cmp(&(pal[b].plain, pal[b].name, &pal[b].props))
-                });
-                SPLT_PAL.0.fetch_add(t_pal0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                SPLT_PAL.1.fetch_add(1, Ordering::Relaxed);
-                out.extend_from_slice(&(n as u16).to_le_bytes());
-                for &oi in &order_idx {
-                    put_entry(out, &pal[oi])?;
+                (
+                    pre.vox.clone(),
+                    pre.counts.clone(),
+                    (0..n).collect(),
+                    &[],
+                    0,
+                )
+            } else {
+                // One unpack feeds everything downstream (v0.9.7): frequency
+                // counts for the canonical order, the remap, and the dense/RLE
+                // candidates used to re-unpack the same 4096 voxels a second
+                // time (~4 µs/section). Failure modes keep the old outputs:
+                // malformed data still yields None (via the sanity check
+                // below), and the no-data path keeps the all-zero counts
+                // order.
+                let data: &[i64] = match pdv.data {
+                    Some(d) => d,
+                    None => {
+                        if n > 1 {
+                            return None;
+                        }
+                        let t_pal0 = std::time::Instant::now();
+                        let mut order_idx: Vec<usize> = (0..n).collect();
+                        order_idx.sort_by(|&a, &b| {
+                            (pal[a].plain, pal[a].name, &pal[a].props)
+                                .cmp(&(pal[b].plain, pal[b].name, &pal[b].props))
+                        });
+                        SPLT_PAL.0.fetch_add(t_pal0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        SPLT_PAL.1.fetch_add(1, Ordering::Relaxed);
+                        out.extend_from_slice(&(n as u16).to_le_bytes());
+                        for &oi in &order_idx {
+                            put_entry(out, &pal[oi])?;
+                        }
+                        return Some((false, 0));
+                    }
+                };
+                let t_unp = std::time::Instant::now();
+                let in_bits = section_data_bits(n, entries, data.len());
+                let per = (64 / in_bits) as usize;
+                if data.len() != (entries + per - 1) / per {
+                    return None;
                 }
-                return Some((false, 0));
-            }
-        };
-        let t_unp = std::time::Instant::now();
-        let in_bits = section_data_bits(n, entries, data.len());
-        let per = (64 / in_bits) as usize;
-        if data.len() != (entries + per - 1) / per {
-            return None;
-        }
-        // v0.9.16: unpack + bounds + counts fused into one pass (was three
-        // passes over the same stream: unpack, sanity any(), counts loop).
-        // The fallback decision is identical (first out-of-range voxel).
-        let mut counts = vec![0u32; n];
-        let v = match unpack_counts_vox(data, entries, in_bits, n, &mut counts) {
-            Some(v) => v,
-            None => {
-                ST_ENC_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                // v0.9.16: unpack + bounds + counts fused into one pass (was
+                // three passes over the same stream: unpack, sanity any(),
+                // counts loop). The fallback decision is identical (first
+                // out-of-range voxel).
+                let mut counts = vec![0u32; n];
+                let v = match unpack_counts_vox(data, entries, in_bits, n, &mut counts) {
+                    Some(v) => v,
+                    None => {
+                        ST_ENC_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                        SPLT_UNP.0.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        SPLT_UNP.1.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                };
                 SPLT_UNP.0.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 SPLT_UNP.1.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-        };
-        SPLT_UNP.0.fetch_add(t_unp.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        SPLT_UNP.1.fetch_add(1, Ordering::Relaxed);
-        // Frequency-canonical order: the dominant state becomes index 0, so
-        // the dense data stream is dominated by zero runs that compress
-        // extremely well. Ties break by (plain, name, props) so the order is
-        // a pure function of content (deterministic => dedup-stable).
-        let t_pal = std::time::Instant::now();
-        // canonical order as a sorted INDEX vec over the shared palette
-        // (stable sort: ties keep original index order, exactly like the old
-        // (entry, old_index) pair sort)
-        let mut order_idx: Vec<usize> = (0..n).collect();
-        order_idx.sort_by(|&a, &b| {
-            counts[b]
-                .cmp(&counts[a])
-                .then_with(|| {
-                    (pal[a].plain, pal[a].name, &pal[a].props)
-                        .cmp(&(pal[b].plain, pal[b].name, &pal[b].props))
-                })
-        });
-        SPLT_PAL.0.fetch_add(t_pal.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        SPLT_PAL.1.fetch_add(1, Ordering::Relaxed);
+                // Frequency-canonical order: the dominant state becomes index
+                // 0, so the dense data stream is dominated by zero runs that
+                // compress extremely well. Ties break by (plain, name, props)
+                // so the order is a pure function of content (deterministic
+                // => dedup-stable).
+                let t_pal = std::time::Instant::now();
+                // canonical order as a sorted INDEX vec over the shared palette
+                // (stable sort: ties keep original index order, exactly like the old
+                // (entry, old_index) pair sort)
+                let mut order_idx: Vec<usize> = (0..n).collect();
+                order_idx.sort_by(|&a, &b| {
+                    counts[b]
+                        .cmp(&counts[a])
+                        .then_with(|| {
+                            (pal[a].plain, pal[a].name, &pal[a].props)
+                                .cmp(&(pal[b].plain, pal[b].name, &pal[b].props))
+                        })
+                });
+                SPLT_PAL.0.fetch_add(t_pal.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                SPLT_PAL.1.fetch_add(1, Ordering::Relaxed);
+                (v, counts, order_idx, data, in_bits)
+            };
         // v0.9.114: DEAD-ENTRY DROP — palette entries the voxel stream never
         // references leave the canonical form. The GLOB rebuild
         // (glob_to_section / glob2_to_section) emits only USED states, so a
@@ -9391,6 +9446,308 @@ fn state_key<'a>(s: Option<&'a GlobState>) -> (bool, &'a str, &'a Vec<(String, S
     }
 }
 
+// v0.9.127: direct wire->view routing knobs (process-stable, resolve once —
+// same discipline as KEEP_LIGHT et al.).
+//   CSAVES_RE_DIRECT=0  -> canonical_reencode stays on the Value path (A/B)
+//   CSAVES_RE_EQ=1      -> harness mode: both paths run, bytes compared,
+//                          the Value result stays authoritative, mismatches
+//                          counted + logged loudly
+static RE_DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn re_direct() -> bool {
+    *RE_DIRECT.get_or_init(|| std::env::var("CSAVES_RE_DIRECT").as_deref() != Ok("0"))
+}
+static RE_EQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn re_eq() -> bool {
+    *RE_EQ.get_or_init(|| std::env::var("CSAVES_RE_EQ").as_deref() == Ok("1"))
+}
+
+/// Telemetry for the routing (scan_timing prints it):
+/// wire hits = canonical_reencode calls served by the direct parser,
+/// eq_ok/eq_bad = harness comparisons (eq_bad MUST stay 0).
+pub static RE_WIRE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static RE_EQ_OK: AtomicU64 = AtomicU64::new(0);
+pub static RE_EQ_BAD: AtomicU64 = AtomicU64::new(0);
+
+/// v0.9.127: direct CSEC3/CSEC4 wire -> SecView parser for the identity
+/// recompute path. Semantically identical to
+/// section_decode3 + vanillify_section_value + sec_view_of_value on the
+/// same bytes with zero Value trees: palette entries borrow the wire
+/// slices, the voxel longs are built once at the width the canonical
+/// encoder expects. The two historic quirks are reproduced ON PURPOSE
+/// (both sides of the identity derivation run the same code, so the
+/// derived hashes are self-consistent):
+///   - the n>256 dense read keeps section_decode3's u16->u8 index wrap;
+///   - vanillify's biome repack is folded into the initial pack (biomes
+///     with 1 < n < 16 pack at bits_for(n), everything else at the
+///     4-bit clamp — on wire input the block clamp branch is always a
+///     no-op and the biome branch fires exactly when 1 < n < 16).
+/// Any parse failure returns None and canonical_reencode falls back to
+/// the Value path, so the Some/None contract can never widen.
+fn sec_view_of_wire<'a>(
+    b: &'a [u8],
+    bs_buf: &'a mut Vec<i64>,
+    bio_buf: &'a mut Vec<i64>,
+) -> Option<SecView<'a>> {
+    if b.len() < 3 {
+        return None;
+    }
+    let csec4 = b[0] == CSEC4_MAGIC;
+    if b[0] != CSEC3_MAGIC && !csec4 {
+        return None;
+    }
+    let f1 = b[1];
+    let f2 = b[2];
+    let mut p = 3usize;
+    let mut f3 = 0u8;
+    if csec4 {
+        f3 = *b.get(p)?;
+        p += 1;
+    }
+    let y = *b.get(p)? as i8;
+    p += 1;
+
+    let bs = if f1 & 1 != 0 {
+        let order = (f2 >> 4) & 3;
+        Some(wire_pal_data(b, &mut p, 4096, f1 & 2 != 0, f2 & 4 != 0, order, bs_buf)?)
+    } else {
+        None
+    };
+    let bio = if f1 & 4 != 0 {
+        let order = (f2 >> 6) & 3;
+        Some(wire_pal_data(b, &mut p, 64, f1 & 8 != 0, f2 & 8 != 0, order, bio_buf)?)
+    } else {
+        None
+    };
+    let skylight = if f1 & 16 != 0 {
+        Some(vec![255u8; 2048])
+    } else if f1 & 32 != 0 {
+        Some(vec![0u8; 2048])
+    } else if f1 & 64 != 0 {
+        let l = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let arr = b.get(p..p + l)?;
+        p += l;
+        Some(arr.iter().map(|&x| x).collect())
+    } else {
+        None
+    };
+    let blocklight = if f1 & 128 != 0 {
+        let l = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let arr = b.get(p..p + l)?;
+        p += l;
+        Some(arr.iter().map(|&x| x).collect())
+    } else if f3 & 1 != 0 {
+        Some(vec![0u8; 2048])
+    } else {
+        None
+    };
+    let sl = if f2 & 1 != 0 {
+        let v = *b.get(p)?;
+        p += 1;
+        Some(v as i32)
+    } else {
+        None
+    };
+    let bl = if f2 & 2 != 0 {
+        // decode3 leaves p un-advanced here (last field); nothing follows.
+        let v = *b.get(p)?;
+        Some(v as i32)
+    } else {
+        None
+    };
+    Some(SecView { y, bs, bio, skylight, blocklight, sl, bl })
+}
+
+/// Wire palette entry -> borrowed PalEntry. Kind 0 = plain string, 1 =
+/// name-only compound, 2 = name + properties. Duplicate property keys
+/// collapse last-wins (the Value path's HashMap insertion), then sort
+/// byte-wise (parse_entry's props.sort()).
+fn wire_read_entry<'a>(b: &'a [u8], p: &mut usize) -> Option<PalEntry<'a>> {
+    let kind = *b.get(*p)?;
+    *p += 1;
+    if kind > 2 {
+        return None;
+    }
+    let l = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+    *p += 2;
+    let name = core::str::from_utf8(b.get(*p..*p + l)?).ok()?;
+    *p += l;
+    if kind == 0 {
+        return Some(PalEntry { name, props: Vec::new(), plain: true });
+    }
+    let mut props: Vec<(&str, &str)> = Vec::new();
+    if kind == 2 {
+        let np = *b.get(*p)?;
+        *p += 1;
+        for _ in 0..np {
+            let kl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p += 2;
+            let k = core::str::from_utf8(b.get(*p..*p + kl)?).ok()?;
+            *p += kl;
+            let vl = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+            *p += 2;
+            let v = core::str::from_utf8(b.get(*p..*p + vl)?).ok()?;
+            *p += vl;
+            if let Some(slot) = props.iter_mut().find(|(ek, _)| *ek == k) {
+                slot.1 = v;
+            } else {
+                props.push((k, v));
+            }
+        }
+    }
+    props.sort_unstable();
+    Some(PalEntry { name, props, plain: false })
+}
+
+/// Palette+data decode with the vanillify width folded in. `buf` receives
+/// the vanilla no-straddle longs the canonical encoder unpacks.
+fn wire_pal_data<'a>(
+    b: &'a [u8],
+    p: &mut usize,
+    entries: usize,
+    has_data: bool,
+    narrow: bool,
+    order: u8,
+    buf: &'a mut Vec<i64>,
+) -> Option<PalDataV<'a>> {
+    let n = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
+    *p += 2;
+    let mut pal = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        pal.push(wire_read_entry(b, p)?);
+    }
+    if !has_data {
+        return Some(PalDataV { palette: pal, data: None, pre: None });
+    }
+    let side = if entries == 4096 {
+        16usize
+    } else if entries == 64 {
+        4usize
+    } else {
+        0usize
+    };
+    // RLE form (v0.6): [idx u8][varint run] pairs over the canonical
+    // index stream, vanilla (1) or y-fast transposed (2) order. Legacy
+    // v3 streams carry zeros in the order bits -> dense path.
+    let v: Vec<u8> = if order != 0 {
+        if n > 256 || side == 0 {
+            return None; // RLE uses byte indices; never wide palettes
+        }
+        let mut vv = Vec::with_capacity(entries);
+        while vv.len() < entries {
+            let idx = *b.get(*p)?;
+            *p += 1;
+            let run = read_uvarint(b, p)? as usize;
+            if run == 0 || vv.len() + run > entries {
+                return None;
+            }
+            vv.resize(vv.len() + run, idx);
+        }
+        if order == 2 {
+            transpose_fast_y(&vv, side)
+        } else {
+            vv
+        }
+    } else {
+        // narrow mode packs at ceillog2(n); output is normalized back to
+        // the vanilla-clamped width either way. The wide reader feeds
+        // the historic u8 wrap (see sec_view_of_wire doc).
+        let rbits = if narrow { bits_for(n) } else { bits_for(n).max(4) };
+        let bytes = (entries * rbits as usize + 7) / 8;
+        let dense = b.get(*p..*p + bytes)?;
+        *p += bytes;
+        if n > 256 {
+            dense_unpack_wide(dense, entries, rbits)?
+                .iter()
+                .map(|x| *x as u8)
+                .collect::<Vec<u8>>()
+        } else {
+            dense_unpack(dense, entries, rbits)?
+        }
+    };
+    // vanillify folded in: on wire input the block container always
+    // repacks at max(bits_for(n), 4) (= decode3's out_bits, want==old);
+    // biomes repack to bits_for(n) exactly when 1 < n < 16, else stay at
+    // the clamp width (n<=1: the single-value tolerance branch).
+    let want_bits = if entries == 4096 {
+        bits_for(n).max(4)
+    } else if n > 1 {
+        bits_for(n).max(1)
+    } else {
+        bits_for(n).max(4)
+    };
+    *buf = pack_nostroddle(&v, want_bits);
+    Some(PalDataV { palette: pal, data: Some(&buf[..]), pre: None })
+}
+
+/// The CSEC tail continuation (biomes + lights + starlight; no header, no
+/// block_states) — the verbatim tail a GLOB member carries behind its
+/// payload. Field order and flag bits mirror sec_view_of_wire's post-block
+/// half exactly (the tail rides the section's own f1/f2/f3 flag bytes);
+/// leftover bytes are ignored, exactly like decode3 stops after the last
+/// known field.
+#[allow(clippy::type_complexity)]
+fn wire_tail_fields<'a>(
+    tail: &'a [u8],
+    f1: u8,
+    f2: u8,
+    f3: u8,
+    bio_buf: &'a mut Vec<i64>,
+) -> Option<(
+    Option<PalDataV<'a>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i32>,
+    Option<i32>,
+)> {
+    let mut p = 0usize;
+    let bio = if f1 & 4 != 0 {
+        let order = (f2 >> 6) & 3;
+        Some(wire_pal_data(tail, &mut p, 64, f1 & 8 != 0, f2 & 8 != 0, order, bio_buf)?)
+    } else {
+        None
+    };
+    let skylight = if f1 & 16 != 0 {
+        Some(vec![255u8; 2048])
+    } else if f1 & 32 != 0 {
+        Some(vec![0u8; 2048])
+    } else if f1 & 64 != 0 {
+        let l = u16::from_le_bytes(tail.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let arr = tail.get(p..p + l)?;
+        p += l;
+        Some(arr.iter().map(|&x| x).collect())
+    } else {
+        None
+    };
+    let blocklight = if f1 & 128 != 0 {
+        let l = u16::from_le_bytes(tail.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let arr = tail.get(p..p + l)?;
+        p += l;
+        Some(arr.iter().map(|&x| x).collect())
+    } else if f3 & 1 != 0 {
+        Some(vec![0u8; 2048])
+    } else {
+        None
+    };
+    let sl = if f2 & 1 != 0 {
+        let v = *tail.get(p)?;
+        p += 1;
+        Some(v as i32)
+    } else {
+        None
+    };
+    let bl = if f2 & 2 != 0 {
+        let v = *tail.get(p)?;
+        Some(v as i32)
+    } else {
+        None
+    };
+    Some((bio, skylight, blocklight, sl, bl))
+}
+
 /// Canonical re-encode of a section member given in ANY wire form (v0.9.95):
 /// decode to the section Value, then run the FULL canonical encoder — the
 /// content-deterministic dense/RLE/RLE-transposed form selection and the
@@ -9401,7 +9758,55 @@ fn state_key<'a>(s: Option<&'a GlobState>) -> (bool, &'a str, &'a Vec<(String, S
 /// hash drifts from the write-time dedup key. The canonical encoder is a
 /// pure function of the section content, so the re-encode reproduces the
 /// original bytes bit for bit (differential-tested).
+///
+/// v0.9.127: CSEC3/CSEC4 inputs take the direct wire->SecView parser (zero
+/// Value trees) with the full Value path kept as fallback and as the
+/// equivalence-harness reference (CSAVES_RE_EQ=1).
 pub fn canonical_reencode(member: &[u8]) -> Option<Vec<u8>> {
+    let c4 = is_csec4(member.first());
+    // Harness mode implies the direct parser (an OFF direct flag would make
+    // every comparison a fake mismatch); non-CSEC3/4 inputs never compare —
+    // the direct parser cannot serve them by design, the Value path stays
+    // authoritative there.
+    let harness = re_eq() && c4;
+    let direct = if (harness || re_direct()) && c4 {
+        let mut bs_buf = Vec::new();
+        let mut bio_buf = Vec::new();
+        sec_view_of_wire(member, &mut bs_buf, &mut bio_buf)
+            .and_then(|view| section_encode_view(&view, false).map(|(c, _)| c))
+    } else {
+        None
+    };
+    if harness {
+        // Harness mode: the Value path stays authoritative, the direct
+        // result is compared against it byte for byte.
+        let old = (|| {
+            let v = section_decode(member)?;
+            let view = sec_view_of_value(&v)?;
+            section_encode_view(&view, false).map(|(c, _)| c)
+        })();
+        match (&direct, &old) {
+            (Some(d), Some(c)) if d == c => {
+                RE_EQ_OK.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                let bad = RE_EQ_BAD.fetch_add(1, Ordering::Relaxed);
+                if bad < 32 {
+                    eprintln!(
+                        "[re-eq] MISMATCH direct={:?} old_len={} first={:#x}",
+                        direct.as_ref().map(|d| d.len()),
+                        old.as_ref().map_or(0, |c| c.len()),
+                        member.first().copied().unwrap_or(0)
+                    );
+                }
+            }
+        }
+        return old;
+    }
+    if let Some(d) = direct {
+        RE_WIRE_HITS.fetch_add(1, Ordering::Relaxed);
+        return Some(d);
+    }
     let _t0 = std::time::Instant::now();
     let v = section_decode(member)?;
     let _t1 = std::time::Instant::now();
@@ -9432,7 +9837,25 @@ pub fn glob_any_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> 
 /// (count DESC, ties (plain, name, props) ASC), same dense/RLE/RLE-t form
 /// re-choice for n <= 256, dense-only wide packing for n > 256 — with a
 /// payload-decode step (gform) in front.
-pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+/// The decoded+ordered half of the 0xCC GLOB2 rebuild (v0.9.127 split):
+/// header fields, the vanilla-order gid stream, and the frequency-canonical
+/// used list (count DESC, ties (plain, name, props) ASC via the registry).
+/// glob2_emit_from_parts turns it back into the walked-form wire;
+/// glob_canonical_identity turns it into the canonical section bytes
+/// without the intermediate wire at all.
+struct Glob2Parts<'a> {
+    f1: u8,
+    f2: u8,
+    f3: u8,
+    y: u8,
+    gids: Vec<u32>,
+    narrow_gid: bool,
+    la_pre: u64,
+    used: Vec<(u32, u32)>,
+    tail: &'a [u8],
+}
+
+fn glob2_decode_parts<'a>(glob: &'a [u8], reg: &StateRegistry) -> Option<Glob2Parts<'a>> {
     let _tg = std::time::Instant::now();
     if glob.first() != Some(&GLOB2_MAGIC) {
         return None;
@@ -9640,6 +10063,20 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     }
     ST_GRB_SORT.0.fetch_add(_ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ST_GRB_SORT.1.fetch_add(1, Ordering::Relaxed);
+    Some(Glob2Parts { f1, f2, f3, y, gids, narrow_gid, la_pre, used, tail })
+}
+
+fn glob2_emit_from_parts(parts: &Glob2Parts, reg: &StateRegistry) -> Option<Vec<u8>> {
+    let f1 = parts.f1;
+    let f2 = parts.f2;
+    let f3 = parts.f3;
+    let y = parts.y;
+    let narrow_gid = parts.narrow_gid;
+    let la_pre = parts.la_pre;
+    let gids = &parts.gids;
+    let used = &parts.used;
+    let tail = parts.tail;
+    let n = used.len();
     let _tc = std::time::Instant::now();
     let magic = if f3 != 0 { CSEC4_MAGIC } else { CSEC3_MAGIC };
     // v0.9.117: max gid == the max USED gid (counts[gid]>0 exactly for the
@@ -9687,12 +10124,12 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
         }
         out.push(y);
         out.extend_from_slice(&(n as u16).to_le_bytes());
-        for (_, g) in &used {
+        for (_, g) in used.iter() {
             let st = reg.get(*g)?;
             glob_put_entry(&mut out, st);
         }
         let mut w = BitW::new();
-        for g in &gids {
+        for g in gids.iter() {
             w.put(gid2canon[*g as usize] as u64, out_bits);
         }
         out.extend_from_slice(&w.finish());
@@ -9719,9 +10156,9 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     // the wide forms walk it here (bounded). Only the TRANSPOSED candidate
     // walks for both. Decisions and bytes are identical to the materialized
     // formulation.
-    let la = if narrow_gid { la_pre } else { rle_stream_len_mapped_bounded(&gids, bound) };
+    let la = if narrow_gid { la_pre } else { rle_stream_len_mapped_bounded(gids, bound) };
     let a_ok = la * 4 <= dense_len as u64 && la + 32 <= dense_len as u64;
-    let lb = rle_transposed_len_mapped_bounded(&gids, 16, bound);
+    let lb = rle_transposed_len_mapped_bounded(gids, 16, bound);
     let b_ok = lb * 4 <= dense_len as u64 && lb + 32 <= dense_len as u64;
     ST_GRB_SCAN.0.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
     ST_GRB_SCAN.1.fetch_add(1, Ordering::Relaxed);
@@ -9731,17 +10168,17 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
             best_len = lb as usize;
             best = Some((
                 2,
-                rle_encode_stream_mapped(&transpose_fast_y_u16(&gids, 16), &remap8),
+                rle_encode_stream_mapped(&transpose_fast_y_u16(gids, 16), &remap8),
             ));
         } else {
             best_len = la as usize;
-            best = Some((1, rle_encode_stream_mapped(&gids, &remap8)));
+            best = Some((1, rle_encode_stream_mapped(gids, &remap8)));
         }
     } else if b_ok {
         best_len = lb as usize;
         best = Some((
             2,
-            rle_encode_stream_mapped(&transpose_fast_y_u16(&gids, 16), &remap8),
+            rle_encode_stream_mapped(&transpose_fast_y_u16(gids, 16), &remap8),
         ));
     }
     let mut f2n = f2 & !4 & !16 & !32;
@@ -9761,7 +10198,7 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     }
     out.push(y);
     out.extend_from_slice(&(n as u16).to_le_bytes());
-    for (_, g) in &used {
+    for (_, g) in used.iter() {
         let st = reg.get(*g)?;
         glob_put_entry(&mut out, st);
     }
@@ -9783,6 +10220,145 @@ pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
     ST_GLOB_DEC.fetch_add(1, Ordering::Relaxed);
     Some(out)
 }
+
+pub fn glob2_to_section(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+    let parts = glob2_decode_parts(glob, reg)?;
+    glob2_emit_from_parts(&parts, reg)
+}
+
+// v0.9.127: the fused identity path (decode-half + canonical emit without
+// the intermediate walked-form wire) with an A/B off-switch.
+static GLOB_FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn glob_fused() -> bool {
+    *GLOB_FUSED.get_or_init(|| std::env::var("CSAVES_GLOB_FUSED").as_deref() != Ok("0"))
+}
+
+/// Telemetry: members served by the fused identity derivation.
+pub static GLOB_FUSED_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// v0.9.127: the FUSED identity derivation for 0xCC GLOB2 members. The
+/// rebuild's decode half (payload -> gids -> frequency-canonical order via
+/// the registry) feeds the canonical encoder DIRECTLY through the pre
+/// input — canonical voxels + counts, no walked-form wire emit, no re-parse,
+/// no double pack/unpack — and the verbatim tail rides wire_tail_fields
+/// into the same single section_encode_view call. Byte-parity with the
+/// two-step chain (glob2_to_section -> canonical_reencode) is pinned by
+/// the scan-side EQ harness (CSAVES_RE_EQ=1 compares fused vs two-step on
+/// every member) and by the roundtrip tests.
+/// The n>256 wrap parity: the two-step chain's decode wraps wide indices
+/// u16->u8 (section_decode3's historic read), so the fused voxels wrap
+/// identically before the encoder sees them — the derived identity stays
+/// self-consistent with the write-side derivation.
+/// None -> the caller falls back to the two-step chain (some cost,
+/// identical output), so the Some/None contract can never widen.
+pub fn glob_canonical_identity(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+    if !glob_fused() || glob.first() != Some(&GLOB2_MAGIC) {
+        return None;
+    }
+    let fused = (|| {
+        let parts = glob2_decode_parts(glob, reg)?;
+        let used = &parts.used;
+        let n = used.len();
+        if n == 0 || n > 65535 {
+            return None;
+        }
+        // registry states as the canonical palette (borrowed, no clones —
+        // the same v0.9.75 reference-snapshot discipline as the rebuild)
+        let mut palette: Vec<PalEntry> = Vec::with_capacity(n);
+        for &(_, g) in used.iter() {
+            let st = reg.get(g)?;
+            let props: Vec<(&str, &str)> = st
+                .props
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            palette.push(PalEntry { name: st.name.as_str(), props, plain: st.plain });
+        }
+        let fill = parts.f1 & 3 == 1;
+        let max_gid = used.iter().map(|&(_, g)| g).max().unwrap_or(0) as usize;
+        let mut gid2canon = vec![0u16; max_gid + 1];
+        for (i, &(_, g)) in used.iter().enumerate() {
+            gid2canon[g as usize] = i as u16;
+        }
+        let mut wide_longs: Vec<i64>;
+        let bs = if fill {
+            if n != 1 {
+                return None;
+            }
+            // no-data fill member: the encoder's palette-only branch
+            Some(PalDataV { palette, data: None, pre: None })
+        } else if n > 256 {
+            // WIDE palettes: the two-step chain's decode wraps indices >= 256
+            // (the historic u16->u8 read), which reshuffles the counts onto
+            // wrapped positions and kills zero-count entries — the pre
+            // contract (counts already canonical, no dead entries) cannot
+            // hold there. These members take the longs route instead: wrap
+            // the canonical voxels exactly like decode3, pack at bits_for(n)
+            // (decode3's out_bits for wide palettes), and let the encoder
+            // run its full unpack + sort + dead-drop — byte-identical to the
+            // two-step chain by construction.
+            let mut vox8: Vec<u8> = Vec::with_capacity(4096);
+            for &g in parts.gids.iter() {
+                vox8.push(gid2canon[g as usize] as u8);
+            }
+            wide_longs = pack_nostroddle(&vox8, bits_for(n));
+            Some(PalDataV { palette, data: Some(&wide_longs), pre: None })
+        } else {
+            // canonical voxels; narrow palettes never wrap (indices < n <= 256)
+            let vox: Vec<u32> = parts.gids.iter().map(|&g| gid2canon[g as usize] as u32).collect();
+            let counts: Vec<u32> = used.iter().map(|&(c, _)| c).collect();
+            Some(PalDataV {
+                palette,
+                data: None,
+                pre: Some(PreVox { vox, counts }),
+            })
+        };
+        let mut bio_buf = Vec::new();
+        let (bio, skylight, blocklight, sl, bl) =
+            wire_tail_fields(parts.tail, parts.f1, parts.f2, parts.f3, &mut bio_buf)?;
+        let view = SecView { y: parts.y as i8, bs, bio, skylight, blocklight, sl, bl };
+        section_encode_view(&view, false).map(|(c, _)| c)
+    })();
+    if re_eq() {
+        // harness mode: the two-step chain stays authoritative, the fused
+        // result is compared against it byte for byte
+        let old = glob_any_to_section(glob, reg).and_then(|d| canonical_reencode(&d));
+        match (&fused, &old) {
+            (Some(a), Some(b)) if a == b => {
+                RE_EQ_OK.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                let bad = RE_EQ_BAD.fetch_add(1, Ordering::Relaxed);
+                if bad < 32 {
+                    eprintln!(
+                        "[fused-eq] MISMATCH fused={:?} old={:?} head={:02x?}",
+                        fused.as_ref().map(|c| c.len()),
+                        old.as_ref().map(|c| c.len()),
+                        &glob[..glob.len().min(6)]
+                    );
+                }
+            }
+        }
+        return old;
+    }
+    if fused.is_some() {
+        GLOB_FUSED_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    fused
+}
+
+/// The scan-side identity chain (v0.9.127): the fused derivation when it
+/// applies, else the two-step rebuild + re-encode. ONE entry point for all
+/// three callers (reopen recompute, verify, pack stability gate) so the
+/// derivation stays byte-identical everywhere; fused refusals fall back to
+/// the two-step chain, so the Some/None contract is the old one.
+pub fn glob_member_identity(glob: &[u8], reg: &StateRegistry) -> Option<Vec<u8>> {
+    match glob_canonical_identity(glob, reg) {
+        Some(c) => Some(c),
+        None => glob_any_to_section(glob, reg).and_then(|d| canonical_reencode(&d)),
+    }
+}
+
 
 static ST_GLOB_ENC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ST_GLOB_DEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -10108,6 +10684,462 @@ mod fused_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fused_identity_matches_two_step_chain() {
+        // v0.9.127: the fused identity derivation (decode half -> canonical
+        // encoder via the pre input) must reproduce the two-step chain's
+        // bytes (glob2_to_section -> canonical_reencode) on every gform the
+        // minter can emit, including the wide-palette wrap and the fill
+        // member. This is the local half of the fused harness; the corpus
+        // half runs through glob_canonical_identity with CSAVES_RE_EQ=1.
+        use fastnbt::LongArray;
+        use std::collections::HashMap as Map;
+        let mk = |kv: Vec<(&str, Value)>| -> Value {
+            Value::Compound(kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+        let vanilla_data = |vox: &[u8], bits: u32| -> Value {
+            Value::LongArray(LongArray::new(pack_nostroddle(vox, bits)))
+        };
+        let sec_of = |pal: Vec<Value>, vox: &[u8], bits: u32, biomes: usize| -> Value {
+            let biome_names = ["minecraft:plains", "minecraft:forest", "minecraft:desert"];
+            let mut bio: Map<String, Value> = Map::new();
+            bio.insert(
+                "palette".to_string(),
+                Value::List(biome_names[..biomes.max(1)].iter().map(|s| Value::String(s.to_string())).collect()),
+            );
+            if biomes > 1 {
+                let bvox: Vec<u8> = (0..64usize).map(|i| ((i * 5 + 1) % biomes as usize) as u8).collect();
+                bio.insert("data".to_string(), vanilla_data(&bvox, bits_for(biomes as usize)));
+            }
+            mk(vec![
+                ("Y", Value::Byte(4)),
+                ("block_states", {
+                    let mut m: Map<String, Value> = Map::new();
+                    m.insert("palette".to_string(), Value::List(pal));
+                    m.insert("data".to_string(), vanilla_data(vox, bits));
+                    Value::Compound(m)
+                }),
+                ("biomes", Value::Compound(bio)),
+            ])
+        };
+        let mut reg = StateRegistry::new();
+        let _g = crate::store::glob_slab_test::tests_glob_lock();
+        // the T variant (0xCC) only wins with the RLE admission opt-in (the
+        // default 8x divisor keeps everything on the 0xCB base wire); the
+        // noisy shape stays 0xCB even then, which pins the fallback path
+        crate::chunknbt::set_gid_rle_div_for_tests(Some(4));
+        // narrow plain states (gform ladder), noisy + strata + wall shapes
+        let shapes: Vec<(String, Value, bool)> = vec![
+            (
+                "wall-2".into(),
+                {
+                    let pal = vec![
+                        Value::String("minecraft:wall0".into()),
+                        Value::String("minecraft:wall1".into()),
+                    ];
+                    let vox: Vec<u8> = (0..4096usize).map(|i| ((i % 16 + (i / 16) % 16) % 2) as u8).collect();
+                    sec_of(pal, &vox, 4, 1)
+                },
+                true,
+            ),
+            (
+                "strata-2".into(),
+                {
+                    let pal = vec![
+                        Value::String("minecraft:s0".into()),
+                        Value::String("minecraft:s1".into()),
+                    ];
+                    let vox: Vec<u8> = (0..4096usize).map(|i| (i / 2048) as u8).collect();
+                    sec_of(pal, &vox, 4, 3)
+                },
+                true,
+            ),
+            (
+                "noisy-6".into(),
+                {
+                    let pal: Vec<Value> = (0..6usize)
+                        .map(|i| Value::String(format!("minecraft:n{i}")))
+                        .collect();
+                    let vox: Vec<u8> = (0..4096usize).map(|i| ((i * 31 + 7) % 6) as u8).collect();
+                    sec_of(pal, &vox, 4, 1)
+                },
+                false,
+            ),
+            (
+                "wide-300".into(),
+                {
+                    let pal: Vec<Value> = (0..300usize)
+                        .map(|i| Value::String(format!("minecraft:w{i}")))
+                        .collect();
+                    let vox: Vec<u16> = (0..4096usize).map(|i| ((i * 31 + 17) % 300) as u16).collect();
+                    let mut m: Map<String, Value> = Map::new();
+                    m.insert("Y".to_string(), Value::Byte(9));
+                    m.insert("block_states".to_string(), {
+                        let mut bm: Map<String, Value> = Map::new();
+                        bm.insert("palette".to_string(), Value::List(pal));
+                        // vanilla no-straddle u16 packing at 9 bits
+                        let per = 64usize / 9;
+                        let mut longs: Vec<i64> = Vec::with_capacity((4096 + per - 1) / per);
+                        for chunk in vox.chunks(per) {
+                            let mut l: i64 = 0;
+                            for (k, &v) in chunk.iter().enumerate() {
+                                l |= (v as i64) << (k as u32 * 9);
+                            }
+                            longs.push(l);
+                        }
+                        bm.insert("data".to_string(), Value::LongArray(LongArray::new(longs)));
+                        Value::Compound(bm)
+                    });
+                    m.insert(
+                        "biomes".to_string(),
+                        mk(vec![("palette", Value::List(vec![Value::String("minecraft:plains".into())]))]),
+                    );
+                    Value::Compound(m)
+                },
+                true,
+            ),
+        ];
+        for (tag, sec, want_g2) in &shapes {
+            let canon = section_encode(sec).unwrap_or_else(|| panic!("{tag}: encode"));
+            let member = section_to_glob(&canon, &mut reg).unwrap_or_else(|| panic!("{tag}: to-glob"));
+            assert_eq!(member[0] == GLOB2_MAGIC, *want_g2, "{tag}: unexpected wire family");
+            let two_step = glob_any_to_section(&member, &reg)
+                .and_then(|d| canonical_reencode(&d))
+                .unwrap_or_else(|| panic!("{tag}: two-step chain"));
+            if *tag != "wide-300" {
+                // wide palettes: the two-step chain's decode wraps indices
+                // >= 256 (the historic u16->u8 read), so its re-encode of
+                // the canonical stream is intentionally non-idempotent —
+                // the fused derivation wraps identically, which is exactly
+                // what keeps the write-side and read-side identities equal
+                assert_eq!(two_step, canon, "{tag}: identity re-encode must be idempotent");
+            }
+            if *want_g2 {
+                let fused = glob_canonical_identity(&member, &reg)
+                    .unwrap_or_else(|| panic!("{tag}: fused derivation"));
+                assert_eq!(two_step, fused, "{tag}: fused-vs-two-step canonical bytes diverge");
+            } else {
+                // 0xCB members refuse the fused path by design; the shared
+                // entry point must still reproduce the canonical bytes
+                let ident = glob_member_identity(&member, &reg)
+                    .unwrap_or_else(|| panic!("{tag}: fallback identity"));
+                assert_eq!(ident, canon, "{tag}: fallback identity diverges");
+            }
+        }
+        crate::chunknbt::set_gid_rle_div_for_tests(None);
+    }
+
+    #[test]
+    fn wire_view_direct_parser_equivalence() {
+        // v0.9.127: the direct wire->SecView parser must reproduce the
+        // Value path's canonical bytes on every wire shape the encoder can
+        // emit, INCLUDING the two historic quirks (the n>256 dense u16->u8
+        // wrap and the biome narrow-width repack). This test IS the local
+        // half of the equivalence harness; the corpus half runs through
+        // canonical_reencode with CSAVES_RE_EQ=1 on the probe stores.
+        use fastnbt::{ByteArray, LongArray, Value};
+        use std::collections::HashMap as Map;
+
+        let mk = |kv: Vec<(&str, Value)>| -> Value {
+            Value::Compound(kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+        let pal = |entries: Vec<Value>| -> Value {
+            Value::Compound({
+                let mut m: Map<String, Value> = Map::new();
+                m.insert("palette".to_string(), Value::List(entries));
+                m
+            })
+        };
+        let vanilla_data = |vox: &[u8], bits: u32| -> Value {
+            Value::LongArray(LongArray::new(pack_nostroddle(vox, bits)))
+        };
+        // vanilla no-straddle packing for wide (u16) index streams — the
+        // pack_nostroddle twin above only takes u8
+        let pack_wide = |vox: &[u16], bits: u32| -> Vec<i64> {
+            let per = (64 / bits) as usize;
+            let mut longs = Vec::with_capacity((vox.len() + per - 1) / per);
+            for chunk in vox.chunks(per) {
+                let mut l: i64 = 0;
+                for (k, &v) in chunk.iter().enumerate() {
+                    l |= (v as i64) << (k as u32 * bits);
+                }
+                longs.push(l);
+            }
+            longs
+        };
+        let named = |name: &str| -> Value { mk(vec![("Name", Value::String(name.into()))]) };
+        let with_props = |name: &str, props: &[(&str, &str)]| -> Value {
+            mk(vec![
+                ("Name", Value::String(name.into())),
+                (
+                    "Properties",
+                    Value::Compound(
+                        props
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+                            .collect(),
+                    ),
+                ),
+            ])
+        };
+
+        let mut cases: Vec<(&str, Value)> = Vec::new();
+        // plain dense (kind 0/1/2 entry shapes mixed)
+        {
+            let vox: Vec<u8> = (0..4096usize).map(|i| ((i * 7 + 3) % 5) as u8).collect();
+            cases.push((
+                "dense-5",
+                mk(vec![
+                    ("Y", Value::Byte(3)),
+                    (
+                        "block_states",
+                        {
+                            let mut m: Map<String, Value> = Map::new();
+                            m.insert(
+                                "palette".to_string(),
+                                Value::List(vec![
+                                    Value::String("minecraft:a".into()),
+                                    named("minecraft:nameonly"),
+                                    with_props("minecraft:oak", &[("axis", "x"), ("half", "upper")]),
+                                    Value::String("minecraft:c".into()),
+                                    Value::String("minecraft:d".into()),
+                                ]),
+                            );
+                            m.insert("data".to_string(), vanilla_data(&vox, 4));
+                            Value::Compound(m)
+                        },
+                    ),
+                    ("biomes", pal(vec![Value::String("minecraft:plains".into())])),
+                ]),
+            ));
+        }
+        // vanilla-order RLE: two y-slabs (runs of 2048)
+        {
+            let vox: Vec<u8> = (0..4096usize).map(|i| (i / 2048) as u8).collect();
+            cases.push((
+                "rle-van",
+                mk(vec![
+                    ("Y", Value::Byte(-2)),
+                    ("block_states", {
+                        let mut m: Map<String, Value> = Map::new();
+                        m.insert(
+                            "palette".to_string(),
+                            Value::List(vec![
+                                Value::String("minecraft:slab0".into()),
+                                Value::String("minecraft:slab1".into()),
+                            ]),
+                        );
+                        m.insert("data".to_string(), vanilla_data(&vox, 4));
+                        Value::Compound(m)
+                    }),
+                    ("biomes", pal(vec![Value::String("minecraft:plains".into())])),
+                ]),
+            ));
+        }
+        // y-fast transposed RLE: two x-slabs (vanilla runs 1, transposed 256)
+        {
+            let vox: Vec<u8> = (0..4096usize).map(|i| ((i % 16) / 8) as u8).collect();
+            cases.push((
+                "rle-transposed",
+                mk(vec![
+                    ("Y", Value::Byte(7)),
+                    ("block_states", {
+                        let mut m: Map<String, Value> = Map::new();
+                        m.insert(
+                            "palette".to_string(),
+                            Value::List(vec![
+                                Value::String("minecraft:wall0".into()),
+                                Value::String("minecraft:wall1".into()),
+                            ]),
+                        );
+                        m.insert("data".to_string(), vanilla_data(&vox, 4));
+                        Value::Compound(m)
+                    }),
+                    ("biomes", pal(vec![Value::String("minecraft:plains".into())])),
+                ]),
+            ));
+        }
+        // wide palette (300 states > 256): the historic u16->u8 wrap path.
+        // canonical re-encode of this stream is intentionally NON-idempotent
+        // (the wrap corrupts indices >= 256 identically on both derivation
+        // sides), so only old-vs-direct equality is asserted here.
+        {
+            let vox: Vec<u16> = (0..4096usize).map(|i| ((i * 31 + 17) % 300) as u16).collect();
+            let entries: Vec<Value> = (0..300usize)
+                .map(|i| Value::String(format!("minecraft:w{i}")))
+                .collect();
+            cases.push((
+                "wide-300",
+                mk(vec![
+                    ("Y", Value::Byte(0)),
+                    ("block_states", {
+                        let mut m: Map<String, Value> = Map::new();
+                        m.insert("palette".to_string(), Value::List(entries));
+                        m.insert(
+                            "data".to_string(),
+                            Value::LongArray(LongArray::new(pack_wide(&vox, 9))),
+                        );
+                        Value::Compound(m)
+                    }),
+                    ("biomes", pal(vec![Value::String("minecraft:plains".into())])),
+                ]),
+            ));
+        }
+        // biome container with 3 distinct values: narrow wire (2 bits) ->
+        // decode-side clamp repack -> bits_for(n) restore (vanillify fold)
+        {
+            let bvox: Vec<u8> = (0..64usize).map(|i| ((i * 5 + 1) % 3) as u8).collect();
+            let vox: Vec<u8> = (0..4096usize).map(|i| ((i * 13) % 2) as u8).collect();
+            cases.push((
+                "biomes-3",
+                mk(vec![
+                    ("Y", Value::Byte(11)),
+                    ("block_states", {
+                        let mut m: Map<String, Value> = Map::new();
+                        m.insert(
+                            "palette".to_string(),
+                            Value::List(vec![
+                                Value::String("minecraft:x0".into()),
+                                Value::String("minecraft:x1".into()),
+                            ]),
+                        );
+                        m.insert("data".to_string(), vanilla_data(&vox, 4));
+                        Value::Compound(m)
+                    }),
+                    ("biomes", {
+                        let mut m: Map<String, Value> = Map::new();
+                        m.insert(
+                            "palette".to_string(),
+                            Value::List(vec![
+                                Value::String("minecraft:plains".into()),
+                                Value::String("minecraft:forest".into()),
+                                Value::String("minecraft:desert".into()),
+                            ]),
+                        );
+                        m.insert("data".to_string(), vanilla_data(&bvox, 2));
+                        Value::Compound(m)
+                    }),
+                ]),
+            ));
+        }
+        // palette-only biome container (no data longs)
+        {
+            let vox: Vec<u8> = (0..4096usize).map(|i| ((i * 3) % 2) as u8).collect();
+            cases.push((
+                "biomes-nodata",
+                mk(vec![
+                    ("Y", Value::Byte(5)),
+                    ("block_states", {
+                        let mut m: Map<String, Value> = Map::new();
+                        m.insert(
+                            "palette".to_string(),
+                            Value::List(vec![
+                                Value::String("minecraft:y0".into()),
+                                Value::String("minecraft:y1".into()),
+                            ]),
+                        );
+                        m.insert("data".to_string(), vanilla_data(&vox, 4));
+                        Value::Compound(m)
+                    }),
+                    ("biomes", pal(vec![Value::String("minecraft:plains".into())])),
+                ]),
+            ));
+        }
+        // full-light section: FF skylight flag + varied blocklight bytes +
+        // both starlight states (CSEC4 header, f3 bits)
+        {
+            let vox: Vec<u8> = (0..4096usize).map(|i| ((i * 11 + 5) % 4) as u8).collect();
+            let mut slb = vec![0i8; 2048];
+            for (k, v) in slb.iter_mut().enumerate() {
+                *v = ((k * 17) % 16) as i8;
+            }
+            cases.push((
+                "lights-mixed",
+                mk(vec![
+                    ("Y", Value::Byte(2)),
+                    ("block_states", {
+                        let mut m: Map<String, Value> = Map::new();
+                        m.insert(
+                            "palette".to_string(),
+                            Value::List(vec![
+                                Value::String("minecraft:l0".into()),
+                                Value::String("minecraft:l1".into()),
+                                Value::String("minecraft:l2".into()),
+                                Value::String("minecraft:l3".into()),
+                            ]),
+                        );
+                        m.insert("data".to_string(), vanilla_data(&vox, 4));
+                        Value::Compound(m)
+                    }),
+                    ("biomes", pal(vec![Value::String("minecraft:plains".into())])),
+                    ("SkyLight", Value::ByteArray(ByteArray::new(vec![-1i8; 2048]))),
+                    ("BlockLight", Value::ByteArray(ByteArray::new(slb))),
+                    ("starlight.skylight_state", Value::Int(3)),
+                    ("starlight.blocklight_state", Value::Int(7)),
+                ]),
+            ));
+        }
+        // all-zero blocklight + varied skylight bytes (the other light flags)
+        {
+            let vox: Vec<u8> = vec![1u8; 4096];
+            let mut slb = vec![0i8; 2048];
+            for (k, v) in slb.iter_mut().enumerate() {
+                *v = ((k / 128) % 15) as i8;
+            }
+            cases.push((
+                "lights-bytes",
+                mk(vec![
+                    ("Y", Value::Byte(1)),
+                    ("block_states", {
+                        let mut m: Map<String, Value> = Map::new();
+                        m.insert(
+                            "palette".to_string(),
+                            Value::List(vec![
+                                Value::String("minecraft:z0".into()),
+                                Value::String("minecraft:z1".into()),
+                            ]),
+                        );
+                        m.insert("data".to_string(), vanilla_data(&vox, 4));
+                        Value::Compound(m)
+                    }),
+                    ("biomes", pal(vec![Value::String("minecraft:plains".into())])),
+                    ("SkyLight", Value::ByteArray(ByteArray::new(slb))),
+                    ("BlockLight", Value::ByteArray(ByteArray::new(vec![0i8; 2048]))),
+                ]),
+            ));
+        }
+
+        let mut saw_csec3 = false;
+        let mut saw_csec4 = false;
+        for (tag, sec) in &cases {
+            let canon = section_encode(sec).unwrap_or_else(|| panic!("{tag}: encode"));
+            if canon[0] == CSEC3_MAGIC {
+                saw_csec3 = true;
+            }
+            if canon[0] == CSEC4_MAGIC {
+                saw_csec4 = true;
+            }
+            // the Value reference path (what canonical_reencode falls back to)
+            let v = section_decode(&canon).unwrap_or_else(|| panic!("{tag}: old decode"));
+            let view = sec_view_of_value(&v).unwrap_or_else(|| panic!("{tag}: old view"));
+            let (old, _) =
+                section_encode_view(&view, false).unwrap_or_else(|| panic!("{tag}: old encode"));
+            // the direct wire parser
+            let mut bs_buf = Vec::new();
+            let mut bio_buf = Vec::new();
+            let dview = sec_view_of_wire(&canon, &mut bs_buf, &mut bio_buf)
+                .unwrap_or_else(|| panic!("{tag}: wire view"));
+            let (direct, _) = section_encode_view(&dview, false)
+                .unwrap_or_else(|| panic!("{tag}: direct encode"));
+            assert_eq!(old, direct, "{tag}: wire-vs-Value canonical bytes diverge");
+            if *tag != "wide-300" {
+                assert_eq!(canon, old, "{tag}: canonical re-encode must be idempotent");
+            }
+        }
+        assert!(saw_csec3, "CSEC3 wire shape must be covered");
+        assert!(saw_csec4, "CSEC4 wire shape must be covered");
+    }
+
     #[test]
     fn structural_hash_wire_parity() {
         use fastnbt::{ByteArray, IntArray, LongArray, Value};

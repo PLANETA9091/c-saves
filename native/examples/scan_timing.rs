@@ -47,6 +47,13 @@ fn main() {
             c_saves::chunknbt::SCAN_RE_VIEW.load(Ordering::Relaxed),
             c_saves::chunknbt::SCAN_RE_ENC.load(Ordering::Relaxed)
         );
+        println!(
+            "  re-wire: hits {} | fused {} | eq_ok {} | eq_bad {}",
+            c_saves::chunknbt::RE_WIRE_HITS.load(Ordering::Relaxed),
+            c_saves::chunknbt::GLOB_FUSED_HITS.load(Ordering::Relaxed),
+            c_saves::chunknbt::RE_EQ_OK.load(Ordering::Relaxed),
+            c_saves::chunknbt::RE_EQ_BAD.load(Ordering::Relaxed)
+        );
         drop(st);
     }
 }

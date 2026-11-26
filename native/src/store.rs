@@ -5099,43 +5099,22 @@ impl Store {
                         // by hash_of(stored bytes); fallback NBT members
                         // (tails) are keyed structurally, which
                         // structural_hash_wire recomputes without a parse.
+                        // v0.9.127: glob_member_identity = the fused
+                        // derivation (rebuild decode half -> canonical
+                        // encoder directly) with the two-step
+                        // rebuild + re-encode as the fallback; a refusal is
+                        // real corruption — fail the parse LOUDLY, never
+                        // mint a wrong identity.
                         let h = match bytes.first() {
                             Some(&0xCB) | Some(&0xCC) => {
-                                let direct: Option<Vec<u8>> = match chunknbt::glob_any_to_section(bytes, reg) {
-                                    // v0.9.95: hash the FULL CANONICAL
-                                    // RE-ENCODE, not glob_any_to_section's
-                                    // direct output — the direct wire re-emits
-                                    // the walked form (2444 vs 3056 B on
-                                    // RLE-form sections), semantically equal
-                                    // but byte-different, and its hash would
-                                    // drift from the write-time dedup key. The
-                                    // canonical encoder is content-
-                                    // deterministic: the re-encode reproduces
-                                    // the original bytes bit for bit.
-                                    Some(d) => Some(d),
-                                    // unresolvable gid = real corruption: fail
-                                    // the parse LOUDLY, never mint a wrong
-                                    // identity
-                                    None => {
-                                        eprintln!(
-                                            "[c-saves] slab parse: reconstruction refused, {}-B glob member reg={} stamp={dict_id:#04x} head={:02x?}",
-                                            bytes.len(),
-                                            reg.len(),
-                                            &bytes[..bytes.len().min(12)],
-                                        );
-                                        None
-                                    }
-                                };
-                                let Some(direct) = direct else {
-                                    continue;
-                                };
-                                match chunknbt::canonical_reencode(&direct) {
+                                match chunknbt::glob_member_identity(bytes, reg) {
                                     Some(canon) => Some(xxhash_rust::xxh3::xxh3_128(&canon)),
                                     None => {
                                         eprintln!(
-                                            "[c-saves] slab parse: re-encode refused, {}-B glob member stamp={dict_id:#04x} head={:02x?}",
+                                            "[c-saves] slab parse: identity derivation refused, {}-B glob member reg={} stamp={dict_id:#04x} head={:02x?}",
                                             bytes.len(),
-                                            &bytes[..bytes.len().min(12)]
+                                            reg.len(),
+                                            &bytes[..bytes.len().min(12)],
                                         );
                                         None
                                     }
@@ -5630,17 +5609,14 @@ impl Store {
                 }
                 glob_tab_raw += 16;
                 let reg = self.glob_reg.lock();
-                match chunknbt::glob_any_to_section(body, &reg) {
-                    Some(direct) => match chunknbt::canonical_reencode(&direct) {
-                        Some(canon) => {
-                            if xxhash_rust::xxh3::xxh3_128(&canon) == stored {
-                                pass += 1;
-                            } else {
-                                fail_drift += 1;
-                            }
+                match chunknbt::glob_member_identity(body, &reg) {
+                    Some(canon) => {
+                        if xxhash_rust::xxh3::xxh3_128(&canon) == stored {
+                            pass += 1;
+                        } else {
+                            fail_drift += 1;
                         }
-                        None => fail_reconstruct += 1,
-                    },
+                    }
                     None => fail_reconstruct += 1,
                 }
             }
@@ -7766,11 +7742,8 @@ impl Store {
                         let stable = match &r {
                             Some(g) => {
                                 let reg = self.glob_reg.lock();
-                                match chunknbt::glob_any_to_section(g, &reg) {
-                                    Some(direct) => match chunknbt::canonical_reencode(&direct) {
-                                        Some(canon) => canon == flat_raws[j],
-                                        None => false,
-                                    },
+                                match chunknbt::glob_member_identity(g, &reg) {
+                                    Some(canon) => canon == flat_raws[j],
                                     // unresolvable reconstruction = keep hashes
                                     None => false,
                                 }

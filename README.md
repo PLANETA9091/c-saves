@@ -2184,6 +2184,46 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.127 identity derivation fused: the rebuild feeds the canonical
+  encoder directly** — the deferred 0.9.126 lever shipped in TWO stages,
+  each carrying its own equivalence harness. Stage 1, the direct
+  CSEC-wire → SecView parser (`sec_view_of_wire`): zero Value trees on the
+  0xC7/0xC8 inputs (palette entries borrow the wire, the vanillify biome
+  repack folds into the initial pack, the historic wide-palette u16→u8
+  wrap reproduced ON PURPOSE — both sides of the identity derivation run
+  the same code, so the hashes stay self-consistent), the Value path
+  stays as fallback + reference behind `CSAVES_RE_EQ=1`. Honest
+  measurement: only −5 ms — the 0.9.126 estimate priced the whole decode
+  as killable, but the real split is bit-work ~40 ms that BOTH parsers do
+  + Value-tree ~25 ms — which re-pointed the lever. Stage 2,
+  `glob_canonical_identity`: the rebuild's decode half
+  (`glob2_decode_parts`, split out of `glob2_to_section` byte-identically)
+  feeds the canonical encoder DIRECTLY through a new pre input — canonical
+  voxels + counts already in the frequency-canonical registry order, so
+  the unpack + sort halves of `enc_pal_data_canon` disappear for narrow
+  palettes; wide palettes (n>256) keep the longs route (the wrap
+  reshuffles counts onto wrapped positions and kills zero-count entries —
+  the pre contract cannot hold there, measured on the fused-vs-two-step
+  test before it could ship) and the verbatim tail rides
+  `wire_tail_fields` into the same single `section_encode_view` call. ONE
+  entry point for all three callers — reopen recompute, verify, pack
+  stability gate (`glob_member_identity`); fused refusals fall back to
+  the two-step chain, so the Some/None contract never widens. Measured on
+  the 192×192 overworld reopen: open 209.6 → **105.6 ms (−50%)**, all
+  6309 GLOB members served fused — the 0.9.126 target (reid ~70 ms,
+  open ~115 ms) beaten; restart projection at the 6.25M-chunk operator
+  scale: ~24 s → ~12 s. Harness: `CSAVES_RE_EQ=1` compares fused vs
+  two-step on EVERY member — **37904/37904 byte-identical across the
+  192²×3 corpus (eq_bad=0)**, plus the local tests (wire-vs-Value on 8
+  shapes incl. both magics, RLE vanilla/transposed, the biome repack,
+  lights, the wide wrap; fused-vs-two-step on the gform ladder + the 0xCB
+  fallback). Honest close weight unchanged at the floor: 192×192
+  overworld 7.9, nether 1.6, end 3.4, ALL THREE 4.3 B/chunk (x958);
+  50 GB → ~47 MiB; 20000×20000 chunks 4.8 GiB. enc_fp pin EXACT (the
+  write path untouched — the pre input is read-side only), 122/122
+  tests, speed verify 728+218 bad=0, full-dimension probe 64 + 192
+  bad=0 miss=0.
+
 * **The v0.9.126 canonical re-encode pipeline decomposed, the direct
   parser priced and deferred** — `scan_timing` now splits the re-encode
   stage per phase: on the 192×192 overworld identity recompute (139 ms)
