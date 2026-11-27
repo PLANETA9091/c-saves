@@ -2241,6 +2241,65 @@ all stall points are captured as CI artifacts.
   enc_fp pin EXACT (no store code moved), probe verify+reopen bad=0
   miss=0 at 192² and 256² ringed.
 
+* **The v0.9.131 batch-pool + order census: the last two unpriced byte axes
+  closed with printed bounds — both under the shipping bar.** With every
+  grid/recipe/heightmap axis priced (0.9.128–0.9.130), two fronts remained
+  untouched: the batch-class window shape and the pool ORDER itself.
+  - **batch-class whole-window pooling priced ~−1.8% of the container —
+    NOT shipped.** Decoding the real 0x0D record payloads per store and
+    re-pricing them as ONE LZMA2 window (the slab-pool design: pooled
+    stream + entry table instead of per-record streams) gives −11.4% /
+    −3.4% / −1.7% of the class (OW/NH/END; best ladder variant
+    9|EXTREME lc0/lp0/pb1 −9.4% grand). The window-curve evidence caps
+    the hope: the marginal cost of the k-th record inside the window
+    plateaus after the third record (11.6 → 10.0 → 9.8 → 10.2 KB OW) —
+    the pooled win does NOT grow with scale, the record bodies are the
+    same shapes at any corpus size. The honest bound (~−1.8% of the
+    container) buys against the real wire cost: four decode sites + the
+    pool entry table + the batch-random-access contract — the same
+    "smaller than a wire-kind's test surface" verdict as the 0.9.130
+    recipe columns. Axis closed with the bound printed.
+  - **the per-record batch tune ladder priced −0.4% of the container —
+    NOT shipped.** Each record compressed as its OWN stream (the shipped
+    wire) under alternative tunes: preset 9|EXTREME lc0/lp0/pb0 (binary
+    contexts suit the varint-dense columns) is the best at −1.7% of the
+    class; every other lc/lp/pb variant is −0.4…−1.1%. A batch-only wire
+    stamp (the slab tunes are shared constants minted per stream) plus
+    the full decode-site retest surface for a sub-half-percent slice —
+    closed, bound printed.
+  - **spatial pack order — the one order axis the 0.9.129 census never
+    named — priced NEGATIVE on every pool class; the lex walk stays
+    champion.** New `examples/spatial_probe.rs` attributes every deduped
+    slab member to its first-introduction 96-chunk column band (band
+    drains make the slab frames disk-visible; members dedup on BODY
+    CONTENT because hashless entry rows carry no stored identity — the
+    stored-hash diff collapses to one bucket). The SAME member sets are
+    then LZMA-priced (shipped tune) in four orders: lex (shipped),
+    spatial cz-major, spatial cx-major, diagonal, plus a
+    delta-varint-vs-neighbor bound:
+    - end tail_nbt (1,239 members, 1.12 MB): **lex 91,637 B** vs spatial
+      92,5–92,6 (+0.9–1.0%), delta-vs-prev 261,525 (+185%).
+    - overworld tail_nbt (797 members, 723 KB): **lex 47,792** vs spatial
+      +0.6%, delta 145,673 (+205%).
+    - overworld glob_g1 (1,289 members, 182 KB): **lex 29,095** vs
+      spatial 31,5–31,7 (+8.8%), delta 33,695 (+15.8%).
+    The verdict matches the 0.9.120 inter-section delta probe (+112.8%
+    on the g26 grids): island heightmaps differ across the WHOLE array
+    (per-column generator noise), so spatial proximity carries no
+    LZMA-visible similarity that the content lex clustering does not
+    already capture — and lex clustering additionally concentrates the
+    shared template material where the window sees it once. The order
+    axis joins the closed set; the byte wall stands at the honest floor
+    with EVERY axis now priced.
+  - operational note: band drains × seal roll one segment per band —
+    1,536 bands exceed the 1024-fd default ("Too many open files" on the
+    batcher commit); band=96 (480 segments) stays safe, raise the limit
+    for finer bands.
+  Gates: 123/123 tests, enc_fp pin EXACT 6d240d7166cdda99/12130/9971843
+  (no store code moved — probe + offline pricing only), full-world probe
+  192 PASS bad=0 miss=0 reopen clean (OW 7.6 / NH 1.5 / END 3.3 / ALL
+  4.1 B/chunk, projection 4.6 GiB linear / 4.9 GiB ringed marginal).
+
 * **The v0.9.130 recipe columnar census: the last axis flagged unpriced is
   closed — TINY, with a printed bound.** The 0.9.128/0.9.129 NEXT lists
   carried one unpriced byte axis ("the recipe format census —
