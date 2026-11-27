@@ -2272,6 +2272,31 @@ all stall points are captured as CI artifacts.
   ×1000), probe wall unchanged (52.3 s vs 52.0 s — within noise; the
   read path gained zero persistent syscalls on the hot paths).
 
+  **The first CI pass exposed two latent read-path bugs the old mmap
+  behavior had been masking BY ACCIDENT** (serve-bench byte-identity
+  red + a 4 GiB OOM in size-bench; both reproduced locally and fixed
+  in the same version):
+  - **the sealed read's out-of-range `?` exit was a masked sentinel.**
+    A map taken while a segment is still appending pins a stale length;
+    the sync loop's early map made that a DESIGN property for the
+    writer segment, so a formerly-writer segment served `None`
+    ("unreadable") for every record beyond the pinned length after the
+    pack. Fix: out-of-range falls THROUGH to the pread arm (real
+    bytes), and the sync loop no longer maps — the writer segment gets
+    its full map at roll/seal/scan once complete.
+  - **the BATCHED sentinel reached load_recipe as a byte length.**
+    optimize_fields_step's drop-refs re-read passed the u32::MAX
+    pointer marker straight to seg_read_body; the old mmap `?` exit
+    returned None before any allocation, the new pread fall-through
+    turned it into a `vec![0u8; 4 GiB]` OOM inside compact_step. Fix:
+    the re-read routes through `recipe_at`, which resolves the
+    sentinel through the batch index (all other load_recipe callers
+    audited — every one already guards the sentinel).
+  Post-fix: bench_size compact x0.06 vs anvil (was panic), serve_probe
+  full pipeline PASS (replay verify 16384/16384 bad=0, chunk hook
+  byte-for-byte), 124/124 tests, enc_fp pin EXACT, probe 192 PASS
+  reopen clean.
+
 * **The v0.9.131 batch-pool + order census: the last two unpriced byte axes
   closed with printed bounds — both under the shipping bar.** With every
   grid/recipe/heightmap axis priced (0.9.128–0.9.130), two fronts remained

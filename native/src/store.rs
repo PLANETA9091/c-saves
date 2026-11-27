@@ -1049,8 +1049,15 @@ impl Seg {
         if sealed {
             self.ensure_mmap();
             if let Some(mm) = self.mmap.get().and_then(|m| m.as_ref()) {
-                let s = mm.get(off as usize..off as usize + len)?;
-                return Some(s.to_vec());
+                if let Some(s) = mm.get(off as usize..off as usize + len) {
+                    return Some(s.to_vec());
+                }
+                // v0.9.132 HOTFIX: beyond the mapped length the seg GREW
+                // after the map was taken (a formerly-writer segment mapped
+                // while still appending). Fall through to the pread arm —
+                // the early `?` exit served None ("unreadable") for records
+                // the file actually holds (bench_size/serve-bench caught
+                // it as missing chunks after the pack).
             }
         }
         // pread: positional read on a shared fd -- seek()+read() here would
@@ -7465,7 +7472,10 @@ impl Store {
         let segs = self.segs.read();
         for s in segs.values() {
             let _ = s.sync_data_seg();
-            s.ensure_mmap(); // drops the stored handle once the map covers reads
+            // NO ensure_mmap here: the WRITER segment is still appending —
+            // an early map would pin a stale length for the seg's whole
+            // life (the fallback pread covers reads meanwhile; the writer
+            // seg gets its full map at roll/seal/scan once complete).
         }
     }
 
@@ -8866,7 +8876,14 @@ impl Store {
                 self.recipe_batch.lock().push(key, bare);
             }
             self.bump_recipe_refs(&new_rec);
-            if let Some(old_rec) = self.load_recipe(seg, off, len) {
+            // v0.9.132: resolve the OLD pointer through recipe_at — the
+            // captured len can be the BATCHED sentinel (u32::MAX), which
+            // load_recipe would pass to seg_read_body as a byte length. The
+            // pre-0.9.132 code survived it by accident: the sealed mmap's
+            // out-of-range `?` exit returned None before any allocation;
+            // the bounded-fd fall-through to pread exposed the bug as a
+            // 4 GiB allocation (bench_size/compact_step OOM).
+            if let Some(old_rec) = self.recipe_at(key, seg, off, len) {
                 self.drop_recipe_refs(&old_rec);
             }
             if let Some(s) = self.segs.read().get(&seg) {
