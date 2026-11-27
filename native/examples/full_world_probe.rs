@@ -85,6 +85,10 @@ struct DimStat {
     full: u64,
     ok_s: usize,
     miss: usize,
+    /// ringed mode: the last ring's marginal full-disk B/chunk (the honest
+    /// at-scale incremental cost, mix-preserving stripes)
+    last_marg: f64,
+    ring_lines: Vec<String>,
 }
 
 fn mib(b: u64) -> String {
@@ -188,7 +192,11 @@ fn main() {
             anvil += write_region(&dim_dir, rk.0, rk.1, &slots);
         }
 
-        // 3) the production import path into its own store + full drain
+        // 3) the production import path into its own store + full drain.
+        // CSAVES_FULLWORLD_RINGS=k>1: import in k mix-preserving stripes
+        // (cx % k == r covers every terrain band per ring — the marginal
+        // measures pure dedup saturation, not the spatial mix), drain and
+        // weigh after each.
         c_saves::store::pack_census_reset();
         let store_dir = out.join(format!("store-{}", name));
         let st = Store::open_cfg(&store_dir, true, Cfg::from_env()).unwrap();
@@ -197,12 +205,43 @@ fn main() {
         keys.sort();
         let by_key: Map<u64, usize> =
             payloads.iter().enumerate().map(|(i, (k, _, _))| (*k, i)).collect();
-        for &k in &keys {
-            st.write_chunk_import(k, &payloads[by_key[&k]].1).unwrap();
+        let rings: usize = std::env::var("CSAVES_FULLWORLD_RINGS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let mut ring_lines: Vec<String> = Vec::new();
+        let mut last_marg = 0.0f64;
+        let mut prev_full = 0u64;
+        for r in 0..rings {
+            let t_r = std::time::Instant::now();
+            let mut rc = 0u64;
+            for &k in &keys {
+                let cx = (k >> 32) as i32;
+                if cx.rem_euclid(rings as i32) == r as i32 {
+                    st.write_chunk_import(k, &payloads[by_key[&k]].1).unwrap();
+                    rc += 1;
+                }
+            }
+            drain(&st);
+            let full_now = st.full_disk_bytes();
+            let marg = (full_now - prev_full) as f64 / rc.max(1) as f64;
+            last_marg = marg;
+            ring_lines.push(format!(
+                "   ring {r} (cx%{rings}=={r}): {rc} chunks | cum {} | marginal {:.1} B/chunk ({:.1?})",
+                mib(full_now),
+                marg,
+                t_r.elapsed()
+            ));
+            prev_full = full_now;
         }
         let import_t = t0.elapsed();
-        drain(&st);
-        println!("   pack census: {}", c_saves::store::pack_census_json());
+        if rings == 1 {
+            println!("   pack census: {}", c_saves::store::pack_census_json());
+        } else {
+            for l in &ring_lines {
+                println!("{l}");
+            }
+        }
         let container = st.disk_bytes();
         let full = st.full_disk_bytes();
 
@@ -299,6 +338,8 @@ fn main() {
             full: close_full,
             ok_s,
             miss,
+            last_marg,
+            ring_lines,
         });
     }
 
@@ -379,6 +420,24 @@ fn main() {
         pc_all * world_chunks * dims_n / 1073741824.0,
         pa_all * dims_n / pc_all.max(0.000001),
     );
+    if stats.iter().any(|s| !s.ring_lines.is_empty()) {
+        // the ringed marginal measured on THIS corpus at THIS footprint: the
+        // honest at-scale incremental cost (mix-preserving stripes). Both
+        // numbers are printed — the linear projection stays the conservative
+        // bound, the marginal projection is the measured saturation view.
+        let pc_ring = stats.iter().map(|s| s.last_marg).sum::<f64>() / dims_n;
+        println!(
+            "  ALL THREE (ringed marginal at {f}x{f}, cx%k stripes) c-saves ~{:.1} GiB — the measured at-scale view vs the {:.1} GiB linear bound",
+            pc_ring * world_chunks * dims_n / 1073741824.0,
+            pc_all * world_chunks * dims_n / 1073741824.0,
+        );
+        for s in &stats {
+            println!("  ring trace {}:", s.name);
+            for l in &s.ring_lines {
+                println!("    {}", l.trim_start());
+            }
+        }
+    }
 
     // 8) the pass verdict: every chunk of every dimension verified on the
     // live store AND after a fresh reopen

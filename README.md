@@ -2184,6 +2184,63 @@ all stall points are captured as CI artifacts.
   stores at **~4.8 GiB vs ~4.48 TiB across the three dimensions (x2878)**
   (`full_world_probe`, CI-gated).
 
+* **The v0.9.129 byte-wall census: every remaining byte axis priced, the
+  naive CM closed with numbers, the scale question settled — the 1 GiB
+  ask hits the honest full-storage floor.** The directive was 4.6 GiB →
+  1 GiB → 500 MiB on the 20000×20000-chunk projection; the tick priced
+  every untried axis and returns the honest map:
+  - **the naive context-modeling coder loses to the shipped LZMA2 by
+    5.4–11.4×** on the real grids. The CM (pool-wide adaptive range
+    coder, the one encoder family never tried — LZMA cannot see the
+    vertical axis and the 0.9.119 lc/lp nibble-phase ladder was flat)
+    was priced per-member on the drained stores, roundtrips byte-exact:
+    overworld g26 (4,994 ocean grids, 10.23 MB raw): LZMA 113,710 B
+    (22.8 B/member) vs CM(above,plane) 1,294,129 / CM(above,left,plane)
+    617,824 / CM transposed 1,095,509; mountains g6 (2,310 transposed
+    u8 grids): LZMA-as-is 56,487 B (24.5/member) vs CM 695–719 KB
+    (300+/member). The lex-clustered pool is template-dominated — 97%+
+    of every member is matched material, so LZMA's match machinery
+    expresses the sharing almost perfectly while per-position models
+    converge too slowly to compete. A match-model CM (lpaq-class) is
+    the only machinery that could fight LZMA on its own turf — closed
+    BY CONTRACT: its decode runs ~20–30× slower than LZMA2 and the
+    open/restart latency gates are shipped contracts (reopen 105.6 ms,
+    restart ~12 s at scale).
+  - **the missing dense-transposed admission form priced WORSE**: LZMA
+    over column-major g26 grids 291,491 vs 113,710 as-is (the transpose
+    destroys the byte-level similarity the window matches); g6 already
+    ships its transposed winner — un-transposing costs +23%.
+  - **the end-city piece factoring priced ~1–2%**: the census over the
+    raw payloads shows the 1,233 city chunks carry BYTE-IDENTICAL
+    Structures nodes (empty-structure twins at 26 B × 35,631, the
+    end_city starts at 22 B × 1,233), so the structure repeats are
+    already free under the wire's LZMA window; the tail mass is the
+    heightmap bytes (terrain entropy), not the structure NBT.
+  - **the scale question settled with mix-preserving stripes**
+    (`CSAVES_FULLWORLD_RINGS=k` in `full_world_probe`: ring r imports
+    cx%k==r, every terrain band per ring — the marginal measures pure
+    dedup saturation, not the spatial mix): overworld marginal cost is
+    FLAT with scale (8.4→7.5→7.5→8.3 B/chunk at 256²; 7.2→7.3 at 512²
+    before the 3 GB sandbox OOM), the nether saturates early (1.7→1.3),
+    the end is flat-noisy (3.9→3.4→3.0→3.4) — the linear projection is
+    the honest number, no scale lunch exists on this corpus (the
+    tectonic ring decline was a banded-ring artifact; both projections
+    now print side by side, the linear one as the conservative bound).
+  - the remaining legal levers priced single-digit-percentage: the
+    entry-table columns are already LZMA-periodic (two varints per
+    member, constant-run lengths match as one period), a heightmap CM
+    on the end tails bounds ~1–2%, the dicts at rest are load-bearing
+    (blob decode keys them).
+  The honest verdict: the full-storage tier's floor at 20000×20000
+  chunks is the terrain entropy itself at the LZMA match floor
+  (~4.6 GiB; heroic match-model work is bounded ~3.5–4.0 GiB); 1 GiB
+  (0.89 B/chunk) requires eliminating the terrain entropy — the
+  seed/contract family, forbidden by directive. The pricing harnesses
+  ship as examples (`cm_probe` both modes with roundtrip asserts,
+  `end_factor_probe`, the ringed `full_world_probe`); 123/123 tests,
+  enc_fp pin EXACT (no store code moved), probe verify+reopen bad=0
+  miss=0 at 192² and 256² ringed.
+
 * **The v0.9.128 batch LZMA tier + a latent-corruption fix in the cold
   encoder.** The compression sprint opens on the batch pool (recipes are
   the nether's 61% and the end's 16% of the close weight): batch records
