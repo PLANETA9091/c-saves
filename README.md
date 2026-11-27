@@ -2241,6 +2241,30 @@ all stall points are captured as CI artifacts.
   enc_fp pin EXACT (no store code moved), probe verify+reopen bad=0
   miss=0 at 192² and 256² ringed.
 
+* **The v0.9.130 recipe columnar census: the last axis flagged unpriced is
+  closed — TINY, with a printed bound.** The 0.9.128/0.9.129 NEXT lists
+  carried one unpriced byte axis ("the recipe format census —
+  pointer-dense, may compress harder columnar"); the batch class is the
+  nether's 61% and ~18% of the overworld close weight. The census
+  (`examples/recipe_census.rs`) dumps the EXACT bodies the flush commits
+  (new env hook `CSAVES_RECIPE_DUMP` — per-flush `[u64 key][u32
+  len][body..]` on the real import path), applies the same hash dedup the
+  grouping uses, and A/Bs the shipped 0x0C layout (varint key column +
+  varint idx column + u16 len column + concat unique bodies) against a
+  full columnar re-layout (hdr / id-delta / run / tail / verbatim-other
+  columns over the unique bodies) under the SAME tuned LZMA2 the 0x0D
+  record ships (preset 6|EXTREME lc4/lp0/pb0). Verdict at 192²:
+  **overworld −1.5%, nether −2.5%, end −4.9% of the class — a
+  sub-1% slice of the container; the axis is priced and NOT shipped**
+  (the mode histogram explains why: every recipe is a mode-8 split wire,
+  the RLE mode-10 never wins at these section counts, and the bodies are
+  already delta-varint — the columns are pointer-dense exactly where
+  LZMA's match machinery is strongest; the win that exists is smaller
+  than a wire-kind's test surface). The recipe byte wall joins the
+  0.9.129 census as closed; the remaining byte fronts stay the priced
+  single-digit grinds. Gates: 123/123 tests, enc_fp pin EXACT
+  (no wire moved), probe 64 PASS bad=0 miss=0.
+
 * **The v0.9.128 batch LZMA tier + a latent-corruption fix in the cold
   encoder.** The compression sprint opens on the batch pool (recipes are
   the nether's 61% and the end's 16% of the close weight): batch records

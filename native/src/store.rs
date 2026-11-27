@@ -4099,6 +4099,25 @@ impl Store {
             let snapshot: Vec<(u64, Arc<Vec<u8>>)> =
                 b.entries.iter().map(|(k, a)| (*k, a.clone())).collect();
             b.bytes = 0;
+            // 0.9.130 census hook: dump the EXACT batched bodies ([0xFF]
+            // prefix included) the flush is about to commit. Appended per
+            // flush as [u64 key][u32 len][body..]; the census example applies
+            // the same hash-dedup the grouping path uses. No-op unless
+            // CSAVES_RECIPE_DUMP names a file.
+            if let Ok(dump_path) = std::env::var("CSAVES_RECIPE_DUMP") {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&dump_path)
+                {
+                    for (k, a) in &snapshot {
+                        let _ = f.write_all(&k.to_le_bytes());
+                        let _ = f.write_all(&(a.len() as u32).to_le_bytes());
+                        let _ = f.write_all(a);
+                    }
+                }
+            }
             // split into batch-sized groups (same accumulation as before)
             let mut groups: Vec<Vec<(u64, Arc<Vec<u8>>)>> = Vec::new();
             let mut cur: Vec<(u64, Arc<Vec<u8>>)> = Vec::new();
