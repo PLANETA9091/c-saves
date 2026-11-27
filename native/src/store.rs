@@ -991,7 +991,17 @@ impl BlobLoc {
 }
 
 struct Seg {
-    file: File,
+    /// v0.9.132 bounded-fd lifecycle: the stored read handle is a CACHE, not
+    /// a requirement. Every segment ever rolled used to hold its rfile open
+    /// forever (2 fds/segment with the writer handle) — a huge-world import
+    /// at the shipped 64 MiB roll rate broke the 1024-fd default mid-import
+    /// ("Too many open files" on the batcher commit, observed at 1,536
+    /// rolled segments). The mmap alone covers all sealed reads (file-backed
+    /// clean pages persist after the fd closes); the fd reopens transiently
+    /// for the rare unsealed pread on a closed segment. Steady state: the
+    /// writer segment's handles + transient opens, regardless of roll count.
+    path: PathBuf,
+    file: std::sync::RwLock<Option<File>>,
     /// Lazily-mapped read view for SEALED segments. OnceLock: lock-free after
     /// the first successful map (one Mutex acquire per blob read was measured
     /// as real contention under Moonrise's parallel IO workers).
@@ -1018,10 +1028,27 @@ struct Seg {
 }
 
 impl Seg {
+    /// Map the segment once (transient fd — the map itself holds the data
+    /// alive) and drop the stored handle on success. Failure caches None and
+    /// the pread fallback takes over, byte-for-byte today's contract.
+    fn ensure_mmap(&self) {
+        let mapped = self.mmap.get_or_init(|| {
+            let Ok(f) = OpenOptions::new().read(true).open(&self.path) else {
+                return None;
+            };
+            unsafe { Mmap::map(&f) }.ok().map(Arc::new)
+        });
+        if mapped.is_some() {
+            if let Ok(mut g) = self.file.write() {
+                *g = None;
+            }
+        }
+    }
+
     fn read_at(&self, off: u64, len: usize, sealed: bool) -> Option<Vec<u8>> {
         if sealed {
-            let m = self.mmap.get_or_init(|| unsafe { Mmap::map(&self.file) }.ok().map(Arc::new));
-            if let Some(mm) = m.as_ref() {
+            self.ensure_mmap();
+            if let Some(mm) = self.mmap.get().and_then(|m| m.as_ref()) {
                 let s = mm.get(off as usize..off as usize + len)?;
                 return Some(s.to_vec());
             }
@@ -1031,8 +1058,34 @@ impl Seg {
         // return garbage (observed as infinite spawn-load retries).
         let mut buf = vec![0u8; len];
         use std::os::unix::fs::FileExt;
-        self.file.read_exact_at(&mut buf, off).ok()?;
+        {
+            let g = self.file.read().unwrap();
+            if let Some(f) = g.as_ref() {
+                f.read_exact_at(&mut buf, off).ok()?;
+                return Some(buf);
+            }
+        }
+        // fd closed (bounded-fd lifecycle): transient open, pread, drop —
+        // no caching, so the fd count stays bounded no matter how many
+        // segments roll.
+        let mut f = OpenOptions::new().read(true).open(&self.path).ok()?;
+        f.read_exact_at(&mut buf, off).ok()?;
         Some(buf)
+    }
+
+    /// fsync through the cached handle, or transiently when the fd is
+    /// closed (fsync is per-inode; the handle identity is irrelevant).
+    fn sync_data_seg(&self) {
+        {
+            let g = self.file.read().unwrap();
+            if let Some(f) = g.as_ref() {
+                let _ = f.sync_data();
+                return;
+            }
+        }
+        if let Ok(f) = OpenOptions::new().read(true).open(&self.path) {
+            let _ = f.sync_data();
+        }
     }
 }
 
@@ -3332,7 +3385,8 @@ impl Store {
         self.segs.write().insert(
             id,
             Arc::new(Seg {
-                file: rfile,
+                path: path.clone(),
+                file: std::sync::RwLock::new(Some(rfile)),
                 mmap: std::sync::OnceLock::new(),
                 total: AtomicU64::new(0),
                 live: AtomicU64::new(0),
@@ -3912,6 +3966,15 @@ impl Store {
                     let f = OpenOptions::new().write(true).open(&path)?;
                     f.set_len(valid_end)?;
                     f.sync_data()?;
+                }
+                // v0.9.132 bounded-fd lifecycle: the walk is done — map the
+                // segment and drop its stored handle (one fd per rolled
+                // segment used to persist for the store's whole life).
+                {
+                    let segs = self.segs.read();
+                    if let Some(seg) = segs.get(&id) {
+                        seg.ensure_mmap();
+                    }
                 }
             }
         }
@@ -4622,6 +4685,17 @@ impl Store {
             let target = w.written;
             self.drain_flusher(target);
             let _ = w.file.sync_data();
+            // v0.9.132: the just-rolled segment is complete — map it and
+            // drop its stored handle NOW. A long import rolls hundreds of
+            // segments between sync() calls; leaving the fd open here would
+            // still break the 1024-fd default mid-import.
+            {
+                let old_id = w.seg_id;
+                let segs = self.segs.read();
+                if let Some(s) = segs.get(&old_id) {
+                    s.ensure_mmap();
+                }
+            }
             self.flush_ctl.flushed.store(0, Ordering::Release);
             self.flush_ctl.handed_to.store(0, Ordering::Release);
             let id = self.next_seg.fetch_add(1, Ordering::SeqCst) as u32;
@@ -7390,7 +7464,8 @@ impl Store {
         // writer-handle fsync was redundant.
         let segs = self.segs.read();
         for s in segs.values() {
-            let _ = s.file.sync_data();
+            let _ = s.sync_data_seg();
+            s.ensure_mmap(); // drops the stored handle once the map covers reads
         }
     }
 
@@ -7427,7 +7502,8 @@ impl Store {
         if let Some(id) = seg_id {
             let segs = self.segs.read();
             if let Some(s) = segs.get(&id) {
-                let _ = s.file.sync_data();
+                let _ = s.sync_data_seg();
+                s.ensure_mmap(); // the sealed segment is complete — map it, drop the fd
             }
         }
     }
@@ -9934,6 +10010,88 @@ pub mod tests {
         }
         root.insert("sections".to_string(), Value::List(sec_list));
         fastnbt::to_bytes(&Value::Compound(root)).unwrap()
+    }
+
+    #[test]
+    fn seg_fds_stay_bounded_across_rolls() {
+        // v0.9.132: every rolled segment used to hold its read handle open
+        // for the store's whole life (2 fds/segment with the writer handle).
+        // At the shipped 64 MiB roll rate a huge-world import broke the
+        // 1024-fd default mid-run ("Too many open files" on the batcher
+        // commit, observed at 1,536 rolled segments in the spatial probe).
+        // The mmap alone covers all sealed reads (file-backed clean pages
+        // survive the fd close), so the store must map + drop per segment:
+        // the fd count stays flat no matter how many segments roll.
+        let dir = temp_dir("seg-fd-bounded");
+        let cfg = Cfg {
+            seg_roll: 16 * 1024,
+            compact_min: u64::MAX,
+            auto_pack_bytes: 0,
+            ..bench_cfg()
+        };
+        let st = Store::open_cfg(&dir, true, cfg).unwrap();
+        let n = 60u64;
+        let payloads: Vec<Vec<u8>> = (0..n).map(|i| unique_payload(i as i32, 1700 + i)).collect();
+        for (i, p) in payloads.iter().enumerate() {
+            st.write_chunk(i as u64, p, false).unwrap();
+        }
+        st.sync();
+        st.seal();
+        let seg_files = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().to_string();
+                name.starts_with("seg-").then_some(name)
+            })
+            .count();
+        assert!(seg_files >= 6, "expected several rolled segments, got {seg_files}");
+        let dir_str = dir.to_string_lossy().to_string();
+        let fd_count = || -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            match std::fs::read_link(e.path()) {
+                                Ok(p) => p.to_string_lossy().contains(&dir_str),
+                                Err(_) => false,
+                            }
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let open_fds = fd_count();
+        assert!(
+            open_fds <= 4,
+            "unbounded fd lifecycle: {seg_files} segments but {open_fds} open fds (pre-0.9.132 behavior leaked 2 fds per roll)"
+        );
+        // every chunk still readable (the mmap path carries the data)
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable after fd drops"));
+            assert!(semantic(&got, p), "chunk {i} corrupted after fd drops");
+        }
+        // reopen: the scan maps every segment and the count stays flat
+        drop(st);
+        let st2 = Store::open_cfg(&dir, true, Cfg {
+            seg_roll: 16 * 1024,
+            compact_min: u64::MAX,
+            auto_pack_bytes: 0,
+            ..bench_cfg()
+        })
+        .unwrap();
+        let open_fds2 = fd_count();
+        assert!(
+            open_fds2 <= 4,
+            "reopen leaked fds: {open_fds2} open after scan (pre-0.9.132 behavior: ~2 per segment)"
+        );
+        for (i, p) in payloads.iter().enumerate() {
+            let got = st2
+                .read_chunk(i as u64)
+                .unwrap_or_else(|| panic!("chunk {i} unreadable after reopen"));
+            assert!(semantic(&got, p), "chunk {i} corrupted after reopen");
+        }
     }
 
     #[test]

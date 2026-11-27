@@ -2241,6 +2241,37 @@ all stall points are captured as CI artifacts.
   enc_fp pin EXACT (no store code moved), probe verify+reopen bad=0
   miss=0 at 192² and 256² ringed.
 
+* **The v0.9.132 bounded-fd lifecycle: the huge-world import can no longer
+  break the 1024-fd default mid-run.** The spatial probe exposed it: every
+  segment ever rolled held its read handle open for the store's whole life
+  (2 fds/segment with the writer handle) — at the shipped 64 MiB roll rate
+  a 100 GB-class import rolls ~1,600 segments and blew the default limit
+  MID-RUN ("Too many open files" on the batcher commit, batcher retries
+  spinning). The fix is the correct ownership model, not a limit bump:
+  - the mmap alone covers all SEALED reads (file-backed clean pages
+    persist after the fd closes on Linux) — segments now map + drop their
+    stored handle at roll/seal/scan (a transient fd for the one map
+    syscall; a failed map still caches None and the pread fallback takes
+    over byte-for-byte today's contract);
+  - UNSEALED preads on a closed segment take a transient open with NO
+    caching — the fd count stays flat no matter how many segments roll;
+  - fsync goes through the cached handle or transiently (per-inode — the
+    handle identity was already irrelevant, the shipped code synced
+    through read handles);
+  - sealed reads beyond a mapped length still fall through to the pread
+    arm exactly as before (append-only segments make the pinned-length
+    question moot, but the fall-through keeps the semantics identical).
+  Steady state: the writer segment's handles + transient opens,
+  regardless of roll count. The regression test
+  `seg_fds_stay_bounded_across_rolls` pins the bound permanently
+  (≥6 rolled segments, ≤4 open fds pointing into the store dir, every
+  chunk verified across the fd drop AND across a reopen — the scan's
+  map-and-drop path included). Gates: 124/124 tests, enc_fp pin EXACT
+  6d240d7166cdda99/12130/9971843, full-world probe 192 PASS bad=0
+  miss=0 reopen clean, close weights byte-identical (ALL 4.1 B/chunk
+  ×1000), probe wall unchanged (52.3 s vs 52.0 s — within noise; the
+  read path gained zero persistent syscalls on the hot paths).
+
 * **The v0.9.131 batch-pool + order census: the last two unpriced byte axes
   closed with printed bounds — both under the shipping bar.** With every
   grid/recipe/heightmap axis priced (0.9.128–0.9.130), two fronts remained
