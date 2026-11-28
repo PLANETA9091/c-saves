@@ -663,6 +663,23 @@ pub struct Cfg {
     /// data never lost, the untouched mass stays a 136-byte record.
     /// CSAVES_PRISTINE_REGION=1 opts in.
     pub pristine_region: bool,
+    /// v0.9.133 AUTO-REGEN serve fallback (OPT-IN, default OFF). When a
+    /// read hits a key that is totally ABSENT (no contract, no stored
+    /// chunk — the semantics of a missing region file) and this flag is
+    /// set, the store asks its registered regeneration source for the
+    /// chunk, STORES the result through the normal import pipeline and
+    /// serves it — the miss self-heals and never repeats. With the flag
+    /// off (the default) a miss is a miss, byte-for-byte today's contract;
+    /// with the flag on but NO source registered the behavior is identical
+    /// to off. The source is pluggable (set_autoregen_source): the probe
+    /// harness wires the wgen generator, a future bridge can wire
+    /// c-chunkky's native vanilla-exact generator. The registered function
+    /// must not touch the store (no reads/writes inside — it runs while no
+    /// store lock is held, but re-entrancy is not supported). Note this is
+    /// a DIFFERENT lever from the v0.9.44 pristine contracts (which defer
+    /// regeneration to Paper's worldgen and store nothing): autoregen
+    /// stores the regenerated chunk on first touch. CSAVES_AUTOREGEN=1.
+    pub autoregen: bool,
     /// Min segment size before compaction considers it.
     pub compact_min: u64,
     /// v0.9.114: physically-dead bytes that make a segment UNDER compact_min
@@ -785,6 +802,7 @@ impl Default for Cfg {
             // (direct-API callers) freshness is asserted by the caller.
             pristine_fresh: true,
             pristine_region: false,
+            autoregen: false,
             compact_min: 64 * 1024,
             compact_dead_min: 8 * 1024,
             compact_ratio: 0.25,
@@ -901,6 +919,9 @@ impl Cfg {
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
             pristine_region: std::env::var("CSAVES_PRISTINE_REGION")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false),
+            autoregen: std::env::var("CSAVES_AUTOREGEN")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(false),
         }
@@ -2147,6 +2168,10 @@ pub fn pack_census_reset() {
 }
 /// Unchanged-chunk autosave skips (hash match against the last write).
 pub static ST_WRITE_SKIP: AtomicU64 = AtomicU64::new(0);
+/// v0.9.133 auto-regen fallback: (attempts, stored-and-served). Attempts
+/// count every absent-key read while the flag+source are armed; successes
+/// count chunks the import pipeline actually accepted.
+pub static ST_AUTOREGEN: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 /// v0.9.46: re-saves of contracted chunks that kept the contract through
 /// the strip-canonical legend (raw hash differed, canonical hash matched —
 /// relit light / timer churn / key-order drift, zero bytes stored).
@@ -2472,6 +2497,12 @@ pub struct Store {
     /// region keys share the u64 space with chunk keys, so a recipe-batch
     /// entry could collide with a real chunk key; a side file cannot.
     pristine_regions: RwLock<HashMap<u64, [u64; 16]>>,
+    /// v0.9.133: the registered regeneration source for the auto-regen
+    /// serve fallback (Cfg::autoregen). Pluggable — the engine does not
+    /// hardcode a generator; callers wire one explicitly. `None` (default)
+    /// = the fallback is inert even when the flag is on.
+    autoregen_src:
+        RwLock<Option<std::sync::Arc<dyn Fn(u64) -> Option<Vec<u8>> + Send + Sync>>>,
     pub disk_written: AtomicU64,
     pub logical_bytes: AtomicU64,
     /// Whole-mode stores (entities/POI) hold raw NBT payloads whose repeated
@@ -2748,6 +2779,7 @@ impl Store {
             write_skips: AtomicU64::new(0),
             pristine_flips: AtomicU64::new(0),
             pristine_regions: RwLock::new(HashMap::new()),
+            autoregen_src: RwLock::new(None),
             disk_written: AtomicU64::new(0),
             logical_bytes: AtomicU64::new(0),
             whole_mode: AtomicBool::new(false),
@@ -6479,6 +6511,51 @@ impl Store {
         Some((*arc).clone())
     }
 
+    /// v0.9.133: register the regeneration source for the auto-regen serve
+    /// fallback (`Cfg::autoregen`, opt-in). `source(key)` must return the
+    /// FULL chunk payload bytes (the same shape `write_chunk` /
+    /// `write_chunk_import` accept) and must not touch the store — it runs
+    /// between reads, with no store lock held, but re-entrancy is not
+    /// supported. Callers: the probe harness (wgen), a future c-chunkky
+    /// bridge (vanilla-exact native generation). Passing `None` disarms the
+    /// fallback.
+    pub fn set_autoregen_source(
+        &self,
+        source: Option<std::sync::Arc<dyn Fn(u64) -> Option<Vec<u8>> + Send + Sync>>,
+    ) {
+        *self.autoregen_src.write() = source;
+    }
+
+    /// The auto-regen serve step: call the source, store what it produced
+    /// through the LIVE pipeline (a regenerated chunk is fresh worldgen —
+    /// the same class a first autosave would produce; the live path's
+    /// key-verified pos strip reinserts on read, roundtrip byte-exact),
+    /// count and log. Called from read_chunk's absent branch — NO store
+    /// lock is held here (see the Loc::Absent comment); a source that
+    /// returns None (or a race where the key appeared meanwhile) degrades
+    /// to a plain miss.
+    fn autoregen_serve(&self, key: u64) -> Option<Vec<u8>> {
+        let src = self.autoregen_src.read().clone()?;
+        ST_AUTOREGEN.0.fetch_add(1, Ordering::Relaxed);
+        let payload = src(key)?;
+        match self.write_chunk(key, &payload, false) {
+            Ok(()) => {
+                ST_AUTOREGEN.1.fetch_add(1, Ordering::Relaxed);
+                let cx = (key >> 32) as i32;
+                let cz = key as u32 as i32;
+                eprintln!(
+                    "[c-saves] autoregen: chunk ({cx},{cz}) regenerated from the configured source and stored ({} B)",
+                    payload.len()
+                );
+                Some(payload)
+            }
+            Err(e) => {
+                eprintln!("[c-saves] autoregen: chunk {key:016x} regenerated but NOT stored: {e} — serving the generated bytes this once");
+                Some(payload)
+            }
+        }
+    }
+
     /// Load one chunk payload (uncompressed NBT, `NbtIo.write` form).
     pub fn read_chunk(&self, key: u64) -> Option<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -6495,18 +6572,38 @@ impl Store {
         enum Loc {
             Seg(u32, u64, u32),
             Pending(Arc<Vec<u8>>),
+            Absent,
         }
         // READ-YOUR-WRITES: the pending batch wins over the committed
         // chunks-map entry. A rewrite of a BATCHED chunk removes its batch_idx
         // entry at supersede time, so the stale committed pointer is
         // unreadable until the next flush — the pending recipe is the truth.
+        // v0.9.133: a total miss is Loc::Absent (NOT an early return) so the
+        // opt-in auto-regen fallback below runs OUTSIDE the match scrutinee's
+        // temporary guards (recipe_batch / chunks locks) — the store path it
+        // takes would deadlock on the same locks.
         let loc = match self.recipe_batch.lock().get(key).cloned() {
             Some(pending) => Loc::Pending(pending),
             None => match self.chunks.read().get(&key).copied() {
                 Some((s, o, l)) => Loc::Seg(s, o, l),
-                None => return None,
+                None => Loc::Absent,
             },
         };
+        if let Loc::Absent = &loc {
+            // v0.9.133 AUTO-REGEN (opt-in: Cfg::autoregen + a registered
+            // source): a totally absent key — no contract, no content, the
+            // semantics of a missing region file — gets regenerated by the
+            // configured source, STORED through the normal import pipeline
+            // (the miss self-heals: the next read is a store hit) and
+            // served. Default: flag off, source none -> None, exactly the
+            // v0.9.132 contract.
+            if self.cfg.autoregen {
+                if let Some(payload) = self.autoregen_serve(key) {
+                    return Some(payload);
+                }
+            }
+            return None;
+        }
         // v0.9.82: warm result cache — a committed recipe's (seg, off, len)
         // is its version stamp; a match serves the decoded payload straight
         // from RAM (one lookup + one memcpy instead of the whole decode).
@@ -6530,6 +6627,9 @@ impl Store {
         let rec = match &loc {
             Loc::Pending(body) => self.parse_recipe_body(body),
             Loc::Seg(seg, off, len) => self.recipe_at(key, *seg, *off, *len),
+            // Unreachable: the Absent branch above either returned the
+            // regenerated payload or bailed out with None before this point.
+            Loc::Absent => None,
         };
         {
             let el = t_recipe.elapsed().as_nanos() as u64;
@@ -9650,6 +9750,63 @@ pub mod tests {
 
     /// Semi-realistic chunk: 24 sections, some shared via `variant`,
     /// palette + packed longs, heightmaps, block entities.
+    #[test]
+    fn autoregen_off_by_default_absent_is_a_miss() {
+        // v0.9.133 CONTRACT PIN: the flag is OFF by default, and even with a
+        // source registered an absent key is a plain miss — byte-for-byte
+        // the v0.9.132 behavior. The source must never be consulted.
+        let dir = temp_dir("autoregen-off");
+        let s = Store::open_cfg(&dir, true, Cfg::default()).unwrap();
+        s.set_autoregen_source(Some(Arc::new(|_k| {
+            panic!("source must not run while the flag is off");
+        })));
+        assert!(s.read_chunk(0x0000_0001_0000_0002).is_none());
+        assert_eq!(ST_AUTOREGEN.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn autoregen_opt_in_regenerates_stores_and_self_heals() {
+        // v0.9.133: flag ON + source wired. First read of an absent key
+        // regenerates, STORES through the import pipeline and serves; the
+        // second read is a plain store hit (self-healed); a source that
+        // declines (None) degrades to a plain miss.
+        let dir = temp_dir("autoregen-on");
+        let cfg = Cfg { autoregen: true, ..Cfg::default() };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        let k = |cx: i32, cz: i32| ((cx as u64) << 32) | (cz as u32 as u64);
+        let expected = chunk_payload(3, 4, 9);
+        let exp2 = expected.clone();
+        let target = k(3, 4);
+        s.set_autoregen_source(Some(Arc::new(move |key| {
+            if key == target {
+                Some(exp2.clone())
+            } else {
+                None
+            }
+        })));
+        let got = s.read_chunk(k(3, 4)).expect("absent key regenerates");
+        assert!(semantic(&got, &expected), "served bytes = source payload");
+        // self-heal: the chunk is IN the store now (a plain read again)
+        let got2 = s.read_chunk(k(3, 4)).expect("stored on first touch");
+        assert!(semantic(&got2, &expected), "store hit = the same chunk");
+        assert!(
+            ST_AUTOREGEN.0.load(Ordering::Relaxed) >= 1,
+            "attempt counted"
+        );
+        // a source that declines -> plain miss, no panic
+        assert!(s.read_chunk(k(9, 9)).is_none());
+    }
+
+    #[test]
+    fn autoregen_flag_on_without_source_is_inert() {
+        // flag ON, source never wired: identical to off — the fallback is
+        // inert, absent stays absent.
+        let dir = temp_dir("autoregen-nosrc");
+        let cfg = Cfg { autoregen: true, ..Cfg::default() };
+        let s = Store::open_cfg(&dir, true, cfg).unwrap();
+        assert!(s.read_chunk(0x0000_000A_0000_000B).is_none());
+    }
+
     pub(crate) fn chunk_payload(cx: i32, cz: i32, variant: u64) -> Vec<u8> {
         let mut root: Map<String, Value> = Map::new();
         root.insert("DataVersion".to_string(), Value::Int(4189));

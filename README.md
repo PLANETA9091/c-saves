@@ -2297,6 +2297,30 @@ all stall points are captured as CI artifacts.
   byte-for-byte), 124/124 tests, enc_fp pin EXACT, probe 192 PASS
   reopen clean.
 
+* **The v0.9.133 auto-regen serve fallback: opt-in self-healing reads,
+  default OFF.** A read of a TOTALLY ABSENT key (no contract, no stored
+  chunk — the semantics of a missing region file) can now regenerate the
+  chunk from a pluggable source, STORE it through the live pipeline and
+  serve it — the miss self-heals and never repeats. Design points:
+  - **pluggable, not hardcoded**: `Store::set_autoregen_source` wires any
+    `Fn(key) -> Option<payload>`; the engine ships no generator. The probe
+    harness can wire wgen; the intended production source is a c-chunkky
+    bridge (vanilla-exact native generation) — the CRUSSTY co-run with
+    both modules scans into one deterministic load order (the runtime's
+    modscan proof on the real manifests).
+  - **the write goes through the LIVE path** (`write_chunk`, not import):
+    a regenerated chunk is fresh worldgen, the same class a first autosave
+    produces; the key-verified pos strip reinserts on read, roundtrip
+    byte-exact.
+  - **the OFF contract is pinned**: default `Cfg` (flag off) with a source
+    registered never consults it (the test panics inside the source if the
+    contract breaks); flag on + no source is inert; absent stays absent —
+    zero wire movement, enc_fp pin EXACT 6d240d7166cdda99/12130/9971843.
+    `CSAVES_AUTOREGEN=1` opts in. Counters: ST_AUTOREGEN (attempts,
+    stored-and-served).
+  Gates: 127/127 tests (three new: off-by-default, opt-in
+  regenerate+store+self-heal, flag-on-inert), enc_fp EXACT.
+
 * **The v0.9.131 batch-pool + order census: the last two unpriced byte axes
   closed with printed bounds — both under the shipping bar.** With every
   grid/recipe/heightmap axis priced (0.9.128–0.9.130), two fronts remained
